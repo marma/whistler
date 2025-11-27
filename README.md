@@ -14,6 +14,8 @@ Whistler has the following features:
 
 **Note**: preemtible and ephemeral sessions are not yet supported.
 
+![Whistler](img/screenshot_1.png "Whistler")
+
 ## Install
 
 ### Installation through Helm Chart
