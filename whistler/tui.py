@@ -1,0 +1,694 @@
+from textual.app import App, ComposeResult
+from textual.widgets import Header, Footer, Static, DataTable, Input, Button, Label, Select
+from textual.containers import Container
+from textual.screen import Screen
+
+class InstanceCreateScreen(Screen):
+    CSS = """
+    InstanceCreateScreen {
+        align: center middle;
+    }
+
+    .main-container {
+        width: 60;
+        height: auto;
+        border: solid green;
+        padding: 1;
+        background: $surface;
+    }
+
+    .input-grid {
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 1fr 2fr;
+        width: 100%;
+        margin-bottom: 1;
+    }
+
+    .input-grid Label {
+        padding: 1;
+        text-align: left;
+        align-vertical: middle;
+    }
+
+    .header {
+        text-align: center;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    .buttons {
+        width: 100%;
+        height: auto;
+        align: center middle;
+        layout: horizontal;
+    }
+
+    Button {
+        margin: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Label("Create New Instance", classes="header"),
+            Container(
+                Label("Instance Name:"),
+                Input(placeholder="e.g. my-instance", id="instance_name"),
+                classes="input-grid"
+            ),
+            Container(
+                Button("Create", variant="primary", id="create_btn"),
+                Button("Cancel", variant="error", id="cancel_btn"),
+                classes="buttons"
+            ),
+            classes="main-container"
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "create_btn":
+            name = self.query_one("#instance_name", Input).value
+            if name:
+                self.dismiss(name)
+        elif event.button.id == "cancel_btn":
+            self.dismiss(None)
+
+class TemplateEditScreen(Screen):
+    CSS = """
+    TemplateEditScreen {
+        align: center middle;
+    }
+
+    .main-container {
+        width: 70;
+        height: 50;
+        border: round orange;
+        padding: 0;
+        margin: 0;
+        background: $surface;
+    }
+
+    .input-grid {
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 1fr 2fr;
+        width: 100%;
+        margin-bottom: 1;
+    }
+
+    .input-grid Label {
+        padding: 0;
+        margin: 0;
+        text-align: left;
+        align-vertical: middle;
+    }
+
+    .input-grid Input {
+        padding: 0;
+        margin: 0;
+        text-align: left;
+    }
+
+    .header {
+        text-align: center;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    .buttons {
+        width: 100%;
+        height: auto;
+        align: center middle;
+        layout: horizontal;
+    }
+
+    .inputs {
+        text-align: left;
+        align-vertical: middle;
+        padding: 0;
+        margin: 0;
+    }
+
+    .labels {
+        text-align: left;
+        align-vertical: middle;
+        padding: 0;
+        margin: 0;
+    }
+
+    Button {
+        margin: 1;
+    }
+
+    Input {
+        border: round grey;
+        
+    }
+
+    Select {
+        border: none;
+        margin: 0;
+        padding: 0;
+    }
+    """
+
+    def __init__(self, template: dict | None = None):
+        super().__init__()
+        self.template = template or {}
+
+    def compose(self) -> ComposeResult:
+        resources = self.template.get("resources", {})
+        node_selector = self.template.get("nodeSelector", {})
+        
+        # Get selectors from config
+        config = self.app.config_manager.config if self.app.config_manager else {}
+        selectors = config.get("selectors", {})
+        
+        gpu_types = [(t, t) for t in selectors.get("gpu_types", [])]
+        node_names = [(n, n) for n in selectors.get("node_names", [])]
+        node_types = [(t, t) for t in selectors.get("node_types", [])]
+        
+        # Current values
+        current_gpu_type = node_selector.get("accelerator", Select.BLANK)
+        current_node_name = node_selector.get("kubernetes.io/hostname", Select.BLANK)
+        current_node_type = node_selector.get("instance-type", Select.BLANK)
+
+        yield Container(
+            Label("Template Details", classes="header"),
+            Container(
+                Label("Name:"),
+                Input(value=self.template.get("name", ""), placeholder="e.g. my-template", id="name"),
+                Label("Description:"),
+                Input(value=self.template.get("description", ""), placeholder="e.g. My custom template", id="description"),
+                Label("Image:"),
+                Input(value=self.template.get("image", ""), placeholder="e.g. ubuntu:latest", id="image"),
+                Label("CPU:"),
+                Input(value=resources.get("cpu", ""), placeholder="e.g. 500m", id="cpu"),
+                Label("Memory:"),
+                Input(value=resources.get("memory", ""), placeholder="e.g. 512Mi", id="memory"),
+                Label("GPU (optional):"),
+                Input(value=resources.get("gpu", ""), placeholder="e.g. 1", id="gpu"),
+                classes="input-grid"
+            ),
+            
+            Container(
+                Label("Node Selectors:", classes="header"),
+                Container(
+                    Label("GPU Type:"),
+                    Select(gpu_types, value=current_gpu_type, prompt="Select GPU Type", id="sel_gpu_type"),
+                    Label("Node Name:"),
+                    Select(node_names, value=current_node_name, prompt="Select Node Name", id="sel_node_name"),
+                    Label("Node Type:"),
+                    Select(node_types, value=current_node_type, prompt="Select Node Type", id="sel_node_type"),
+                    classes="input-grid"
+                ),
+                id="advanced_container"
+            ),
+
+            Container(
+                Button("Save", variant="primary", id="save_btn"),
+                Button("Cancel", variant="error", id="cancel_btn"),
+                classes="buttons"
+            ),
+            classes="main-container"
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save_btn":
+            name = self.query_one("#name", Input).value
+            image = self.query_one("#image", Input).value
+            cpu = self.query_one("#cpu", Input).value
+            memory = self.query_one("#memory", Input).value
+            gpu = self.query_one("#gpu", Input).value
+
+            # Collect selectors
+            node_selector = {}
+            
+            gpu_type = self.query_one("#sel_gpu_type", Select).value
+            if gpu_type != Select.BLANK:
+                node_selector["accelerator"] = gpu_type
+                
+            node_name = self.query_one("#sel_node_name", Select).value
+            if node_name != Select.BLANK:
+                node_selector["kubernetes.io/hostname"] = node_name
+                
+            node_type = self.query_one("#sel_node_type", Select).value
+            if node_type != Select.BLANK:
+                node_selector["instance-type"] = node_type
+
+            if name and image:
+                template_data = {
+                    "name": name,
+                    "description": self.query_one("#description", Input).value,
+                    "image": image,
+                    "resources": {
+                        "cpu": cpu,
+                        "memory": memory
+                    },
+                    "nodeSelector": node_selector
+                }
+                if gpu:
+                    template_data["resources"]["gpu"] = gpu
+                self.dismiss(template_data)
+            else:
+                self.notify("Name and Image are required.", severity="error")
+        elif event.button.id == "cancel_btn":
+            self.dismiss(None)
+
+class TemplateViewScreen(Screen):
+    CSS = """
+    TemplateViewScreen {
+        align: center middle;
+    }
+
+    .main-container {
+        width: 70;
+        height: auto;
+        border: solid green;
+        padding: 1;
+        background: $surface;
+    }
+
+    .details-grid {
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 1fr 2fr;
+        height: auto;
+        width: 100%;
+        margin-bottom: 1;
+    }
+
+    .details-grid Label {
+        padding: 1;
+        text-align: left;
+        width: 100%;
+    }
+    
+    .label-key {
+        text-style: bold;
+    }
+
+    .value {
+        color: $text-muted;
+    }
+
+    .buttons {
+        width: 100%;
+        height: auto;
+        align: center middle;
+        layout: horizontal;
+    }
+
+    Button {
+        margin: 1;
+    }
+    """
+
+    BINDINGS = [("e", "edit", "Edit Template"), ("escape", "close", "Close")]
+
+    def __init__(self, template: dict):
+        super().__init__()
+        self.template = template
+
+    def compose(self) -> ComposeResult:
+        resources = self.template.get("resources", {})
+        node_selector = self.template.get("nodeSelector", {})
+        
+        # Format node selector for display
+        ns_str = "\n".join([f"{k}: {v}" for k, v in node_selector.items()]) if node_selector else "None"
+
+        yield Container(
+            Label("Template Details", classes="label-key"),
+            Container(
+                Label("Name:", classes="label-key"),
+                Label(self.template.get("name", ""), classes="value"),
+                
+                Label("Description:", classes="label-key"),
+                Label(self.template.get("description", ""), classes="value"),
+                
+                Label("Image:", classes="label-key"),
+                Label(self.template.get("image", ""), classes="value"),
+                
+                Label("CPU:", classes="label-key"),
+                Label(str(resources.get("cpu", "")), classes="value"),
+                
+                Label("Memory:", classes="label-key"),
+                Label(str(resources.get("memory", "")), classes="value"),
+                
+                Label("GPU:", classes="label-key"),
+                Label(str(resources.get("gpu", "None")), classes="value"),
+                
+                Label("Node Selector:", classes="label-key"),
+                Label(ns_str, classes="value"),
+
+                Label("Source:", classes="label-key"),
+                Label(self.template.get("source", "user"), classes="value"),
+                
+                classes="details-grid"
+            ),
+            Container(
+                Button("Edit", variant="primary", id="edit_btn", disabled=self.template.get("source") == "system"),
+                Button("Close", variant="default", id="close_btn"),
+                classes="buttons"
+            ),
+            classes="main-container"
+        )
+
+    def action_edit(self) -> None:
+        if self.template.get("source") != "system":
+            self.dismiss("edit")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "edit_btn":
+            self.action_edit()
+        elif event.button.id == "close_btn":
+            self.action_close()
+
+class WhistlerApp(App):
+    """A Textual app to manage Kubernetes pods via SSH."""
+
+    CSS = """
+    Screen {
+        layout: vertical;
+        align: center top;
+    }
+
+    .logo {
+        color: green;
+        text-align: center;
+        margin: 1;
+    }
+
+    .welcome {
+        text-align: center;
+        color: $text;
+    }
+
+    DataTable {
+        margin: 1;
+        height: 10;
+        width: auto;
+    }
+
+    .section-header {
+        margin-top: 1;
+        text-align: center;
+        width: 100%;
+        text-style: bold;
+    }
+
+    Static {
+        width: 100%;
+        text-align: center;
+    }
+    """
+
+    BINDINGS = [
+        ("d", "toggle_dark", "Toggle dark mode"),
+        ("q", "quit", "Quit"),
+        ("i", "instantiate", "Instantiate Template"),
+        ("c", "create_template", "Create Template"),
+        ("e", "edit_template", "Edit Template"),
+        ("v", "view_template", "View Template"),
+        ("D", "delete_instance", "Delete Instance"),
+        ("C", "connect_instance", "Connect Instance")
+    ]
+
+    def __init__(self, config_manager=None, username=None, session=None, **kwargs):
+        super().__init__(**kwargs)
+        self.config_manager = config_manager
+        self.username = username
+        self.session = session
+
+    def compose(self) -> ComposeResult:
+        import sys
+        print("WhistlerApp.compose", file=sys.stderr, flush=True)
+        yield Header()
+        logo = r"""
+██╗    ██╗██╗  ██╗██╗███████╗████████╗██╗     ███████╗██████╗ 
+██║    ██║██║  ██║██║██╔════╝╚══██╔══╝██║     ██╔════╝██╔══██╗
+██║ █╗ ██║███████║██║███████╗   ██║   ██║     █████╗  ██████╔╝
+██║███╗██║██╔══██║██║╚════██║   ██║   ██║     ██╔══╝  ██╔══██╗
+╚███╔███╔╝██║  ██║██║███████║   ██║   ███████╗███████╗██║  ██║
+ ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝╚══════╝   ╚═╝   ╚══════╝╚══════╝╚═╝  ╚═╝"""
+ 
+        yield Static(logo, classes="logo")
+        yield Static("Use 'ssh <username>-<instance-or-template-name>@<hostname>' to connect to an existing instance or create one from template", classes="welcome")
+        
+        yield Label("Templates", classes="section-header")
+        yield DataTable(id="templates_table")
+        
+        yield Label("Instances", classes="section-header")
+        yield DataTable(id="instances_table")
+        
+        yield Footer()
+
+    def _setup_tables(self) -> None:
+        # Calculate column width (screen width - margins) // number of columns
+        # We have 5 columns in templates table now
+        width = self.size.width
+        if width == 0:
+            # Fallback if size is not yet available
+            width = 80
+            
+        col_width = max(10, (width - 4) // 5)
+        
+        # Setup Templates Table
+        try:
+            templates_table = self.query_one("#templates_table", DataTable)
+            templates_table.clear(columns=True)
+            templates_table.cursor_type = "row"
+            templates_table.add_column("Template Name", width=col_width)
+            templates_table.add_column("Image", width=col_width)
+            templates_table.add_column("CPU", width=col_width)
+            templates_table.add_column("Memory", width=col_width)
+            templates_table.add_column("Source", width=col_width)
+            
+            # Setup Instances Table
+            # Instances table has 5 columns
+            inst_col_width = max(10, (width - 4) // 5)
+            instances_table = self.query_one("#instances_table", DataTable)
+            instances_table.clear(columns=True)
+            instances_table.cursor_type = "row"
+            instances_table.add_column("Instance Name", width=inst_col_width)
+            instances_table.add_column("Template", width=inst_col_width)
+            instances_table.add_column("Status", width=inst_col_width)
+            instances_table.add_column("IP", width=inst_col_width)
+            instances_table.add_column("CPU", width=inst_col_width)
+        except Exception:
+            # Widgets might not be ready yet
+            pass
+
+    def on_mount(self) -> None:
+        import sys
+        print("WhistlerApp.on_mount", file=sys.stderr, flush=True)
+        self._setup_tables()
+        self.refresh_data()
+
+    def on_resize(self, event=None) -> None:
+        self._setup_tables()
+        self.refresh_data()
+
+    def refresh_data(self) -> None:
+        if not self.config_manager or not self.username:
+            return
+
+        # Refresh Templates
+        templates_table = self.query_one("#templates_table", DataTable)
+        templates_table.clear()
+        templates = self.config_manager.get_user_templates(self.username)
+        for template in templates:
+            resources = template.get("resources", {})
+            source = template.get("source", "user")
+            templates_table.add_row(
+                template.get("name", "Unknown"),
+                template.get("image", "Unknown"),
+                resources.get("cpu", "-"),
+                resources.get("memory", "-"),
+                source,
+                key=template.get("name") # Use name as row key
+            )
+
+        # Refresh Instances
+        instances_table = self.query_one("#instances_table", DataTable)
+        instances_table.clear()
+        instances = self.config_manager.get_user_instances(self.username)
+        for instance in instances:
+            resources = instance.get("resources", {})
+            instances_table.add_row(
+                instance.get("name", "Unknown"),
+                instance.get("template", "Unknown"),
+                instance.get("status", "Unknown"),
+                instance.get("ip", "-"),
+                resources.get("cpu", "-")
+            )
+
+    def action_instantiate(self) -> None:
+        templates_table = self.query_one("#templates_table", DataTable)
+        if not templates_table.has_focus:
+            self.notify("Select a template first.")
+            return
+
+        try:
+            row_key = templates_table.coordinate_to_cell_key(templates_table.cursor_coordinate).row_key
+            template_name = row_key.value
+        except Exception:
+            self.notify("No template selected.")
+            return
+
+        def create_instance(instance_name: str | None) -> None:
+            if instance_name:
+                if self.config_manager.add_instance(self.username, template_name, instance_name):
+                    self.notify(f"Instance {instance_name} created!")
+                    self.refresh_data()
+                else:
+                    self.notify("Failed to create instance (name might exist).", severity="error")
+
+        self.push_screen(InstanceCreateScreen(), create_instance)
+
+    def action_create_template(self) -> None:
+        def save_template(template_data: dict | None) -> None:
+            if template_data:
+                # New templates are always user source
+                template_data["source"] = "user"
+                if self.config_manager.save_template(self.username, template_data):
+                    self.notify(f"Template {template_data['name']} saved!")
+                    self.refresh_data()
+                else:
+                    self.notify("Failed to save template.", severity="error")
+        
+        self.push_screen(TemplateEditScreen(), save_template)
+
+    def _get_selected_template(self):
+        templates_table = self.query_one("#templates_table", DataTable)
+        if not templates_table.has_focus:
+            self.notify("Select a template first.")
+            return None
+
+        try:
+            row_key = templates_table.coordinate_to_cell_key(templates_table.cursor_coordinate).row_key
+            template_name = row_key.value
+        except Exception:
+            self.notify("No template selected.")
+            return None
+
+        templates = self.config_manager.get_user_templates(self.username)
+        return next((t for t in templates if t["name"] == template_name), None)
+
+    def edit_template_internal(self, template: dict) -> None:
+        if template.get("source") == "system":
+            self.notify("Cannot edit system templates.", severity="error")
+            return
+
+        def save_template(template_data: dict | None) -> None:
+            if template_data:
+                # Preserve source (should be user)
+                template_data["source"] = "user"
+                if self.config_manager.save_template(self.username, template_data):
+                    self.notify(f"Template {template_data['name']} updated!")
+                    self.refresh_data()
+                else:
+                    self.notify("Failed to save template.", severity="error")
+        
+        self.push_screen(TemplateEditScreen(template), save_template)
+
+    def action_edit_template(self) -> None:
+        template = self._get_selected_template()
+        if template:
+            self.edit_template_internal(template)
+
+    def action_view_template(self) -> None:
+        template = self._get_selected_template()
+        if template:
+            def on_close(result: str | None) -> None:
+                if result == "edit":
+                    self.edit_template_internal(template)
+            
+            self.push_screen(TemplateViewScreen(template), on_close)
+
+    def action_toggle_dark(self) -> None:
+        """An action to toggle dark mode."""
+        self.theme = "textual-light" if self.theme == "textual-dark" else "textual-dark"
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id == "templates_table":
+            self.action_view_template()
+
+    def _get_selected_instance(self):
+        instances_table = self.query_one("#instances_table", DataTable)
+        if not instances_table.has_focus:
+            return None
+
+        try:
+            row_index = instances_table.cursor_coordinate.row
+            # Get the first cell of the row (Instance Name)
+            return instances_table.get_row_at(row_index)[0]
+        except Exception:
+            return None
+
+    def action_delete_instance(self) -> None:
+        instances_table = self.query_one("#instances_table", DataTable)
+        if not instances_table.has_focus:
+            self.notify("Select an instance first.")
+            return
+
+        instance_name = self._get_selected_instance()
+        if not instance_name:
+            self.notify("No instance selected.")
+            return
+
+        if self.config_manager.delete_instance(self.username, instance_name):
+            self.notify(f"Instance {instance_name} deleted.")
+            self.refresh_data()
+        else:
+            self.notify(f"Failed to delete instance {instance_name}.", severity="error")
+
+    def action_connect_instance(self) -> None:
+        instances_table = self.query_one("#instances_table", DataTable)
+        if not instances_table.has_focus:
+            self.notify("Select an instance first.")
+            return
+
+        instance_name = self._get_selected_instance()
+        if not instance_name:
+            self.notify("No instance selected.")
+            return
+
+        self.notify(f"Connecting to {instance_name}... (Not implemented yet)")
+
+    @property
+    def driver(self):
+        return getattr(self, "_driver", None)
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+    import os
+    
+    # Add parent directory to path to allow importing whistler modules
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    
+    from whistler.config import ConfigManager
+
+    parser = argparse.ArgumentParser(description="Run Whistler TUI")
+    parser.add_argument("--config", help="Path to configuration file")
+    parser.add_argument("--user", help="Username to load from config")
+    args = parser.parse_args()
+
+    config_manager = None
+    username = None
+
+    if args.config:
+        config_manager = ConfigManager(args.config)
+        if args.user:
+            username = args.user
+        elif config_manager.config.get("users"):
+            # Default to first user if not specified
+            username = next(iter(config_manager.config["users"]))
+            print(f"No user specified, defaulting to: {username}")
+
+    app = WhistlerApp(config_manager=config_manager, username=username)
+    app.run()

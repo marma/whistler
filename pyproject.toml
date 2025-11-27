@@ -1,0 +1,15 @@
+[project]
+name = "whistler"
+version = "0.1.0"
+description = "A TUI written in Python using Textual, served over SSH."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=6.6.0",
+    "asyncssh>=2.14.0",
+    "pyyaml>=6.0.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
