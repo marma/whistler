@@ -437,7 +437,7 @@ class WhistlerApp(App):
  ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝╚══════╝   ╚═╝   ╚══════╝╚══════╝╚═╝  ╚═╝"""
  
         yield Static(logo, classes="logo")
-        yield Static("Use 'ssh <username>-<instance-or-template-name>@<hostname>' to connect to an existing instance or create one from template", classes="welcome")
+        yield Static("Your friendly terminal operator", classes="welcome")
         
         yield Label("Templates", classes="section-header")
         yield DataTable(id="templates_table")
