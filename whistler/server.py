@@ -228,14 +228,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
             self._app_task = asyncio.create_task(self._run_app())
         elif self.target_type == "instance":
             # Find the instance
-            instances = self.config_manager.get_user_instances(self.username)
-            instance = next((i for i in instances if i["name"] == self.target_name), None)
-            
-            if instance and instance.get("podName") and instance.get("status") == "Running":
-                 self._shell_task = asyncio.create_task(self._run_pod_shell(instance["podName"]))
-            else:
-                 self._chan.write(f"Instance {self.target_name} not found or not running.\r\n".encode('utf-8'))
-                 self._chan.exit(1)
+            self._shell_task = asyncio.create_task(self._connect_to_instance())
         elif self.target_type == "template":
              # Create instance logic would go here, then connect
              # For now, just error
@@ -258,6 +251,52 @@ class WhistlerSession(asyncssh.SSHServerSession):
         finally:
             print("WhistlerSession._run_app finished", file=sys.stderr, flush=True)
             self._chan.exit(0)
+
+    async def _connect_to_instance(self):
+        instances = self.config_manager.get_user_instances(self.username)
+        instance = next((i for i in instances if i["name"] == self.target_name), None)
+        
+        if instance:
+             pod_name = instance.get("podName")
+             
+             # If terminating, wait for it to finish first
+             if instance.get("status") == "Terminating":
+                 self._chan.write(b"Waiting for existing pod to terminate ")
+                 while instance and instance.get("status") == "Terminating":
+                     await asyncio.sleep(1)
+                     self._chan.write(b".")
+                     instances = self.config_manager.get_user_instances(self.username)
+                     instance = next((i for i in instances if i["name"] == self.target_name), None)
+                 self._chan.write(b"\r\n")
+                 # Refresh pod_name/status after wait
+                 if instance:
+                     pod_name = instance.get("podName")
+             
+             if not pod_name or (instance and instance.get("status") != "Running"):
+                 self._chan.write(f"Instance {self.target_name} is stopped. Waking up...\r\n".encode('utf-8'))
+                 # Trigger operator to ensure pod exists by patching annotation
+                 import time
+                 try:
+                     self.config_manager.api.patch_namespaced_custom_object(
+                         self.config_manager.group, self.config_manager.version, self.config_manager.namespace,
+                         "whistlerinstances", self.target_name,
+                         {"metadata": {"annotations": {"whistler.io/last-connect": str(time.time())}}}
+                     )
+                 except Exception as e:
+                     print(f"Failed to patch instance: {e}", file=sys.stderr)
+                 
+                 # Wait for pod to be ready
+                 pod_name = await self._wait_for_pod(self.target_name)
+             
+             if pod_name:
+                 self._chan.write(b"Instance is running. Starting shell...\r\n")
+                 await self._run_pod_shell(pod_name)
+             else:
+                 self._chan.write(f"Failed to start instance {self.target_name}.\r\n".encode('utf-8'))
+                 self._chan.exit(1)
+        else:
+             self._chan.write(f"Instance {self.target_name} not found.\r\n".encode('utf-8'))
+             self._chan.exit(1)
 
     async def _run_pod_shell(self, pod_name):
         print(f"Starting shell for pod {pod_name}", file=sys.stderr)
@@ -301,6 +340,33 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 os.close(self._master_fd)
                 self._master_fd = None
             self._chan.exit(0)
+
+    async def _wait_for_pod(self, instance_name, timeout=60):
+        start_time = asyncio.get_running_loop().time()
+        last_status = None
+        
+        while asyncio.get_running_loop().time() - start_time < timeout:
+            instances = self.config_manager.get_user_instances(self.username)
+            instance = next((i for i in instances if i["name"] == instance_name), None)
+            
+            if instance:
+                status = instance.get("status")
+                pod_name = instance.get("podName")
+                
+                if status == "Running" and pod_name:
+                    self._chan.write(b"\r\n")
+                    return pod_name
+                
+                if status != last_status:
+                    if last_status:
+                        self._chan.write(b"\r\n")
+                    self._chan.write(f"Instance status: {status} ".encode('utf-8'))
+                    last_status = status
+                else:
+                    self._chan.write(b".")
+            
+            await asyncio.sleep(1)
+        return None
 
     def data_received(self, data, datatype):
         # print(f"WhistlerSession.data_received: {len(data)} bytes", file=sys.stderr, flush=True)

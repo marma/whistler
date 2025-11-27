@@ -414,7 +414,8 @@ class WhistlerApp(App):
         ("e", "edit_template", "Edit Template"),
         ("v", "view_template", "View Template"),
         ("D", "delete_instance", "Delete Instance"),
-        ("C", "connect_instance", "Connect Instance")
+        ("C", "connect_instance", "Connect Instance"),
+        ("r", "refresh_data", "Refresh")
     ]
 
     def __init__(self, config_manager=None, username=None, session=None, **kwargs):
@@ -468,8 +469,8 @@ class WhistlerApp(App):
             templates_table.add_column("Source", width=col_width)
             
             # Setup Instances Table
-            # Instances table has 5 columns
-            inst_col_width = max(10, (width - 4) // 5)
+            # Instances table has 4 columns
+            inst_col_width = max(10, (width - 4) // 4)
             instances_table = self.query_one("#instances_table", DataTable)
             instances_table.clear(columns=True)
             instances_table.cursor_type = "row"
@@ -477,7 +478,6 @@ class WhistlerApp(App):
             instances_table.add_column("Template", width=inst_col_width)
             instances_table.add_column("Status", width=inst_col_width)
             instances_table.add_column("IP", width=inst_col_width)
-            instances_table.add_column("CPU", width=inst_col_width)
         except Exception:
             # Widgets might not be ready yet
             pass
@@ -522,8 +522,7 @@ class WhistlerApp(App):
                 instance.get("name", "Unknown"),
                 instance.get("template", "Unknown"),
                 instance.get("status", "Unknown"),
-                instance.get("ip", "-"),
-                resources.get("cpu", "-")
+                instance.get("ip") or "-"
             )
 
     def action_instantiate(self) -> None:

@@ -232,16 +232,21 @@ class KubeConfigManager(ConfigManager):
                     
                     pod_status = "Stopped" # Default if no pod
                     pod_name = None
+                    pod_ip = None
                     
                     if pod:
                         pod_name = pod.metadata.name
                         pod_status = pod.status.phase
+                        if pod.metadata.deletion_timestamp:
+                            pod_status = "Terminating"
+                        pod_ip = pod.status.pod_ip
                         
                     inst = {
                         "name": name,
                         "template": spec.get("templateRef"),
                         "status": pod_status,
                         "podName": pod_name,
+                        "ip": pod_ip,
                         "sshHost": None, 
                         "sshPort": None
                     }

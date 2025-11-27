@@ -3,9 +3,8 @@ import kubernetes
 import yaml
 from kubernetes import client, config
 
-@kopf.on.create('whistler.io', 'v1', 'whistlerinstances')
-def create_fn(spec, name, namespace, logger, **kwargs):
-    logger.info(f"Creating instance {name} with spec: {spec}")
+def ensure_pod(spec, name, namespace, logger, **kwargs):
+    logger.info(f"Ensuring pod for instance {name}")
     
     template_ref = spec.get('templateRef')
     user = spec.get('user')
@@ -44,10 +43,28 @@ def create_fn(spec, name, namespace, logger, **kwargs):
     try:
         api.create_namespaced_pod(namespace, pod_body)
         logger.info(f"Pod {pod_name} created")
-        
     except client.rest.ApiException as e:
-        logger.error(f"Failed to create pod: {e}")
-        raise kopf.PermanentError(f"Failed to create pod: {e}")
+        if e.status == 409:
+            # Check if terminating
+            try:
+                existing_pod = api.read_namespaced_pod(pod_name, namespace)
+                if existing_pod.metadata.deletion_timestamp:
+                     logger.info(f"Pod {pod_name} is terminating. Waiting...")
+                     raise kopf.TemporaryError("Pod is terminating", delay=2)
+            except client.rest.ApiException:
+                # Pod might have vanished in the meantime
+                pass
+                
+            logger.info(f"Pod {pod_name} already exists")
+        else:
+            logger.error(f"Failed to create pod: {e}")
+            raise kopf.PermanentError(f"Failed to create pod: {e}")
+
+@kopf.on.create('whistler.io', 'v1', 'whistlerinstances')
+@kopf.on.update('whistler.io', 'v1', 'whistlerinstances')
+@kopf.on.resume('whistler.io', 'v1', 'whistlerinstances')
+def reconcile_fn(spec, name, namespace, logger, **kwargs):
+    ensure_pod(spec, name, namespace, logger, **kwargs)
 
 @kopf.on.delete('whistler.io', 'v1', 'whistlerinstances')
 def delete_fn(spec, name, logger, **kwargs):
