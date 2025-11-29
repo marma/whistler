@@ -37,10 +37,15 @@ class ConfigManager(ABC):
     def delete_instance(self, username: str, instance_name: str) -> bool:
         pass
 
+    @abstractmethod
+    def get_selectors(self) -> Dict[str, Any]:
+        pass
+
 class YamlConfigManager(ConfigManager):
     def __init__(self, config_path: str = "config.yaml"):
         self.config_path = Path(config_path)
         self.config: Dict[str, Any] = {}
+        self.namespace = "default"
         self.load_config()
 
     def load_config(self) -> None:
@@ -48,6 +53,9 @@ class YamlConfigManager(ConfigManager):
             logger.warning(f"Config file {self.config_path} not found. Using empty config.")
             self.config = {"users": {}}
             return
+
+    def get_selectors(self) -> Dict[str, Any]:
+        return self.config.get("selectors", {})
 
         try:
             with open(self.config_path, 'r') as f:
@@ -178,7 +186,19 @@ class KubeConfigManager(ConfigManager):
         self.api = client.CustomObjectsApi()
         self.group = "whistler.io"
         self.version = "v1"
-        self.namespace = "default" # TODO: Make configurable
+        self.api = client.CustomObjectsApi()
+        self.group = "whistler.io"
+        self.version = "v1"
+        
+        # Determine namespace
+        import os
+        self.namespace = os.environ.get("POD_NAMESPACE")
+        if not self.namespace:
+            try:
+                with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "r") as f:
+                    self.namespace = f.read().strip()
+            except FileNotFoundError:
+                self.namespace = "whistler" # Default fallback
 
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
         # In K8s mode, we assume users exist or are managed externally.
@@ -292,6 +312,7 @@ class KubeConfigManager(ConfigManager):
                 "namespace": self.namespace
             },
             "spec": {
+                "user": username,
                 "image": template_data.get("image"),
                 "description": template_data.get("description"),
                 "resources": template_data.get("resources"),
@@ -327,3 +348,8 @@ class KubeConfigManager(ConfigManager):
         except ApiException as e:
             logger.error(f"Failed to delete instance: {e}")
             return False
+
+    def get_selectors(self) -> Dict[str, Any]:
+        # In K8s mode, we could fetch these from a ConfigMap
+        # For now, return empty or defaults
+        return {}

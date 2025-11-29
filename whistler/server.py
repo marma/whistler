@@ -40,6 +40,7 @@ class WhistlerDriver(Driver):
 
     def start_application_mode(self) -> None:
         print("WhistlerDriver.start_application_mode", file=sys.stderr, flush=True)
+        
         # Send initial size event
         size = (80, 24) # Default fallback
         if self._app and hasattr(self._app, 'session') and self._app.session:
@@ -63,7 +64,7 @@ class WhistlerDriver(Driver):
         
         # Dispatch again after a short delay to ensure app is ready
         loop = asyncio.get_running_loop()
-        loop.call_later(0.25, self.process_message, event)
+        loop.call_later(0.05, self.process_message, event)
 
     def disable_input(self) -> None:
         print("WhistlerDriver.disable_input", file=sys.stderr, flush=True)
@@ -81,8 +82,8 @@ class WhistlerDriver(Driver):
     def feed_data(self, data: str | bytes) -> None:
         if isinstance(data, bytes):
             data = data.decode('utf-8')
-        if len(data) > 0 and data[0] == '\x1b':
-           print(f"WhistlerDriver.feed_data escape: {repr(data)}", file=sys.stderr, flush=True)
+        # if len(data) > 0 and data[0] == '\x1b':
+        #    print(f"WhistlerDriver.feed_data escape: {repr(data)}", file=sys.stderr, flush=True)
         for event in self._parser.feed(data):
             self.process_message(event)
 
@@ -94,10 +95,12 @@ async def start_server():
     parser = argparse.ArgumentParser(description="Whistler SSH Server")
     parser.add_argument("--config", default="config.yaml", help="Path to configuration file")
     parser.add_argument("--kubeconfig", help="Path to kubeconfig file (enables K8s mode)")
+    parser.add_argument("--in-cluster", action="store_true", help="Run in Kubernetes in-cluster mode")
     args = parser.parse_args()
 
-    if args.kubeconfig:
-        print(f"Starting in Kubernetes mode (config: {args.kubeconfig})", file=sys.stderr)
+    if args.kubeconfig or args.in_cluster:
+        mode = "in-cluster" if args.in_cluster else f"config: {args.kubeconfig}"
+        print(f"Starting in Kubernetes mode ({mode})", file=sys.stderr)
         config_manager = KubeConfigManager(kubeconfig=args.kubeconfig)
     else:
         print(f"Starting in YAML mode (config: {args.config})", file=sys.stderr)
@@ -194,7 +197,12 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self.username = username
         self.target_type = target_type
         self.target_name = target_name
+        self.target_name = target_name
+        self.target_name = target_name
         self.initial_term_size = (80, 24)
+        self._resize_timer = None
+        self._pending_size = None
+        self._last_processed_size = None
         print("WhistlerSession initialized", file=sys.stderr, flush=True)
 
     def connection_made(self, chan):
@@ -204,6 +212,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
     def pty_requested(self, term_type, term_size, term_modes):
         self.initial_term_size = (term_size[0], term_size[1])
+        self.term_type = term_type
         return True
 
     def shell_requested(self):
@@ -222,23 +231,41 @@ class WhistlerSession(asyncssh.SSHServerSession):
     def session_started(self):
         print("WhistlerSession.session_started", file=sys.stderr, flush=True)
         
-        if self.target_type == "tui":
-            self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
-            self._app.ssh_channel = self._chan
-            self._app_task = asyncio.create_task(self._run_app())
-        elif self.target_type == "instance":
-            # Find the instance
-            self._shell_task = asyncio.create_task(self._connect_to_instance())
-        elif self.target_type == "template":
-             # Create instance logic would go here, then connect
-             # For now, just error
-             self._chan.write(f"Creating instance from template {self.target_name} not yet implemented via SSH direct connect.\r\n".encode('utf-8'))
-             self._chan.exit(1)
-        else:
-            print(f"Target type {self.target_type} unknown, falling back to TUI", file=sys.stderr)
-            self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
-            self._app.ssh_channel = self._chan
-            self._app_task = asyncio.create_task(self._run_app())
+        # Temporarily set TERM/COLORTERM based on client request so Textual/Rich picks it up
+        old_term = os.environ.get('TERM')
+        old_colorterm = os.environ.get('COLORTERM')
+        
+        if hasattr(self, 'term_type') and self.term_type:
+            os.environ['TERM'] = self.term_type
+            # Assume truecolor support for modern SSH clients if not specified
+            os.environ['COLORTERM'] = 'truecolor'
+            print(f"Setting env for App init: TERM={self.term_type}, COLORTERM=truecolor", file=sys.stderr)
+
+        try:
+            if self.target_type == "tui":
+                self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
+                self._app.ssh_channel = self._chan
+                self._app_task = asyncio.create_task(self._run_app())
+            elif self.target_type == "instance":
+                # Find the instance
+                self._shell_task = asyncio.create_task(self._connect_to_instance())
+            elif self.target_type == "template":
+                 # Create instance logic would go here, then connect
+                 # For now, just error
+                 self._chan.write(f"Creating instance from template {self.target_name} not yet implemented via SSH direct connect.\r\n".encode('utf-8'))
+                 self._chan.exit(1)
+            else:
+                print(f"Target type {self.target_type} unknown, falling back to TUI", file=sys.stderr)
+                self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
+                self._app.ssh_channel = self._chan
+                self._app_task = asyncio.create_task(self._run_app())
+        finally:
+            # Restore environment
+            if old_term: os.environ['TERM'] = old_term
+            else: os.environ.pop('TERM', None)
+            
+            if old_colorterm: os.environ['COLORTERM'] = old_colorterm
+            else: os.environ.pop('COLORTERM', None)
 
     async def _run_app(self):
         print("WhistlerSession._run_app starting", file=sys.stderr, flush=True)
@@ -312,8 +339,9 @@ class WhistlerSession(asyncssh.SSHServerSession):
             fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
 
         try:
+            cmd = ["kubectl", "exec", "-it", pod_name, "-n", self.config_manager.namespace, "--", "/bin/bash"]
             process = await asyncio.create_subprocess_exec(
-                "kubectl", "exec", "-it", pod_name, "--", "/bin/bash",
+                *cmd,
                 stdin=slave, stdout=slave, stderr=slave,
                 preexec_fn=os.setsid
             )
@@ -377,10 +405,34 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
     def terminal_size_changed(self, width, height, pixwidth, pixheight):
         if self._app:
-            self._app.post_message(Resize(Size(width, height), Size(width, height)))
+            self._pending_size = (width, height)
+            
+            if not self._resize_timer:
+                # Leading edge: process immediately
+                self._process_resize()
+                # Start cooldown timer
+                loop = asyncio.get_running_loop()
+                self._resize_timer = loop.call_later(0.1, self._resize_cooldown_expired)
+            
         elif self._master_fd:
              winsize = struct.pack("HHHH", height, width, 0, 0)
              fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ, winsize)
+
+    def _process_resize(self):
+        if self._app and self._pending_size:
+            width, height = self._pending_size
+            self._app.post_message(Resize(Size(width, height), Size(width, height)))
+            self._last_processed_size = self._pending_size
+
+    def _resize_cooldown_expired(self):
+        # Trailing edge: if pending size is different from what we last processed, process it now
+        if self._pending_size != self._last_processed_size:
+             self._process_resize()
+             # Restart timer to maintain rate limit if we just processed
+             loop = asyncio.get_running_loop()
+             self._resize_timer = loop.call_later(0.1, self._resize_cooldown_expired)
+        else:
+             self._resize_timer = None
 
     def connection_lost(self, exc):
         print("WhistlerSession.connection_lost", file=sys.stderr, flush=True)

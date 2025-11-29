@@ -1,0 +1,22 @@
+apiVersion: skaffold/v4beta1
+kind: Config
+metadata:
+  name: whistler
+build:
+  artifacts:
+    - image: whistler
+      context: .
+      docker:
+        dockerfile: Dockerfile
+deploy:
+  helm:
+    releases:
+      - name: whistler
+        chartPath: charts/whistler
+        namespace: whistler
+        createNamespace: true
+        valuesFiles:
+          - charts/whistler/values.yaml
+        setValueTemplates:
+          image.repository: "{{.IMAGE_REPO_whistler}}"
+          image.tag: "{{.IMAGE_TAG_whistler}}"

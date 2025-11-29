@@ -2,6 +2,7 @@ apiVersion: whistler.io/v1
 kind: WhistlerTemplate
 metadata:
   name: small
+  namespace: whistler
 spec:
   image: ubuntu:latest
   description: "Small Ubuntu instance"
