@@ -1,0 +1,30 @@
+image:
+  repository: whistler
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+operator:
+  enabled: true
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+server:
+  enabled: true
+  replicaCount: 1
+  service:
+    type: NodePort
+    port: 8022
+    nodePort: 30022
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi

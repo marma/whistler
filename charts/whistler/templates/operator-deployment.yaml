@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-operator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: whistler-operator
+spec:
+  replicas: {{ .Values.operator.replicaCount }}
+  selector:
+    matchLabels:
+      app: whistler-operator
+  template:
+    metadata:
+      labels:
+        app: whistler-operator
+    spec:
+      serviceAccountName: {{ .Release.Name }}-operator
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["kopf", "run", "whistler/operator.py", "--verbose"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            {{- toYaml .Values.operator.resources | nindent 12 }}

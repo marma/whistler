@@ -1,0 +1,6 @@
+apiVersion: v2
+name: whistler
+description: A Helm chart for Whistler Kubernetes Operator and SSH Server
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

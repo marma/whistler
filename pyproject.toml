@@ -8,6 +8,8 @@ dependencies = [
     "textual>=6.6.0",
     "asyncssh>=2.14.0",
     "pyyaml>=6.0.1",
+    "kopf>=1.37.0",
+    "kubernetes>=29.0.0",
 ]
 
 [build-system]

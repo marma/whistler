@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-server
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: whistler-server
+spec:
+  replicas: {{ .Values.server.replicaCount }}
+  selector:
+    matchLabels:
+      app: whistler-server
+  template:
+    metadata:
+      labels:
+        app: whistler-server
+    spec:
+      serviceAccountName: {{ .Release.Name }}-operator # Re-use operator SA for now as it needs similar permissions
+      containers:
+        - name: server
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "whistler.server", "--in-cluster"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - containerPort: 8022
+              name: ssh
+          resources:
+            {{- toYaml .Values.server.resources | nindent 12 }}
