@@ -5,6 +5,7 @@ from typing import Dict, Any, List, Optional
 from abc import ABC, abstractmethod
 from kubernetes import client, config as k8s_config
 from kubernetes.client.rest import ApiException
+from sys import stderr
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
-    def add_instance(self, username: str, template_name: str, instance_name: str) -> bool:
+    def add_instance(self, username: str, template_name: str, instance_name: str, preemptible: bool = False) -> bool:
         pass
 
     @abstractmethod
@@ -104,7 +105,7 @@ class YamlConfigManager(ConfigManager):
             return user.get("instances", [])
         return []
 
-    def add_instance(self, username: str, template_name: str, instance_name: str) -> bool:
+    def add_instance(self, username: str, template_name: str, instance_name: str, preemptible: bool = False) -> bool:
         user = self.get_user(username)
         if not user:
             return False
@@ -126,6 +127,7 @@ class YamlConfigManager(ConfigManager):
             "template": template_name,
             "image": template["image"],
             "resources": template.get("resources", {}),
+            "preemptible": preemptible,
             "status": "stopped" # Default status
         }
         user["instances"].append(new_instance)
@@ -247,8 +249,13 @@ class KubeConfigManager(ConfigManager):
                 # status = item.get("status", {}) # Don't rely on CR status
                 
                 if spec.get("user") == username:
-                    name = item["metadata"]["name"]
-                    pod = pod_map.get(name)
+                    full_name = item["metadata"]["name"]
+                    # Strip username prefix for display
+                    display_name = full_name
+                    if full_name.startswith(f"{username}-"):
+                        display_name = full_name[len(username)+1:]
+                        
+                    pod = pod_map.get(full_name)
                     
                     pod_status = "Stopped" # Default if no pod
                     pod_name = None
@@ -262,7 +269,7 @@ class KubeConfigManager(ConfigManager):
                         pod_ip = pod.status.pod_ip
                         
                     inst = {
-                        "name": name,
+                        "name": display_name,
                         "template": spec.get("templateRef"),
                         "status": pod_status,
                         "podName": pod_name,
@@ -275,17 +282,18 @@ class KubeConfigManager(ConfigManager):
             logger.error(f"Failed to list instances: {e}")
         return instances
 
-    def add_instance(self, username: str, template_name: str, instance_name: str) -> bool:
+    def add_instance(self, username: str, template_name: str, instance_name: str, preemptible: bool = False) -> bool:
         body = {
             "apiVersion": f"{self.group}/{self.version}",
             "kind": "WhistlerInstance",
             "metadata": {
-                "name": instance_name,
+                "name": f"{username}-{instance_name}",
                 "namespace": self.namespace
             },
             "spec": {
                 "templateRef": template_name,
-                "user": username
+                "user": username,
+                "preemptible": preemptible
             }
         }
         try:
@@ -340,9 +348,10 @@ class KubeConfigManager(ConfigManager):
             return False
 
     def delete_instance(self, username: str, instance_name: str) -> bool:
+        print(f"Deleting instance {username}-{instance_name}", file=stderr, flush=True)
         try:
             self.api.delete_namespaced_custom_object(
-                self.group, self.version, self.namespace, "whistlerinstances", instance_name
+                self.group, self.version, self.namespace, "whistlerinstances", f"{username}-{instance_name}"
             )
             return True
         except ApiException as e:

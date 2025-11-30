@@ -8,11 +8,53 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
     
     template_ref = spec.get('templateRef')
     user = spec.get('user')
+    preemptible = spec.get('preemptible', False)
     
-    # TODO: Fetch template details to get image, resources, etc.
-    # For now, we'll just create a dummy pod to prove the operator works
+    # Fetch template details
+    custom_api = client.CustomObjectsApi()
+    try:
+        template = custom_api.get_namespaced_custom_object(
+            group="whistler.io",
+            version="v1",
+            namespace=namespace,
+            plural="whistlertemplates",
+            name=template_ref
+        )
+        template_spec = template.get('spec', {})
+    except client.rest.ApiException as e:
+        if e.status == 404:
+            raise kopf.TemporaryError(f"Template {template_ref} not found", delay=10)
+        raise kopf.PermanentError(f"Failed to fetch template: {e}")
+
+    image = template_spec.get('image', 'ubuntu:latest')
+    resources = template_spec.get('resources', {})
+    node_selector = template_spec.get('nodeSelector', {})
     
-    pod_name = f"{user}-{name}"
+    # Construct resource requirements
+    resource_reqs = {}
+    if resources:
+        requests = {}
+        limits = {}
+        
+        if 'cpu' in resources:
+            requests['cpu'] = resources['cpu']
+            limits['cpu'] = resources['cpu']
+        if 'memory' in resources:
+            requests['memory'] = resources['memory']
+            limits['memory'] = resources['memory']
+        if 'gpu' in resources:
+            limits['nvidia.com/gpu'] = resources['gpu']
+            
+        if requests:
+            resource_reqs['requests'] = requests
+        if limits:
+            resource_reqs['limits'] = limits
+    
+    # Use CR name as pod name (it should already be unique and prefixed with user)
+    pod_name = name
+    hostname = name
+    if name.startswith(f"{user}-"):
+        hostname = name[len(user)+1:]
     
     pod_body = {
         "apiVersion": "v1",
@@ -29,12 +71,19 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
             "containers": [
                 {
                     "name": "main",
-                    "image": "ubuntu:latest", # Placeholder
-                    "command": ["sleep", "3600"]
+                    "image": image,
+                    "command": ["sleep", "3600"],
+                    "resources": resource_reqs
                 }
-            ]
+            ],
+            "nodeSelector": node_selector,
+            "hostname": hostname,
+            "subdomain": "whistler" # Optional: for stable DNS if we had a service
         }
     }
+    
+    if preemptible:
+        pod_body["spec"]["priorityClassName"] = "whistler-preemptible"
     
     # Adopt the pod so it gets deleted when the WhistlerInstance is deleted
     kopf.adopt(pod_body)

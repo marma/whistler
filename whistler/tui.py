@@ -1,6 +1,6 @@
 from textual.binding import Binding
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, Static, DataTable, Input, Button, Label, Select
+from textual.widgets import Header, Footer, Static, DataTable, Input, Button, Label, Select, Checkbox
 from textual.containers import Container
 from textual.screen import Screen
 import asyncio
@@ -49,6 +49,13 @@ class InstanceCreateScreen(Screen):
     Button {
         margin: 1;
     }
+
+    .checkbox-container {
+        width: 100%;
+        height: auto;
+        align: center middle;
+        margin-bottom: 1;
+    }
     """
 
     def compose(self) -> ComposeResult:
@@ -58,6 +65,10 @@ class InstanceCreateScreen(Screen):
                 Label("Instance Name:"),
                 Input(placeholder="e.g. my-instance", id="instance_name"),
                 classes="input-grid"
+            ),
+            Container(
+                Checkbox("Preemptible (lower priority)", id="preemptible"),
+                classes="checkbox-container"
             ),
             Container(
                 Button("Create", variant="primary", id="create_btn"),
@@ -70,8 +81,9 @@ class InstanceCreateScreen(Screen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "create_btn":
             name = self.query_one("#instance_name", Input).value
+            preemptible = self.query_one("#preemptible", Checkbox).value
             if name:
-                self.dismiss(name)
+                self.dismiss({"name": name, "preemptible": preemptible})
         elif event.button.id == "cancel_btn":
             self.dismiss(None)
 
@@ -579,9 +591,11 @@ class WhistlerApp(App):
             self.notify("No template selected.")
             return
 
-        def create_instance(instance_name: str | None) -> None:
-            if instance_name:
-                if self.config_manager.add_instance(self.username, template_name, instance_name):
+        def create_instance(result: dict | None) -> None:
+            if result:
+                instance_name = result["name"]
+                preemptible = result["preemptible"]
+                if self.config_manager.add_instance(self.username, template_name, instance_name, preemptible=preemptible):
                     self.notify(f"Instance {instance_name} created!")
                     asyncio.create_task(self._refresh_async())
                 else:

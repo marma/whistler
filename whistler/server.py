@@ -250,10 +250,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 # Find the instance
                 self._shell_task = asyncio.create_task(self._connect_to_instance())
             elif self.target_type == "template":
-                 # Create instance logic would go here, then connect
-                 # For now, just error
-                 self._chan.write(f"Creating instance from template {self.target_name} not yet implemented via SSH direct connect.\r\n".encode('utf-8'))
-                 self._chan.exit(1)
+                 self._shell_task = asyncio.create_task(self._create_and_connect_ephemeral())
             else:
                 print(f"Target type {self.target_type} unknown, falling back to TUI", file=sys.stderr)
                 self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
@@ -278,6 +275,51 @@ class WhistlerSession(asyncssh.SSHServerSession):
         finally:
             print("WhistlerSession._run_app finished", file=sys.stderr, flush=True)
             self._chan.exit(0)
+
+    async def _create_and_connect_ephemeral(self):
+         # Create ephemeral instance
+         import secrets
+         import sys
+         hex_id = secrets.token_hex(4)
+         instance_name = f"{self.target_name}-{hex_id}"
+         
+         self._chan.write(f"Creating ephemeral instance {instance_name} (full name: {self.username}-{instance_name}) from template {self.target_name}...\r\n".encode('utf-8'))
+         
+         # Pass preemptible=True for ephemeral instances? Maybe optional.
+         if self.config_manager.add_instance(self.username, self.target_name, instance_name):
+             try:
+                 # Wait for pod and connect
+                 self.target_name = instance_name # Switch target to the new instance
+                 await self._connect_to_instance()
+             except Exception as e:
+                 print(f"Error in _create_and_connect_ephemeral: {e}", file=sys.stderr, flush=True)
+                 self._chan.write(f"Error connecting to instance: {e}\r\n".encode('utf-8'))
+             except asyncio.CancelledError:
+                 print("Task cancelled in _create_and_connect_ephemeral", file=sys.stderr, flush=True)
+                 raise
+             finally:
+                 # Cleanup
+                 print(f"Entering finally block for {instance_name}", file=sys.stderr, flush=True)
+                 
+                 # Try to notify user, but ignore errors if channel is closed
+                 try:
+                     self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
+                 except Exception:
+                     pass
+
+                 try:
+                     self.config_manager.delete_instance(self.username, instance_name)
+                     print(f"delete_instance called for {instance_name}", file=sys.stderr, flush=True)
+                 except Exception as e:
+                     print(f"Error calling delete_instance: {e}", file=sys.stderr, flush=True)
+                 
+                 try:
+                     self._chan.exit(0)
+                 except Exception:
+                     pass
+         else:
+             self._chan.write(f"Failed to create ephemeral instance.\r\n".encode('utf-8'))
+             self._chan.exit(1)
 
     async def _connect_to_instance(self):
         instances = self.config_manager.get_user_instances(self.username)
@@ -304,9 +346,11 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  # Trigger operator to ensure pod exists by patching annotation
                  import time
                  try:
+                     # We need the full CR name for patching
+                     full_cr_name = f"{self.username}-{self.target_name}"
                      self.config_manager.api.patch_namespaced_custom_object(
                          self.config_manager.group, self.config_manager.version, self.config_manager.namespace,
-                         "whistlerinstances", self.target_name,
+                         "whistlerinstances", full_cr_name,
                          {"metadata": {"annotations": {"whistler.io/last-connect": str(time.time())}}}
                      )
                  except Exception as e:
@@ -338,6 +382,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
             winsize = struct.pack("HHHH", rows, cols, 0, 0)
             fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
 
+        process = None
         try:
             cmd = ["kubectl", "exec", "-it", pod_name, "-n", self.config_manager.namespace, "--", "/bin/bash"]
             process = await asyncio.create_subprocess_exec(
@@ -347,26 +392,53 @@ class WhistlerSession(asyncssh.SSHServerSession):
             )
             os.close(slave) # Close slave in parent
             
-            # Pump data from master to SSH channel
             loop = asyncio.get_running_loop()
+            pty_closed = loop.create_future()
             
-            while True:
+            def read_pty():
                 try:
-                    data = await loop.run_in_executor(None, os.read, master, 1024)
+                    data = os.read(master, 1024)
                     if not data:
-                        break
-                    self._chan.write(data)
-                except OSError:
-                    break
+                        if not pty_closed.done():
+                            pty_closed.set_result(True)
+                    else:
+                        self._chan.write(data)
+                except (OSError, Exception):
+                    if not pty_closed.done():
+                        pty_closed.set_result(True)
+
+            loop.add_reader(master, read_pty)
             
-            await process.wait()
+            # Wait for either process exit or PTY close
+            wait_task = asyncio.create_task(process.wait())
+            
+            try:
+                done, pending = await asyncio.wait(
+                    [wait_task, pty_closed], 
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+            except asyncio.CancelledError:
+                print("Shell task cancelled, cleaning up...", file=sys.stderr)
+                raise
+            
         except Exception as e:
             print(f"Shell error: {e}", file=sys.stderr)
         finally:
-            print("Shell finished", file=sys.stderr)
+            print("Shell finished, cleaning up resources...", file=sys.stderr)
+            loop = asyncio.get_running_loop()
             if self._master_fd:
+                loop.remove_reader(self._master_fd)
                 os.close(self._master_fd)
                 self._master_fd = None
+            
+            if process and process.returncode is None:
+                print("Terminating kubectl process...", file=sys.stderr)
+                try:
+                    process.terminate()
+                    # We could await process.wait() here but we are in finally
+                except ProcessLookupError:
+                    pass
+            
             self._chan.exit(0)
 
     async def _wait_for_pod(self, instance_name, timeout=60):
@@ -435,9 +507,13 @@ class WhistlerSession(asyncssh.SSHServerSession):
              self._resize_timer = None
 
     def connection_lost(self, exc):
-        print("WhistlerSession.connection_lost", file=sys.stderr, flush=True)
+        print(f"WhistlerSession.connection_lost: {exc}", file=sys.stderr, flush=True)
         if self._app_task:
+            print("Cancelling app task", file=sys.stderr, flush=True)
             self._app_task.cancel()
+        if self._shell_task:
+            print(f"Cancelling shell task {self._shell_task}", file=sys.stderr, flush=True)
+            self._shell_task.cancel()
 
 
 if __name__ == '__main__':
