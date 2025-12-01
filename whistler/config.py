@@ -5,6 +5,7 @@ from typing import Dict, Any, List, Optional
 from abc import ABC, abstractmethod
 from kubernetes import client, config as k8s_config
 from kubernetes.client.rest import ApiException
+from sys import stderr
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
-    def add_instance(self, username: str, template_name: str, instance_name: str) -> bool:
+    def add_instance(self, username: str, template_name: str, instance_name: str, preemptible: bool = False) -> bool:
         pass
 
     @abstractmethod
@@ -104,7 +105,7 @@ class YamlConfigManager(ConfigManager):
             return user.get("instances", [])
         return []
 
-    def add_instance(self, username: str, template_name: str, instance_name: str) -> bool:
+    def add_instance(self, username: str, template_name: str, instance_name: str, preemptible: bool = False) -> bool:
         user = self.get_user(username)
         if not user:
             return False
@@ -126,6 +127,7 @@ class YamlConfigManager(ConfigManager):
             "template": template_name,
             "image": template["image"],
             "resources": template.get("resources", {}),
+            "preemptible": preemptible,
             "status": "stopped" # Default status
         }
         user["instances"].append(new_instance)
@@ -200,14 +202,35 @@ class KubeConfigManager(ConfigManager):
             except FileNotFoundError:
                 self.namespace = "whistler" # Default fallback
 
+        self.users = {}
+        self._load_users()
+
+    def _load_users(self):
+        try:
+            with open("/etc/whistler/users.yaml", "r") as f:
+                import yaml
+                data = yaml.safe_load(f)
+                if data:
+                    for u in data:
+                        self.users[u["name"]] = u
+        except FileNotFoundError:
+            logger.warning("No users.yaml found at /etc/whistler/users.yaml")
+        except Exception as e:
+            logger.error(f"Failed to load users: {e}")
+
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
         # In K8s mode, we assume users exist or are managed externally.
         # For now, we return a dummy user object to satisfy the interface.
-        return {"name": username}
+        return self.users.get(username, {"name": username})
 
     def user_exists(self, username: str) -> bool:
-        # Always return True for now, or implement a User CRD/ConfigMap check
-        return True
+        return username in self.users
+
+    def get_user_public_keys(self, username: str) -> List[str]:
+        user = self.users.get(username)
+        if user:
+            return user.get("publicKeys", [])
+        return []
 
     def get_user_templates(self, username: str) -> List[Dict[str, Any]]:
         templates = []
@@ -218,11 +241,30 @@ class KubeConfigManager(ConfigManager):
             )
             for item in resp.get("items", []):
                 t = item.get("spec", {})
-                t["name"] = item["metadata"]["name"]
-                t["source"] = "system" # All CRD templates are effectively system/shared for now
-                templates.append(t)
+                full_name = item["metadata"]["name"]
+                
+                # Determine source and display name
+                owner = t.get("user", "system")
+                if owner == "system":
+                    t["name"] = full_name
+                    t["fullName"] = full_name
+                    t["source"] = "system"
+                    templates.append(t)
+                elif owner == username:
+                    # Strip prefix if present
+                    display_name = full_name
+                    if full_name.startswith(f"{username}-"):
+                        display_name = full_name[len(username)+1:]
+                    t["name"] = display_name
+                    t["fullName"] = full_name
+                    t["source"] = "user"
+                    templates.append(t)
+                # Else: ignore other users' templates
         except ApiException as e:
             logger.error(f"Failed to list templates: {e}")
+            
+        # Sort templates: system first, then user
+        templates.sort(key=lambda x: x.get("source", ""))
         return templates
 
     def get_user_instances(self, username: str) -> List[Dict[str, Any]]:
@@ -247,8 +289,13 @@ class KubeConfigManager(ConfigManager):
                 # status = item.get("status", {}) # Don't rely on CR status
                 
                 if spec.get("user") == username:
-                    name = item["metadata"]["name"]
-                    pod = pod_map.get(name)
+                    full_name = item["metadata"]["name"]
+                    # Strip username prefix for display
+                    display_name = full_name
+                    if full_name.startswith(f"{username}-"):
+                        display_name = full_name[len(username)+1:]
+                        
+                    pod = pod_map.get(full_name)
                     
                     pod_status = "Stopped" # Default if no pod
                     pod_name = None
@@ -262,7 +309,7 @@ class KubeConfigManager(ConfigManager):
                         pod_ip = pod.status.pod_ip
                         
                     inst = {
-                        "name": name,
+                        "name": display_name,
                         "template": spec.get("templateRef"),
                         "status": pod_status,
                         "podName": pod_name,
@@ -275,17 +322,18 @@ class KubeConfigManager(ConfigManager):
             logger.error(f"Failed to list instances: {e}")
         return instances
 
-    def add_instance(self, username: str, template_name: str, instance_name: str) -> bool:
+    def add_instance(self, username: str, template_name: str, instance_name: str, preemptible: bool = False) -> bool:
         body = {
             "apiVersion": f"{self.group}/{self.version}",
             "kind": "WhistlerInstance",
             "metadata": {
-                "name": instance_name,
+                "name": f"{username}-{instance_name}",
                 "namespace": self.namespace
             },
             "spec": {
                 "templateRef": template_name,
-                "user": username
+                "user": username,
+                "preemptible": preemptible
             }
         }
         try:
@@ -304,11 +352,14 @@ class KubeConfigManager(ConfigManager):
         if not name:
             return False
 
+        # Prepend username for user templates to ensure uniqueness
+        full_name = f"{username}-{name}"
+        
         body = {
             "apiVersion": f"{self.group}/{self.version}",
             "kind": "WhistlerTemplate",
             "metadata": {
-                "name": name,
+                "name": full_name,
                 "namespace": self.namespace
             },
             "spec": {
@@ -340,9 +391,10 @@ class KubeConfigManager(ConfigManager):
             return False
 
     def delete_instance(self, username: str, instance_name: str) -> bool:
+        print(f"Deleting instance {username}-{instance_name}", file=stderr, flush=True)
         try:
             self.api.delete_namespaced_custom_object(
-                self.group, self.version, self.namespace, "whistlerinstances", instance_name
+                self.group, self.version, self.namespace, "whistlerinstances", f"{username}-{instance_name}"
             )
             return True
         except ApiException as e:

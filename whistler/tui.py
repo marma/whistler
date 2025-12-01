@@ -1,6 +1,6 @@
 from textual.binding import Binding
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, Static, DataTable, Input, Button, Label, Select
+from textual.widgets import Header, Footer, Static, DataTable, Input, Button, Label, Select, Checkbox
 from textual.containers import Container
 from textual.screen import Screen
 import asyncio
@@ -49,6 +49,13 @@ class InstanceCreateScreen(Screen):
     Button {
         margin: 1;
     }
+
+    .checkbox-container {
+        width: 100%;
+        height: auto;
+        align: center middle;
+        margin-bottom: 1;
+    }
     """
 
     def compose(self) -> ComposeResult:
@@ -58,6 +65,10 @@ class InstanceCreateScreen(Screen):
                 Label("Instance Name:"),
                 Input(placeholder="e.g. my-instance", id="instance_name"),
                 classes="input-grid"
+            ),
+            Container(
+                Checkbox("Preemptible (lower priority)", id="preemptible"),
+                classes="checkbox-container"
             ),
             Container(
                 Button("Create", variant="primary", id="create_btn"),
@@ -70,8 +81,9 @@ class InstanceCreateScreen(Screen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "create_btn":
             name = self.query_one("#instance_name", Input).value
+            preemptible = self.query_one("#preemptible", Checkbox).value
             if name:
-                self.dismiss(name)
+                self.dismiss({"name": name, "preemptible": preemptible})
         elif event.button.id == "cancel_btn":
             self.dismiss(None)
 
@@ -513,7 +525,9 @@ class WhistlerApp(App):
         loop = asyncio.get_running_loop()
         try:
             import sys
-            print("Fetching data from Kubernetes...", file=sys.stderr)
+            import time
+            start_time = time.perf_counter()
+            # print("Fetching data from Kubernetes...", file=sys.stderr)
             # Run blocking K8s calls in executor
             self.cached_templates = await loop.run_in_executor(
                 None, self.config_manager.get_user_templates, self.username
@@ -521,7 +535,6 @@ class WhistlerApp(App):
             self.cached_instances = await loop.run_in_executor(
                 None, self.config_manager.get_user_instances, self.username
             )
-            print("Data fetch complete.", file=sys.stderr)
         except Exception as e:
             import sys
             print(f"Failed to update cache: {e}", file=sys.stderr)
@@ -537,8 +550,19 @@ class WhistlerApp(App):
         if not self.config_manager or not self.username:
             return
 
+
+
         # Refresh Templates
         templates_table = self.query_one("#templates_table", DataTable)
+        
+        # Save selection
+        selected_template = None
+        if templates_table.row_count > 0:
+             try:
+                 selected_template = templates_table.coordinate_to_cell_key(templates_table.cursor_coordinate).row_key.value
+             except:
+                 pass
+
         templates_table.clear()
         # Use cached data
         for template in self.cached_templates:
@@ -552,9 +576,27 @@ class WhistlerApp(App):
                 source,
                 key=template.get("name") # Use name as row key
             )
+            
+        # Restore selection
+        if selected_template:
+            try:
+                # Find the row index for the key
+                row_index = templates_table.get_row_index(selected_template)
+                templates_table.move_cursor(row=row_index)
+            except:
+                pass
 
         # Refresh Instances
         instances_table = self.query_one("#instances_table", DataTable)
+        
+        # Save selection
+        selected_instance = None
+        if instances_table.row_count > 0:
+             try:
+                 selected_instance = instances_table.coordinate_to_cell_key(instances_table.cursor_coordinate).row_key.value
+             except:
+                 pass
+
         instances_table.clear()
         # Use cached data
         for instance in self.cached_instances:
@@ -563,8 +605,17 @@ class WhistlerApp(App):
                 instance.get("name", "Unknown"),
                 instance.get("template", "Unknown"),
                 instance.get("status", "Unknown"),
-                instance.get("ip") or "-"
+                instance.get("ip") or "-",
+                key=instance.get("name")
             )
+            
+        # Restore selection
+        if selected_instance:
+            try:
+                row_index = instances_table.get_row_index(selected_instance)
+                instances_table.move_cursor(row=row_index)
+            except:
+                pass
 
     def action_instantiate(self) -> None:
         templates_table = self.query_one("#templates_table", DataTable)
@@ -579,13 +630,25 @@ class WhistlerApp(App):
             self.notify("No template selected.")
             return
 
-        def create_instance(instance_name: str | None) -> None:
-            if instance_name:
-                if self.config_manager.add_instance(self.username, template_name, instance_name):
-                    self.notify(f"Instance {instance_name} created!")
-                    asyncio.create_task(self._refresh_async())
-                else:
-                    self.notify("Failed to create instance (name might exist).", severity="error")
+        def create_instance(result: dict | None) -> None:
+            if result:
+                instance_name = result["name"]
+                preemptible = result["preemptible"]
+                self.notify(f"Creating instance {instance_name}...")
+                
+                async def do_create():
+                    loop = asyncio.get_running_loop()
+                    success = await loop.run_in_executor(
+                        None, 
+                        lambda: self.config_manager.add_instance(self.username, template_name, instance_name, preemptible=preemptible)
+                    )
+                    if success:
+                        self.notify(f"Instance {instance_name} created!")
+                        asyncio.create_task(self._refresh_async())
+                    else:
+                        self.notify("Failed to create instance (name might exist).", severity="error")
+                
+                asyncio.create_task(do_create())
 
         self.push_screen(InstanceCreateScreen(), create_instance)
 
@@ -594,11 +657,21 @@ class WhistlerApp(App):
             if template_data:
                 # New templates are always user source
                 template_data["source"] = "user"
-                if self.config_manager.save_template(self.username, template_data):
-                    self.notify(f"Template {template_data['name']} saved!")
-                    asyncio.create_task(self._refresh_async())
-                else:
-                    self.notify("Failed to save template.", severity="error")
+                self.notify(f"Saving template {template_data['name']}...")
+                
+                async def do_save():
+                    loop = asyncio.get_running_loop()
+                    success = await loop.run_in_executor(
+                        None,
+                        lambda: self.config_manager.save_template(self.username, template_data)
+                    )
+                    if success:
+                        self.notify(f"Template {template_data['name']} saved!")
+                        asyncio.create_task(self._refresh_async())
+                    else:
+                        self.notify("Failed to save template.", severity="error")
+                
+                asyncio.create_task(do_save())
         
         self.push_screen(TemplateEditScreen(), save_template)
 
@@ -627,11 +700,21 @@ class WhistlerApp(App):
             if template_data:
                 # Preserve source (should be user)
                 template_data["source"] = "user"
-                if self.config_manager.save_template(self.username, template_data):
-                    self.notify(f"Template {template_data['name']} updated!")
-                    asyncio.create_task(self._refresh_async())
-                else:
-                    self.notify("Failed to save template.", severity="error")
+                self.notify(f"Updating template {template_data['name']}...")
+                
+                async def do_save():
+                    loop = asyncio.get_running_loop()
+                    success = await loop.run_in_executor(
+                        None,
+                        lambda: self.config_manager.save_template(self.username, template_data)
+                    )
+                    if success:
+                        self.notify(f"Template {template_data['name']} updated!")
+                        asyncio.create_task(self._refresh_async())
+                    else:
+                        self.notify("Failed to save template.", severity="error")
+                
+                asyncio.create_task(do_save())
         
         self.push_screen(TemplateEditScreen(template), save_template)
 
@@ -680,11 +763,21 @@ class WhistlerApp(App):
             self.notify("No instance selected.")
             return
 
-        if self.config_manager.delete_instance(self.username, instance_name):
-            self.notify(f"Instance {instance_name} deleted.")
-            asyncio.create_task(self._refresh_async())
-        else:
-            self.notify(f"Failed to delete instance {instance_name}.", severity="error")
+        self.notify(f"Deleting instance {instance_name}...")
+        
+        async def do_delete():
+            loop = asyncio.get_running_loop()
+            success = await loop.run_in_executor(
+                None,
+                lambda: self.config_manager.delete_instance(self.username, instance_name)
+            )
+            if success:
+                self.notify(f"Instance {instance_name} deleted.")
+                asyncio.create_task(self._refresh_async())
+            else:
+                self.notify(f"Failed to delete instance {instance_name}.", severity="error")
+        
+        asyncio.create_task(do_delete())
 
     async def _refresh_async(self):
         await self._update_cache()

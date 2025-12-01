@@ -1,0 +1,18 @@
+{{- range $name, $template := .Values.templates }}
+apiVersion: whistler.io/v1
+kind: WhistlerTemplate
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+  user: system
+  description: {{ $template.description | default "" | quote }}
+  image: {{ $template.image }}
+  resources:
+{{ toYaml $template.resources | indent 4 }}
+{{- if $template.nodeSelector }}
+  nodeSelector:
+{{ toYaml $template.nodeSelector | indent 4 }}
+{{- end }}
+---
+{{- end }}

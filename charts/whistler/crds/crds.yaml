@@ -66,6 +66,8 @@ spec:
                   type: string
                 user:
                   type: string
+                preemptible:
+                  type: boolean
             status:
               type: object
               properties:
