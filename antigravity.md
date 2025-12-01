@@ -17,14 +17,14 @@ This rasises one obvious question: what is my contribution and can I consider my
 
 While I have pointed out when things do not work as expected, I have not done a full review of the actual implmentation. There is simply no point at this stage since Antigravity often changes strategy when faced with new demands. I hope to learn a lot by reviewing the first stable version of Whistler :)
 
-# Good stuff
+## Good stuff
 
 ...
 
-# Not so good stuff
+## Not so good stuff
 
 ...
 
-# Bad stuff
+## Bad stuff
 
 ...
