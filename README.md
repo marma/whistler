@@ -1,9 +1,11 @@
 # Whistler
 
+> "I want peace on earth and goodwill toward men." - Irwin Emery
+
 Whistler is a Kubernetes Operator that provisions on-demand and persistant instances in a cluster through SSH.
 
-**Note**: Whistler is currently in alpha and is not ready for production use.<br>
-**Note**: Whistler is also a test of using Google Antigravity, that experience it detailed [here](antigravity.md)
+**Note**: Whistler is currently in active development, you should not install it.<br>
+**Note**: Whistler is also a test of using Google Antigravity, that experience it currently being detailed [here](antigravity.md)
 
 Whistler has the following features:
 
@@ -56,17 +58,18 @@ Connect to the administrative interface for user `someuser`:
 ssh someuser@whistler.example.com
 ```
 
+Connect to an existing instance with the name `123`: 
+
+```
+
+ssh someuser-123@whistler.example.com
+```
 Create and connect to an ephemeral session using template `small`:
 
 ```
 ssh someuser-small@whistler.example.com
 ```
 
-Connect to an existing instance with the name `123`: 
-
-```
-ssh someuser-123@whistler.example.com
-```
 
 # Implementation
 
