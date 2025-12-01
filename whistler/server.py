@@ -130,51 +130,96 @@ class SSHServer(asyncssh.SSHServer):
             print('SSH connection closed.', file=sys.stderr)
 
     def begin_auth(self, username):
-        # We require password auth now to identify the user
+        # We require public key auth now
         return True
 
     def password_auth_supported(self):
-        return True
+        # Allow password auth (which will accept anything) only in dev mode
+        return os.environ.get("WHISTLER_AUTH_ALLOW_ANY") == "true"
 
     def validate_password(self, username, password):
-        # Parse username for target
-        # Format: user, user-template-templatename, user-instance-instancename
-        # For simplicity in this iteration, let's assume:
-        # - "user": TUI
-        # - "user-template": Create instance from template (requires parsing)
-        # - "user-instance": Connect to instance (requires parsing)
-        
-        # Actually, let's stick to the README examples:
-        # ssh someuser@... -> TUI
-        # ssh someuser-small@... -> Create/Connect ephemeral from template 'small'
-        # ssh someuser-123@... -> Connect to instance '123'
+        # Only allowed in dev mode
+        if os.environ.get("WHISTLER_AUTH_ALLOW_ANY") != "true":
+            return False
+            
+        print(f"Dev mode: allowing {username} via password auth", file=sys.stderr)
         
         parts = username.split('-')
         real_user = parts[0]
+        self.username = real_user
         
+        # Determine target (same logic as before)
         if len(parts) == 1:
-            self.username = real_user
             self.target_type = "tui"
         elif len(parts) >= 2:
-            self.username = real_user
-            # Heuristic: check if suffix matches a template or instance
             suffix = "-".join(parts[1:])
-            
-            # Check templates first
             templates = self.config_manager.get_user_templates(real_user)
             if any(t['name'] == suffix for t in templates):
                 self.target_type = "template"
                 self.target_name = suffix
             else:
-                # Assume instance
                 self.target_type = "instance"
                 self.target_name = suffix
-
-        if self.config_manager.user_exists(real_user):
-            print(f"User {real_user} authenticated (found in config). Target: {self.target_type} {self.target_name}", file=sys.stderr, flush=True)
-        else:
-            print(f"User {real_user} authenticated (NOT found in config)", file=sys.stderr, flush=True)
         return True
+
+    def public_key_auth_supported(self):
+        return True
+        
+    def validate_public_key(self, username, key):
+        parts = username.split('-')
+        real_user = parts[0]
+        
+        # Check for dev mode bypass
+        if os.environ.get("WHISTLER_AUTH_ALLOW_ANY") == "true":
+             print(f"Dev mode: allowing {real_user} without key check", file=sys.stderr)
+             self.username = real_user
+             
+             # Determine target (same logic as before)
+             if len(parts) == 1:
+                 self.target_type = "tui"
+             elif len(parts) >= 2:
+                 suffix = "-".join(parts[1:])
+                 templates = self.config_manager.get_user_templates(real_user)
+                 if any(t['name'] == suffix for t in templates):
+                     self.target_type = "template"
+                     self.target_name = suffix
+                 else:
+                     self.target_type = "instance"
+                     self.target_name = suffix
+             return True
+
+        # Check if user exists and key matches
+        if not self.config_manager.user_exists(real_user):
+             print(f"User {real_user} not found", file=sys.stderr)
+             return False
+             
+        allowed_keys = self.config_manager.get_user_public_keys(real_user)
+        key_data = key.export_public_key().decode('utf-8').split()[1] # Extract base64 part
+        
+        # Simple check: is the key in the allowed list?
+        # Note: allowed_keys in values.yaml might be full "ssh-rsa AAA..." strings
+        for allowed in allowed_keys:
+            if key_data in allowed:
+                self.username = real_user
+                
+                # Determine target (same logic as before)
+                if len(parts) == 1:
+                    self.target_type = "tui"
+                elif len(parts) >= 2:
+                    suffix = "-".join(parts[1:])
+                    templates = self.config_manager.get_user_templates(real_user)
+                    if any(t['name'] == suffix for t in templates):
+                        self.target_type = "template"
+                        self.target_name = suffix
+                    else:
+                        self.target_type = "instance"
+                        self.target_name = suffix
+                
+                print(f"User {real_user} authenticated via public key. Target: {self.target_type} {self.target_name}", file=sys.stderr)
+                return True
+                
+        print(f"Public key validation failed for {real_user}", file=sys.stderr)
+        return False
 
     def session_requested(self):
         print("SSHServer.session_requested", file=sys.stderr, flush=True)
@@ -279,14 +324,18 @@ class WhistlerSession(asyncssh.SSHServerSession):
     async def _create_and_connect_ephemeral(self):
          # Create ephemeral instance
          import secrets
-         import sys
          hex_id = secrets.token_hex(4)
          instance_name = f"{self.target_name}-{hex_id}"
+         
+         # Resolve full template name
+         templates = self.config_manager.get_user_templates(self.username)
+         template_obj = next((t for t in templates if t["name"] == self.target_name), None)
+         template_ref = template_obj["fullName"] if template_obj else self.target_name
          
          self._chan.write(f"Creating ephemeral instance {instance_name} (full name: {self.username}-{instance_name}) from template {self.target_name}...\r\n".encode('utf-8'))
          
          # Pass preemptible=True for ephemeral instances? Maybe optional.
-         if self.config_manager.add_instance(self.username, self.target_name, instance_name):
+         if self.config_manager.add_instance(self.username, template_ref, instance_name):
              try:
                  # Wait for pod and connect
                  self.target_name = instance_name # Switch target to the new instance

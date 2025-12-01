@@ -3,6 +3,47 @@ import kubernetes
 import yaml
 from kubernetes import client, config
 
+def ensure_pvc(user, namespace, logger):
+    pvc_name = f"whistler-data-{user}"
+    api = client.CoreV1Api()
+    
+    try:
+        api.read_namespaced_persistent_volume_claim(pvc_name, namespace)
+        # logger.info(f"PVC {pvc_name} already exists")
+        return pvc_name
+    except client.rest.ApiException as e:
+        if e.status != 404:
+            raise kopf.PermanentError(f"Failed to check PVC: {e}")
+
+    # Create PVC
+    logger.info(f"Creating PVC {pvc_name} for user {user}")
+    pvc_body = {
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {
+            "name": pvc_name,
+            "labels": {
+                "app": "whistler",
+                "user": user
+            }
+        },
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {
+                "requests": {
+                    "storage": "10Gi"
+                }
+            }
+        }
+    }
+    
+    try:
+        api.create_namespaced_persistent_volume_claim(namespace, pvc_body)
+        logger.info(f"PVC {pvc_name} created")
+        return pvc_name
+    except client.rest.ApiException as e:
+        raise kopf.PermanentError(f"Failed to create PVC: {e}")
+
 def ensure_pod(spec, name, namespace, logger, **kwargs):
     logger.info(f"Ensuring pod for instance {name}")
     
@@ -56,6 +97,9 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
     if name.startswith(f"{user}-"):
         hostname = name[len(user)+1:]
     
+    # Ensure PVC exists
+    pvc_name = ensure_pvc(user, namespace, logger)
+    
     pod_body = {
         "apiVersion": "v1",
         "kind": "Pod",
@@ -73,7 +117,21 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
                     "name": "main",
                     "image": image,
                     "command": ["sleep", "3600"],
-                    "resources": resource_reqs
+                    "resources": resource_reqs,
+                    "volumeMounts": [
+                        {
+                            "name": "data",
+                            "mountPath": "/data"
+                        }
+                    ]
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "data",
+                    "persistentVolumeClaim": {
+                        "claimName": pvc_name
+                    }
                 }
             ],
             "nodeSelector": node_selector,

@@ -202,14 +202,35 @@ class KubeConfigManager(ConfigManager):
             except FileNotFoundError:
                 self.namespace = "whistler" # Default fallback
 
+        self.users = {}
+        self._load_users()
+
+    def _load_users(self):
+        try:
+            with open("/etc/whistler/users.yaml", "r") as f:
+                import yaml
+                data = yaml.safe_load(f)
+                if data:
+                    for u in data:
+                        self.users[u["name"]] = u
+        except FileNotFoundError:
+            logger.warning("No users.yaml found at /etc/whistler/users.yaml")
+        except Exception as e:
+            logger.error(f"Failed to load users: {e}")
+
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
         # In K8s mode, we assume users exist or are managed externally.
         # For now, we return a dummy user object to satisfy the interface.
-        return {"name": username}
+        return self.users.get(username, {"name": username})
 
     def user_exists(self, username: str) -> bool:
-        # Always return True for now, or implement a User CRD/ConfigMap check
-        return True
+        return username in self.users
+
+    def get_user_public_keys(self, username: str) -> List[str]:
+        user = self.users.get(username)
+        if user:
+            return user.get("publicKeys", [])
+        return []
 
     def get_user_templates(self, username: str) -> List[Dict[str, Any]]:
         templates = []
@@ -220,11 +241,30 @@ class KubeConfigManager(ConfigManager):
             )
             for item in resp.get("items", []):
                 t = item.get("spec", {})
-                t["name"] = item["metadata"]["name"]
-                t["source"] = "system" # All CRD templates are effectively system/shared for now
-                templates.append(t)
+                full_name = item["metadata"]["name"]
+                
+                # Determine source and display name
+                owner = t.get("user", "system")
+                if owner == "system":
+                    t["name"] = full_name
+                    t["fullName"] = full_name
+                    t["source"] = "system"
+                    templates.append(t)
+                elif owner == username:
+                    # Strip prefix if present
+                    display_name = full_name
+                    if full_name.startswith(f"{username}-"):
+                        display_name = full_name[len(username)+1:]
+                    t["name"] = display_name
+                    t["fullName"] = full_name
+                    t["source"] = "user"
+                    templates.append(t)
+                # Else: ignore other users' templates
         except ApiException as e:
             logger.error(f"Failed to list templates: {e}")
+            
+        # Sort templates: system first, then user
+        templates.sort(key=lambda x: x.get("source", ""))
         return templates
 
     def get_user_instances(self, username: str) -> List[Dict[str, Any]]:
@@ -312,11 +352,14 @@ class KubeConfigManager(ConfigManager):
         if not name:
             return False
 
+        # Prepend username for user templates to ensure uniqueness
+        full_name = f"{username}-{name}"
+        
         body = {
             "apiVersion": f"{self.group}/{self.version}",
             "kind": "WhistlerTemplate",
             "metadata": {
-                "name": name,
+                "name": full_name,
                 "namespace": self.namespace
             },
             "spec": {

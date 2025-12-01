@@ -8,11 +8,11 @@ operator:
   replicaCount: 1
   resources:
     limits:
-      cpu: 100m
-      memory: 128Mi
+      cpu: 2000m
+      memory: 1Gi
     requests:
-      cpu: 100m
-      memory: 128Mi
+      cpu: 1000m
+      memory: 512Mi
 
 server:
   enabled: true
@@ -23,8 +23,26 @@ server:
     nodePort: 30022
   resources:
     limits:
-      cpu: 100m
-      memory: 128Mi
+      cpu: 2000m
+      memory: 1Gi
     requests:
-      cpu: 100m
-      memory: 128Mi
+      cpu: 1000m
+      memory: 512Mi
+    requests:
+      cpu: 1000m
+      memory: 512Mi
+
+whistler:
+  auth:
+    allowAny: false
+  users: []
+    # - name: someuser
+    #   publicKeys:
+    #     - "ssh-rsa ..."
+templates:
+  small:
+    description: "Small instance"
+    image: "ubuntu:latest"
+    resources:
+      cpu: 500m
+      memory: 2Gi
