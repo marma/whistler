@@ -8,7 +8,7 @@ My main interest in testing Antigravity for this project is finding out if it ca
 
 - It is fairly chatty, and I like that.
 
-## Thoughts in authorship
+## Thoughts on authorship
 I have "written" very little of this code-base. I have resisted the sometimes very strong urge to simply take over. I have landed in acting as a combo of senior developer, architect and product owner. I.e instead of telling Antigravity **what** to do when something does not work I instead ask for debug output or suggest the area where I **think** the solution lies. Antigravity often knows much more about specific frameworks than I do, but it sometime still makes very human mistakes (looking in the wrong place for a solution, missing imports, etc.)
 
 This rasises one obvious question: what is my contribution and can I consider myself the author of this project? I clearly did not write most of the code. I **did** steer the entire process and I have put a sizeable amount of time into it. I did not ask Antigravity to "write a nice ssh-to-pod tunnel operator in Python". I know how every part works since I spec:ed it.
