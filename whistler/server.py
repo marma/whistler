@@ -111,7 +111,8 @@ async def start_server():
 
     await asyncssh.create_server(server_factory, '', 8022,
                                  server_host_keys=['ssh_host_key'],
-                                 line_editor=False)
+                                 line_editor=False,
+                                 agent_forwarding=True)
 
 class SSHServer(asyncssh.SSHServer):
     def __init__(self, config_manager: ConfigManager):
@@ -131,6 +132,9 @@ class SSHServer(asyncssh.SSHServer):
 
     def begin_auth(self, username):
         # We require public key auth now
+        return True
+
+    def agent_auth_requested(self):
         return True
 
     def password_auth_supported(self):
@@ -248,6 +252,9 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self._resize_timer = None
         self._pending_size = None
         self._last_processed_size = None
+        self._agent_task = None
+        self.local_agent_path = None
+        self.pod_socket_path = None
         print("WhistlerSession initialized", file=sys.stderr, flush=True)
 
     def connection_made(self, chan):
@@ -276,6 +283,14 @@ class WhistlerSession(asyncssh.SSHServerSession):
     def session_started(self):
         print("WhistlerSession.session_started", file=sys.stderr, flush=True)
         
+        # Check for agent forwarding
+        self.local_agent_path = self._chan.get_agent_path()
+        if self.local_agent_path:
+            import secrets
+            # Generate a unique path for the pod socket
+            self.pod_socket_path = f"/tmp/agent-{secrets.token_hex(4)}.sock"
+            print(f"Agent forwarding requested. Local: {self.local_agent_path}, Pod: {self.pod_socket_path}", file=sys.stderr)
+
         # Temporarily set TERM/COLORTERM based on client request so Textual/Rich picks it up
         old_term = os.environ.get('TERM')
         old_colorterm = os.environ.get('COLORTERM')
@@ -409,8 +424,15 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  pod_name = await self._wait_for_pod(self.target_name)
              
              if pod_name:
-                 self._chan.write(b"Instance is running. Starting shell...\r\n")
-                 await self._run_pod_shell(pod_name)
+                self._chan.write(b"Instance is running. Starting shell...\r\n")
+                
+                # Start agent bridge if needed
+                if self.local_agent_path and self.pod_socket_path:
+                    self._agent_task = asyncio.create_task(self._bridge_agent(pod_name))
+                    # Give it a moment to start?
+                    await asyncio.sleep(0.5)
+
+                await self._run_pod_shell(pod_name)
              else:
                  self._chan.write(f"Failed to start instance {self.target_name}.\r\n".encode('utf-8'))
                  self._chan.exit(1)
@@ -432,8 +454,15 @@ class WhistlerSession(asyncssh.SSHServerSession):
             fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
 
         process = None
+        process = None
         try:
-            cmd = ["kubectl", "exec", "-it", pod_name, "-n", self.config_manager.namespace, "--", "/bin/bash"]
+            cmd = ["kubectl", "exec", "-it", pod_name, "-n", self.config_manager.namespace, "--"]
+            
+            if self.pod_socket_path:
+                cmd.extend(["env", f"SSH_AUTH_SOCK={self.pod_socket_path}"])
+                
+            cmd.append("/bin/bash")
+            
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=slave, stdout=slave, stderr=slave,
@@ -563,6 +592,68 @@ class WhistlerSession(asyncssh.SSHServerSession):
         if self._shell_task:
             print(f"Cancelling shell task {self._shell_task}", file=sys.stderr, flush=True)
             self._shell_task.cancel()
+        if self._agent_task:
+            print("Cancelling agent task", file=sys.stderr, flush=True)
+            self._agent_task.cancel()
+
+    async def _bridge_agent(self, pod_name):
+        print(f"Starting agent bridge: {self.local_agent_path} -> pod {pod_name}:{self.pod_socket_path}", file=sys.stderr)
+        try:
+            # Connect to local agent socket
+            local_reader, local_writer = await asyncio.open_unix_connection(self.local_agent_path)
+            
+            # Start socat in pod
+            # Removed fork to ensure single stream stability for v1. 
+            # We will need a loop if we want to handle multiple connections, but let's debug first.
+            cmd = [
+                "kubectl", "exec", "-i", pod_name, "-n", self.config_manager.namespace, "--",
+                "socat", f"UNIX-LISTEN:{self.pod_socket_path},mode=600", "STDIO"
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            async def forward(reader, writer, name):
+                try:
+                    while True:
+                        data = await reader.read(4096)
+                        if not data:
+                            print(f"Bridge {name} closed (EOF)", file=sys.stderr)
+                            break
+                        writer.write(data)
+                        await writer.drain()
+                except Exception as e:
+                    print(f"Bridge {name} error: {e}", file=sys.stderr)
+                finally:
+                    try:
+                        writer.close()
+                    except:
+                        pass
+            
+            # Helper to read stderr
+            async def log_stderr(reader):
+                while True:
+                    line = await reader.readline()
+                    if not line: break
+                    print(f"Agent bridge stderr: {line.decode().strip()}", file=sys.stderr)
+
+            # local -> remote (process.stdin)
+            t1 = asyncio.create_task(forward(local_reader, process.stdin, "local->remote"))
+            # remote (process.stdout) -> local
+            t2 = asyncio.create_task(forward(process.stdout, local_writer, "remote->local"))
+            # stderr logger
+            t3 = asyncio.create_task(log_stderr(process.stderr))
+            
+            await asyncio.gather(t1, t2)
+            
+        except Exception as e:
+             print(f"Agent bridge failed: {e}", file=sys.stderr)
+        finally:
+             print("Agent bridge finished", file=sys.stderr)
 
 
 if __name__ == '__main__':
