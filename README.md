@@ -4,7 +4,7 @@
 
 Whistler is a Kubernetes Operator that provisions on-demand and persistant instances in a cluster through SSH.
 
-**Note**: Whistler is currently in active development, you should not install it.<br>
+**Note**: Whistler is currently in active development, you should not install it. I mean it!<br>
 **Note**: Whistler is also a test of using Google Antigravity, that experience it currently being detailed [here](antigravity.md)
 
 Whistler has the following features:
@@ -13,6 +13,7 @@ Whistler has the following features:
 - Ease of use: users use standard SSH to connect to existing pod or create one on-demand
 - It allows for configuration of templates used to start interactive sessions through an administrative TUI available to users
 - Sessions can be preemptible, ephemeral, or persistent
+- Support for ssh agent forwarding
 
 ![Whistler](img/screenshot_1.png "Whistler")
 
