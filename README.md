@@ -4,7 +4,7 @@
 
 Whistler is a Kubernetes Operator that provisions on-demand and persistant instances in a cluster through SSH.
 
-**Note**: Whistler is currently in active development, you should not install it. I mean it!<br>
+**Note**: Whistler is currently in active development, **you should not install it!*** <br>
 **Note**: Whistler is also a test of using Google Antigravity, that experience it currently being detailed [here](antigravity.md)
 
 Whistler has the following features:
