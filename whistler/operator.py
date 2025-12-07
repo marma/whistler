@@ -162,7 +162,7 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
                 # Pod might have vanished in the meantime
                 pass
                 
-            logger.info(f"Pod {pod_name} already exists")
+            # logger.info(f"Pod {pod_name} already exists")
         else:
             logger.error(f"Failed to create pod: {e}")
             raise kopf.PermanentError(f"Failed to create pod: {e}")
@@ -170,10 +170,22 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
 @kopf.on.create('whistler.io', 'v1', 'whistlerinstances')
 @kopf.on.update('whistler.io', 'v1', 'whistlerinstances')
 @kopf.on.resume('whistler.io', 'v1', 'whistlerinstances')
-def reconcile_fn(spec, name, namespace, logger, **kwargs):
-    ensure_pod(spec, name, namespace, logger, **kwargs)
+def reconcile_fn(spec, name, namespace, logger, meta, **kwargs):
+    if meta.get('deletionTimestamp'):
+        logger.info(f"Skipping reconcile for deleting instance {name}")
+        return
+        
+    ensure_pod(spec, name, namespace, logger, meta=meta, **kwargs)
 
 @kopf.on.delete('whistler.io', 'v1', 'whistlerinstances')
-def delete_fn(spec, name, logger, **kwargs):
+def delete_fn(spec, name, namespace, logger, **kwargs):
     logger.info(f"Deleting instance {name}")
-    # Pod deletion is handled by k8s garbage collection (ownerReferences)
+    # Explicitly delete pod to ensure cleanup, even though GC should handle it
+    api = client.CoreV1Api()
+    try:
+        pod_name = name # We assume pod name == instance name
+        api.delete_namespaced_pod(pod_name, namespace)
+        logger.info(f"Explicitly deleted pod {pod_name}")
+    except client.rest.ApiException as e:
+        if e.status != 404:
+            logger.warning(f"Failed to delete pod {name}: {e}")
