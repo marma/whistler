@@ -19,6 +19,8 @@ deploy:
           - charts/whistler/values.yaml
         setValues:
           whistler.auth.allowAny: true
+          server.service.type: NodePort
+          server.service.nodePort: 30022
         setValueTemplates:
           image.repository: "{{.IMAGE_REPO_whistler}}"
           image.tag: "{{.IMAGE_TAG_whistler}}"

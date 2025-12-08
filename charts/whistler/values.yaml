@@ -1,5 +1,5 @@
 image:
-  repository: whistler
+  repository: ghcr.io/marma/whistler
   pullPolicy: IfNotPresent
   tag: "latest"
 
