@@ -17,6 +17,7 @@ RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/s
 # Copy application code
 COPY whistler/ whistler/
 COPY manifests/ manifests/
+COPY bin/ bin/
 
 # Install Python dependencies
 COPY pyproject.toml README.md ./

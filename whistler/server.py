@@ -112,7 +112,9 @@ async def start_server():
     await asyncssh.create_server(server_factory, '', 8022,
                                  server_host_keys=['ssh_host_key'],
                                  line_editor=False,
-                                 agent_forwarding=True)
+                                 agent_forwarding=True,
+                                 keepalive_interval=30,
+                                 keepalive_count_max=5)
 
 class SSHServer(asyncssh.SSHServer):
     def __init__(self, config_manager: ConfigManager):
@@ -677,31 +679,26 @@ class WhistlerSession(asyncssh.SSHServerSession):
         return await process.wait() == 0
 
     async def _inject_static_socat(self, pod_name, target_path):
-        import aiohttp
-        url = "https://github.com/andrew-d/static-binaries/raw/master/binaries/linux/x86_64/socat"
-        local_cache = "/tmp/whistler-socat-static"
+        # Use bundled binary
+        local_binary = "/app/bin/socat_x64"
         
-        # Download if not cached
-        if not os.path.exists(local_cache):
-            print(f"Downloading static socat from {url}...", file=sys.stderr)
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                     if response.status == 200:
-                         content = await response.read()
-                         with open(local_cache, "wb") as f:
-                             f.write(content)
-                     else:
-                         raise Exception(f"Failed to download socat: {response.status}")
+        # Fallback for local development (outside container)
+        if not os.path.exists(local_binary):
+            # Try path relative to current directory
+            local_binary = os.path.join(os.getcwd(), "bin", "socat_x64")
+            
+        if not os.path.exists(local_binary):
+             raise Exception(f"Bundled socat binary not found at {local_binary}")
         
         # Inject into pod
-        print(f"Injecting static socat to {pod_name}:{target_path}...", file=sys.stderr)
+        print(f"Injecting static socat from {local_binary} to {pod_name}:{target_path}...", file=sys.stderr)
         # Use cat < local | kubectl exec ... "cat > target && chmod +x target"
         inject_cmd = [
             "kubectl", "exec", "-i", pod_name, "-n", self.config_manager.namespace, "--",
             "sh", "-c", f"cat > {target_path} && chmod +x {target_path}"
         ]
         
-        with open(local_cache, "rb") as f:
+        with open(local_binary, "rb") as f:
             process = await asyncio.create_subprocess_exec(
                 *inject_cmd,
                 stdin=f,
