@@ -26,11 +26,8 @@ server:
       cpu: 2000m
       memory: 1Gi
     requests:
-      cpu: 1000m
-      memory: 512Mi
-    requests:
-      cpu: 1000m
-      memory: 512Mi
+      cpu: 2000m
+      memory: 1Gi
 
 whistler:
   auth:
@@ -39,6 +36,18 @@ whistler:
     # - name: someuser
     #   publicKeys:
     #     - "ssh-rsa ..."
+
+  node_selectors:
+    - name: GPU type
+      key: accelerator
+      values:
+        - nvidia-tesla-p100
+        - A100-SXM4-40GB
+    - name: Node name
+      key: kubernetes.io/hostname
+      values:
+        - node_1
+        - node_2
 templates:
   small:
     description: "Small instance"
@@ -46,3 +55,4 @@ templates:
     resources:
       cpu: 500m
       memory: 2Gi
+

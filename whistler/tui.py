@@ -175,16 +175,31 @@ class TemplateEditScreen(Screen):
         node_selector = self.template.get("nodeSelector", {})
         
         # Get selectors from config
-        selectors = self.app.config_manager.get_selectors() if self.app.config_manager else {}
+        selectors_list = self.app.config_manager.get_selectors() if self.app.config_manager else []
         
-        gpu_types = [(t, t) for t in selectors.get("gpu_types", [])]
-        node_names = [(n, n) for n in selectors.get("node_names", [])]
-        node_types = [(t, t) for t in selectors.get("node_types", [])]
+        # Prepare dynamic widgets list
+        dynamic_widgets = []
         
-        # Current values
-        current_gpu_type = node_selector.get("accelerator", Select.BLANK)
-        current_node_name = node_selector.get("kubernetes.io/hostname", Select.BLANK)
-        current_node_type = node_selector.get("instance-type", Select.BLANK)
+        if isinstance(selectors_list, list):
+            for i, selector in enumerate(selectors_list):
+                 name = selector.get("name", "Unknown")
+                 key = selector.get("key")
+                 values = selector.get("values", [])
+                 
+                 if not key:
+                     continue
+                     
+                 # Convert values to Select options
+                 options = [(v, v) for v in values]
+                 
+                 # Current value
+                 current_val = node_selector.get(key, Select.BLANK)
+                 
+                 # Widget ID
+                 widget_id = f"sel_{i}"
+                 
+                 dynamic_widgets.append(Label(f"{name}:"))
+                 dynamic_widgets.append(Select(options, value=current_val, prompt=f"Select {name}", id=widget_id))
 
         yield Container(
             Label("Template Details", classes="header"),
@@ -207,12 +222,7 @@ class TemplateEditScreen(Screen):
             Container(
                 Label("Node Selectors:", classes="header"),
                 Container(
-                    Label("GPU Type:"),
-                    Select(gpu_types, value=current_gpu_type, prompt="Select GPU Type", id="sel_gpu_type"),
-                    Label("Node Name:"),
-                    Select(node_names, value=current_node_name, prompt="Select Node Name", id="sel_node_name"),
-                    Label("Node Type:"),
-                    Select(node_types, value=current_node_type, prompt="Select Node Type", id="sel_node_type"),
+                    *dynamic_widgets,
                     classes="input-grid"
                 ),
                 id="advanced_container"
@@ -237,17 +247,17 @@ class TemplateEditScreen(Screen):
             # Collect selectors
             node_selector = {}
             
-            gpu_type = self.query_one("#sel_gpu_type", Select).value
-            if gpu_type != Select.BLANK:
-                node_selector["accelerator"] = gpu_type
-                
-            node_name = self.query_one("#sel_node_name", Select).value
-            if node_name != Select.BLANK:
-                node_selector["kubernetes.io/hostname"] = node_name
-                
-            node_type = self.query_one("#sel_node_type", Select).value
-            if node_type != Select.BLANK:
-                node_selector["instance-type"] = node_type
+            selectors_list = self.app.config_manager.get_selectors() if self.app.config_manager else []
+            if isinstance(selectors_list, list):
+                for i, selector in enumerate(selectors_list):
+                    key = selector.get("key")
+                    widget_id = f"sel_{i}"
+                    try:
+                        val = self.query_one(f"#{widget_id}", Select).value
+                        if val != Select.BLANK:
+                            node_selector[key] = val
+                    except:
+                        pass
 
             if name and image:
                 template_data = {

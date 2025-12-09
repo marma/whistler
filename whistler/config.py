@@ -205,6 +205,9 @@ class KubeConfigManager(ConfigManager):
         self.users = {}
         self._load_users()
 
+        self.selectors = []
+        self._load_selectors()
+
     def _load_users(self):
         try:
             with open("/etc/whistler/users.yaml", "r") as f:
@@ -374,17 +377,26 @@ class KubeConfigManager(ConfigManager):
             # Check if exists to update, or create
             try:
                 self.api.get_namespaced_custom_object(
-                    self.group, self.version, self.namespace, "whistlertemplates", name
+                    self.group, self.version, self.namespace, "whistlertemplates", full_name
                 )
                 # Update (replace)
+                # We need to preserve resourceVersion to update
+                existing = self.api.get_namespaced_custom_object(
+                    self.group, self.version, self.namespace, "whistlertemplates", full_name
+                )
+                body["metadata"]["resourceVersion"] = existing["metadata"]["resourceVersion"]
+                
                 self.api.replace_namespaced_custom_object(
-                    self.group, self.version, self.namespace, "whistlertemplates", name, body
+                    self.group, self.version, self.namespace, "whistlertemplates", full_name, body
                 )
-            except ApiException:
-                # Create
-                self.api.create_namespaced_custom_object(
-                    self.group, self.version, self.namespace, "whistlertemplates", body
-                )
+            except ApiException as e:
+                if e.status == 404:
+                    # Create
+                    self.api.create_namespaced_custom_object(
+                        self.group, self.version, self.namespace, "whistlertemplates", body
+                    )
+                else:
+                    raise e
             return True
         except ApiException as e:
             logger.error(f"Failed to save template: {e}")
@@ -401,7 +413,17 @@ class KubeConfigManager(ConfigManager):
             logger.error(f"Failed to delete instance: {e}")
             return False
 
+    def _load_selectors(self):
+        try:
+            with open("/etc/whistler-config/selectors.yaml", "r") as f:
+                import yaml
+                data = yaml.safe_load(f)
+                if data:
+                    self.selectors = data
+        except FileNotFoundError:
+            logger.warning("No selectors.yaml found at /etc/whistler-config/selectors.yaml")
+        except Exception as e:
+            logger.error(f"Failed to load selectors: {e}")
+
     def get_selectors(self) -> Dict[str, Any]:
-        # In K8s mode, we could fetch these from a ConfigMap
-        # For now, return empty or defaults
-        return {}
+        return self.selectors
