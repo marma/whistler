@@ -257,6 +257,8 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self._agent_task = None
         self.local_agent_path = None
         self.pod_socket_path = None
+        self.term_type = None
+        self._process_stdin = None
         print("WhistlerSession initialized", file=sys.stderr, flush=True)
 
     def connection_made(self, chan):
@@ -408,7 +410,8 @@ class WhistlerSession(asyncssh.SSHServerSession):
                      pod_name = instance.get("podName")
              
              if not pod_name or (instance and instance.get("status") != "Running"):
-                 self._chan.write(f"Instance {self.target_name} is stopped. Waking up...\r\n".encode('utf-8'))
+                 if self.term_type:
+                     self._chan.write(f"Instance {self.target_name} is stopped. Waking up...\r\n".encode('utf-8'))
                  # Trigger operator to ensure pod exists by patching annotation
                  import time
                  try:
@@ -426,7 +429,8 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  pod_name = await self._wait_for_pod(self.target_name)
              
              if pod_name:
-                self._chan.write(b"Instance is running. Starting shell...\r\n")
+                if self.term_type:
+                    self._chan.write(b"Instance is running. Starting shell...\r\n")
                 
                 # Start agent bridge if needed
                 if self.local_agent_path and self.pod_socket_path:
@@ -445,62 +449,109 @@ class WhistlerSession(asyncssh.SSHServerSession):
     async def _run_pod_shell(self, pod_name):
         print(f"Starting shell for pod {pod_name}", file=sys.stderr)
         
-        # Create PTY
-        master, slave = pty.openpty()
-        self._master_fd = master
+        process = None
+        use_pty = self.term_type is not None
         
-        # Set initial size
-        if self.initial_term_size:
-            cols, rows = self.initial_term_size
-            winsize = struct.pack("HHHH", rows, cols, 0, 0)
-            fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
-
-        process = None
-        process = None
         try:
-            cmd = ["kubectl", "exec", "-it", pod_name, "-n", self.config_manager.namespace, "--"]
+            cmd = ["kubectl", "exec", "-n", self.config_manager.namespace]
+            
+            if use_pty:
+                cmd.append("-it")
+            else:
+                cmd.append("-i")
+                
+            cmd.append(pod_name)
+            cmd.append("--")
             
             if self.pod_socket_path:
                 cmd.extend(["env", f"SSH_AUTH_SOCK={self.pod_socket_path}"])
                 
             cmd.append("/bin/bash")
             
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=slave, stdout=slave, stderr=slave,
-                preexec_fn=os.setsid
-            )
-            os.close(slave) # Close slave in parent
-            
-            loop = asyncio.get_running_loop()
-            pty_closed = loop.create_future()
-            
-            def read_pty():
-                try:
-                    data = os.read(master, 1024)
-                    if not data:
+            if use_pty:
+                # PTY Mode
+                master, slave = pty.openpty()
+                self._master_fd = master
+                
+                # Set initial size
+                if self.initial_term_size:
+                    cols, rows = self.initial_term_size
+                    winsize = struct.pack("HHHH", rows, cols, 0, 0)
+                    fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
+
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=slave, stdout=slave, stderr=slave,
+                    preexec_fn=os.setsid
+                )
+                os.close(slave) # Close slave in parent
+                
+                loop = asyncio.get_running_loop()
+                pty_closed = loop.create_future()
+                
+                def read_pty():
+                    try:
+                        data = os.read(master, 1024)
+                        if not data:
+                            if not pty_closed.done():
+                                pty_closed.set_result(True)
+                        else:
+                            self._chan.write(data)
+                    except (OSError, Exception):
                         if not pty_closed.done():
                             pty_closed.set_result(True)
-                    else:
-                        self._chan.write(data)
-                except (OSError, Exception):
-                    if not pty_closed.done():
-                        pty_closed.set_result(True)
 
-            loop.add_reader(master, read_pty)
-            
-            # Wait for either process exit or PTY close
-            wait_task = asyncio.create_task(process.wait())
-            
-            try:
-                done, pending = await asyncio.wait(
-                    [wait_task, pty_closed], 
-                    return_when=asyncio.FIRST_COMPLETED
+                loop.add_reader(master, read_pty)
+                
+                # Wait for either process exit or PTY close
+                wait_task = asyncio.create_task(process.wait())
+                
+                try:
+                    done, pending = await asyncio.wait(
+                        [wait_task, pty_closed], 
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                except asyncio.CancelledError:
+                    print("Shell task cancelled, cleaning up...", file=sys.stderr)
+                    raise
+
+            else:
+                # Non-PTY Mode (Pipes)
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
                 )
-            except asyncio.CancelledError:
-                print("Shell task cancelled, cleaning up...", file=sys.stderr)
-                raise
-            
+                self._process_stdin = process.stdin
+                
+                async def forward_output(reader, channel_write_func):
+                    try:
+                        while True:
+                            data = await reader.read(1024)
+                            if not data:
+                                break
+                            channel_write_func(data)
+                    except Exception as e:
+                        print(f"Output forwarder error: {e}", file=sys.stderr)
+
+                # Forward stdout -> channel stdout
+                stdout_task = asyncio.create_task(forward_output(process.stdout, self._chan.write))
+                
+                # Forward stderr -> channel stderr
+                stderr_task = asyncio.create_task(forward_output(process.stderr, partial(self._chan.write, datatype=asyncssh.EXTENDED_DATA_STDERR)))
+                
+                try:
+                    await process.wait()
+                    # Wait for output forwarding to finish (drain pipes)
+                    await asyncio.gather(stdout_task, stderr_task)
+                except asyncio.CancelledError:
+                    print("Shell task cancelled, cleaning up...", file=sys.stderr)
+                    stdout_task.cancel()
+                    stderr_task.cancel()
+                    raise
+                # finally: tasks are already done or cancelled
+
         except Exception as e:
             print(f"Shell error: {e}", file=sys.stderr)
         finally:
@@ -515,7 +566,6 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 print("Terminating kubectl process...", file=sys.stderr)
                 try:
                     process.terminate()
-                    # We could await process.wait() here but we are in finally
                 except ProcessLookupError:
                     pass
             
@@ -534,26 +584,48 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 pod_name = instance.get("podName")
                 
                 if status == "Running" and pod_name:
-                    self._chan.write(b"\r\n")
+                    if self.term_type:
+                        self._chan.write(b"\r\n")
                     return pod_name
                 
                 if status != last_status:
-                    if last_status:
+                    if last_status and self.term_type:
                         self._chan.write(b"\r\n")
-                    self._chan.write(f"Instance status: {status} ".encode('utf-8'))
+                    if self.term_type:
+                        self._chan.write(f"Instance status: {status} ".encode('utf-8'))
                     last_status = status
                 else:
-                    self._chan.write(b".")
+                    if self.term_type:
+                        self._chan.write(b".")
             
             await asyncio.sleep(1)
         return None
 
     def data_received(self, data, datatype):
-        # print(f"WhistlerSession.data_received: {len(data)} bytes", file=sys.stderr, flush=True)
         if self._app and self._app.driver:
             self._app.driver.feed_data(data)
         elif self._master_fd:
             os.write(self._master_fd, data.encode('utf-8') if isinstance(data, str) else data)
+        elif self._process_stdin:
+            self._process_stdin.write(data.encode('utf-8') if isinstance(data, str) else data)
+
+    def eof_received(self):
+        print("WhistlerSession.eof_received", file=sys.stderr, flush=True)
+        if self._master_fd:
+            try:
+                # Send EOT (Ctrl-D) to PTY
+                os.write(self._master_fd, b'\x04')
+            except Exception as e:
+                 print(f"Error sending EOT to PTY: {e}", file=sys.stderr)
+        elif self._process_stdin:
+            try:
+                if self._process_stdin.can_write_eof():
+                     self._process_stdin.write_eof()
+                else:
+                     self._process_stdin.close()
+            except Exception as e:
+                 print(f"Error closing stdin on EOF: {e}", file=sys.stderr)
+        return False # Continue to allow output from command processing
 
     def terminal_size_changed(self, width, height, pixwidth, pixheight):
         if self._app:
