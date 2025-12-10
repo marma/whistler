@@ -2,10 +2,12 @@ from textual.binding import Binding
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Static, DataTable, Input, Button, Label, Select, Checkbox
 from textual.containers import Container
-from textual.screen import Screen
+from textual.screen import ModalScreen
 import asyncio
 
-class InstanceCreateScreen(Screen):
+class InstanceCreateScreen(ModalScreen):
+    BINDINGS = [("escape", "app.pop_screen", "Close")]
+    
     CSS = """
     InstanceCreateScreen {
         align: center middle;
@@ -87,7 +89,9 @@ class InstanceCreateScreen(Screen):
         elif event.button.id == "cancel_btn":
             self.dismiss(None)
 
-class TemplateEditScreen(Screen):
+class TemplateEditScreen(ModalScreen):
+    BINDINGS = [("escape", "app.pop_screen", "Cancel")]
+    
     CSS = """
     TemplateEditScreen {
         align: center middle;
@@ -95,9 +99,11 @@ class TemplateEditScreen(Screen):
 
     .main-container {
         width: 70;
-        height: 50;
+        height: auto;
+        max-height: 90vh;
+        overflow-y: auto;
         border: round orange;
-        padding: 0;
+        padding: 1;
         margin: 0;
         background: $surface;
     }
@@ -107,20 +113,31 @@ class TemplateEditScreen(Screen):
         grid-size: 2;
         grid-columns: 1fr 2fr;
         width: 100%;
-        margin-bottom: 1;
+        height: auto;
+        grid-gutter: 0;
     }
 
     .input-grid Label {
-        padding: 0;
-        margin: 0;
+        padding: 1;
+        height: auto;
         text-align: left;
         align-vertical: middle;
     }
 
     .input-grid Input {
-        padding: 0;
-        margin: 0;
+        height: auto;
+        min-height: 3;
         text-align: left;
+    }
+
+    .input-grid Select {
+        height: auto;
+        min-height: 3;
+    }
+
+    .input-grid Checkbox {
+        height: auto;
+        min-height: 3;
     }
 
     .header {
@@ -152,6 +169,7 @@ class TemplateEditScreen(Screen):
 
     Button {
         margin: 1;
+        text-align: left;
     }
 
     Input {
@@ -161,8 +179,18 @@ class TemplateEditScreen(Screen):
 
     Select {
         border: none;
-        margin: 0;
-        padding: 0;
+        height: auto;
+        min-height: 3;
+    }
+
+    #advanced_container {
+        height: auto;
+        margin-top: 1;
+    }
+
+    #volumes_container {
+        height: auto;
+        margin-top: 1;
     }
     """
 
@@ -229,12 +257,42 @@ class TemplateEditScreen(Screen):
             ),
 
             Container(
+                Label("Volumes:", classes="header"),
+                Container(
+                    *self._create_volume_widgets(),
+                    classes="input-grid"
+                ),
+                id="volumes_container"
+            ),
+
+            Container(
                 Button("Save", variant="primary", id="save_btn"),
                 Button("Cancel", variant="error", id="cancel_btn"),
                 classes="buttons"
             ),
             classes="main-container"
         )
+
+    def _create_volume_widgets(self):
+        widgets = []
+        volumes_list = self.app.config_manager.get_volumes() if self.app.config_manager else []
+        current_volumes = self.template.get("volumes", {})
+        
+        if isinstance(volumes_list, list):
+            for i, vol in enumerate(volumes_list):
+                 vol_name = vol.get("name")
+                 if not vol_name: continue
+                 
+                 is_checked = vol_name in current_volumes
+                 # Default path is /<name> if not specified, otherwise use saved path
+                 path_val = current_volumes.get(vol_name, f"/{vol_name}")
+                 
+                 widgets.append(Checkbox(vol_name, value=is_checked, id=f"vol_chk_{i}"))
+                 widgets.append(Input(value=path_val, placeholder=f"/{vol_name}", id=f"vol_path_{i}"))
+        return widgets
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "save_btn":
@@ -259,6 +317,22 @@ class TemplateEditScreen(Screen):
                     except:
                         pass
 
+            # Collect volumes
+            volumes = {}
+            volumes_list = self.app.config_manager.get_volumes() if self.app.config_manager else []
+            if isinstance(volumes_list, list):
+                for i, vol in enumerate(volumes_list):
+                    vol_name = vol.get("name")
+                    try:
+                        checked = self.query_one(f"#vol_chk_{i}", Checkbox).value
+                        if checked:
+                            path = self.query_one(f"#vol_path_{i}", Input).value
+                            if not path:
+                                path = f"/{vol_name}"
+                            volumes[vol_name] = path
+                    except Exception:
+                        pass
+
             if name and image:
                 template_data = {
                     "name": name,
@@ -268,7 +342,8 @@ class TemplateEditScreen(Screen):
                         "cpu": cpu,
                         "memory": memory
                     },
-                    "nodeSelector": node_selector
+                    "nodeSelector": node_selector,
+                    "volumes": volumes
                 }
                 if gpu:
                     template_data["resources"]["gpu"] = gpu
@@ -278,7 +353,9 @@ class TemplateEditScreen(Screen):
         elif event.button.id == "cancel_btn":
             self.dismiss(None)
 
-class TemplateViewScreen(Screen):
+class TemplateViewScreen(ModalScreen):
+    BINDINGS = [("escape", "app.pop_screen", "Close"), ("e", "edit", "Edit Template")]
+    
     CSS = """
     TemplateViewScreen {
         align: center middle;
@@ -327,8 +404,6 @@ class TemplateViewScreen(Screen):
     }
     """
 
-    BINDINGS = [("e", "edit", "Edit Template"), ("escape", "close", "Close")]
-
     def __init__(self, template: dict):
         super().__init__()
         self.template = template
@@ -336,9 +411,12 @@ class TemplateViewScreen(Screen):
     def compose(self) -> ComposeResult:
         resources = self.template.get("resources", {})
         node_selector = self.template.get("nodeSelector", {})
+        volumes = self.template.get("volumes", {})
         
         # Format node selector for display
         ns_str = "\n".join([f"{k}: {v}" for k, v in node_selector.items()]) if node_selector else "None"
+        # Format volumes for display
+        vol_str = "\n".join([f"{k} -> {v}" for k, v in volumes.items()]) if volumes else "None"
 
         yield Container(
             Label("Template Details", classes="label-key"),
@@ -363,6 +441,9 @@ class TemplateViewScreen(Screen):
                 
                 Label("Node Selector:", classes="label-key"),
                 Label(ns_str, classes="value"),
+                
+                Label("Volumes:", classes="label-key"),
+                Label(vol_str, classes="value"),
 
                 Label("Source:", classes="label-key"),
                 Label(self.template.get("source", "user"), classes="value"),
@@ -381,14 +462,75 @@ class TemplateViewScreen(Screen):
         if self.template.get("source") != "system":
             self.dismiss("edit")
 
-    def action_close(self) -> None:
-        self.dismiss(None)
-
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "edit_btn":
             self.action_edit()
         elif event.button.id == "close_btn":
-            self.action_close()
+            self.dismiss(None)
+
+class LoadingScreen(ModalScreen):
+    """Full-screen loading screen with animated spinner."""
+    
+    CSS = """
+    LoadingScreen {
+        align: center middle;
+        background: $surface;
+    }
+
+    .loading-container {
+        width: auto;
+        height: auto;
+        border: round green;
+        padding: 2;
+        background: $surface;
+        align: center middle;
+    }
+
+    .spinner {
+        text-align: center;
+        text-style: bold;
+        color: green;
+        margin-bottom: 1;
+    }
+
+    .status {
+        text-align: center;
+        color: $text;
+        margin-top: 1;
+    }
+    """
+    
+    def __init__(self, initial_status: str = "Loading..."):
+        super().__init__()
+        self.status_message = initial_status
+        self.spinner_state = 0
+        self.spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Label("", id="spinner", classes="spinner"),
+            Label(self.status_message, id="status", classes="status"),
+            classes="loading-container"
+        )
+    
+    def on_mount(self) -> None:
+        self.update_spinner()
+        self.set_interval(0.25, self.update_spinner)
+    
+    def update_spinner(self) -> None:
+        """Update the spinner animation."""
+        spinner_label = self.query_one("#spinner", Label)
+        spinner_label.update(f"{self.spinner_chars[self.spinner_state]} Loading")
+        self.spinner_state = (self.spinner_state + 1) % len(self.spinner_chars)
+    
+    def update_status(self, status: str) -> None:
+        """Update the status message."""
+        self.status_message = status
+        try:
+            status_label = self.query_one("#status", Label)
+            status_label.update(status)
+        except Exception:
+            pass
 
 class WhistlerApp(App):
     """A Textual app to manage Kubernetes pods via SSH."""
@@ -439,11 +581,6 @@ class WhistlerApp(App):
         Binding("r", "refresh", "refresh"),
     ]
 
-    def __init__(self, config_manager=None, username=None, session=None, **kwargs):
-        super().__init__(**kwargs)
-        self.config_manager = config_manager
-        self.username = username
-        self.session = session
 
     def compose(self) -> ComposeResult:
         import sys
@@ -560,10 +697,12 @@ class WhistlerApp(App):
         if not self.config_manager or not self.username:
             return
 
-
-
         # Refresh Templates
-        templates_table = self.query_one("#templates_table", DataTable)
+        try:
+            templates_table = self.query_one("#templates_table", DataTable)
+        except Exception:
+            # Widgets not found (likely on a different screen), skip refresh
+            return
         
         # Save selection
         selected_template = None

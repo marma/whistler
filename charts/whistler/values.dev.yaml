@@ -1,0 +1,8 @@
+whistler:
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: whistler-data-pvc
+    - name: data2
+      persistentVolumeClaim:
+        claimName: whistler-data2-pvc

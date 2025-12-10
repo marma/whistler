@@ -8,3 +8,6 @@ metadata:
 data:
   selectors.yaml: |
 {{ toYaml .Values.whistler.node_selectors | indent 4 }}
+  volumes.yaml: |
+{{ toYaml .Values.whistler.volumes | indent 4 }}
+

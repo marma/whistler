@@ -17,6 +17,7 @@ deploy:
         createNamespace: true
         valuesFiles:
           - charts/whistler/values.yaml
+          - charts/whistler/values.dev.yaml
         setValues:
           whistler.auth.allowAny: true
           server.service.type: NodePort
@@ -24,4 +25,3 @@ deploy:
         setValueTemplates:
           image.repository: "{{.IMAGE_REPO_whistler}}"
           image.tag: "{{.IMAGE_TAG_whistler}}"
-          

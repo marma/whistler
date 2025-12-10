@@ -44,6 +44,16 @@ def ensure_pvc(user, namespace, logger):
     except client.rest.ApiException as e:
         raise kopf.PermanentError(f"Failed to create PVC: {e}")
 
+def load_volume_definitions():
+    import yaml
+    try:
+        with open("/etc/whistler-config/volumes.yaml", "r") as f:
+            data = yaml.safe_load(f)
+            return {v['name']: v for v in data} if data else {}
+    except Exception as e:
+        # It's possible the file doesn't exist if not configured
+        return {}
+
 def ensure_pod(spec, name, namespace, logger, **kwargs):
     logger.info(f"Ensuring pod for instance {name}")
     
@@ -100,6 +110,41 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
     # Ensure PVC exists
     pvc_name = ensure_pvc(user, namespace, logger)
     
+    # Load available volume definitions
+    available_volumes = load_volume_definitions()
+    requested_volumes = template_spec.get('volumes', {})
+
+    pod_volumes = [
+        {
+            "name": "data",
+            "persistentVolumeClaim": {
+                "claimName": pvc_name
+            }
+        }
+    ]
+    
+    volume_mounts = [
+        {
+            "name": "data",
+            "mountPath": "/data"
+        }
+    ]
+
+    # Process requested volumes
+    for vol_name, mount_path in requested_volumes.items():
+        if vol_name in available_volumes:
+            if vol_name == "data":
+                logger.warning(f"Volume name 'data' is reserved. Skipping '{vol_name}'")
+                continue
+            
+            pod_volumes.append(available_volumes[vol_name])
+            volume_mounts.append({
+                "name": vol_name,
+                "mountPath": mount_path
+            })
+        else:
+             logger.warning(f"Requested volume '{vol_name}' not found in configuration.")
+
     pod_body = {
         "apiVersion": "v1",
         "kind": "Pod",
@@ -118,22 +163,10 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
                     "image": image,
                     "command": ["sleep", "3600"],
                     "resources": resource_reqs,
-                    "volumeMounts": [
-                        {
-                            "name": "data",
-                            "mountPath": "/data"
-                        }
-                    ]
+                    "volumeMounts": volume_mounts
                 }
             ],
-            "volumes": [
-                {
-                    "name": "data",
-                    "persistentVolumeClaim": {
-                        "claimName": pvc_name
-                    }
-                }
-            ],
+            "volumes": pod_volumes,
             "nodeSelector": node_selector,
             "hostname": hostname,
             "subdomain": "whistler" # Optional: for stable DNS if we had a service

@@ -41,6 +41,11 @@ spec:
               mountPath: "/etc/whistler-config/selectors.yaml"
               subPath: "selectors.yaml"
               readOnly: true
+            - name: selectors-config
+              mountPath: "/etc/whistler-config/volumes.yaml"
+              subPath: "volumes.yaml"
+              readOnly: true
+
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}
       volumes:

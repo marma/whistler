@@ -12,13 +12,42 @@ from textual.app import App
 from textual.geometry import Size
 from textual.events import Resize
 from textual._xterm_parser import XTermParser
-from whistler.tui import WhistlerApp
+from whistler.tui import WhistlerApp, LoadingScreen
 
 import argparse
 from functools import partial
 from functools import partial
 from whistler.config import ConfigManager, KubeConfigManager
 from asyncio import Event
+from textual.worker import Worker, WorkerState
+
+class LoadingApp(App):
+    """App to display loading screen during pod operations."""
+    
+    def __init__(self, ssh_channel, initial_term_size=(80, 24), initial_status="Loading...", **kwargs):
+        from whistler.server import WhistlerDriver
+        super().__init__(driver_class=WhistlerDriver, **kwargs)
+        self.ssh_channel = ssh_channel
+        self.initial_term_size = initial_term_size
+        self.initial_status = initial_status
+        self.loading_screen = None
+        self._should_exit = False
+    
+    def on_mount(self) -> None:
+        self.loading_screen = LoadingScreen(initial_status=self.initial_status)
+        self.push_screen(self.loading_screen)
+    
+    def update_status(self, status: str) -> None:
+        """Update the loading screen status."""
+        if self.loading_screen:
+            self.loading_screen.update_status(status)
+    
+    def request_exit(self) -> None:
+        """Request the app to exit."""
+        self._should_exit = True
+        self.exit()
+
+
 
 class WhistlerDriver(Driver):
     def __init__(self, next_driver: Driver | None = None, *, debug: bool = False, size: tuple[int, int] | None = None, **kwargs):
@@ -367,12 +396,12 @@ class WhistlerSession(asyncssh.SSHServerSession):
         # Temporarily set TERM/COLORTERM based on client request so Textual/Rich picks it up
         old_term = os.environ.get('TERM')
         old_colorterm = os.environ.get('COLORTERM')
+        old_escdelay = os.environ.get('ESCDELAY')
         
         if hasattr(self, 'term_type') and self.term_type:
             os.environ['TERM'] = self.term_type
             # Assume truecolor support for modern SSH clients if not specified
             os.environ['COLORTERM'] = 'truecolor'
-            print(f"Setting env for App init: TERM={self.term_type}, COLORTERM=truecolor", file=sys.stderr)
 
         try:
             if self.target_type == "tui":
@@ -420,105 +449,211 @@ class WhistlerSession(asyncssh.SSHServerSession):
          template_obj = next((t for t in templates if t["name"] == self.target_name), None)
          template_ref = template_obj["fullName"] if template_obj else self.target_name
          
-         self._chan.write(f"Creating ephemeral instance {instance_name} (full name: {self.username}-{instance_name}) from template {self.target_name}...\r\n".encode('utf-8'))
-         
-         # Pass preemptible=True for ephemeral instances? Maybe optional.
-         if self.config_manager.add_instance(self.username, template_ref, instance_name):
+         if self.term_type:
+             # Use loading screen for PTY mode
+             loading_app = LoadingApp(self._chan, self.initial_term_size, f"Creating ephemeral instance {instance_name}...")
+             loading_app.ssh_channel = self._chan
+             
+             async def create_task():
+                 # Create instance
+                 if self.config_manager.add_instance(self.username, template_ref, instance_name):
+                     loading_app.update_status(f"Waiting for instance {instance_name} to be ready...")
+                     self.target_name = instance_name
+                     await self._connect_to_instance_with_app(loading_app)
+                 else:
+                     loading_app.request_exit()
+                     self._chan.write(f"Failed to create ephemeral instance.\r\n".encode('utf-8'))
+                     self._chan.exit(1)
+                     return
+             
+             # Run the loading app with the create task
+             task = asyncio.create_task(create_task())
              try:
-                 # Wait for pod and connect
-                 self.target_name = instance_name # Switch target to the new instance
-                 await self._connect_to_instance()
-             except Exception as e:
-                 print(f"Error in _create_and_connect_ephemeral: {e}", file=sys.stderr, flush=True)
-                 self._chan.write(f"Error connecting to instance: {e}\r\n".encode('utf-8'))
+                 await loading_app.run_async()
+                 # Wait for task to complete
+                 await task
              except asyncio.CancelledError:
                  print("Task cancelled in _create_and_connect_ephemeral", file=sys.stderr, flush=True)
+                 task.cancel()
                  raise
              finally:
                  # Cleanup
                  print(f"Entering finally block for {instance_name}", file=sys.stderr, flush=True)
-                 
-                 # Try to notify user, but ignore errors if channel is closed
                  try:
                      self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
                  except Exception:
                      pass
-
                  try:
                      self.config_manager.delete_instance(self.username, instance_name)
                      print(f"delete_instance called for {instance_name}", file=sys.stderr, flush=True)
                  except Exception as e:
                      print(f"Error calling delete_instance: {e}", file=sys.stderr, flush=True)
-                 
                  try:
                      self._chan.exit(0)
                  except Exception:
                      pass
          else:
-             self._chan.write(f"Failed to create ephemeral instance.\r\n".encode('utf-8'))
-             self._chan.exit(1)
+             # Non-PTY mode: use simple text output
+             self._chan.write(f"Creating ephemeral instance {instance_name} (full name: {self.username}-{instance_name}) from template {self.target_name}...\r\n".encode('utf-8'))
+             
+             if self.config_manager.add_instance(self.username, template_ref, instance_name):
+                 try:
+                     self.target_name = instance_name
+                     await self._connect_to_instance()
+                 except Exception as e:
+                     print(f"Error in _create_and_connect_ephemeral: {e}", file=sys.stderr, flush=True)
+                     self._chan.write(f"Error connecting to instance: {e}\r\n".encode('utf-8'))
+                 except asyncio.CancelledError:
+                     print("Task cancelled in _create_and_connect_ephemeral", file=sys.stderr, flush=True)
+                     raise
+                 finally:
+                     print(f"Entering finally block for {instance_name}", file=sys.stderr, flush=True)
+                     try:
+                         self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
+                     except Exception:
+                         pass
+                     try:
+                         self.config_manager.delete_instance(self.username, instance_name)
+                         print(f"delete_instance called for {instance_name}", file=sys.stderr, flush=True)
+                     except Exception as e:
+                         print(f"Error calling delete_instance: {e}", file=sys.stderr, flush=True)
+                     try:
+                         self._chan.exit(0)
+                     except Exception:
+                         pass
+             else:
+                 self._chan.write(f"Failed to create ephemeral instance.\r\n".encode('utf-8'))
+                 self._chan.exit(1)
 
-    async def _connect_to_instance(self):
+    async def _connect_to_instance_with_app(self, loading_app):
+        """Connect to instance using the provided loading app."""
         instances = self.config_manager.get_user_instances(self.username)
         instance = next((i for i in instances if i["name"] == self.target_name), None)
         
-        if instance:
-             pod_name = instance.get("podName")
-             
-             # If terminating, wait for it to finish first
-             if instance.get("status") == "Terminating":
-                 self._chan.write(b"Waiting for existing pod to terminate ")
-                 while instance and instance.get("status") == "Terminating":
-                     await asyncio.sleep(1)
-                     self._chan.write(b".")
-                     instances = self.config_manager.get_user_instances(self.username)
-                     instance = next((i for i in instances if i["name"] == self.target_name), None)
-                 self._chan.write(b"\r\n")
-                 # Refresh pod_name/status after wait
-                 if instance:
-                     pod_name = instance.get("podName")
-             
-             if not pod_name or (instance and instance.get("status") != "Running"):
-                 if self.term_type:
-                     self._chan.write(f"Instance {self.target_name} is stopped. Waking up...\r\n".encode('utf-8'))
-                 # Trigger operator to ensure pod exists by patching annotation
-                 import time
-                 try:
-                     # We need the full CR name for patching
-                     full_cr_name = f"{self.username}-{self.target_name}"
-                     self.config_manager.api.patch_namespaced_custom_object(
-                         self.config_manager.group, self.config_manager.version, self.config_manager.namespace,
-                         "whistlerinstances", full_cr_name,
-                         {"metadata": {"annotations": {"whistler.io/last-connect": str(time.time())}}}
-                     )
-                 except Exception as e:
-                     print(f"Failed to patch instance: {e}", file=sys.stderr)
-                 
-                 # Wait for pod to be ready
-                 pod_name = await self._wait_for_pod(self.target_name)
-             
-             if pod_name:
-                if self.term_type:
-                    self._chan.write(b"Instance is running. Starting shell...\r\n")
-                
-                # Update server context for forwarding
-                if self.server:
-                    self.server.active_instance_name = self.target_name
-                    print(f"Updated server active_instance_name to {self.target_name}", file=sys.stderr)
+        if not instance:
+            loading_app.request_exit()
+            self._chan.write(f"Instance {self.target_name} not found.\r\n".encode('utf-8'))
+            self._chan.exit(1)
+            return
+            
+        pod_name = instance.get("podName")
+        
+        # If terminating, wait for it to finish first
+        if instance.get("status") == "Terminating":
+            loading_app.update_status("Waiting for existing pod to terminate...")
+            while instance and instance.get("status") == "Terminating":
+                await asyncio.sleep(0.5)
+                instances = self.config_manager.get_user_instances(self.username)
+                instance = next((i for i in instances if i["name"] == self.target_name), None)
+            
+            if instance:
+                pod_name = instance.get("podName")
+        
+        if not pod_name or (instance and instance.get("status") != "Running"):
+            # Trigger operator to ensure pod exists
+            import time
+            try:
+                full_cr_name = f"{self.username}-{self.target_name}"
+                self.config_manager.api.patch_namespaced_custom_object(
+                    self.config_manager.group, self.config_manager.version, self.config_manager.namespace,
+                    "whistlerinstances", full_cr_name,
+                    {"metadata": {"annotations": {"whistler.io/last-connect": str(time.time())}}}
+                )
+            except Exception as e:
+                print(f"Failed to patch instance: {e}", file=sys.stderr)
+            
+            loading_app.update_status(f"Starting instance {self.target_name}...")
+            pod_name = await self._wait_for_pod_with_app(self.target_name, loading_app)
+        
+        # Exit the loading app
+        loading_app.request_exit()
+        
+        if pod_name:
+            # Update server context for forwarding
+            if self.server:
+                self.server.active_instance_name = self.target_name
+                print(f"Updated server active_instance_name to {self.target_name}", file=sys.stderr)
 
-                # Start agent bridge if needed
-                if self.local_agent_path and self.pod_socket_path:
-                    self._agent_task = asyncio.create_task(self._bridge_agent(pod_name))
-                    # Give it a moment to start?
-                    await asyncio.sleep(0.5)
+            # Start agent bridge if needed
+            if self.local_agent_path and self.pod_socket_path:
+                self._agent_task = asyncio.create_task(self._bridge_agent(pod_name))
+                await asyncio.sleep(0.5)
 
-                await self._run_pod_shell(pod_name)
-             else:
-                 self._chan.write(f"Failed to start instance {self.target_name}.\r\n".encode('utf-8'))
-                 self._chan.exit(1)
+            await self._run_pod_shell(pod_name)
         else:
-             self._chan.write(f"Instance {self.target_name} not found.\r\n".encode('utf-8'))
-             self._chan.exit(1)
+            self._chan.write(f"Failed to start instance {self.target_name}.\r\n".encode('utf-8'))
+            self._chan.exit(1)
+
+    async def _connect_to_instance(self, loading_screen=None):
+        """Connect to instance (for non-PTY mode)."""
+        instances = self.config_manager.get_user_instances(self.username)
+        instance = next((i for i in instances if i["name"] == self.target_name), None)
+        
+        if self.term_type and not loading_screen:
+            # PTY mode: use loading app
+            loading_app = LoadingApp(self._chan, self.initial_term_size, f"Connecting to instance {self.target_name}...")
+            loading_app.ssh_channel = self._chan
+            
+            task = asyncio.create_task(self._connect_to_instance_with_app(loading_app))
+            try:
+                await loading_app.run_async()
+                await task
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
+            return
+        
+        # Non-PTY mode or already have loading screen
+        if not instance:
+            self._chan.write(f"Instance {self.target_name} not found.\r\n".encode('utf-8'))
+            self._chan.exit(1)
+            return
+            
+        pod_name = instance.get("podName")
+        
+        # If terminating, wait for it to finish first
+        if instance.get("status") == "Terminating":
+            self._chan.write(b"Waiting for existing pod to terminate ")
+            while instance and instance.get("status") == "Terminating":
+                await asyncio.sleep(0.5)
+                self._chan.write(b".")
+                instances = self.config_manager.get_user_instances(self.username)
+                instance = next((i for i in instances if i["name"] == self.target_name), None)
+            self._chan.write(b"\r\n")
+            
+            if instance:
+                pod_name = instance.get("podName")
+        
+        if not pod_name or (instance and instance.get("status") != "Running"):
+            # Trigger operator to ensure pod exists
+            import time
+            try:
+                full_cr_name = f"{self.username}-{self.target_name}"
+                self.config_manager.api.patch_namespaced_custom_object(
+                    self.config_manager.group, self.config_manager.version, self.config_manager.namespace,
+                    "whistlerinstances", full_cr_name,
+                    {"metadata": {"annotations": {"whistler.io/last-connect": str(time.time())}}}
+                )
+            except Exception as e:
+                print(f"Failed to patch instance: {e}", file=sys.stderr)
+            
+            pod_name = await self._wait_for_pod(self.target_name)
+        
+        if pod_name:
+            # Update server context for forwarding
+            if self.server:
+                self.server.active_instance_name = self.target_name
+                print(f"Updated server active_instance_name to {self.target_name}", file=sys.stderr)
+
+            # Start agent bridge if needed
+            if self.local_agent_path and self.pod_socket_path:
+                self._agent_task = asyncio.create_task(self._bridge_agent(pod_name))
+                await asyncio.sleep(0.5)
+
+            await self._run_pod_shell(pod_name)
+        else:
+            self._chan.write(f"Failed to start instance {self.target_name}.\r\n".encode('utf-8'))
+            self._chan.exit(1)
 
     async def _run_pod_shell(self, pod_name):
         print(f"Starting shell for pod {pod_name}", file=sys.stderr)
@@ -645,7 +780,8 @@ class WhistlerSession(asyncssh.SSHServerSession):
             
             self._chan.exit(0)
 
-    async def _wait_for_pod(self, instance_name, timeout=60):
+    async def _wait_for_pod_with_app(self, instance_name, loading_app, timeout=60):
+        """Wait for pod to be ready, updating the loading app."""
         start_time = asyncio.get_running_loop().time()
         last_status = None
         
@@ -658,21 +794,40 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 pod_name = instance.get("podName")
                 
                 if status == "Running" and pod_name:
-                    if self.term_type:
-                        self._chan.write(b"\r\n")
                     return pod_name
                 
                 if status != last_status:
-                    if last_status and self.term_type:
+                    loading_app.update_status(f"Instance status: {status}")
+                    last_status = status
+            
+            await asyncio.sleep(0.5)
+        return None
+
+    async def _wait_for_pod(self, instance_name, timeout=60):
+        """Wait for pod (non-PTY mode)."""
+        start_time = asyncio.get_running_loop().time()
+        last_status = None
+        
+        while asyncio.get_running_loop().time() - start_time < timeout:
+            instances = self.config_manager.get_user_instances(self.username)
+            instance = next((i for i in instances if i["name"] == instance_name), None)
+            
+            if instance:
+                status = instance.get("status")
+                pod_name = instance.get("podName")
+                
+                if status == "Running" and pod_name:
+                    return pod_name
+                
+                if status != last_status:
+                    if last_status:
                         self._chan.write(b"\r\n")
-                    if self.term_type:
-                        self._chan.write(f"Instance status: {status} ".encode('utf-8'))
+                    self._chan.write(f"Instance status: {status} ".encode('utf-8'))
                     last_status = status
                 else:
-                    if self.term_type:
-                        self._chan.write(b".")
+                    self._chan.write(b".")
             
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
         return None
 
     def data_received(self, data, datatype):

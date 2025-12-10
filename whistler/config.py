@@ -42,6 +42,10 @@ class ConfigManager(ABC):
     def get_selectors(self) -> Dict[str, Any]:
         pass
 
+    @abstractmethod
+    def get_volumes(self) -> List[Dict[str, Any]]:
+        pass
+
 class KubeConfigManager(ConfigManager):
     def __init__(self, kubeconfig: str = None):
         try:
@@ -77,6 +81,9 @@ class KubeConfigManager(ConfigManager):
 
         self.selectors = []
         self._load_selectors()
+
+        self.volumes = []
+        self._load_volumes()
 
     def _load_users(self):
         try:
@@ -240,7 +247,8 @@ class KubeConfigManager(ConfigManager):
                 "image": template_data.get("image"),
                 "description": template_data.get("description"),
                 "resources": template_data.get("resources"),
-                "nodeSelector": template_data.get("nodeSelector")
+                "nodeSelector": template_data.get("nodeSelector"),
+                "volumes": template_data.get("volumes")
             }
         }
         try:
@@ -297,3 +305,18 @@ class KubeConfigManager(ConfigManager):
 
     def get_selectors(self) -> Dict[str, Any]:
         return self.selectors
+
+    def _load_volumes(self):
+        try:
+            with open("/etc/whistler-config/volumes.yaml", "r") as f:
+                import yaml
+                data = yaml.safe_load(f)
+                if data:
+                    self.volumes = data
+        except FileNotFoundError:
+            logger.warning("No volumes.yaml found at /etc/whistler-config/volumes.yaml")
+        except Exception as e:
+            logger.error(f"Failed to load volumes: {e}")
+
+    def get_volumes(self) -> List[Dict[str, Any]]:
+        return self.volumes

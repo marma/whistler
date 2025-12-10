@@ -48,6 +48,11 @@ whistler:
       values:
         - node_1
         - node_2
+  #volumes:
+  #  - name: data
+  #    persistentVolumeClaim:
+  #      claimName: whistler-data-pvc
+
 templates:
   small:
     description: "Small instance"

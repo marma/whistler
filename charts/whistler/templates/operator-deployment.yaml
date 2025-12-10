@@ -26,3 +26,13 @@ spec:
               value: "1"
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: "/etc/whistler-config/volumes.yaml"
+              subPath: "volumes.yaml"
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-config
+
