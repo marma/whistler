@@ -17,7 +17,7 @@ from whistler.tui import WhistlerApp
 import argparse
 from functools import partial
 from functools import partial
-from whistler.config import ConfigManager, YamlConfigManager, KubeConfigManager
+from whistler.config import ConfigManager, KubeConfigManager
 from asyncio import Event
 
 class WhistlerDriver(Driver):
@@ -93,18 +93,14 @@ class WhistlerDriver(Driver):
 
 async def start_server():
     parser = argparse.ArgumentParser(description="Whistler SSH Server")
-    parser.add_argument("--config", default="config.yaml", help="Path to configuration file")
-    parser.add_argument("--kubeconfig", help="Path to kubeconfig file (enables K8s mode)")
+    parser.add_argument("--kubeconfig", help="Path to kubeconfig file")
     parser.add_argument("--in-cluster", action="store_true", help="Run in Kubernetes in-cluster mode")
     args = parser.parse_args()
 
-    if args.kubeconfig or args.in_cluster:
-        mode = "in-cluster" if args.in_cluster else f"config: {args.kubeconfig}"
-        print(f"Starting in Kubernetes mode ({mode})", file=sys.stderr)
-        config_manager = KubeConfigManager(kubeconfig=args.kubeconfig)
-    else:
-        print(f"Starting in YAML mode (config: {args.config})", file=sys.stderr)
-        config_manager = YamlConfigManager(args.config)
+    # Always run in K8s mode
+    mode = "in-cluster" if args.in_cluster else f"config: {args.kubeconfig}" if args.kubeconfig else "default"
+    print(f"Starting in Kubernetes mode ({mode})", file=sys.stderr)
+    config_manager = KubeConfigManager(kubeconfig=args.kubeconfig)
     
     # Create a partial to pass config_manager to SSHServer
     server_factory = partial(SSHServer, config_manager=config_manager)
