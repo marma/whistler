@@ -171,6 +171,7 @@ class SSHServer(asyncssh.SSHServer):
     def public_key_auth_supported(self):
         return True
         
+
     def validate_public_key(self, username, key):
         parts = username.split('-')
         real_user = parts[0]
@@ -192,6 +193,7 @@ class SSHServer(asyncssh.SSHServer):
                  else:
                      self.target_type = "instance"
                      self.target_name = suffix
+                     self.active_instance_name = suffix
              return True
 
         # Check if user exists and key matches
@@ -220,6 +222,7 @@ class SSHServer(asyncssh.SSHServer):
                     else:
                         self.target_type = "instance"
                         self.target_name = suffix
+                        self.active_instance_name = suffix
                 
                 print(f"User {real_user} authenticated via public key. Target: {self.target_type} {self.target_name}", file=sys.stderr)
                 return True
@@ -230,15 +233,87 @@ class SSHServer(asyncssh.SSHServer):
     def session_requested(self):
         print("SSHServer.session_requested", file=sys.stderr, flush=True)
         return WhistlerSession(
+            server=self,
             config_manager=self.config_manager, 
             username=self.username,
             target_type=self.target_type,
             target_name=self.target_name
         )
+    
+    async def connection_requested(self, dest_host, dest_port, orig_host, orig_port):
+        print(f"Connection requested: {dest_host}:{dest_port} from {orig_host}:{orig_port}", file=sys.stderr)
+        
+        # Only allow forwarding to localhost (which maps to the container)
+        if dest_host not in ("localhost", "127.0.0.1"):
+            print(f"Forwarding denied: destination {dest_host} not allowed (only localhost)", file=sys.stderr)
+            raise asyncssh.ChannelOpenError(
+                asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED,
+                "Forwarding is only allowed to localhost (the container)"
+            )
+            
+        instance_name = getattr(self, "active_instance_name", None)
+        if not instance_name:
+             print("Forwarding denied: no active instance", file=sys.stderr)
+             raise asyncssh.ChannelOpenError(
+                asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED,
+                "No active container instance found for forwarding"
+            )
+            
+        # Resolve instance
+        instances = self.config_manager.get_user_instances(self.username)
+        instance = next((i for i in instances if i["name"] == instance_name), None)
+        
+        if instance and instance.get("podName") and instance.get("status") == "Running":
+            print(f"Tunneling {dest_host}:{dest_port} -> Pod {instance['podName']}:127.0.0.1:{dest_port}", file=sys.stderr)
+            return await self._create_pod_tunnel(instance['podName'], dest_port)
+        else:
+            print(f"Forwarding failed: instance {instance_name} not running or not found", file=sys.stderr)
+            raise asyncssh.ChannelOpenError(
+                asyncssh.OPEN_CONNECT_FAILED,
+                f"Container {instance_name} is not reachable"
+            )
+
+    async def _create_pod_tunnel(self, pod_name, port):
+        # Use kubectl exec + socat to tunnel to localhost inside the pod
+        # This handles services bound to 127.0.0.1 strictly
+        cmd = [
+            "kubectl", "exec", "-i", pod_name, "-n", self.config_manager.namespace,
+            "--", "socat", "-", f"TCP4:127.0.0.1:{port}"
+        ]
+        
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            # Helper to log stderr without blocking
+            async def log_stderr():
+                try:
+                    while True:
+                        line = await process.stderr.readline()
+                        if not line: break
+                        print(f"Tunnel {pod_name}:{port} stderr: {line.decode().strip()}", file=sys.stderr)
+                except Exception:
+                    pass
+
+            asyncio.create_task(log_stderr())
+            
+            return process.stdout, process.stdin
+        except Exception as e:
+            print(f"Failed to create tunnel: {e}", file=sys.stderr)
+            raise asyncssh.ChannelOpenError(
+                asyncssh.OPEN_CONNECT_FAILED,
+                f"Tunnel creation failed: {e}"
+            )
+
 
 class WhistlerSession(asyncssh.SSHServerSession):
-    def __init__(self, config_manager=None, username=None, target_type="tui", target_name=None, *args, **kwargs):
+    def __init__(self, server=None, config_manager=None, username=None, target_type="tui", target_name=None, *args, **kwargs):
         # super().__init__(*args, **kwargs) # SSHServerSession is just object
+        self.server = server
         self._app = None
         self._app_task = None
         self._chan = None
@@ -247,8 +322,6 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self.config_manager = config_manager
         self.username = username
         self.target_type = target_type
-        self.target_name = target_name
-        self.target_name = target_name
         self.target_name = target_name
         self.initial_term_size = (80, 24)
         self._resize_timer = None
@@ -283,7 +356,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
     def exec_requested(self, command):
         print(f"WhistlerSession.exec_requested: {command}", file=sys.stderr, flush=True)
         return True
-
+    
     def session_started(self):
         print("WhistlerSession.session_started", file=sys.stderr, flush=True)
         
@@ -316,7 +389,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
             elif self.target_type == "template":
                  self._shell_task = asyncio.create_task(self._create_and_connect_ephemeral())
             else:
-                print(f"Target type {self.target_type} unknown, falling back to TUI", file=sys.stderr)
+                print(f"Target type {self.target_type} unknown, falling back to TUI", file=sys.stderr, flush=True)
                 self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
                 self._app.ssh_channel = self._chan
                 self._app_task = asyncio.create_task(self._run_app())
@@ -432,6 +505,11 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 if self.term_type:
                     self._chan.write(b"Instance is running. Starting shell...\r\n")
                 
+                # Update server context for forwarding
+                if self.server:
+                    self.server.active_instance_name = self.target_name
+                    print(f"Updated server active_instance_name to {self.target_name}", file=sys.stderr)
+
                 # Start agent bridge if needed
                 if self.local_agent_path and self.pod_socket_path:
                     self._agent_task = asyncio.create_task(self._bridge_agent(pod_name))

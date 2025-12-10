@@ -13,7 +13,7 @@ Whistler has the following features:
 - Ease of use: users use standard SSH to connect to existing pod or create one on-demand
 - It allows for configuration of templates used to start interactive sessions through an administrative TUI available to users
 - Sessions can be preemptible, ephemeral, or persistent
-- Support for ssh agent forwarding
+- Support for ssh agent and port forwarding
 
 ![Whistler](img/screenshot_1.png "Whistler")
 

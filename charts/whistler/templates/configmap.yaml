@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: whistler-server
+data:
+  selectors.yaml: |
+{{ toYaml .Values.whistler.node_selectors | indent 4 }}
