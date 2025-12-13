@@ -195,7 +195,8 @@ class KubeConfigManager(ConfigManager):
                         "podName": pod_name,
                         "ip": pod_ip,
                         "sshHost": None, 
-                        "sshPort": None
+                        "sshPort": None,
+                        "preemptible": spec.get("preemptible", False)
                     }
                     instances.append(inst)
         except ApiException as e:

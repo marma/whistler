@@ -389,6 +389,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self.pod_socket_path = None
         self.term_type = None
         self._process_stdin = None
+        self.is_ephemeral = False
         print("WhistlerSession initialized", file=sys.stderr, flush=True)
 
     def connection_made(self, chan):
@@ -409,6 +410,19 @@ class WhistlerSession(asyncssh.SSHServerSession):
         # print(f"WhistlerSession.data_received: {len(data)}", file=sys.stderr, flush=True)
         if self._app and self._app.driver:
             self._app.driver.feed_data(data)
+        elif self._master_fd is not None:
+             # Forward to PTY master
+             try:
+                 os.write(self._master_fd, data.encode('utf-8') if isinstance(data, str) else data)
+             except OSError:
+                 pass
+        elif self._process_stdin is not None:
+             # Forward to process stdin (non-PTY)
+             try:
+                 self._process_stdin.write(data.encode('utf-8') if isinstance(data, str) else data)
+                 # self._process_stdin.drain() # Not async here, need to check if we can await or if it's buffered
+             except Exception:
+                 pass
 
     def exec_requested(self, command):
         print(f"WhistlerSession.exec_requested: {command}", file=sys.stderr, flush=True)
@@ -472,6 +486,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
     async def _create_and_connect_ephemeral(self):
          # Create ephemeral instance
+         self.is_ephemeral = True
          import secrets
          hex_id = secrets.token_hex(4)
          instance_name = f"{self.target_name}-{hex_id}"
@@ -488,22 +503,25 @@ class WhistlerSession(asyncssh.SSHServerSession):
              
              async def create_task():
                  # Create instance
-                 if self.config_manager.add_instance(self.username, template_ref, instance_name):
+                 if self.config_manager.add_instance(self.username, template_ref, instance_name, preemptible=True):
                      loading_app.update_status(f"Waiting for instance {instance_name} to be ready...")
                      self.target_name = instance_name
-                     await self._connect_to_instance_with_app(loading_app)
+                     return await self._connect_to_instance_with_app(loading_app)
                  else:
                      loading_app.request_exit()
                      self._chan.write(f"Failed to create ephemeral instance.\r\n".encode('utf-8'))
                      self._chan.exit(1)
-                     return
+                     return None
              
              # Run the loading app with the create task
              task = asyncio.create_task(create_task())
              try:
                  await loading_app.run_async()
                  # Wait for task to complete
-                 await task
+                 pod_name = await task
+                 
+                 if pod_name:
+                     await self._run_pod_shell(pod_name)
              except asyncio.CancelledError:
                  print("Task cancelled in _create_and_connect_ephemeral", file=sys.stderr, flush=True)
                  task.cancel()
@@ -611,10 +629,11 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 self._agent_task = asyncio.create_task(self._bridge_agent(pod_name))
                 await asyncio.sleep(0.5)
 
-            await self._run_pod_shell(pod_name)
+            return pod_name
         else:
             self._chan.write(f"Failed to start instance {self.target_name}.\r\n".encode('utf-8'))
             self._chan.exit(1)
+            return None
 
     async def _connect_to_instance(self, loading_screen=None):
         """Connect to instance (for non-PTY mode)."""
@@ -629,7 +648,9 @@ class WhistlerSession(asyncssh.SSHServerSession):
             task = asyncio.create_task(self._connect_to_instance_with_app(loading_app))
             try:
                 await loading_app.run_async()
-                await task
+                pod_name = await task
+                if pod_name:
+                    await self._run_pod_shell(pod_name)
             except asyncio.CancelledError:
                 task.cancel()
                 raise
@@ -687,8 +708,107 @@ class WhistlerSession(asyncssh.SSHServerSession):
             self._chan.write(f"Failed to start instance {self.target_name}.\r\n".encode('utf-8'))
             self._chan.exit(1)
 
+    def _generate_motd(self, instance, template, all_volumes):
+        message = []
+        
+        # Welcome message
+        message.append(f"Welcome to Whistler. You are connected to {instance['name']}")
+        
+        # Personal mount check
+        personal_mount = template.get("personalMountPath")
+        if personal_mount:
+            message.append(f"and your user directory is mounted under {personal_mount}")
+            
+        message.append("\n") # Newline
+        
+        # Volumes list
+        # Combine template volumes and manually mounted volumes if any (though currently only template has volumes)
+        # Template volumes structure: [{"name": "pv-name", "mountPath": "/path"}, ...]
+        template_volumes = template.get("volumes", [])
+        
+        # Filter relevant volumes (exclude system ones if needed, but for now show all)
+        visible_volumes = []
+        for vol in template_volumes:
+             if "persistentVolumeClaim" in vol:
+                 # It's a PVC volume, maybe from template definition
+                 # But template['volumes'] in WhistlerTemplate spec is simplified: 
+                 # [{"name": "my-pvc", "mountPath": "/data", "persistentVolumeClaim": {"claimName": "..."}}]
+                 # Or if it's from the processed template data passed around
+                 pass
+             
+             # The user request says: "* <PV1 name> - <mount path 1>"
+             # We should try to get a friendly name.
+             name = vol.get("name", "Unknown")
+             path = vol.get("mountPath", "Unknown")
+             visible_volumes.append(f"* {name} - {path}")
+             
+        # Also check global volumes.yaml? The user request implies showing mounted volumes.
+        # k8s template spec has volumes.
+        
+        if visible_volumes:
+            message.append("Mounted volumes are")
+            message.extend(visible_volumes)
+            message.append("")
+            
+        # Ephemeral warning
+        if self.is_ephemeral:
+            message.append("This instance is ephemeral and will be terminated once you close the connection. Make sure to save any work to mounted persistant volumes before exiting.")
+            message.append("")
+            
+        # Preemptible warning
+        if instance.get("preemptible"):
+            message.append("This instance is preemptible so it can terminate without warning at any time. Plan accordingly.")
+            message.append("")
+            
+        return "\n".join(message) + "\n"
+
     async def _run_pod_shell(self, pod_name):
         print(f"Starting shell for pod {pod_name}", file=sys.stderr)
+        
+        # Get instance and template info for MOTD
+        instances = self.config_manager.get_user_instances(self.username)
+        instance = next((i for i in instances if i["name"] == self.target_name), None)
+        
+        motd = ""
+        if instance:
+            templates = self.config_manager.get_user_templates(self.username)
+            # TemplateRef in instance might be full name "user-template", but get_user_templates returns list with "name" (short) and "fullName"
+            # Instance template ref is likely just the name if created via TUI? 
+            # In config.py add_instance: "templateRef": template_name
+            # Let's match by fullName or name
+            template_ref = instance.get("template")
+            template = next((t for t in templates if t["fullName"] == template_ref or t["name"] == template_ref), {})
+            
+            all_volumes = self.config_manager.get_volumes() # Global volume definitions if needed
+            motd = self._generate_motd(instance, template, all_volumes)
+            print(f"Generated MOTD for {self.username}: {len(motd)} chars", file=sys.stderr)
+        else:
+             print(f"MOTD: Instance {self.target_name} not found in {len(instances)} instances", file=sys.stderr)
+             motd = f"Connecting to {self.target_name}...\r\n(Instance details not found for MOTD)\r\n"
+            
+        if motd:
+            # We need to write CRLF for raw PTY/SSH output to look right
+            formatted_motd = motd.replace("\n", "\r\n")
+            
+            # Clear screen? Maybe not, just header.
+            # self._chan.write(b"\x1b[2J\x1b[H") 
+            
+            self._chan.write(formatted_motd.encode('utf-8'))
+            print("MOTD sent to channel", file=sys.stderr)
+            
+            # Ensure the MOTD is sent before we hook up the PTY
+            # Although asyncssh write is immediate, drain ensures buffers are flushed if full,
+            # and acts as a yield point.
+            # However, drain() might block if window is full. 
+            # Checking asyncssh source: class SSHChannel... drain(self).
+            try:
+                await self._chan.drain()
+                # Give the client a moment to render the message before starting the shell PTY
+                # which might reset the terminal or clear screen.
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                print(f"Error draining channel: {e}", file=sys.stderr)
+
         
         process = None
         use_pty = self.term_type is not None
