@@ -248,6 +248,7 @@ class KubeConfigManager(ConfigManager):
                 "description": template_data.get("description"),
                 "resources": template_data.get("resources"),
                 "nodeSelector": template_data.get("nodeSelector"),
+                "personalMountPath": template_data.get("personalMountPath"),
                 "volumes": template_data.get("volumes")
             }
         }

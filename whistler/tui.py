@@ -2,7 +2,7 @@ from textual.binding import Binding
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Static, DataTable, Input, Button, Label, Select, Checkbox
 from textual.containers import Container
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 import asyncio
 
 class InstanceCreateScreen(ModalScreen):
@@ -259,6 +259,8 @@ class TemplateEditScreen(ModalScreen):
             Container(
                 Label("Volumes:", classes="header"),
                 Container(
+                    Label("User volume:"),
+                    Input(value=self.template.get("personalMountPath", "/userdata"), placeholder="/userdata", id="personal_mount_path"),
                     *self._create_volume_widgets(),
                     classes="input-grid"
                 ),
@@ -342,6 +344,7 @@ class TemplateEditScreen(ModalScreen):
                         "cpu": cpu,
                         "memory": memory
                     },
+                    "personalMountPath": self.query_one("#personal_mount_path", Input).value or "/userdata",
                     "nodeSelector": node_selector,
                     "volumes": volumes
                 }
@@ -445,6 +448,10 @@ class TemplateViewScreen(ModalScreen):
                 Label("Volumes:", classes="label-key"),
                 Label(vol_str, classes="value"),
 
+                Label("Personal Mount Path:", classes="label-key"),
+                Label(self.template.get("personalMountPath", "/userdata"), classes="value"),
+
+
                 Label("Source:", classes="label-key"),
                 Label(self.template.get("source", "user"), classes="value"),
                 
@@ -468,35 +475,47 @@ class TemplateViewScreen(ModalScreen):
         elif event.button.id == "close_btn":
             self.dismiss(None)
 
-class LoadingScreen(ModalScreen):
+class LoadingScreen(Screen):
     """Full-screen loading screen with animated spinner."""
     
     CSS = """
     LoadingScreen {
         align: center middle;
-        background: $surface;
+        background: $surface;  /* Opaque background */
     }
 
     .loading-container {
-        width: auto;
+        width: 60;
         height: auto;
-        border: round green;
+        border: thick $accent;
         padding: 2;
         background: $surface;
         align: center middle;
     }
 
+    .title {
+        text-align: center;
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 2;
+        width: 100%;
+        content-align: center middle;
+    }
+
     .spinner {
         text-align: center;
         text-style: bold;
-        color: green;
+        color: $warning;
         margin-bottom: 1;
+        width: 100%;
+        content-align: center middle;
     }
 
     .status {
         text-align: center;
         color: $text;
         margin-top: 1;
+        width: 100%;
     }
     """
     
@@ -505,9 +524,12 @@ class LoadingScreen(ModalScreen):
         self.status_message = initial_status
         self.spinner_state = 0
         self.spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self.spinner_colors = ["#ff0000", "#ff7f00", "#ffff00", "#00ff00", "#0000ff", "#4b0082", "#9400d3"]
+        self.color_index = 0
     
     def compose(self) -> ComposeResult:
         yield Container(
+            Label("WHISTLER", classes="title"),
             Label("", id="spinner", classes="spinner"),
             Label(self.status_message, id="status", classes="status"),
             classes="loading-container"
@@ -515,13 +537,19 @@ class LoadingScreen(ModalScreen):
     
     def on_mount(self) -> None:
         self.update_spinner()
-        self.set_interval(0.25, self.update_spinner)
+        self.set_interval(0.1, self.update_spinner)
     
     def update_spinner(self) -> None:
         """Update the spinner animation."""
         spinner_label = self.query_one("#spinner", Label)
-        spinner_label.update(f"{self.spinner_chars[self.spinner_state]} Loading")
+        char = self.spinner_chars[self.spinner_state]
+        color = self.spinner_colors[self.color_index]
+        
+        # Use rich text for coloring
+        spinner_label.update(f"[{color}]{char}[/] Loading...")
+        
         self.spinner_state = (self.spinner_state + 1) % len(self.spinner_chars)
+        self.color_index = (self.color_index + 1) % len(self.spinner_colors)
     
     def update_status(self, status: str) -> None:
         """Update the status message."""

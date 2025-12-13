@@ -21,31 +21,7 @@ from whistler.config import ConfigManager, KubeConfigManager
 from asyncio import Event
 from textual.worker import Worker, WorkerState
 
-class LoadingApp(App):
-    """App to display loading screen during pod operations."""
-    
-    def __init__(self, ssh_channel, initial_term_size=(80, 24), initial_status="Loading...", **kwargs):
-        from whistler.server import WhistlerDriver
-        super().__init__(driver_class=WhistlerDriver, **kwargs)
-        self.ssh_channel = ssh_channel
-        self.initial_term_size = initial_term_size
-        self.initial_status = initial_status
-        self.loading_screen = None
-        self._should_exit = False
-    
-    def on_mount(self) -> None:
-        self.loading_screen = LoadingScreen(initial_status=self.initial_status)
-        self.push_screen(self.loading_screen)
-    
-    def update_status(self, status: str) -> None:
-        """Update the loading screen status."""
-        if self.loading_screen:
-            self.loading_screen.update_status(status)
-    
-    def request_exit(self) -> None:
-        """Request the app to exit."""
-        self._should_exit = True
-        self.exit()
+
 
 
 
@@ -57,7 +33,7 @@ class WhistlerDriver(Driver):
         print("WhistlerDriver initialized", file=sys.stderr, flush=True)
 
     def write(self, data: str | bytes) -> None:
-        # print(f"WhistlerDriver.write: {len(data)} bytes", file=sys.stderr, flush=True)
+        # print(f"WhistlerDriver.write: {len(data)} bytes: {repr(data)[:50]}", file=sys.stderr, flush=True)
         if self._app and self._app.ssh_channel:
             if isinstance(data, str):
                 data = data.encode('utf-8')
@@ -75,6 +51,9 @@ class WhistlerDriver(Driver):
         if self._app and hasattr(self._app, 'session') and self._app.session:
              size = self._app.session.initial_term_size
              print(f"Using initial_term_size from session: {size}", file=sys.stderr, flush=True)
+        elif self._app and hasattr(self._app, 'initial_term_size'):
+             size = self._app.initial_term_size
+             print(f"Using initial_term_size from app: {size}", file=sys.stderr, flush=True)
         elif self._app and self._app.ssh_channel:
              term_size = self._app.ssh_channel.get_terminal_size()
              if term_size:
@@ -119,6 +98,59 @@ class WhistlerDriver(Driver):
     def process_message(self, event: Event) -> None:
         if self._app:
             self._app.post_message(event)
+
+    def disable_input(self) -> None:
+        print("WhistlerDriver.disable_input", file=sys.stderr, flush=True)
+        self.exit_event.set()
+
+    def stop_application_mode(self) -> None:
+        print("WhistlerDriver.stop_application_mode", file=sys.stderr, flush=True)
+        self.write("\x1b[?1000l") # Disable mouse support
+        self.write("\x1b[?1006l")
+        self.write("\x1b[?1015l")
+        self.write("\x1b[?1049l") # Disable alt screen
+        self.write("\x1b[?25h")   # Show cursor
+        self.flush()
+
+    def feed_data(self, data: str | bytes) -> None:
+        if isinstance(data, bytes):
+            data = data.decode('utf-8')
+        # if len(data) > 0 and data[0] == '\x1b':
+        #    print(f"WhistlerDriver.feed_data escape: {repr(data)}", file=sys.stderr, flush=True)
+        for event in self._parser.feed(data):
+            self.process_message(event)
+
+    def process_message(self, event: Event) -> None:
+        if self._app:
+            self._app.post_message(event)
+
+class LoadingApp(App):
+    """App to display loading screen during pod operations."""
+    
+    def __init__(self, ssh_channel, initial_term_size=(80, 24), initial_status="Loading...", **kwargs):
+        # Use WhistlerDriver directly
+        super().__init__(driver_class=WhistlerDriver, **kwargs)
+        self.ssh_channel = ssh_channel
+        self.initial_term_size = initial_term_size
+        self.initial_status = initial_status
+        self.loading_screen = None
+        self._should_exit = False
+    
+    def on_mount(self) -> None:
+        print("LoadingApp.on_mount", file=sys.stderr, flush=True)
+        self.loading_screen = LoadingScreen(initial_status=self.initial_status)
+        self.push_screen(self.loading_screen)
+    
+    def update_status(self, status: str) -> None:
+        """Update the loading screen status."""
+        if self.loading_screen:
+            self.loading_screen.update_status(status)
+    
+    def request_exit(self) -> None:
+        """Request the app to exit."""
+        print("LoadingApp.request_exit", file=sys.stderr, flush=True)
+        self._should_exit = True
+        self.exit()
 
 async def start_server():
     parser = argparse.ArgumentParser(description="Whistler SSH Server")

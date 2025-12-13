@@ -80,6 +80,7 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
     image = template_spec.get('image', 'ubuntu:latest')
     resources = template_spec.get('resources', {})
     node_selector = template_spec.get('nodeSelector', {})
+    personal_mount_path = template_spec.get('personalMountPath', '/userdata')
     
     # Construct resource requirements
     resource_reqs = {}
@@ -126,7 +127,7 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
     volume_mounts = [
         {
             "name": "data",
-            "mountPath": "/data"
+            "mountPath": personal_mount_path
         }
     ]
 
