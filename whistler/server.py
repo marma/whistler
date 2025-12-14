@@ -712,35 +712,47 @@ class WhistlerSession(asyncssh.SSHServerSession):
         message = []
         
         # Welcome message
+        banner = """
+    ********************************************************************
+    *  ██╗    ██╗██╗  ██╗██╗███████╗████████╗██╗     ███████╗██████╗   *
+    *  ██║    ██║██║  ██║██║██╔════╝╚══██╔══╝██║     ██╔════╝██╔══██╗  *
+    *  ██║ █╗ ██║███████║██║███████╗   ██║   ██║     █████╗  ██████╔╝  *
+    *  ██║███╗██║██╔══██║██║╚════██║   ██║   ██║     ██╔══╝  ██╔══██╗  *
+    *  ╚███╔███╔╝██║  ██║██║███████║   ██║   ███████╗███████╗██║  ██║  *
+    *   ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝╚══════╝   ╚═╝   ╚══════╝╚══════╝╚═╝  ╚═╝  *
+    ********************************************************************
+        """
+        message.append(banner)
         message.append(f"Welcome to Whistler. You are connected to {instance['name']}")
         
         # Personal mount check
         personal_mount = template.get("personalMountPath")
+        if not personal_mount:
+             personal_mount = "/userdata"
+
         if personal_mount:
             message.append(f"and your user directory is mounted under {personal_mount}")
             
-        message.append("\n") # Newline
-        
         # Volumes list
-        # Combine template volumes and manually mounted volumes if any (though currently only template has volumes)
-        # Template volumes structure: [{"name": "pv-name", "mountPath": "/path"}, ...]
-        template_volumes = template.get("volumes", [])
-        
-        # Filter relevant volumes (exclude system ones if needed, but for now show all)
         visible_volumes = []
-        for vol in template_volumes:
-             if "persistentVolumeClaim" in vol:
-                 # It's a PVC volume, maybe from template definition
-                 # But template['volumes'] in WhistlerTemplate spec is simplified: 
-                 # [{"name": "my-pvc", "mountPath": "/data", "persistentVolumeClaim": {"claimName": "..."}}]
-                 # Or if it's from the processed template data passed around
-                 pass
+        
+        # Use actual mounts from pod if available (source of truth)
+        real_mounts = instance.get("mounts")
+        if real_mounts is not None:
+             for m in real_mounts:
+                 visible_volumes.append(f"* {m['name']} - {m['mountPath']}")
+        else:
+             # Fallback to template definition if pod info unavailable
+             template_volumes = template.get("volumes", [])
              
-             # The user request says: "* <PV1 name> - <mount path 1>"
-             # We should try to get a friendly name.
-             name = vol.get("name", "Unknown")
-             path = vol.get("mountPath", "Unknown")
-             visible_volumes.append(f"* {name} - {path}")
+             # Add personal mount to the list of volumes
+             if personal_mount:
+                  visible_volumes.append(f"* User Volume - {personal_mount}")
+    
+             for vol in template_volumes:
+                  name = vol.get("name", "Unknown")
+                  path = vol.get("mountPath", "Unknown")
+                  visible_volumes.append(f"* {name} - {path}")
              
         # Also check global volumes.yaml? The user request implies showing mounted volumes.
         # k8s template spec has volumes.
@@ -752,12 +764,12 @@ class WhistlerSession(asyncssh.SSHServerSession):
             
         # Ephemeral warning
         if self.is_ephemeral:
-            message.append("This instance is ephemeral and will be terminated once you close the connection. Make sure to save any work to mounted persistant volumes before exiting.")
+            message.append("This instance is ephemeral and will be terminated once you close the connection.\nMake sure to save any work to mounted persistant volumes before exiting.")
             message.append("")
             
         # Preemptible warning
         if instance.get("preemptible"):
-            message.append("This instance is preemptible so it can terminate without warning at any time. Plan accordingly.")
+            message.append("This instance is preemptible, it can terminate without warning at any time.\nPlan accordingly.")
             message.append("")
             
         return "\n".join(message) + "\n"
@@ -797,17 +809,9 @@ class WhistlerSession(asyncssh.SSHServerSession):
             print("MOTD sent to channel", file=sys.stderr)
             
             # Ensure the MOTD is sent before we hook up the PTY
-            # Although asyncssh write is immediate, drain ensures buffers are flushed if full,
-            # and acts as a yield point.
-            # However, drain() might block if window is full. 
-            # Checking asyncssh source: class SSHChannel... drain(self).
-            try:
-                await self._chan.drain()
-                # Give the client a moment to render the message before starting the shell PTY
-                # which might reset the terminal or clear screen.
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                print(f"Error draining channel: {e}", file=sys.stderr)
+            # asyncssh doesn't have drain on channel. buffer is managed.
+            # We keep the sleep to ensure render.
+            await asyncio.sleep(0.5)
 
         
         process = None

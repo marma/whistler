@@ -188,6 +188,15 @@ class KubeConfigManager(ConfigManager):
                             pod_status = "Terminating"
                         pod_ip = pod.status.pod_ip
                         
+                    mounts = []
+                    if pod and pod.spec and pod.spec.containers:
+                         # Assume first container is the main one
+                         # Python k8s client uses snake_case for attributes
+                         for m in pod.spec.containers[0].volume_mounts or []:
+                             # Skip service account tokens (usuall mounted at /var/run/secrets/...)
+                             if not m.mount_path.startswith("/var/run/secrets"):
+                                 mounts.append({"name": m.name, "mountPath": m.mount_path})
+
                     inst = {
                         "name": display_name,
                         "template": spec.get("templateRef"),
@@ -196,6 +205,7 @@ class KubeConfigManager(ConfigManager):
                         "ip": pod_ip,
                         "sshHost": None, 
                         "sshPort": None,
+                        "mounts": mounts,
                         "preemptible": spec.get("preemptible", False)
                     }
                     instances.append(inst)
