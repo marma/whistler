@@ -21,7 +21,11 @@ rules:
     verbs: [list, watch]
   - apiGroups: [""]
     resources: [namespaces]
-    verbs: [list, watch]
+    verbs: [list, watch, create, get, update, patch, delete]
+
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [list, watch, create, get, update, patch, delete]
 
   # Application: watching & handling for the custom resource we declare.
   - apiGroups: [whistler.io]

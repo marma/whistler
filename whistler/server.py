@@ -322,7 +322,7 @@ class SSHServer(asyncssh.SSHServer):
         
         if instance and instance.get("podName") and instance.get("status") == "Running":
             print(f"Tunneling {dest_host}:{dest_port} -> Pod {instance['podName']}:127.0.0.1:{dest_port}", file=sys.stderr)
-            return await self._create_pod_tunnel(instance['podName'], dest_port)
+            return await self._create_pod_tunnel(instance['podName'], instance.get('namespace'), dest_port)
         else:
             print(f"Forwarding failed: instance {instance_name} not running or not found", file=sys.stderr)
             raise asyncssh.ChannelOpenError(
@@ -330,11 +330,11 @@ class SSHServer(asyncssh.SSHServer):
                 f"Container {instance_name} is not reachable"
             )
 
-    async def _create_pod_tunnel(self, pod_name, port):
+    async def _create_pod_tunnel(self, pod_name, namespace, port):
         # Use kubectl exec + socat to tunnel to localhost inside the pod
         # This handles services bound to 127.0.0.1 strictly
         cmd = [
-            "kubectl", "exec", "-i", pod_name, "-n", self.config_manager.namespace,
+            "kubectl", "exec", "-i", pod_name, "-n", namespace,
             "--", "socat", "-", f"TCP4:127.0.0.1:{port}"
         ]
         
@@ -604,8 +604,9 @@ class WhistlerSession(asyncssh.SSHServerSession):
             import time
             try:
                 full_cr_name = f"{self.username}-{self.target_name}"
+                ns = instance.get("namespace", self.config_manager.namespace)
                 self.config_manager.api.patch_namespaced_custom_object(
-                    self.config_manager.group, self.config_manager.version, self.config_manager.namespace,
+                    self.config_manager.group, self.config_manager.version, ns,
                     "whistlerinstances", full_cr_name,
                     {"metadata": {"annotations": {"whistler.io/last-connect": str(time.time())}}}
                 )
@@ -626,7 +627,8 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
             # Start agent bridge if needed
             if self.local_agent_path and self.pod_socket_path:
-                self._agent_task = asyncio.create_task(self._bridge_agent(pod_name))
+                ns = instance.get("namespace", self.config_manager.namespace)
+                self._agent_task = asyncio.create_task(self._bridge_agent(pod_name, ns))
                 await asyncio.sleep(0.5)
 
             return pod_name
@@ -682,8 +684,9 @@ class WhistlerSession(asyncssh.SSHServerSession):
             import time
             try:
                 full_cr_name = f"{self.username}-{self.target_name}"
+                ns = instance.get("namespace", self.config_manager.namespace)
                 self.config_manager.api.patch_namespaced_custom_object(
-                    self.config_manager.group, self.config_manager.version, self.config_manager.namespace,
+                    self.config_manager.group, self.config_manager.version, ns,
                     "whistlerinstances", full_cr_name,
                     {"metadata": {"annotations": {"whistler.io/last-connect": str(time.time())}}}
                 )
@@ -700,7 +703,8 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
             # Start agent bridge if needed
             if self.local_agent_path and self.pod_socket_path:
-                self._agent_task = asyncio.create_task(self._bridge_agent(pod_name))
+                ns = instance.get("namespace", self.config_manager.namespace)
+                self._agent_task = asyncio.create_task(self._bridge_agent(pod_name, ns))
                 await asyncio.sleep(0.5)
 
             await self._run_pod_shell(pod_name)
@@ -818,7 +822,8 @@ class WhistlerSession(asyncssh.SSHServerSession):
         use_pty = self.term_type is not None
         
         try:
-            cmd = ["kubectl", "exec", "-n", self.config_manager.namespace]
+            ns = instance.get("namespace", self.config_manager.namespace) if instance else self.config_manager.namespace
+            cmd = ["kubectl", "exec", "-n", ns]
             
             if use_pty:
                 cmd.append("-it")
@@ -1055,16 +1060,16 @@ class WhistlerSession(asyncssh.SSHServerSession):
             print("Cancelling agent task", file=sys.stderr, flush=True)
             self._agent_task.cancel()
 
-    async def _bridge_agent(self, pod_name):
+    async def _bridge_agent(self, pod_name, namespace):
         print(f"Starting agent bridge: {self.local_agent_path} -> pod {pod_name}:{self.pod_socket_path}", file=sys.stderr)
         try:
             # Ensure socat is available in the pod
             socat_bin = "socat"
-            if not await self._is_command_available(pod_name, "socat"):
+            if not await self._is_command_available(pod_name, namespace, "socat"):
                 print(f"socat not found in pod {pod_name}, attempting to inject static binary...", file=sys.stderr)
                 socat_bin = "/tmp/socat-static"
-                if not await self._is_file_present(pod_name, socat_bin):
-                     await self._inject_static_socat(pod_name, socat_bin)
+                if not await self._is_file_present(pod_name, namespace, socat_bin):
+                     await self._inject_static_socat(pod_name, namespace, socat_bin)
             
             # Connect to local agent socket
             local_reader, local_writer = await asyncio.open_unix_connection(self.local_agent_path)
@@ -1072,7 +1077,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
             # Start socat in pod using the determined binary path
             # Using fork again to allow multiple sequential connections (ssh behavior)
             cmd = [
-                "kubectl", "exec", "-i", pod_name, "-n", self.config_manager.namespace, "--",
+                "kubectl", "exec", "-i", pod_name, "-n", namespace, "--",
                 socat_bin, f"UNIX-LISTEN:{self.pod_socket_path},fork,mode=600", "STDIO"
             ]
             
@@ -1121,21 +1126,21 @@ class WhistlerSession(asyncssh.SSHServerSession):
         finally:
              print("Agent bridge finished", file=sys.stderr)
 
-    async def _is_command_available(self, pod_name, cmd):
-        check_cmd = ["kubectl", "exec", pod_name, "-n", self.config_manager.namespace, "--", "command", "-v", cmd]
+    async def _is_command_available(self, pod_name, namespace, cmd):
+        check_cmd = ["kubectl", "exec", pod_name, "-n", namespace, "--", "command", "-v", cmd]
         process = await asyncio.create_subprocess_exec(
             *check_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
         )
         return await process.wait() == 0
 
-    async def _is_file_present(self, pod_name, path):
-        check_cmd = ["kubectl", "exec", pod_name, "-n", self.config_manager.namespace, "--", "test", "-f", path]
+    async def _is_file_present(self, pod_name, namespace, path):
+        check_cmd = ["kubectl", "exec", pod_name, "-n", namespace, "--", "test", "-f", path]
         process = await asyncio.create_subprocess_exec(
             *check_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
         )
         return await process.wait() == 0
 
-    async def _inject_static_socat(self, pod_name, target_path):
+    async def _inject_static_socat(self, pod_name, namespace, target_path):
         # Use bundled binary
         local_binary = "/app/bin/socat_x64"
         
@@ -1151,7 +1156,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
         print(f"Injecting static socat from {local_binary} to {pod_name}:{target_path}...", file=sys.stderr)
         # Use cat < local | kubectl exec ... "cat > target && chmod +x target"
         inject_cmd = [
-            "kubectl", "exec", "-i", pod_name, "-n", self.config_manager.namespace, "--",
+            "kubectl", "exec", "-i", pod_name, "-n", namespace, "--",
             "sh", "-c", f"cat > {target_path} && chmod +x {target_path}"
         ]
         

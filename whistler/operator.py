@@ -62,7 +62,9 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
     preemptible = spec.get('preemptible', False)
     
     # Fetch template details
+    # Fetch template details
     custom_api = client.CustomObjectsApi()
+    template = None
     try:
         template = custom_api.get_namespaced_custom_object(
             group="whistler.io",
@@ -71,11 +73,30 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
             plural="whistlertemplates",
             name=template_ref
         )
-        template_spec = template.get('spec', {})
     except client.rest.ApiException as e:
         if e.status == 404:
-            raise kopf.TemporaryError(f"Template {template_ref} not found", delay=10)
-        raise kopf.PermanentError(f"Failed to fetch template: {e}")
+            # Try system namespace
+            import os
+            system_ns = os.environ.get("POD_NAMESPACE", "whistler")
+            if system_ns != namespace:
+                try:
+                    template = custom_api.get_namespaced_custom_object(
+                        group="whistler.io",
+                        version="v1",
+                        namespace=system_ns,
+                        plural="whistlertemplates",
+                        name=template_ref
+                    )
+                except client.rest.ApiException as e2:
+                    if e2.status == 404:
+                        raise kopf.TemporaryError(f"Template {template_ref} not found in {namespace} or {system_ns}", delay=10)
+                    raise kopf.PermanentError(f"Failed to fetch template from system ns: {e2}")
+            else:
+                 raise kopf.TemporaryError(f"Template {template_ref} not found", delay=10)
+        else:
+            raise kopf.PermanentError(f"Failed to fetch template: {e}")
+            
+    template_spec = template.get('spec', {})
 
     image = template_spec.get('image', 'ubuntu:latest')
     resources = template_spec.get('resources', {})
