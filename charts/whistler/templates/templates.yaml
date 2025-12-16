@@ -14,5 +14,8 @@ spec:
   nodeSelector:
 {{ toYaml $template.nodeSelector | indent 4 }}
 {{- end }}
+{{- if $template.personalMountPath }}
+  personalMountPath: {{ $template.personalMountPath | quote }}
+{{- end }}
 ---
 {{- end }}

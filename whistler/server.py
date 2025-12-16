@@ -726,7 +726,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
     *   ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝╚══════╝   ╚═╝   ╚══════╝╚══════╝╚═╝  ╚═╝  *
     ********************************************************************
         """
-        message.append(banner)
+        message.append(f"\033[32m{banner}\033[0m")
         message.append(f"Welcome to Whistler. You are connected to {instance['name']}")
         
         # Personal mount check
@@ -762,7 +762,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
         # k8s template spec has volumes.
         
         if visible_volumes:
-            message.append("Mounted volumes are")
+            message.append("\nMounted volumes are")
             message.extend(visible_volumes)
             message.append("")
             

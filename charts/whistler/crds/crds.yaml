@@ -38,6 +38,8 @@ spec:
                   type: object
                   additionalProperties:
                     type: string
+                personalMountPath:
+                  type: string
   scope: Namespaced
   names:
     plural: whistlertemplates

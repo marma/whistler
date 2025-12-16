@@ -61,3 +61,6 @@ templates:
       cpu: 500m
       memory: 2Gi
 
+
+userVolume:
+  accessMode: ReadWriteMany

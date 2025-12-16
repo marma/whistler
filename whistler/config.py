@@ -349,6 +349,8 @@ class KubeConfigManager(ConfigManager):
                 "volumes": template_data.get("volumes")
             }
         }
+        import sys
+        print(f"DEBUG: Saving template body: {body}", file=sys.stderr)
         try:
             # Check if exists to update, or create
             try:

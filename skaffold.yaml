@@ -22,6 +22,7 @@ deploy:
           whistler.auth.allowAny: true
           server.service.type: NodePort
           server.service.nodePort: 30022
+          userVolume.accessMode: ReadWriteOnce
         setValueTemplates:
           image.repository: "{{.IMAGE_REPO_whistler}}"
           image.tag: "{{.IMAGE_TAG_whistler}}"

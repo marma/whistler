@@ -24,6 +24,8 @@ spec:
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
+            - name: USER_VOLUME_ACCESS_MODE
+              value: {{ .Values.userVolume.accessMode | quote }}
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
           volumeMounts:
