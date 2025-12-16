@@ -23,6 +23,7 @@ deploy:
           server.service.type: NodePort
           server.service.nodePort: 30022
           userVolume.accessMode: ReadWriteOnce
+          userVolume.size: 10Mi
         setValueTemplates:
           image.repository: "{{.IMAGE_REPO_whistler}}"
           image.tag: "{{.IMAGE_TAG_whistler}}"

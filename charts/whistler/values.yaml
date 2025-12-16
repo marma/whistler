@@ -64,3 +64,4 @@ templates:
 
 userVolume:
   accessMode: ReadWriteMany
+  size: 10Gi

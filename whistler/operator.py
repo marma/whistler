@@ -19,6 +19,7 @@ def ensure_pvc(user, namespace, logger):
     logger.info(f"Creating PVC {pvc_name} for user {user}")
     import os
     access_mode = os.environ.get("USER_VOLUME_ACCESS_MODE", "ReadWriteMany")
+    volume_size = os.environ.get("USER_VOLUME_SIZE", "10Gi")
     pvc_body = {
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
@@ -33,7 +34,7 @@ def ensure_pvc(user, namespace, logger):
             "accessModes": [access_mode],
             "resources": {
                 "requests": {
-                    "storage": "10Gi"
+                    "storage": volume_size
                 }
             }
         }

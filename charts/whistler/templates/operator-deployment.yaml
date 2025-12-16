@@ -26,6 +26,8 @@ spec:
               value: "1"
             - name: USER_VOLUME_ACCESS_MODE
               value: {{ .Values.userVolume.accessMode | quote }}
+            - name: USER_VOLUME_SIZE
+              value: {{ .Values.userVolume.size | quote }}
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
           volumeMounts:
