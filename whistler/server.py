@@ -608,7 +608,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 self.config_manager.api.patch_namespaced_custom_object(
                     self.config_manager.group, self.config_manager.version, ns,
                     "whistlerinstances", full_cr_name,
-                    {"metadata": {"annotations": {"whistler.io/last-connect": str(time.time())}}}
+                    {"metadata": {"annotations": {"whistler.example.com/last-connect": str(time.time())}}}
                 )
             except Exception as e:
                 print(f"Failed to patch instance: {e}", file=sys.stderr)
@@ -688,7 +688,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 self.config_manager.api.patch_namespaced_custom_object(
                     self.config_manager.group, self.config_manager.version, ns,
                     "whistlerinstances", full_cr_name,
-                    {"metadata": {"annotations": {"whistler.io/last-connect": str(time.time())}}}
+                    {"metadata": {"annotations": {"whistler/last-connect": str(time.time())}}}
                 )
             except Exception as e:
                 print(f"Failed to patch instance: {e}", file=sys.stderr)

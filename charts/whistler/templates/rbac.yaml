@@ -28,7 +28,7 @@ rules:
     verbs: [list, watch, create, get, update, patch, delete]
 
   # Application: watching & handling for the custom resource we declare.
-  - apiGroups: [whistler.io]
+  - apiGroups: [whistler.example.com]
     resources: [whistlerinstances, whistlertemplates, whistlerinstances/status, whistlertemplates/status]
     verbs: [list, watch, patch, get, update, create, delete]
 

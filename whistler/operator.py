@@ -70,7 +70,7 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
     template = None
     try:
         template = custom_api.get_namespaced_custom_object(
-            group="whistler.io",
+            group="whistler.example.com",
             version="v1",
             namespace=namespace,
             plural="whistlertemplates",
@@ -84,7 +84,7 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
             if system_ns != namespace:
                 try:
                     template = custom_api.get_namespaced_custom_object(
-                        group="whistler.io",
+                        group="whistler.example.com",
                         version="v1",
                         namespace=system_ns,
                         plural="whistlertemplates",
@@ -225,9 +225,9 @@ def ensure_pod(spec, name, namespace, logger, **kwargs):
             logger.error(f"Failed to create pod: {e}")
             raise kopf.PermanentError(f"Failed to create pod: {e}")
 
-@kopf.on.create('whistler.io', 'v1', 'whistlerinstances')
-@kopf.on.update('whistler.io', 'v1', 'whistlerinstances')
-@kopf.on.resume('whistler.io', 'v1', 'whistlerinstances')
+@kopf.on.create('whistler.example.com', 'v1', 'whistlerinstances')
+@kopf.on.update('whistler.example.com', 'v1', 'whistlerinstances')
+@kopf.on.resume('whistler.example.com', 'v1', 'whistlerinstances')
 def reconcile_fn(spec, name, namespace, logger, meta, **kwargs):
     if meta.get('deletionTimestamp'):
         logger.info(f"Skipping reconcile for deleting instance {name}")
@@ -235,7 +235,7 @@ def reconcile_fn(spec, name, namespace, logger, meta, **kwargs):
         
     ensure_pod(spec, name, namespace, logger, meta=meta, **kwargs)
 
-@kopf.on.delete('whistler.io', 'v1', 'whistlerinstances')
+@kopf.on.delete('whistler.example.com', 'v1', 'whistlerinstances')
 def delete_fn(spec, name, namespace, logger, **kwargs):
     logger.info(f"Deleting instance {name}")
     # Explicitly delete pod to ensure cleanup, even though GC should handle it

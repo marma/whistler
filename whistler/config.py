@@ -61,10 +61,10 @@ class KubeConfigManager(ConfigManager):
                 logger.warning("Could not load kubernetes config")
 
         self.api = client.CustomObjectsApi()
-        self.group = "whistler.io"
+        self.group = "whistler.example.com"
         self.version = "v1"
         self.api = client.CustomObjectsApi()
-        self.group = "whistler.io"
+        self.group = "whistler.example.com"
         self.version = "v1"
         
         # Determine namespace
@@ -106,8 +106,8 @@ class KubeConfigManager(ConfigManager):
                     "metadata": {
                         "name": ns_name,
                         "labels": {
-                            "whistler.io/user": username,
-                            "whistler.io/managed": "true"
+                            "whistler.example.com/user": username,
+                            "whistler.example.com/managed": "true"
                         }
                     }
                 }

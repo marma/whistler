@@ -1,5 +1,5 @@
 {{- range $name, $template := .Values.templates }}
-apiVersion: whistler.io/v1
+apiVersion: whistler.example.com/v1
 kind: WhistlerTemplate
 metadata:
   name: {{ $name }}
