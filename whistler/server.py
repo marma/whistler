@@ -568,6 +568,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  pod_name = await task
                  
                  if pod_name:
+                     self._app = None # Clear app reference so input goes to shell
                      await self._run_pod_shell(pod_name)
              except asyncio.CancelledError:
                  print("Task cancelled in _create_and_connect_ephemeral", file=sys.stderr, flush=True)
@@ -722,6 +723,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
                 pod_name = await task
                 if pod_name:
+                    self._app = None # Clear app reference so input goes to shell
                     await self._run_pod_shell(pod_name)
             except asyncio.CancelledError:
                 task.cancel()
@@ -1018,13 +1020,13 @@ class WhistlerSession(asyncssh.SSHServerSession):
             
             self._chan.exit(0)
 
-    async def _wait_for_pod_with_app(self, instance_name, loading_app, timeout=60):
+    async def _wait_for_pod_with_app(self, instance_name, loading_app, timeout=None):
         """Wait for pod to be ready, updating the loading app."""
         loop = asyncio.get_running_loop()
         start_time = loop.time()
         last_status = None
         
-        while loop.time() - start_time < timeout:
+        while timeout is None or loop.time() - start_time < timeout:
             instances = await loop.run_in_executor(None, self.config_manager.get_user_instances, self.username)
             instance = next((i for i in instances if i["name"] == instance_name), None)
             
@@ -1042,12 +1044,12 @@ class WhistlerSession(asyncssh.SSHServerSession):
             await asyncio.sleep(0.5)
         return None
 
-    async def _wait_for_pod(self, instance_name, timeout=60):
+    async def _wait_for_pod(self, instance_name, timeout=None):
         """Wait for pod (non-PTY mode)."""
         start_time = asyncio.get_running_loop().time()
         last_status = None
         
-        while asyncio.get_running_loop().time() - start_time < timeout:
+        while timeout is None or asyncio.get_running_loop().time() - start_time < timeout:
             instances = self.config_manager.get_user_instances(self.username)
             instance = next((i for i in instances if i["name"] == instance_name), None)
             

@@ -517,6 +517,14 @@ class LoadingScreen(Screen):
         margin-top: 1;
         width: 100%;
     }
+
+    .help {
+        text-align: center;
+        color: $text-muted;
+        margin-top: 1;
+        width: 100%;
+        text-style: italic;
+    }
     """
     
     def __init__(self, initial_status: str = "Loading..."):
@@ -532,6 +540,7 @@ class LoadingScreen(Screen):
             Label("WHISTLER", classes="title"),
             Label("", id="spinner", classes="spinner"),
             Label(self.status_message, id="status", classes="status"),
+            Label("(press ctrl-c to cancel)", classes="help"),
             classes="loading-container"
         )
     
