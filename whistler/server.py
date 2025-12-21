@@ -390,6 +390,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self.term_type = None
         self._process_stdin = None
         self.is_ephemeral = False
+        self.is_sftp = False
         print("WhistlerSession initialized", file=sys.stderr, flush=True)
 
     def connection_made(self, chan):
@@ -401,6 +402,13 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self.initial_term_size = (term_size[0], term_size[1])
         self.term_type = term_type
         return True
+
+    def subsystem_requested(self, subsystem):
+        print(f"WhistlerSession.subsystem_requested: {subsystem}", file=sys.stderr, flush=True)
+        if subsystem == 'sftp':
+            self.is_sftp = True
+            return True
+        return False
 
     def shell_requested(self):
         print("WhistlerSession.shell_requested", file=sys.stderr, flush=True)
@@ -480,15 +488,25 @@ class WhistlerSession(asyncssh.SSHServerSession):
             os.environ['COLORTERM'] = 'truecolor'
 
         try:
-            if self.target_type == "tui":
+            if self.target_type == "tui" and not self.is_sftp:
                 self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
                 self._app.ssh_channel = self._chan
                 self._app_task = asyncio.create_task(self._run_app())
-            elif self.target_type == "instance":
+            elif self.target_type == "instance" or (self.is_sftp and self.target_type != "template"):
                 # Find the instance
-                self._shell_task = asyncio.create_task(self._connect_to_instance())
+                if self.is_sftp:
+                    self._shell_task = asyncio.create_task(self._connect_to_instance_sftp())
+                else:
+                    self._shell_task = asyncio.create_task(self._connect_to_instance())
             elif self.target_type == "template":
-                 self._shell_task = asyncio.create_task(self._create_and_connect_ephemeral())
+                 if self.is_sftp:
+                     # SFTP to a template implies creating an ephemeral instance? 
+                     # Or maybe just fail for now? 
+                     # Let's try to support it if possible, but SFTP clients might timeout.
+                     # For now, let's treat it same as shell - create ephemeral
+                     self._shell_task = asyncio.create_task(self._create_and_connect_ephemeral(sftp=True))
+                 else:
+                     self._shell_task = asyncio.create_task(self._create_and_connect_ephemeral())
             else:
                 print(f"Target type {self.target_type} unknown, falling back to TUI", file=sys.stderr, flush=True)
                 self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
@@ -514,7 +532,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
             print("WhistlerSession._run_app finished", file=sys.stderr, flush=True)
             self._chan.exit(0)
 
-    async def _create_and_connect_ephemeral(self):
+    async def _create_and_connect_ephemeral(self, sftp=False):
          # Create ephemeral instance
          self.is_ephemeral = True
          import secrets
@@ -569,7 +587,11 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  
                  if pod_name:
                      self._app = None # Clear app reference so input goes to shell
-                     await self._run_pod_shell(pod_name)
+                     if sftp:
+                         await self._run_sftp_bridge(pod_name, self.config_manager.namespace) # Namespace might be different if multi-tenant
+                         # We should get namespace from instance obj really, but for ephemeral it's usually default or simple
+                     else:
+                         await self._run_pod_shell(pod_name)
              except asyncio.CancelledError:
                  print("Task cancelled in _create_and_connect_ephemeral", file=sys.stderr, flush=True)
                  task.cancel()
@@ -598,12 +620,31 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  self._app = None
          else:
              # Non-PTY mode: use simple text output
-             self._chan.write(f"Creating ephemeral instance {instance_name} (full name: {self.username}-{instance_name}) from template {self.target_name}...\r\n".encode('utf-8'))
+             if not sftp:
+                 self._chan.write(f"Creating ephemeral instance {instance_name} (full name: {self.username}-{instance_name}) from template {self.target_name}...\r\n".encode('utf-8'))
              
              if self.config_manager.add_instance(self.username, template_ref, instance_name):
                  try:
                      self.target_name = instance_name
-                     await self._connect_to_instance()
+                     # Wait for pod
+                     pod_name = await self._wait_for_pod(instance_name)
+                     
+                     if pod_name:
+                         if sftp:
+                              # Need to resolve namespace, assumed self.config_manager.namespace or user default
+                              # Ideally we fetch the instance object again to get namespace but for now using default as fallback or query?
+                              # Let's query to be safe
+                              instances = self.config_manager.get_user_instances(self.username)
+                              instance = next((i for i in instances if i["name"] == instance_name), None)
+                              ns = instance.get("namespace") if instance else self.config_manager.namespace
+                              
+                              await self._run_sftp_bridge(pod_name, ns)
+                         else:
+                              # Need to call _connect_to_instance which handles attaching
+                              await self._connect_to_instance() 
+                     else:
+                         self._chan.exit(1)
+
                  except Exception as e:
                      print(f"Error in _create_and_connect_ephemeral: {e}", file=sys.stderr, flush=True)
                      self._chan.write(f"Error connecting to instance: {e}\r\n".encode('utf-8'))
@@ -1020,8 +1061,108 @@ class WhistlerSession(asyncssh.SSHServerSession):
             
             self._chan.exit(0)
 
+    async def _connect_to_instance_sftp(self):
+        """Connect to instance for SFTP session."""
+        instances = self.config_manager.get_user_instances(self.username)
+        instance = next((i for i in instances if i["name"] == self.target_name), None)
+        
+        if not instance:
+             self._chan.exit(1)
+             return
+
+        pod_name = instance.get("podName")
+        
+        if not pod_name or instance.get("status") != "Running":
+             # Try to wake it up or wait?
+             # For SFTP we probably just fail if not running, or maybe wait briefly?
+             # Let's wait briefly like we do for shell
+             pod_name = await self._wait_for_pod(self.target_name, timeout=30)
+        
+        if pod_name:
+            await self._run_sftp_bridge(pod_name, instance.get("namespace"))
+        else:
+            self._chan.exit(1)
+
+    async def _run_sftp_bridge(self, pod_name, namespace):
+        """Bridge SFTP session to sftp-server in pod."""
+        print(f"Starting SFTP bridge to {pod_name}", file=sys.stderr)
+        
+        # Probe for sftp-server path
+        sftp_server_paths = [
+            "/usr/lib/openssh/sftp-server",
+            "/usr/libexec/openssh/sftp-server",
+            "/usr/lib/ssh/sftp-server",
+            "/usr/libexec/sftp-server"
+        ]
+        
+        sftp_path = None
+        for path in sftp_server_paths:
+            if await self._is_file_present(pod_name, namespace, path):
+                sftp_path = path
+                break
+        
+        if not sftp_path:
+             print(f"sftp-server not found in pod {pod_name}", file=sys.stderr)
+             # Try just 'sftp-server' in path
+             if await self._is_command_available(pod_name, namespace, "sftp-server"):
+                 sftp_path = "sftp-server"
+             else:
+                 # Last ditch: try to see if we can find it via `find`? No, too slow.
+                 # Just fail.
+                 self._chan.exit(1)
+                 return
+
+        print(f"Using sftp-server at {sftp_path}", file=sys.stderr)
+
+        cmd = [
+            "kubectl", "exec", "-i", pod_name, "-n", namespace,
+            "--", sftp_path
+        ]
+        
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            self._process_stdin = process.stdin
+            
+            # Forward pod stdout -> channel stdout
+            async def forward_output(reader, writer_func):
+                try:
+                    while True:
+                        data = await reader.read(32768)
+                        if not data:
+                            break
+                        writer_func(data)
+                except Exception:
+                    pass
+
+            stdout_task = asyncio.create_task(forward_output(process.stdout, self._chan.write))
+            
+            # Forward pod stderr -> channel stderr
+            stderr_task = asyncio.create_task(forward_output(process.stderr, partial(self._chan.write, datatype=asyncssh.EXTENDED_DATA_STDERR)))
+            
+            try:
+                await process.wait()
+                await asyncio.gather(stdout_task, stderr_task)
+            except asyncio.CancelledError:
+                process.terminate()
+                raise
+            finally:
+                 if process.returncode is None:
+                     process.terminate()
+                 self._chan.exit(process.returncode or 0)
+
+        except Exception as e:
+            print(f"SFTP bridge error: {e}", file=sys.stderr)
+            self._chan.exit(1)
+            
     async def _wait_for_pod_with_app(self, instance_name, loading_app, timeout=None):
         """Wait for pod to be ready, updating the loading app."""
+
         loop = asyncio.get_running_loop()
         start_time = loop.time()
         last_status = None
@@ -1062,11 +1203,14 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 
                 if status != last_status:
                     if last_status:
-                        self._chan.write(b"\r\n")
-                    self._chan.write(f"Instance status: {status} ".encode('utf-8'))
+                        if not self.is_sftp:
+                            self._chan.write(b"\r\n")
+                    if not self.is_sftp:
+                        self._chan.write(f"Instance status: {status} ".encode('utf-8'))
                     last_status = status
                 else:
-                    self._chan.write(b".")
+                    if not self.is_sftp:
+                        self._chan.write(b".")
             
             await asyncio.sleep(0.5)
         return None
