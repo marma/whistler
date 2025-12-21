@@ -535,6 +535,19 @@ class LoadingScreen(Screen):
             classes="loading-container"
         )
     
+    def action_cancel(self) -> None:
+        self.app.exit("cancelled")
+        
+    def on_key(self, event) -> None:
+        # Explicitly handle ctrl+c if binding doesn't catch it for some reason?
+        # Actually standard bindings should work.
+        pass
+    
+    BINDINGS = [
+        Binding("ctrl+c", "cancel", "Cancel"),
+    ]
+
+    
     def on_mount(self) -> None:
         self.update_spinner()
         self.set_interval(0.1, self.update_spinner)

@@ -407,9 +407,23 @@ class WhistlerSession(asyncssh.SSHServerSession):
         return True
 
     def data_received(self, data, datatype):
-        # print(f"WhistlerSession.data_received: {len(data)}", file=sys.stderr, flush=True)
-        if self._app and self._app.driver:
-            self._app.driver.feed_data(data)
+        # Debugging input data
+        # print(f"DEBUG: WhistlerSession.data_received: len={len(data)} val={repr(data)}", file=sys.stderr, flush=True)
+        if self._app:
+             # Check for Ctrl-C explicitly to handle race conditions where driver is not ready or fails to route
+             is_ctrl_c = False
+             if isinstance(data, bytes) and b'\x03' in data:
+                 is_ctrl_c = True
+             elif isinstance(data, str) and '\x03' in data:
+                 is_ctrl_c = True
+             
+             if is_ctrl_c:
+                 if hasattr(self._app, 'exit'):
+                     self._app.exit("cancelled")
+                     return
+
+             if hasattr(self._app, 'driver') and self._app.driver:
+                self._app.driver.feed_data(data)
         elif self._master_fd is not None:
              # Forward to PTY master
              try:
@@ -423,6 +437,22 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  # self._process_stdin.drain() # Not async here, need to check if we can await or if it's buffered
              except Exception:
                  pass
+
+    def signal_received(self, signal):
+        # print(f"DEBUG: WhistlerSession.signal_received: {signal}", file=sys.stderr, flush=True)
+        if signal == 'INT' or signal == 'TERM':
+             if self._app and hasattr(self._app, 'action_cancel'):
+                 asyncio.create_task(self._app.action_cancel())
+             elif self._app and hasattr(self._app, 'exit'):
+                 self._app.exit("cancelled")
+
+    def break_received(self, msec):
+        print(f"WhistlerSession.break_received: {msec}", file=sys.stderr, flush=True)
+        # Treat break as Ctrl-C
+        if self._app and hasattr(self._app, 'action_cancel'):
+             asyncio.create_task(self._app.action_cancel())
+        elif self._app and hasattr(self._app, 'exit'):
+             self._app.exit("cancelled")
 
     def exec_requested(self, command):
         print(f"WhistlerSession.exec_requested: {command}", file=sys.stderr, flush=True)
@@ -503,7 +533,13 @@ class WhistlerSession(asyncssh.SSHServerSession):
              
              async def create_task():
                  # Create instance
-                 if self.config_manager.add_instance(self.username, template_ref, instance_name, preemptible=True):
+                 loop = asyncio.get_running_loop()
+                 success = await loop.run_in_executor(
+                     None, 
+                     lambda: self.config_manager.add_instance(self.username, template_ref, instance_name, preemptible=True)
+                 )
+                 
+                 if success:
                      loading_app.update_status(f"Waiting for instance {instance_name} to be ready...")
                      self.target_name = instance_name
                      return await self._connect_to_instance_with_app(loading_app)
@@ -515,8 +551,19 @@ class WhistlerSession(asyncssh.SSHServerSession):
              
              # Run the loading app with the create task
              task = asyncio.create_task(create_task())
+             # Set app so input is routed to it
+             self._app = loading_app
              try:
-                 await loading_app.run_async()
+                 result = await loading_app.run_async()
+                 if result == "cancelled":
+                     print(f"User cancelled creation of {instance_name}", file=sys.stderr)
+                     task.cancel()
+                     try:
+                         await task
+                     except asyncio.CancelledError:
+                         pass
+                     return
+
                  # Wait for task to complete
                  pod_name = await task
                  
@@ -534,14 +581,20 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  except Exception:
                      pass
                  try:
-                     self.config_manager.delete_instance(self.username, instance_name)
+                     loop = asyncio.get_running_loop()
+                     await loop.run_in_executor(None, self.config_manager.delete_instance, self.username, instance_name)
                      print(f"delete_instance called for {instance_name}", file=sys.stderr, flush=True)
                  except Exception as e:
                      print(f"Error calling delete_instance: {e}", file=sys.stderr, flush=True)
                  try:
+                     # Restore terminal state explicitly: Show Cursor, Disable Alt Screen
+                     self._chan.write(b"\x1b[?25h\x1b[?1049l")
+                     # Give a moment for the buffer to flush before exit
+                     await asyncio.sleep(0.1)
                      self._chan.exit(0)
                  except Exception:
                      pass
+                 self._app = None
          else:
              # Non-PTY mode: use simple text output
              self._chan.write(f"Creating ephemeral instance {instance_name} (full name: {self.username}-{instance_name}) from template {self.target_name}...\r\n".encode('utf-8'))
@@ -563,7 +616,9 @@ class WhistlerSession(asyncssh.SSHServerSession):
                      except Exception:
                          pass
                      try:
-                         self.config_manager.delete_instance(self.username, instance_name)
+                         # Run blocking delete in executor
+                         loop = asyncio.get_running_loop()
+                         await loop.run_in_executor(None, self.config_manager.delete_instance, self.username, instance_name)
                          print(f"delete_instance called for {instance_name}", file=sys.stderr, flush=True)
                      except Exception as e:
                          print(f"Error calling delete_instance: {e}", file=sys.stderr, flush=True)
@@ -577,7 +632,8 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
     async def _connect_to_instance_with_app(self, loading_app):
         """Connect to instance using the provided loading app."""
-        instances = self.config_manager.get_user_instances(self.username)
+        loop = asyncio.get_running_loop()
+        instances = await loop.run_in_executor(None, self.config_manager.get_user_instances, self.username)
         instance = next((i for i in instances if i["name"] == self.target_name), None)
         
         if not instance:
@@ -593,7 +649,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
             loading_app.update_status("Waiting for existing pod to terminate...")
             while instance and instance.get("status") == "Terminating":
                 await asyncio.sleep(0.5)
-                instances = self.config_manager.get_user_instances(self.username)
+                instances = await loop.run_in_executor(None, self.config_manager.get_user_instances, self.username)
                 instance = next((i for i in instances if i["name"] == self.target_name), None)
             
             if instance:
@@ -605,11 +661,14 @@ class WhistlerSession(asyncssh.SSHServerSession):
             try:
                 full_cr_name = f"{self.username}-{self.target_name}"
                 ns = instance.get("namespace", self.config_manager.namespace)
-                self.config_manager.api.patch_namespaced_custom_object(
-                    self.config_manager.group, self.config_manager.version, ns,
-                    "whistlerinstances", full_cr_name,
-                    {"metadata": {"annotations": {"whistler.example.com/last-connect": str(time.time())}}}
-                )
+                
+                def patch_ts():
+                     self.config_manager.api.patch_namespaced_custom_object(
+                        self.config_manager.group, self.config_manager.version, ns,
+                        "whistlerinstances", full_cr_name,
+                        {"metadata": {"annotations": {"whistler.example.com/last-connect": str(time.time())}}}
+                    )
+                await loop.run_in_executor(None, patch_ts)
             except Exception as e:
                 print(f"Failed to patch instance: {e}", file=sys.stderr)
             
@@ -648,14 +707,32 @@ class WhistlerSession(asyncssh.SSHServerSession):
             loading_app.ssh_channel = self._chan
             
             task = asyncio.create_task(self._connect_to_instance_with_app(loading_app))
+            # Set app so input is routed to it
+            self._app = loading_app
             try:
-                await loading_app.run_async()
+                result = await loading_app.run_async()
+                if result == "cancelled":
+                    print(f"User cancelled connection to {self.target_name}", file=sys.stderr)
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    return
+
                 pod_name = await task
                 if pod_name:
                     await self._run_pod_shell(pod_name)
             except asyncio.CancelledError:
                 task.cancel()
                 raise
+            finally:
+                self._app = None
+                try:
+                    # Restore terminal state explicitly: Show Cursor, Disable Alt Screen
+                    self._chan.write(b"\x1b[?25h\x1b[?1049l")
+                except:
+                    pass
             return
         
         # Non-PTY mode or already have loading screen
@@ -943,11 +1020,12 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
     async def _wait_for_pod_with_app(self, instance_name, loading_app, timeout=60):
         """Wait for pod to be ready, updating the loading app."""
-        start_time = asyncio.get_running_loop().time()
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
         last_status = None
         
-        while asyncio.get_running_loop().time() - start_time < timeout:
-            instances = self.config_manager.get_user_instances(self.username)
+        while loop.time() - start_time < timeout:
+            instances = await loop.run_in_executor(None, self.config_manager.get_user_instances, self.username)
             instance = next((i for i in instances if i["name"] == instance_name), None)
             
             if instance:
@@ -991,13 +1069,6 @@ class WhistlerSession(asyncssh.SSHServerSession):
             await asyncio.sleep(0.5)
         return None
 
-    def data_received(self, data, datatype):
-        if self._app and self._app.driver:
-            self._app.driver.feed_data(data)
-        elif self._master_fd:
-            os.write(self._master_fd, data.encode('utf-8') if isinstance(data, str) else data)
-        elif self._process_stdin:
-            self._process_stdin.write(data.encode('utf-8') if isinstance(data, str) else data)
 
     def eof_received(self):
         print("WhistlerSession.eof_received", file=sys.stderr, flush=True)
