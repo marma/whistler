@@ -390,6 +390,8 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self.term_type = None
         self._process_stdin = None
         self.is_ephemeral = False
+        self.exec_command = None
+        self._stdin_queue = asyncio.Queue()
         print("WhistlerSession initialized", file=sys.stderr, flush=True)
 
     def connection_made(self, chan):
@@ -430,6 +432,12 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  os.write(self._master_fd, data.encode('utf-8') if isinstance(data, str) else data)
              except OSError:
                  pass
+        elif hasattr(self, '_stdin_queue'):
+             # Forward to queue for non-PTY process stdin
+             try:
+                 self._stdin_queue.put_nowait(data.encode('utf-8') if isinstance(data, str) else data)
+             except Exception as e:
+                 print(f"Error queuing input data: {e}", file=sys.stderr)
         elif self._process_stdin is not None:
              # Forward to process stdin (non-PTY)
              try:
@@ -456,6 +464,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
     def exec_requested(self, command):
         print(f"WhistlerSession.exec_requested: {command}", file=sys.stderr, flush=True)
+        self.exec_command = command
         return True
     
     def session_started(self):
@@ -481,14 +490,21 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
         try:
             if self.target_type == "tui":
-                self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
-                self._app.ssh_channel = self._chan
-                self._app_task = asyncio.create_task(self._run_app())
+                if self.exec_command:
+                     # If the user tries to run a command against the TUI, we should likely fail or just print it?
+                     # For now, let's just warn and run the TUI anyway, or maybe we shouldn't support exec on TUI?
+                     # Standard behavior: ignore command or error. Let's error.
+                     self._chan.write("Exec commands not supported on TUI interface. Connect to an instance.\r\n".encode('utf-8'))
+                     self._chan.exit(1)
+                else:
+                    self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
+                    self._app.ssh_channel = self._chan
+                    self._app_task = asyncio.create_task(self._run_app())
             elif self.target_type == "instance":
                 # Find the instance
-                self._shell_task = asyncio.create_task(self._connect_to_instance())
+                self._shell_task = asyncio.create_task(self._connect_to_instance(command=self.exec_command))
             elif self.target_type == "template":
-                 self._shell_task = asyncio.create_task(self._create_and_connect_ephemeral())
+                 self._shell_task = asyncio.create_task(self._create_and_connect_ephemeral(command=self.exec_command))
             else:
                 print(f"Target type {self.target_type} unknown, falling back to TUI", file=sys.stderr, flush=True)
                 self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
@@ -514,7 +530,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
             print("WhistlerSession._run_app finished", file=sys.stderr, flush=True)
             self._chan.exit(0)
 
-    async def _create_and_connect_ephemeral(self):
+    async def _create_and_connect_ephemeral(self, command=None):
          # Create ephemeral instance
          self.is_ephemeral = True
          import secrets
@@ -569,7 +585,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  
                  if pod_name:
                      self._app = None # Clear app reference so input goes to shell
-                     await self._run_pod_shell(pod_name)
+                     await self._run_pod_shell(pod_name, command=command)
              except asyncio.CancelledError:
                  print("Task cancelled in _create_and_connect_ephemeral", file=sys.stderr, flush=True)
                  task.cancel()
@@ -598,22 +614,30 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  self._app = None
          else:
              # Non-PTY mode: use simple text output
-             self._chan.write(f"Creating ephemeral instance {instance_name} (full name: {self.username}-{instance_name}) from template {self.target_name}...\r\n".encode('utf-8'))
+             if self.term_type and not command:
+                 try:
+                    self._chan.write(f"Creating ephemeral instance {instance_name} (full name: {self.username}-{instance_name}) from template {self.target_name}...\r\n".encode('utf-8'))
+                 except Exception:
+                    pass
              
              if self.config_manager.add_instance(self.username, template_ref, instance_name):
                  try:
                      self.target_name = instance_name
-                     await self._connect_to_instance()
+                     await self._connect_to_instance(command=command)
                  except Exception as e:
                      print(f"Error in _create_and_connect_ephemeral: {e}", file=sys.stderr, flush=True)
-                     self._chan.write(f"Error connecting to instance: {e}\r\n".encode('utf-8'))
+                     try:
+                         self._chan.write(f"Error connecting to instance: {e}\r\n".encode('utf-8'))
+                     except Exception:
+                         pass
                  except asyncio.CancelledError:
                      print("Task cancelled in _create_and_connect_ephemeral", file=sys.stderr, flush=True)
                      raise
                  finally:
                      print(f"Entering finally block for {instance_name}", file=sys.stderr, flush=True)
                      try:
-                         self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
+                         if self.term_type and not command:
+                             self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
                      except Exception:
                          pass
                      try:
@@ -628,8 +652,11 @@ class WhistlerSession(asyncssh.SSHServerSession):
                      except Exception:
                          pass
              else:
-                 self._chan.write(f"Failed to create ephemeral instance.\r\n".encode('utf-8'))
-                 self._chan.exit(1)
+                 try:
+                    self._chan.write(f"Failed to create ephemeral instance.\r\n".encode('utf-8'))
+                    self._chan.exit(1)
+                 except Exception:
+                    pass
 
     async def _connect_to_instance_with_app(self, loading_app):
         """Connect to instance using the provided loading app."""
@@ -697,11 +724,19 @@ class WhistlerSession(asyncssh.SSHServerSession):
             self._chan.exit(1)
             return None
 
-    async def _connect_to_instance(self, loading_screen=None):
+    async def _connect_to_instance(self, loading_screen=None, command=None):
         """Connect to instance (for non-PTY mode)."""
         instances = self.config_manager.get_user_instances(self.username)
         instance = next((i for i in instances if i["name"] == self.target_name), None)
         
+        if self.term_type and not loading_screen and not command:
+            # PTY mode (interactive): use loading app
+            # If command is present, we might be in PTY mode but executing a single command (ssh -t cmd)
+            # In that case, we should maybe still use loading screen? Or just text?
+            # For now, let's treat command execution as "just do it" without LoadingApp unless it takes too long?
+            # Actually, reusing the LoadingApp logic for connection is robust.
+            pass
+            
         if self.term_type and not loading_screen:
             # PTY mode: use loading app
             loading_app = LoadingApp(self._chan, self.initial_term_size, f"Connecting to instance {self.target_name}...")
@@ -724,7 +759,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 pod_name = await task
                 if pod_name:
                     self._app = None # Clear app reference so input goes to shell
-                    await self._run_pod_shell(pod_name)
+                    await self._run_pod_shell(pod_name, command=command)
             except asyncio.CancelledError:
                 task.cancel()
                 raise
@@ -739,29 +774,45 @@ class WhistlerSession(asyncssh.SSHServerSession):
         
         # Non-PTY mode or already have loading screen
         if not instance:
-            self._chan.write(f"Instance {self.target_name} not found.\r\n".encode('utf-8'))
-            self._chan.exit(1)
+            try:
+                self._chan.write(f"Instance {self.target_name} not found.\r\n".encode('utf-8'))
+                self._chan.exit(1)
+            except Exception:
+                pass
             return
             
         pod_name = instance.get("podName")
         
         # If terminating, wait for it to finish first
         if instance.get("status") == "Terminating":
-            self._chan.write(b"Waiting for existing pod to terminate ")
+            try:
+                if self.term_type and not command:
+                    self._chan.write(b"Waiting for existing pod to terminate ")
+            except Exception:
+                pass
             while instance and instance.get("status") == "Terminating":
                 await asyncio.sleep(0.5)
-                self._chan.write(b".")
+                try:
+                    if self.term_type and not command:
+                        self._chan.write(b".")
+                except Exception:
+                    pass
                 instances = self.config_manager.get_user_instances(self.username)
                 instance = next((i for i in instances if i["name"] == self.target_name), None)
-            self._chan.write(b"\r\n")
+            
+            try:
+                if self.term_type and not command:
+                    self._chan.write(b"\r\n")
+            except Exception:
+                pass
             
             if instance:
                 pod_name = instance.get("podName")
         
         if not pod_name or (instance and instance.get("status") != "Running"):
-            # Trigger operator to ensure pod exists
-            import time
             try:
+                # Trigger operator to ensure pod exists
+                import time
                 full_cr_name = f"{self.username}-{self.target_name}"
                 ns = instance.get("namespace", self.config_manager.namespace)
                 self.config_manager.api.patch_namespaced_custom_object(
@@ -786,7 +837,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 self._agent_task = asyncio.create_task(self._bridge_agent(pod_name, ns))
                 await asyncio.sleep(0.5)
 
-            await self._run_pod_shell(pod_name)
+            await self._run_pod_shell(pod_name, command=command)
         else:
             self._chan.write(f"Failed to start instance {self.target_name}.\r\n".encode('utf-8'))
             self._chan.exit(1)
@@ -821,25 +872,6 @@ class WhistlerSession(asyncssh.SSHServerSession):
         
         # Use actual mounts from pod if available (source of truth)
         real_mounts = instance.get("mounts")
-        if real_mounts is not None:
-             for m in real_mounts:
-                 visible_volumes.append(f"* {m['name']} - {m['mountPath']}")
-        else:
-             # Fallback to template definition if pod info unavailable
-             template_volumes = template.get("volumes", [])
-             
-             # Add personal mount to the list of volumes
-             if personal_mount:
-                  visible_volumes.append(f"* User Volume - {personal_mount}")
-    
-             for vol in template_volumes:
-                  name = vol.get("name", "Unknown")
-                  path = vol.get("mountPath", "Unknown")
-                  visible_volumes.append(f"* {name} - {path}")
-             
-        # Also check global volumes.yaml? The user request implies showing mounted volumes.
-        # k8s template spec has volumes.
-        
         if visible_volumes:
             message.append("\nMounted volumes are")
             message.extend(visible_volumes)
@@ -857,29 +889,30 @@ class WhistlerSession(asyncssh.SSHServerSession):
             
         return "\n".join(message) + "\n"
 
-    async def _run_pod_shell(self, pod_name):
-        print(f"Starting shell for pod {pod_name}", file=sys.stderr)
+    async def _run_pod_shell(self, pod_name, command=None):
+        print(f"Starting shell for pod {pod_name}. Command: {command}", file=sys.stderr, flush=True)
         
-        # Get instance and template info for MOTD
-        instances = self.config_manager.get_user_instances(self.username)
-        instance = next((i for i in instances if i["name"] == self.target_name), None)
-        
+        # Get instance and template info for MOTD (Only if not running a command and interactive)
         motd = ""
-        if instance:
-            templates = self.config_manager.get_user_templates(self.username)
-            # TemplateRef in instance might be full name "user-template", but get_user_templates returns list with "name" (short) and "fullName"
-            # Instance template ref is likely just the name if created via TUI? 
-            # In config.py add_instance: "templateRef": template_name
-            # Let's match by fullName or name
-            template_ref = instance.get("template")
-            template = next((t for t in templates if t["fullName"] == template_ref or t["name"] == template_ref), {})
+        if not command and self.term_type:
+            instances = self.config_manager.get_user_instances(self.username)
+            instance = next((i for i in instances if i["name"] == self.target_name), None)
             
-            all_volumes = self.config_manager.get_volumes() # Global volume definitions if needed
-            motd = self._generate_motd(instance, template, all_volumes)
-            print(f"Generated MOTD for {self.username}: {len(motd)} chars", file=sys.stderr)
-        else:
-             print(f"MOTD: Instance {self.target_name} not found in {len(instances)} instances", file=sys.stderr)
-             motd = f"Connecting to {self.target_name}...\r\n(Instance details not found for MOTD)\r\n"
+            if instance:
+                templates = self.config_manager.get_user_templates(self.username)
+                # TemplateRef in instance might be full name "user-template", but get_user_templates returns list with "name" (short) and "fullName"
+                # Instance template ref is likely just the name if created via TUI? 
+                # In config.py add_instance: "templateRef": template_name
+                # Let's match by fullName or name
+                template_ref = instance.get("template")
+                template = next((t for t in templates if t["fullName"] == template_ref or t["name"] == template_ref), {})
+                
+                all_volumes = self.config_manager.get_volumes() # Global volume definitions if needed
+                motd = self._generate_motd(instance, template, all_volumes)
+                print(f"Generated MOTD for {self.username}: {len(motd)} chars", file=sys.stderr)
+            else:
+                 print(f"MOTD: Instance {self.target_name} not found in {len(instances)} instances", file=sys.stderr)
+                 motd = f"Connecting to {self.target_name}...\r\n(Instance details not found for MOTD)\r\n"
             
         if motd:
             # We need to write CRLF for raw PTY/SSH output to look right
@@ -901,7 +934,10 @@ class WhistlerSession(asyncssh.SSHServerSession):
         use_pty = self.term_type is not None
         
         try:
+            instances = self.config_manager.get_user_instances(self.username)
+            instance = next((i for i in instances if i["name"] == self.target_name), None)
             ns = instance.get("namespace", self.config_manager.namespace) if instance else self.config_manager.namespace
+            
             cmd = ["kubectl", "exec", "-n", ns]
             
             if use_pty:
@@ -915,7 +951,26 @@ class WhistlerSession(asyncssh.SSHServerSession):
             if self.pod_socket_path:
                 cmd.extend(["env", f"SSH_AUTH_SOCK={self.pod_socket_path}"])
                 
-            cmd.append("/bin/bash")
+            if command:
+                # Use base64 encoding to avoid argument parsing issues with kubectl/sh
+                import base64
+                import secrets
+                
+                b64_cmd = base64.b64encode(command.encode('utf-8')).decode('utf-8')
+                script_path = f"/tmp/whistler-exec-{secrets.token_hex(4)}.sh"
+                
+                # Write decoded command to temp file, execute with sh -l (login shell), then cleanup
+                # We use '&&' to ensure execution only happens if write succeeds
+                # Using ';' for cleanup to ensure it runs even if command fails
+                # Note: sh -l <file> generally preserves stdin for the commands in the file
+                wrapped_cmd = f"echo {b64_cmd} | base64 -d > {script_path} && sh -l {script_path}; rm -f {script_path}"
+                
+                cmd.extend(["bash", "-c", wrapped_cmd])
+            else:
+                # Interactive shell
+                cmd.append("/bin/bash")
+            
+            print(f"Executing subprocess: {cmd}", file=sys.stderr, flush=True)
             
             if use_pty:
                 # PTY Mode
@@ -963,9 +1018,14 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 except asyncio.CancelledError:
                     print("Shell task cancelled, cleaning up...", file=sys.stderr)
                     raise
+                finally:
+                    # Clean up reader immediately 
+                    loop.remove_reader(master)
 
             else:
                 # Non-PTY Mode (Pipes)
+                # Queue is already initialized in __init__ to buffer early input
+                
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdin=asyncio.subprocess.PIPE,
@@ -973,6 +1033,25 @@ class WhistlerSession(asyncssh.SSHServerSession):
                     stderr=asyncio.subprocess.PIPE
                 )
                 self._process_stdin = process.stdin
+                
+                # Task to consume queue and write to stdin
+                async def consume_stdin(writer, queue):
+                    try:
+                        while True:
+                            item = await queue.get()
+                            if item is None: # EOF sentinel
+                                if writer.can_write_eof():
+                                    writer.write_eof()
+                                else:
+                                    writer.close()
+                                break
+                            
+                            writer.write(item)
+                            await writer.drain()
+                    except Exception as e:
+                        print(f"Stdin consumer error: {e}", file=sys.stderr)
+
+                stdin_task = asyncio.create_task(consume_stdin(self._process_stdin, self._stdin_queue))
                 
                 async def forward_output(reader, channel_write_func):
                     try:
@@ -982,7 +1061,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                                 break
                             channel_write_func(data)
                     except Exception as e:
-                        print(f"Output forwarder error: {e}", file=sys.stderr)
+                        print(f"Output forwarder error: {e}", file=sys.stderr, flush=True)
 
                 # Forward stdout -> channel stdout
                 stdout_task = asyncio.create_task(forward_output(process.stdout, self._chan.write))
@@ -998,16 +1077,26 @@ class WhistlerSession(asyncssh.SSHServerSession):
                     print("Shell task cancelled, cleaning up...", file=sys.stderr)
                     stdout_task.cancel()
                     stderr_task.cancel()
+                    stdin_task.cancel()
                     raise
-                # finally: tasks are already done or cancelled
+                finally:
+                    stdin_task.cancel() # Ensure consumer stops
+                    try:
+                         await stdin_task
+                    except asyncio.CancelledError:
+                         pass
 
         except Exception as e:
             print(f"Shell error: {e}", file=sys.stderr)
         finally:
-            print("Shell finished, cleaning up resources...", file=sys.stderr)
+            print("Shell finished, cleaning up resources...", file=sys.stderr, flush=True)
             loop = asyncio.get_running_loop()
             if self._master_fd:
-                loop.remove_reader(self._master_fd)
+                # Ensure reader is removed if not already
+                try:
+                    loop.remove_reader(self._master_fd)
+                except Exception:
+                    pass
                 os.close(self._master_fd)
                 self._master_fd = None
             
@@ -1018,7 +1107,10 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 except ProcessLookupError:
                     pass
             
-            self._chan.exit(0)
+            try:
+                self._chan.exit(0)
+            except Exception as e:
+                pass
 
     async def _wait_for_pod_with_app(self, instance_name, loading_app, timeout=None):
         """Wait for pod to be ready, updating the loading app."""
@@ -1062,11 +1154,23 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 
                 if status != last_status:
                     if last_status:
-                        self._chan.write(b"\r\n")
-                    self._chan.write(f"Instance status: {status} ".encode('utf-8'))
+                        try:
+                            if self.term_type and not self.exec_command:
+                                self._chan.write(b"\r\n")
+                        except Exception:
+                            pass
+                    try:
+                        if self.term_type and not self.exec_command:
+                            self._chan.write(f"Instance status: {status} ".encode('utf-8'))
+                    except Exception:
+                        pass
                     last_status = status
                 else:
-                    self._chan.write(b".")
+                    try:
+                        if self.term_type and not self.exec_command:
+                            self._chan.write(b".")
+                    except Exception:
+                        pass
             
             await asyncio.sleep(0.5)
         return None
@@ -1080,6 +1184,12 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 os.write(self._master_fd, b'\x04')
             except Exception as e:
                  print(f"Error sending EOT to PTY: {e}", file=sys.stderr)
+        elif hasattr(self, '_stdin_queue'):
+            # Signal EOF to queue consumer
+            try:
+                self._stdin_queue.put_nowait(None)
+            except Exception as e:
+                print(f"Error queuing EOF: {e}", file=sys.stderr)
         elif self._process_stdin:
             try:
                 if self._process_stdin.can_write_eof():
@@ -1088,7 +1198,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                      self._process_stdin.close()
             except Exception as e:
                  print(f"Error closing stdin on EOF: {e}", file=sys.stderr)
-        return False # Continue to allow output from command processing
+        return True # Return True to keep channel open/manual EOF handling
 
     def terminal_size_changed(self, width, height, pixwidth, pixheight):
         if self._app:
