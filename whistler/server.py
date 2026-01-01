@@ -12,7 +12,11 @@ from textual.app import App
 from textual.geometry import Size
 from textual.events import Resize
 from textual._xterm_parser import XTermParser
+import stat
+import time
 from whistler.tui import WhistlerApp, LoadingScreen
+from whistler.sftp_support import WhistlerSFTPServer
+from whistler.globals import CONN_SERVER_MAP as _CONN_SERVER_MAP
 
 import argparse
 from functools import partial
@@ -20,10 +24,6 @@ from functools import partial
 from whistler.config import ConfigManager, KubeConfigManager
 from asyncio import Event
 from textual.worker import Worker, WorkerState
-
-
-
-
 
 class WhistlerDriver(Driver):
     def __init__(self, next_driver: Driver | None = None, *, debug: bool = False, size: tuple[int, int] | None = None, **kwargs):
@@ -182,12 +182,23 @@ class SSHServer(asyncssh.SSHServer):
 
     def connection_made(self, conn):
         print('SSH connection received from %s.' % conn.get_extra_info('peername')[0], file=sys.stderr)
+        _CONN_SERVER_MAP[conn] = self
+        self._conn = conn
 
     def connection_lost(self, exc):
         if exc:
             print('SSH connection error: ' + str(exc), file=sys.stderr)
         else:
             print('SSH connection closed.', file=sys.stderr)
+        # Cleanup global map
+        if hasattr(self, '_conn') and self._conn in _CONN_SERVER_MAP:
+            del _CONN_SERVER_MAP[self._conn]
+
+    def subsystem_requested(self, subsystem):
+        if subsystem == "sftp":
+            print("SFTP Subsystem requested", file=sys.stderr, flush=True)
+            return WhistlerSFTPServer
+        return False
 
     def begin_auth(self, username):
         # We require public key auth now
