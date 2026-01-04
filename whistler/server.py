@@ -424,66 +424,59 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self._chan.set_encoding(None)
 
     def connection_lost(self, exc):
-        if getattr(self, 'sftp_handler', None) and not self._sftp_reader.at_eof():
-            self._sftp_reader.feed_eof()
-            return
         if self._app:
              self._app.exit()
 
     def subsystem_requested(self, subsystem):
         if subsystem == "sftp":
-            print("WhistlerSession starting SFTP subsystem via Handler", file=sys.stderr, flush=True)
+            print("WhistlerSession starting SFTP subsystem", file=sys.stderr, flush=True)
             try:
                 from asyncssh.sftp import SFTPServerHandler
-                import inspect
-                print(f"SFTPServerHandler signature: {inspect.signature(SFTPServerHandler)}", file=sys.stderr, flush=True)
 
+                # Store session info on the channel so WhistlerSFTPServer can access it
+                self._chan._whistler_session = self
+                # Mark that SFTP is active so session_started doesn't start a shell
+                self._sftp_active = True
+
+                # Create reader for SFTP protocol
                 self._sftp_reader = asyncio.StreamReader()
                 conn = self._chan.get_connection()
-                
-                # SFTPServerHandler expects reader to have a logger and get_extra_info
                 self._sftp_reader.logger = conn.logger
                 def get_extra_info(name, default=None):
                     return conn.get_extra_info(name, default)
                 self._sftp_reader.get_extra_info = get_extra_info
-                
-                # WhistlerSFTPServer instance
-                # It needs the session to access context
-                sftp_server = WhistlerSFTPServer(self)
-                
-                # Verify sftp_server initialized correctly
-                if not sftp_server:
-                     print("Failed to initialize WhistlerSFTPServer", file=sys.stderr, flush=True)
-                     return False
-                
-                # Initialize Handler
-                # Signature is (server_instance, reader, writer, sftp_version)
+
+                # Create WhistlerSFTPServer instance
+                print(f"Creating WhistlerSFTPServer instance", file=sys.stderr, flush=True)
+                sftp_server = WhistlerSFTPServer(self._chan)
+                print(f"WhistlerSFTPServer instance created", file=sys.stderr, flush=True)
+
+                # Create and start handler
                 self.sftp_handler = SFTPServerHandler(sftp_server, self._sftp_reader, self._chan, 3)
-                
-                # Start the handler loop
-                print("Starting SFTP Handler loop", file=sys.stderr, flush=True)
+                print("Starting SFTP handler", file=sys.stderr, flush=True)
                 self._sftp_task = asyncio.create_task(self.sftp_handler.run())
+
                 def notify_done(future):
                     try:
                         future.result()
                     except asyncio.CancelledError:
                         pass
                     except Exception as e:
-                        print(f"SFTP Handler Task CRASHED: {e}", file=sys.stderr, flush=True)
+                        print(f"SFTP handler failed: {e}", file=sys.stderr, flush=True)
                         traceback.print_exc(file=sys.stderr)
+
                 self._sftp_task.add_done_callback(notify_done)
-                
+                print("SFTP handler running", file=sys.stderr, flush=True)
+
                 return True
             except Exception as e:
-                print(f"Failed to start SFTP handler: {e}", file=sys.stderr, flush=True)
+                print(f"Failed to start SFTP: {e}", file=sys.stderr, flush=True)
+                import traceback
                 traceback.print_exc(file=sys.stderr)
                 return False
         return False
 
     def pty_requested(self, term_type, term_size, term_modes):
-        if getattr(self, 'sftp_handler', None):
-             return False # No PTY for SFTP
-             
         print(f"WhistlerSession.pty_requested: {term_type} {term_size}", file=sys.stderr, flush=True)
         self.initial_term_size = (term_size[0], term_size[1])
         self.term_type = term_type
@@ -495,7 +488,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
     def data_received(self, data, datatype):
         if getattr(self, 'sftp_handler', None):
-            print(f"SFTP data proxy: {len(data)} bytes", file=sys.stderr, flush=True)
+            #print(f"SFTP data proxy: {len(data)} bytes", file=sys.stderr, flush=True)
             self._sftp_reader.feed_data(data)
             return
 
@@ -558,8 +551,8 @@ class WhistlerSession(asyncssh.SSHServerSession):
         return True
     
     def session_started(self):
-        # If SFTP handler is active, don't do anything else
-        if getattr(self, 'sftp_handler', None):
+        # If SFTP is active, don't start a shell
+        if getattr(self, '_sftp_active', False):
              print("Session started in SFTP mode, bypassing shell startup", file=sys.stderr)
              return
 
