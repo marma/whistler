@@ -545,6 +545,19 @@ class WhistlerSFTPServer(asyncssh.SFTPServer):
         newpath = self._norm_path(newpath)
         await self._exec(["mv", oldpath, newpath])
 
+    async def fstat(self, file_obj):
+        print(f"SFTP: fstat(file_obj={file_obj})", file=sys.stderr, flush=True)
+        attrs = asyncssh.SFTPAttrs()
+        attrs.size = getattr(file_obj, 'pos', 0)
+        attrs.permissions = stat.S_IFREG | 0o644
+        return attrs
+
+    async def fsetstat(self, file_obj, attrs):
+        print(f"SFTP: fsetstat(file_obj={file_obj}, attrs={attrs})", file=sys.stderr, flush=True)
+        if hasattr(file_obj, 'setstat'):
+            file_obj.setstat(attrs)
+        return None
+
     async def setstat(self, path, attrs):
         path = self._norm_path(path)
         print(f"SFTP: setstat on path {path}, attrs={attrs} - ignoring", file=sys.stderr, flush=True)
