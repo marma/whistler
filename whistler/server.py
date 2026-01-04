@@ -2,6 +2,7 @@ import asyncio
 import asyncssh
 import sys
 import os
+from asyncssh.process import SSHCompletedProcess
 import pty
 import fcntl
 import termios
@@ -19,7 +20,6 @@ from whistler.sftp_support import WhistlerSFTPServer
 from whistler.globals import CONN_SERVER_MAP as _CONN_SERVER_MAP
 
 import argparse
-from functools import partial
 from functools import partial
 from whistler.config import ConfigManager, KubeConfigManager
 from asyncio import Event
@@ -195,9 +195,7 @@ class SSHServer(asyncssh.SSHServer):
             del _CONN_SERVER_MAP[self._conn]
 
     def subsystem_requested(self, subsystem):
-        if subsystem == "sftp":
-            print("SFTP Subsystem requested", file=sys.stderr, flush=True)
-            return WhistlerSFTPServer
+        # SFTP is handled at the session level in WhistlerSession.subsystem_requested
         return False
 
     def begin_auth(self, username):
@@ -300,12 +298,25 @@ class SSHServer(asyncssh.SSHServer):
 
     def session_requested(self):
         print("SSHServer.session_requested", file=sys.stderr, flush=True)
+        target_name = self.target_name
+        template_name = None
+        is_ephemeral = False
+        
+        if self.target_type == "template":
+            import secrets
+            template_name = self.target_name
+            target_name = f"{self.target_name}-{secrets.token_hex(4)}"
+            is_ephemeral = True
+            print(f"SSHServer: Generated ephemeral name {target_name} for template {template_name}", file=sys.stderr, flush=True)
+
         return WhistlerSession(
             server=self,
             config_manager=self.config_manager, 
             username=self.username,
             target_type=self.target_type,
-            target_name=self.target_name
+            target_name=target_name,
+            template_name=template_name,
+            is_ephemeral=is_ephemeral
         )
     
     async def connection_requested(self, dest_host, dest_port, orig_host, orig_port):
@@ -379,7 +390,8 @@ class SSHServer(asyncssh.SSHServer):
 
 
 class WhistlerSession(asyncssh.SSHServerSession):
-    def __init__(self, server=None, config_manager=None, username=None, target_type="tui", target_name=None, *args, **kwargs):
+    def __init__(self, server=None, config_manager=None, username=None, target_type="tui", target_name=None, 
+                 template_name=None, is_ephemeral=False, *args, **kwargs):
         # super().__init__(*args, **kwargs) # SSHServerSession is just object
         self.server = server
         self._app = None
@@ -400,17 +412,79 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self.pod_socket_path = None
         self.term_type = None
         self._process_stdin = None
-        self.is_ephemeral = False
+        self.is_ephemeral = is_ephemeral
+        self.template_name = template_name
         self.exec_command = None
         self._stdin_queue = asyncio.Queue()
-        print("WhistlerSession initialized", file=sys.stderr, flush=True)
+        print(f"WhistlerSession initialized: user={username}, type={target_type}, target={target_name}, ephemeral={is_ephemeral}", file=sys.stderr, flush=True)
 
     def connection_made(self, chan):
         print("WhistlerSession.connection_made", file=sys.stderr, flush=True)
         self._chan = chan
         self._chan.set_encoding(None)
 
+    def connection_lost(self, exc):
+        if getattr(self, 'sftp_handler', None) and not self._sftp_reader.at_eof():
+            self._sftp_reader.feed_eof()
+            return
+        if self._app:
+             self._app.exit()
+
+    def subsystem_requested(self, subsystem):
+        if subsystem == "sftp":
+            print("WhistlerSession starting SFTP subsystem via Handler", file=sys.stderr, flush=True)
+            try:
+                from asyncssh.sftp import SFTPServerHandler
+                import inspect
+                print(f"SFTPServerHandler signature: {inspect.signature(SFTPServerHandler)}", file=sys.stderr, flush=True)
+
+                self._sftp_reader = asyncio.StreamReader()
+                conn = self._chan.get_connection()
+                
+                # SFTPServerHandler expects reader to have a logger and get_extra_info
+                self._sftp_reader.logger = conn.logger
+                def get_extra_info(name, default=None):
+                    return conn.get_extra_info(name, default)
+                self._sftp_reader.get_extra_info = get_extra_info
+                
+                # WhistlerSFTPServer instance
+                # It needs the session to access context
+                sftp_server = WhistlerSFTPServer(self)
+                
+                # Verify sftp_server initialized correctly
+                if not sftp_server:
+                     print("Failed to initialize WhistlerSFTPServer", file=sys.stderr, flush=True)
+                     return False
+                
+                # Initialize Handler
+                # Signature is (server_instance, reader, writer, sftp_version)
+                self.sftp_handler = SFTPServerHandler(sftp_server, self._sftp_reader, self._chan, 3)
+                
+                # Start the handler loop
+                print("Starting SFTP Handler loop", file=sys.stderr, flush=True)
+                self._sftp_task = asyncio.create_task(self.sftp_handler.run())
+                def notify_done(future):
+                    try:
+                        future.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        print(f"SFTP Handler Task CRASHED: {e}", file=sys.stderr, flush=True)
+                        traceback.print_exc(file=sys.stderr)
+                self._sftp_task.add_done_callback(notify_done)
+                
+                return True
+            except Exception as e:
+                print(f"Failed to start SFTP handler: {e}", file=sys.stderr, flush=True)
+                traceback.print_exc(file=sys.stderr)
+                return False
+        return False
+
     def pty_requested(self, term_type, term_size, term_modes):
+        if getattr(self, 'sftp_handler', None):
+             return False # No PTY for SFTP
+             
+        print(f"WhistlerSession.pty_requested: {term_type} {term_size}", file=sys.stderr, flush=True)
         self.initial_term_size = (term_size[0], term_size[1])
         self.term_type = term_type
         return True
@@ -420,6 +494,11 @@ class WhistlerSession(asyncssh.SSHServerSession):
         return True
 
     def data_received(self, data, datatype):
+        if getattr(self, 'sftp_handler', None):
+            print(f"SFTP data proxy: {len(data)} bytes", file=sys.stderr, flush=True)
+            self._sftp_reader.feed_data(data)
+            return
+
         # Debugging input data
         # print(f"DEBUG: WhistlerSession.data_received: len={len(data)} val={repr(data)}", file=sys.stderr, flush=True)
         if self._app:
@@ -479,6 +558,11 @@ class WhistlerSession(asyncssh.SSHServerSession):
         return True
     
     def session_started(self):
+        # If SFTP handler is active, don't do anything else
+        if getattr(self, 'sftp_handler', None):
+             print("Session started in SFTP mode, bypassing shell startup", file=sys.stderr)
+             return
+
         print("WhistlerSession.session_started", file=sys.stderr, flush=True)
         
         # Check for agent forwarding
@@ -543,15 +627,14 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
     async def _create_and_connect_ephemeral(self, command=None):
          # Create ephemeral instance
-         self.is_ephemeral = True
-         import secrets
-         hex_id = secrets.token_hex(4)
-         instance_name = f"{self.target_name}-{hex_id}"
+         # self.is_ephemeral already set in __init__
+         instance_name = self.target_name
+         template_name = self.template_name or self.target_name
          
          # Resolve full template name
          templates = self.config_manager.get_user_templates(self.username)
-         template_obj = next((t for t in templates if t["name"] == self.target_name), None)
-         template_ref = template_obj["fullName"] if template_obj else self.target_name
+         template_obj = next((t for t in templates if t["name"] == template_name), None)
+         template_ref = template_obj["fullName"] if template_obj else template_name
          
          if self.term_type:
              # Use loading screen for PTY mode
@@ -1189,6 +1272,10 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
     def eof_received(self):
         print("WhistlerSession.eof_received", file=sys.stderr, flush=True)
+        if getattr(self, 'sftp_handler', None):
+            self._sftp_reader.feed_eof()
+            return
+
         if self._master_fd:
             try:
                 # Send EOT (Ctrl-D) to PTY
