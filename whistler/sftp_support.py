@@ -330,8 +330,6 @@ class WhistlerSFTPServer(asyncssh.SFTPServer):
             return path.decode('utf-8', errors='replace')
         return path
 
-    # ... existing methods ...
-
     async def _ensure_pod(self):
         """Ensure target pod is running, start if necessary."""
         async with self._lock:
