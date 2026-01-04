@@ -416,7 +416,24 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self.template_name = template_name
         self.exec_command = None
         self._stdin_queue = asyncio.Queue()
+        self._cleanup_done = False
+        self._cleanup_lock = asyncio.Lock()
         print(f"WhistlerSession initialized: user={username}, type={target_type}, target={target_name}, ephemeral={is_ephemeral}", file=sys.stderr, flush=True)
+
+    async def _cleanup_ephemeral(self):
+        """Cleanup ephemeral instance if not already done."""
+        async with self._cleanup_lock:
+            if not self.is_ephemeral or self._cleanup_done:
+                return
+
+            instance_name = self.target_name
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self.config_manager.delete_instance, self.username, instance_name)
+            except Exception as e:
+                print(f"Error calling delete_instance: {e}", file=sys.stderr, flush=True)
+            
+            self._cleanup_done = True
 
     def connection_made(self, chan):
         print("WhistlerSession.connection_made", file=sys.stderr, flush=True)
@@ -426,6 +443,10 @@ class WhistlerSession(asyncssh.SSHServerSession):
     def connection_lost(self, exc):
         if self._app:
              self._app.exit()
+        
+        # Ensure cleanup happens if session ends (e.g. sftp disconnect)
+        if self.is_ephemeral and not self._cleanup_done:
+             asyncio.create_task(self._cleanup_ephemeral())
 
     def subsystem_requested(self, subsystem):
         if subsystem == "sftp":
@@ -680,16 +701,14 @@ class WhistlerSession(asyncssh.SSHServerSession):
              finally:
                  # Cleanup
                  print(f"Entering finally block for {instance_name}", file=sys.stderr, flush=True)
-                 try:
-                     self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
-                 except Exception:
-                     pass
-                 try:
-                     loop = asyncio.get_running_loop()
-                     await loop.run_in_executor(None, self.config_manager.delete_instance, self.username, instance_name)
-                     print(f"delete_instance called for {instance_name}", file=sys.stderr, flush=True)
-                 except Exception as e:
-                     print(f"Error calling delete_instance: {e}", file=sys.stderr, flush=True)
+                 if self.term_type:
+                     try:
+                         self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
+                     except Exception:
+                         pass
+                 
+                 await self._cleanup_ephemeral()
+                 
                  try:
                      # Restore terminal state explicitly: Show Cursor, Disable Alt Screen
                      self._chan.write(b"\x1b[?25h\x1b[?1049l")
@@ -722,18 +741,14 @@ class WhistlerSession(asyncssh.SSHServerSession):
                      raise
                  finally:
                      print(f"Entering finally block for {instance_name}", file=sys.stderr, flush=True)
-                     try:
-                         if self.term_type and not command:
+                     if self.term_type and not command:
+                         try:
                              self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
-                     except Exception:
-                         pass
-                     try:
-                         # Run blocking delete in executor
-                         loop = asyncio.get_running_loop()
-                         await loop.run_in_executor(None, self.config_manager.delete_instance, self.username, instance_name)
-                         print(f"delete_instance called for {instance_name}", file=sys.stderr, flush=True)
-                     except Exception as e:
-                         print(f"Error calling delete_instance: {e}", file=sys.stderr, flush=True)
+                         except Exception:
+                             pass
+                     
+                     await self._cleanup_ephemeral()
+
                      try:
                          self._chan.exit(0)
                      except Exception:
@@ -1322,17 +1337,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
         else:
              self._resize_timer = None
 
-    def connection_lost(self, exc):
-        print(f"WhistlerSession.connection_lost: {exc}", file=sys.stderr, flush=True)
-        if self._app_task:
-            print("Cancelling app task", file=sys.stderr, flush=True)
-            self._app_task.cancel()
-        if self._shell_task:
-            print(f"Cancelling shell task {self._shell_task}", file=sys.stderr, flush=True)
-            self._shell_task.cancel()
-        if self._agent_task:
-            print("Cancelling agent task", file=sys.stderr, flush=True)
-            self._agent_task.cancel()
+
 
     async def _bridge_agent(self, pod_name, namespace):
         print(f"Starting agent bridge: {self.local_agent_path} -> pod {pod_name}:{self.pod_socket_path}", file=sys.stderr)

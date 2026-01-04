@@ -15,6 +15,7 @@ class WhistlerSFTPFile:
         object.__setattr__(self, 'attrs', attrs)
         object.__setattr__(self, 'pos', 0)
         object.__setattr__(self, 'proc', None)
+        object.__setattr__(self, '_stream_pos', 0)
         object.__setattr__(self, '_closing', False)
         object.__setattr__(self, '_write_lock', asyncio.Lock())
 
@@ -23,34 +24,35 @@ class WhistlerSFTPFile:
         if not name.startswith('_') and name not in ('sftp_server', 'path', 'flags', 'attrs', 'pos', 'proc'):
             attr = object.__getattribute__(self, name)
             if name in ('write', 'writev'):
-                import inspect
-                print(f"SFTP: File attribute access: {name}, iscoroutinefunction={inspect.iscoroutinefunction(attr)}, callable={callable(attr)}, type={type(attr)}", file=sys.stderr, flush=True)
+                # import inspect
+                # print(f"SFTP: File attribute access: {name}, iscoroutinefunction={inspect.iscoroutinefunction(attr)}, callable={callable(attr)}, type={type(attr)}", file=sys.stderr, flush=True)
 
                 # Wrap to detect actual calls
                 def write_wrapper(*args, **kwargs):
-                    arg_info = f"data_len={len(args[0])}" if args else "no args"
-                    print(f"SFTP: write WRAPPER CALLED with {arg_info}, kwargs={kwargs}", file=sys.stderr, flush=True)
+                    # arg_info = f"data_len={len(args[0])}" if args else "no args"
+                    # print(f"SFTP: write WRAPPER CALLED with {arg_info}, kwargs={kwargs}", file=sys.stderr, flush=True)
                     try:
                         result = attr(*args, **kwargs)
-                        print(f"SFTP: write WRAPPER result type={type(result)}", file=sys.stderr, flush=True)
+                        # print(f"SFTP: write WRAPPER result type={type(result)}", file=sys.stderr, flush=True)
                         return result
                     except Exception as e:
-                        print(f"SFTP: write WRAPPER exception: {e}", file=sys.stderr, flush=True)
-                        import traceback
-                        traceback.print_exc(file=sys.stderr)
+                        # print(f"SFTP: write WRAPPER exception: {e}", file=sys.stderr, flush=True)
+                        # import traceback
+                        # traceback.print_exc(file=sys.stderr)
                         raise
 
                 if name == 'write':
                     return write_wrapper
             elif name == 'setstat':
-                print(f"SFTP: File attribute access: {name} (IMPORTANT!)", file=sys.stderr, flush=True)
+                pass
+                # print(f"SFTP: File attribute access: {name} (IMPORTANT!)", file=sys.stderr, flush=True)
 
                 # Wrap setstat to see if it's being called
                 def setstat_wrapper(*args, **kwargs):
-                    print(f"SFTP: setstat WRAPPER CALLED with args={args}, kwargs={kwargs}", file=sys.stderr, flush=True)
+                    # print(f"SFTP: setstat WRAPPER CALLED with args={args}, kwargs={kwargs}", file=sys.stderr, flush=True)
                     try:
                         result = attr(*args, **kwargs)
-                        print(f"SFTP: setstat WRAPPER result={result}", file=sys.stderr, flush=True)
+                        # print(f"SFTP: setstat WRAPPER result={result}", file=sys.stderr, flush=True)
                         return result
                     except Exception as e:
                         print(f"SFTP: setstat WRAPPER exception: {e}", file=sys.stderr, flush=True)
@@ -60,12 +62,13 @@ class WhistlerSFTPFile:
 
                 return setstat_wrapper
             else:
-                print(f"SFTP: File attribute access: {name}", file=sys.stderr, flush=True)
+                pass
+                # print(f"SFTP: File attribute access: {name}", file=sys.stderr, flush=True)
             return attr
         return object.__getattribute__(self, name)
     
     def fileno(self):
-        print(f"SFTP: fileno() called, returning None", file=sys.stderr, flush=True)
+        # print(f"SFTP: fileno() called, returning None", file=sys.stderr, flush=True)
         return None
 
     def __getattr__(self, name):
@@ -74,7 +77,7 @@ class WhistlerSFTPFile:
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
     async def writev(self, chunks, offset):
-        print(f"SFTP: writev({len(chunks)} chunks, offset={offset})", file=sys.stderr, flush=True)
+        # print(f"SFTP: writev({len(chunks)} chunks, offset={offset})", file=sys.stderr, flush=True)
         # Fallback to write (inefficient but safe)
         length = 0
         for data in chunks:
@@ -84,12 +87,12 @@ class WhistlerSFTPFile:
 
     def write(self, data):
         """Synchronous wrapper that returns a coroutine"""
-        print(f"SFTP: write() SYNC wrapper called with len={len(data)}, offset={self.pos}", file=sys.stderr, flush=True)
+        # print(f"SFTP: write() SYNC wrapper called with len={len(data)}, offset={self.pos}", file=sys.stderr, flush=True)
         return self._write_actual(data, self.pos)
 
     async def _write_actual(self, data, offset):
         # logging at top to verify call
-        print(f"SFTP: _write_actual(len={len(data)}, offset={offset})", file=sys.stderr, flush=True)
+        # print(f"SFTP: _write_actual(len={len(data)}, offset={offset})", file=sys.stderr, flush=True)
 
         if self._closing:
             raise asyncssh.SFTPError(asyncssh.FX_BAD_MESSAGE, "File is closed")
@@ -102,14 +105,16 @@ class WhistlerSFTPFile:
                     if not self.sftp_server.pod_name:
                         raise asyncssh.SFTPError(asyncssh.FX_NO_CONNECTION, "No active pod found")
 
-                    # Restart writer if seeking to new position or if it's the first write
-                    if self.proc and offset != self.pos:
-                        print(f"SFTP: offset mismatch (req={offset}, current={self.pos}), restarting writer", file=sys.stderr, flush=True)
-                        await self._stop_process()
-
-                    print(self.proc, file=sys.stderr, flush=True)
+                    # Check if we can reuse the existing process
+                    # We can reuse if the process exists AND the requested write offset matches 
+                    # exactly where the process stream is currently positioned.
+                    if self.proc:
+                        if offset != self._stream_pos:
+                            print(f"SFTP: offset mismatch (req={offset}, stream={self._stream_pos}), restarting writer", file=sys.stderr, flush=True)
+                            await self._stop_process()
+                    
                     if not self.proc:
-                        # Use truncate to ensure we append at the exact correct offset
+                        # Use truncate to ensure we start writing at the exact correct offset
                         if offset == 0:
                             shell_cmd = f"(cat > '{self.path}')"
                         else:
@@ -126,6 +131,9 @@ class WhistlerSFTPFile:
                                 stdout=asyncio.subprocess.DEVNULL,
                                 stderr=asyncio.subprocess.PIPE)
 
+                            # Initialize stream position to the starting offset
+                            self._stream_pos = offset
+
                             async def consume_stderr(proc, path):
                                 try:
                                     while True:
@@ -136,16 +144,26 @@ class WhistlerSFTPFile:
                                     pass
                             asyncio.create_task(consume_stderr(self.proc, self.path))
 
-                            await asyncio.sleep(0.5)
+                            # Give a tiny bit of time for immediate failures (like 'No such file')
+                            await asyncio.sleep(0.1)
+                            if self.proc.returncode is not None:
+                                raise Exception(f"Process exited immediately with code {self.proc.returncode}")
+
                         except Exception as e:
                             if attempt == 0:
+                                await self._stop_process()
                                 continue
                             raise asyncssh.SFTPError(asyncssh.FX_FAILURE, str(e))
+                        
+                        # Sync file pos to offset as well if we just started
                         self.pos = offset
 
                     self.proc.stdin.write(data)
                     await self.proc.stdin.drain()
+                    
+                    # Update both positions
                     self.pos += len(data)
+                    self._stream_pos += len(data)
                     break
 
                 except (BrokenPipeError, ConnectionResetError) as e:
