@@ -264,21 +264,10 @@ class WhistlerSFTPFile:
             self.proc = None
 
     def close(self):
-        """Mark file as closed for writes, but keep handle alive for fsetstat."""
-        print(f"SFTP: close({self.path}) - marking closed but keeping handle alive", file=sys.stderr, flush=True)
-        # Set a flag to prevent new writes, but don't actually close
-        # This keeps the handle in asyncssh's mapping for late fsetstat operations
-        object.__setattr__(self, '_write_closed', True)
-        # Schedule actual cleanup after a delay to allow fsetstat
-        asyncio.create_task(self._delayed_cleanup())
-
-    async def _delayed_cleanup(self):
-        """Cleanup resources after allowing time for final operations."""
-        # Wait for any pending fsetstat operations
-        await asyncio.sleep(0.5)
-        print(f"SFTP: delayed cleanup for {self.path}", file=sys.stderr, flush=True)
+        """Mark file as closed and clean up resources."""
+        print(f"SFTP: close({self.path})", file=sys.stderr, flush=True)
         self._closing = True
-        await self._stop_process()
+        asyncio.create_task(self._stop_process())
 
     async def close_async(self):
         """Asynchronous cleanup."""
@@ -322,7 +311,7 @@ class WhistlerSFTPServer(asyncssh.SFTPServer):
         self.namespace = self.config_manager.namespace
         self._lock = asyncio.Lock()
         # Cache for recently closed files to handle late fsetstat operations
-        self._closed_files = {}  # path -> file object
+        # self._closed_files = {}  # path -> file object - REMOVED
         print(f"SFTP context: user={self.username}, target={self.target_name}, type={self.target_type}", file=sys.stderr, flush=True)
         
     def _norm_path(self, path):
