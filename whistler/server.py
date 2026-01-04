@@ -160,7 +160,18 @@ async def start_server():
 
     # Always run in K8s mode
     mode = "in-cluster" if args.in_cluster else f"config: {args.kubeconfig}" if args.kubeconfig else "default"
-    print(f"Starting in Kubernetes mode ({mode})", file=sys.stderr)
+    
+    # Configure logging
+    import logging
+    log_level = os.environ.get("WHISTLER_LOG_LEVEL", "DEBUG").upper()
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        stream=sys.stderr
+    )
+    logger = logging.getLogger("whistler.server")
+    logger.info(f"Starting in Kubernetes mode ({mode}) with log level {log_level}")
+    
     config_manager = KubeConfigManager(kubeconfig=args.kubeconfig)
     
     # Create a partial to pass config_manager to SSHServer

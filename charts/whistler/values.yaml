@@ -28,6 +28,7 @@ server:
     requests:
       cpu: 2000m
       memory: 1Gi
+    logLevel: ERROR
 
 whistler:
   auth:
