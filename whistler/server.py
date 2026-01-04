@@ -2,6 +2,7 @@ import asyncio
 import asyncssh
 import sys
 import os
+from asyncssh.process import SSHCompletedProcess
 import pty
 import fcntl
 import termios
@@ -12,18 +13,17 @@ from textual.app import App
 from textual.geometry import Size
 from textual.events import Resize
 from textual._xterm_parser import XTermParser
+import stat
+import time
 from whistler.tui import WhistlerApp, LoadingScreen
+from whistler.sftp_support import WhistlerSFTPServer
+from whistler.globals import CONN_SERVER_MAP as _CONN_SERVER_MAP
 
 import argparse
-from functools import partial
 from functools import partial
 from whistler.config import ConfigManager, KubeConfigManager
 from asyncio import Event
 from textual.worker import Worker, WorkerState
-
-
-
-
 
 class WhistlerDriver(Driver):
     def __init__(self, next_driver: Driver | None = None, *, debug: bool = False, size: tuple[int, int] | None = None, **kwargs):
@@ -160,7 +160,18 @@ async def start_server():
 
     # Always run in K8s mode
     mode = "in-cluster" if args.in_cluster else f"config: {args.kubeconfig}" if args.kubeconfig else "default"
-    print(f"Starting in Kubernetes mode ({mode})", file=sys.stderr)
+    
+    # Configure logging
+    import logging
+    log_level = os.environ.get("WHISTLER_LOG_LEVEL", "DEBUG").upper()
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        stream=sys.stderr
+    )
+    logger = logging.getLogger("whistler.server")
+    logger.info(f"Starting in Kubernetes mode ({mode}) with log level {log_level}")
+    
     config_manager = KubeConfigManager(kubeconfig=args.kubeconfig)
     
     # Create a partial to pass config_manager to SSHServer
@@ -182,12 +193,21 @@ class SSHServer(asyncssh.SSHServer):
 
     def connection_made(self, conn):
         print('SSH connection received from %s.' % conn.get_extra_info('peername')[0], file=sys.stderr)
+        _CONN_SERVER_MAP[conn] = self
+        self._conn = conn
 
     def connection_lost(self, exc):
         if exc:
             print('SSH connection error: ' + str(exc), file=sys.stderr)
         else:
             print('SSH connection closed.', file=sys.stderr)
+        # Cleanup global map
+        if hasattr(self, '_conn') and self._conn in _CONN_SERVER_MAP:
+            del _CONN_SERVER_MAP[self._conn]
+
+    def subsystem_requested(self, subsystem):
+        # SFTP is handled at the session level in WhistlerSession.subsystem_requested
+        return False
 
     def begin_auth(self, username):
         # We require public key auth now
@@ -289,12 +309,25 @@ class SSHServer(asyncssh.SSHServer):
 
     def session_requested(self):
         print("SSHServer.session_requested", file=sys.stderr, flush=True)
+        target_name = self.target_name
+        template_name = None
+        is_ephemeral = False
+        
+        if self.target_type == "template":
+            import secrets
+            template_name = self.target_name
+            target_name = f"{self.target_name}-{secrets.token_hex(4)}"
+            is_ephemeral = True
+            print(f"SSHServer: Generated ephemeral name {target_name} for template {template_name}", file=sys.stderr, flush=True)
+
         return WhistlerSession(
             server=self,
             config_manager=self.config_manager, 
             username=self.username,
             target_type=self.target_type,
-            target_name=self.target_name
+            target_name=target_name,
+            template_name=template_name,
+            is_ephemeral=is_ephemeral
         )
     
     async def connection_requested(self, dest_host, dest_port, orig_host, orig_port):
@@ -368,7 +401,8 @@ class SSHServer(asyncssh.SSHServer):
 
 
 class WhistlerSession(asyncssh.SSHServerSession):
-    def __init__(self, server=None, config_manager=None, username=None, target_type="tui", target_name=None, *args, **kwargs):
+    def __init__(self, server=None, config_manager=None, username=None, target_type="tui", target_name=None, 
+                 template_name=None, is_ephemeral=False, *args, **kwargs):
         # super().__init__(*args, **kwargs) # SSHServerSession is just object
         self.server = server
         self._app = None
@@ -389,17 +423,93 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self.pod_socket_path = None
         self.term_type = None
         self._process_stdin = None
-        self.is_ephemeral = False
+        self.is_ephemeral = is_ephemeral
+        self.template_name = template_name
         self.exec_command = None
         self._stdin_queue = asyncio.Queue()
-        print("WhistlerSession initialized", file=sys.stderr, flush=True)
+        self._cleanup_done = False
+        self._cleanup_lock = asyncio.Lock()
+        print(f"WhistlerSession initialized: user={username}, type={target_type}, target={target_name}, ephemeral={is_ephemeral}", file=sys.stderr, flush=True)
+
+    async def _cleanup_ephemeral(self):
+        """Cleanup ephemeral instance if not already done."""
+        async with self._cleanup_lock:
+            if not self.is_ephemeral or self._cleanup_done:
+                return
+
+            instance_name = self.target_name
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self.config_manager.delete_instance, self.username, instance_name)
+            except Exception as e:
+                print(f"Error calling delete_instance: {e}", file=sys.stderr, flush=True)
+            
+            self._cleanup_done = True
 
     def connection_made(self, chan):
         print("WhistlerSession.connection_made", file=sys.stderr, flush=True)
         self._chan = chan
         self._chan.set_encoding(None)
 
+    def connection_lost(self, exc):
+        if self._app:
+             self._app.exit()
+        
+        # Ensure cleanup happens if session ends (e.g. sftp disconnect)
+        if self.is_ephemeral and not self._cleanup_done:
+             asyncio.create_task(self._cleanup_ephemeral())
+
+    def subsystem_requested(self, subsystem):
+        if subsystem == "sftp":
+            print("WhistlerSession starting SFTP subsystem", file=sys.stderr, flush=True)
+            try:
+                from asyncssh.sftp import SFTPServerHandler
+
+                # Store session info on the channel so WhistlerSFTPServer can access it
+                self._chan._whistler_session = self
+                # Mark that SFTP is active so session_started doesn't start a shell
+                self._sftp_active = True
+
+                # Create reader for SFTP protocol
+                self._sftp_reader = asyncio.StreamReader()
+                conn = self._chan.get_connection()
+                self._sftp_reader.logger = conn.logger
+                def get_extra_info(name, default=None):
+                    return conn.get_extra_info(name, default)
+                self._sftp_reader.get_extra_info = get_extra_info
+
+                # Create WhistlerSFTPServer instance
+                print(f"Creating WhistlerSFTPServer instance", file=sys.stderr, flush=True)
+                sftp_server = WhistlerSFTPServer(self._chan)
+                print(f"WhistlerSFTPServer instance created", file=sys.stderr, flush=True)
+
+                # Create and start handler
+                self.sftp_handler = SFTPServerHandler(sftp_server, self._sftp_reader, self._chan, 3)
+                print("Starting SFTP handler", file=sys.stderr, flush=True)
+                self._sftp_task = asyncio.create_task(self.sftp_handler.run())
+
+                def notify_done(future):
+                    try:
+                        future.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        print(f"SFTP handler failed: {e}", file=sys.stderr, flush=True)
+                        traceback.print_exc(file=sys.stderr)
+
+                self._sftp_task.add_done_callback(notify_done)
+                print("SFTP handler running", file=sys.stderr, flush=True)
+
+                return True
+            except Exception as e:
+                print(f"Failed to start SFTP: {e}", file=sys.stderr, flush=True)
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+                return False
+        return False
+
     def pty_requested(self, term_type, term_size, term_modes):
+        print(f"WhistlerSession.pty_requested: {term_type} {term_size}", file=sys.stderr, flush=True)
         self.initial_term_size = (term_size[0], term_size[1])
         self.term_type = term_type
         return True
@@ -409,6 +519,11 @@ class WhistlerSession(asyncssh.SSHServerSession):
         return True
 
     def data_received(self, data, datatype):
+        if getattr(self, 'sftp_handler', None):
+            #print(f"SFTP data proxy: {len(data)} bytes", file=sys.stderr, flush=True)
+            self._sftp_reader.feed_data(data)
+            return
+
         # Debugging input data
         # print(f"DEBUG: WhistlerSession.data_received: len={len(data)} val={repr(data)}", file=sys.stderr, flush=True)
         if self._app:
@@ -468,6 +583,11 @@ class WhistlerSession(asyncssh.SSHServerSession):
         return True
     
     def session_started(self):
+        # If SFTP is active, don't start a shell
+        if getattr(self, '_sftp_active', False):
+             print("Session started in SFTP mode, bypassing shell startup", file=sys.stderr)
+             return
+
         print("WhistlerSession.session_started", file=sys.stderr, flush=True)
         
         # Check for agent forwarding
@@ -532,15 +652,14 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
     async def _create_and_connect_ephemeral(self, command=None):
          # Create ephemeral instance
-         self.is_ephemeral = True
-         import secrets
-         hex_id = secrets.token_hex(4)
-         instance_name = f"{self.target_name}-{hex_id}"
+         # self.is_ephemeral already set in __init__
+         instance_name = self.target_name
+         template_name = self.template_name or self.target_name
          
          # Resolve full template name
          templates = self.config_manager.get_user_templates(self.username)
-         template_obj = next((t for t in templates if t["name"] == self.target_name), None)
-         template_ref = template_obj["fullName"] if template_obj else self.target_name
+         template_obj = next((t for t in templates if t["name"] == template_name), None)
+         template_ref = template_obj["fullName"] if template_obj else template_name
          
          if self.term_type:
              # Use loading screen for PTY mode
@@ -593,16 +712,14 @@ class WhistlerSession(asyncssh.SSHServerSession):
              finally:
                  # Cleanup
                  print(f"Entering finally block for {instance_name}", file=sys.stderr, flush=True)
-                 try:
-                     self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
-                 except Exception:
-                     pass
-                 try:
-                     loop = asyncio.get_running_loop()
-                     await loop.run_in_executor(None, self.config_manager.delete_instance, self.username, instance_name)
-                     print(f"delete_instance called for {instance_name}", file=sys.stderr, flush=True)
-                 except Exception as e:
-                     print(f"Error calling delete_instance: {e}", file=sys.stderr, flush=True)
+                 if self.term_type:
+                     try:
+                         self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
+                     except Exception:
+                         pass
+                 
+                 await self._cleanup_ephemeral()
+                 
                  try:
                      # Restore terminal state explicitly: Show Cursor, Disable Alt Screen
                      self._chan.write(b"\x1b[?25h\x1b[?1049l")
@@ -635,18 +752,14 @@ class WhistlerSession(asyncssh.SSHServerSession):
                      raise
                  finally:
                      print(f"Entering finally block for {instance_name}", file=sys.stderr, flush=True)
-                     try:
-                         if self.term_type and not command:
+                     if self.term_type and not command:
+                         try:
                              self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
-                     except Exception:
-                         pass
-                     try:
-                         # Run blocking delete in executor
-                         loop = asyncio.get_running_loop()
-                         await loop.run_in_executor(None, self.config_manager.delete_instance, self.username, instance_name)
-                         print(f"delete_instance called for {instance_name}", file=sys.stderr, flush=True)
-                     except Exception as e:
-                         print(f"Error calling delete_instance: {e}", file=sys.stderr, flush=True)
+                         except Exception:
+                             pass
+                     
+                     await self._cleanup_ephemeral()
+
                      try:
                          self._chan.exit(0)
                      except Exception:
@@ -1178,6 +1291,10 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
     def eof_received(self):
         print("WhistlerSession.eof_received", file=sys.stderr, flush=True)
+        if getattr(self, 'sftp_handler', None):
+            self._sftp_reader.feed_eof()
+            return
+
         if self._master_fd:
             try:
                 # Send EOT (Ctrl-D) to PTY
@@ -1231,17 +1348,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
         else:
              self._resize_timer = None
 
-    def connection_lost(self, exc):
-        print(f"WhistlerSession.connection_lost: {exc}", file=sys.stderr, flush=True)
-        if self._app_task:
-            print("Cancelling app task", file=sys.stderr, flush=True)
-            self._app_task.cancel()
-        if self._shell_task:
-            print(f"Cancelling shell task {self._shell_task}", file=sys.stderr, flush=True)
-            self._shell_task.cancel()
-        if self._agent_task:
-            print("Cancelling agent task", file=sys.stderr, flush=True)
-            self._agent_task.cancel()
+
 
     async def _bridge_agent(self, pod_name, namespace):
         print(f"Starting agent bridge: {self.local_agent_path} -> pod {pod_name}:{self.pod_socket_path}", file=sys.stderr)
