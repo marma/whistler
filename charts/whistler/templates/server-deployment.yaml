@@ -30,6 +30,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: WHISTLER_AUTH_ALLOW_ANY
               value: "{{ .Values.whistler.auth.allowAny }}"
+            - name: WHISTLER_LOG_LEVEL
+              value: "{{ .Values.server.logLevel }}"
           ports:
             - containerPort: 8022
               name: ssh
