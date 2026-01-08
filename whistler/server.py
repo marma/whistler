@@ -16,12 +16,46 @@ from whistler.tui import WhistlerApp, LoadingScreen
 
 import argparse
 from functools import partial
-from functools import partial
 from whistler.config import ConfigManager, KubeConfigManager
 from asyncio import Event
 from textual.worker import Worker, WorkerState
 
+class SubprocessTunnelProtocol(asyncio.Protocol):
+    """Protocol to bridge an SSH channel to a subprocess (e.g. kubectl exec)."""
+    def __init__(self, process):
+        self.process = process
+        self.transport = None
+        self._stdout_task = None
 
+    def connection_made(self, transport):
+        self.transport = transport
+        self._stdout_task = asyncio.create_task(self._pipe_stdout())
+
+    async def _pipe_stdout(self):
+        try:
+            while True:
+                data = await self.process.stdout.read(4096)
+                if not data:
+                    break
+                self.transport.write(data)
+        except Exception as e:
+            print(f"Tunnel pipe error: {e}", file=sys.stderr)
+        finally:
+            if self.transport:
+                self.transport.close()
+
+    def data_received(self, data):
+        if self.process.stdin and not self.process.stdin.is_closing():
+            self.process.stdin.write(data)
+
+    def connection_lost(self, exc):
+        if self._stdout_task:
+            self._stdout_task.cancel()
+        if self.process.returncode is None:
+            try:
+                self.process.terminate()
+            except ProcessLookupError:
+                pass
 
 
 
@@ -331,11 +365,22 @@ class SSHServer(asyncssh.SSHServer):
             )
 
     async def _create_pod_tunnel(self, pod_name, namespace, port):
-        # Use kubectl exec + socat to tunnel to localhost inside the pod
-        # This handles services bound to 127.0.0.1 strictly
+        # Use kubectl exec + bridge to tunnel to localhost inside the pod
+        # We try socat first, then fallback to nc (netcat)
+        # Bash /dev/tcp could be another fallback but usually it's not even bash.
+        bridge_cmd = (
+            f"if command -v socat >/dev/null 2>&1; then "
+            f"socat - TCP4:127.0.0.1:{port}; "
+            f"elif command -v nc >/dev/null 2>&1; then "
+            f"nc 127.0.0.1 {port}; "
+            f"else "
+            f"echo 'Error: neither socat nor nc found in pod' >&2; exit 1; "
+            f"fi"
+        )
+        
         cmd = [
             "kubectl", "exec", "-i", pod_name, "-n", namespace,
-            "--", "socat", "-", f"TCP4:127.0.0.1:{port}"
+            "--", "sh", "-c", bridge_cmd
         ]
         
         try:
@@ -352,13 +397,16 @@ class SSHServer(asyncssh.SSHServer):
                     while True:
                         line = await process.stderr.readline()
                         if not line: break
-                        print(f"Tunnel {pod_name}:{port} stderr: {line.decode().strip()}", file=sys.stderr)
+                        msg = line.decode().strip()
+                        if msg:
+                            print(f"Tunnel {pod_name}:{port} stderr: {msg}", file=sys.stderr)
                 except Exception:
                     pass
 
             asyncio.create_task(log_stderr())
             
-            return process.stdout, process.stdin
+            # Return a factory that initializes our protocol with the process
+            return lambda: SubprocessTunnelProtocol(process)
         except Exception as e:
             print(f"Failed to create tunnel: {e}", file=sys.stderr)
             raise asyncssh.ChannelOpenError(
