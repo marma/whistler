@@ -25,7 +25,7 @@ from whistler.config import ConfigManager, KubeConfigManager
 from asyncio import Event
 from textual.worker import Worker, WorkerState
 
-class SubprocessTunnelProtocol(asyncio.Protocol):
+class SubprocessTunnelProtocol(asyncssh.SSHServerSession):
     """Protocol to bridge an SSH channel to a subprocess (e.g. kubectl exec)."""
     def __init__(self, process):
         self.process = process
@@ -35,6 +35,9 @@ class SubprocessTunnelProtocol(asyncio.Protocol):
     def connection_made(self, transport):
         self.transport = transport
         self._stdout_task = asyncio.create_task(self._pipe_stdout())
+    
+    def session_started(self):
+        pass
 
     async def _pipe_stdout(self):
         try:
@@ -49,7 +52,7 @@ class SubprocessTunnelProtocol(asyncio.Protocol):
             if self.transport:
                 self.transport.close()
 
-    def data_received(self, data):
+    def data_received(self, data, datatype):
         if self.process.stdin and not self.process.stdin.is_closing():
             self.process.stdin.write(data)
 
@@ -400,25 +403,37 @@ class SSHServer(asyncssh.SSHServer):
             )
 
     async def _create_pod_tunnel(self, pod_name, namespace, port):
-        # Use kubectl exec + bridge to tunnel to localhost inside the pod
-        # We try socat first, then fallback to nc (netcat)
-        # Bash /dev/tcp could be another fallback but usually it's not even bash.
-        bridge_cmd = (
-            f"if command -v socat >/dev/null 2>&1; then "
-            f"socat - TCP4:127.0.0.1:{port}; "
-            f"elif command -v nc >/dev/null 2>&1; then "
-            f"nc 127.0.0.1 {port}; "
-            f"else "
-            f"echo 'Error: neither socat nor nc found in pod' >&2; exit 1; "
-            f"fi"
-        )
+        # Determine bridge command
+        cmd_str = f"socat - TCP4:127.0.0.1:{port}"
+        
+        # Check for socat
+        if not await self._is_command_available(pod_name, namespace, "socat"):
+             # Try fallback to nc?
+             if await self._is_command_available(pod_name, namespace, "nc"):
+                  cmd_str = f"nc 127.0.0.1 {port}"
+                  print(f"socat not found, falling back to nc for {pod_name}:{port}", file=sys.stderr)
+             else:
+                  # Inject socat
+                  socat_bin = "/tmp/socat-static"
+                  if not await self._is_file_present(pod_name, namespace, socat_bin):
+                       print(f"Injecting static socat for tunnel {pod_name}:{port}...", file=sys.stderr)
+                       try:
+                           await self._inject_static_socat(pod_name, namespace, socat_bin)
+                       except Exception as e:
+                           print(f"Injection failed: {e}", file=sys.stderr)
+                           raise asyncssh.ChannelOpenError(
+                             asyncssh.OPEN_CONNECT_FAILED,
+                             f"Failed to inject socat: {e}"
+                           )
+                  cmd_str = f"{socat_bin} - TCP4:127.0.0.1:{port}"
         
         cmd = [
             "kubectl", "exec", "-i", pod_name, "-n", namespace,
-            "--", "sh", "-c", bridge_cmd
+            "--", "sh", "-c", cmd_str
         ]
         
         try:
+            print(f"Starting tunnel process: {cmd}", file=sys.stderr)
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
@@ -440,14 +455,78 @@ class SSHServer(asyncssh.SSHServer):
 
             asyncio.create_task(log_stderr())
             
-            # Return a factory that initializes our protocol with the process
-            return lambda: SubprocessTunnelProtocol(process)
+            # Return protocol instance directly
+            return SubprocessTunnelProtocol(process)
         except Exception as e:
             print(f"Failed to create tunnel: {e}", file=sys.stderr)
             raise asyncssh.ChannelOpenError(
                 asyncssh.OPEN_CONNECT_FAILED,
                 f"Tunnel creation failed: {e}"
             )
+
+    async def _is_command_available(self, pod_name, namespace, cmd):
+        check_cmd = ["kubectl", "exec", pod_name, "-n", namespace, "--", "command", "-v", cmd]
+        process = await asyncio.create_subprocess_exec(
+            *check_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
+        return await process.wait() == 0
+
+    async def _is_file_present(self, pod_name, namespace, path):
+        check_cmd = ["kubectl", "exec", pod_name, "-n", namespace, "--", "test", "-f", path]
+        process = await asyncio.create_subprocess_exec(
+            *check_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
+        return await process.wait() == 0
+
+    async def _inject_static_socat(self, pod_name, namespace, target_path):
+        # Use bundled binary
+        local_binary = "/app/bin/socat_x64"
+        
+        # Fallback for local development (outside container)
+        if not os.path.exists(local_binary):
+            # Try path relative to current directory
+            local_binary = os.path.join(os.getcwd(), "bin", "socat_x64")
+            
+        if not os.path.exists(local_binary):
+             raise Exception(f"Bundled socat binary not found at {local_binary}")
+        
+        # Inject into pod
+        print(f"Injecting static socat from {local_binary} to {pod_name}:{target_path}...", file=sys.stderr)
+        # Use cat < local | kubectl exec ... "cat > target && chmod +x target"
+        inject_cmd = [
+            "kubectl", "exec", "-i", pod_name, "-n", namespace, "--",
+            "sh", "-c", f"cat > {target_path} && chmod +x {target_path}"
+        ]
+        
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *inject_cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            # Manual write to stdin to ensure data is sent correctly
+            with open(local_binary, "rb") as f:
+                while True:
+                    chunk = f.read(4096)
+                    if not chunk:
+                        break
+                    process.stdin.write(chunk)
+                    await process.stdin.drain()
+            
+            process.stdin.close()
+            await process.stdin.wait_closed()
+            
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                 raise Exception(f"Failed to inject socat: {stderr.decode()}")
+
+        except Exception as e:
+            print(f"Injection failed: {e}", file=sys.stderr)
+            raise
+
 
 
 class WhistlerSession(asyncssh.SSHServerSession):
@@ -1405,11 +1484,11 @@ class WhistlerSession(asyncssh.SSHServerSession):
         try:
             # Ensure socat is available in the pod
             socat_bin = "socat"
-            if not await self._is_command_available(pod_name, namespace, "socat"):
+            if not await self.server._is_command_available(pod_name, namespace, "socat"):
                 print(f"socat not found in pod {pod_name}, attempting to inject static binary...", file=sys.stderr)
                 socat_bin = "/tmp/socat-static"
-                if not await self._is_file_present(pod_name, namespace, socat_bin):
-                     await self._inject_static_socat(pod_name, namespace, socat_bin)
+                if not await self.server._is_file_present(pod_name, namespace, socat_bin):
+                     await self.server._inject_static_socat(pod_name, namespace, socat_bin)
             
             # Connect to local agent socket
             local_reader, local_writer = await asyncio.open_unix_connection(self.local_agent_path)
@@ -1466,51 +1545,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
         finally:
              print("Agent bridge finished", file=sys.stderr)
 
-    async def _is_command_available(self, pod_name, namespace, cmd):
-        check_cmd = ["kubectl", "exec", pod_name, "-n", namespace, "--", "command", "-v", cmd]
-        process = await asyncio.create_subprocess_exec(
-            *check_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-        )
-        return await process.wait() == 0
 
-    async def _is_file_present(self, pod_name, namespace, path):
-        check_cmd = ["kubectl", "exec", pod_name, "-n", namespace, "--", "test", "-f", path]
-        process = await asyncio.create_subprocess_exec(
-            *check_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-        )
-        return await process.wait() == 0
-
-    async def _inject_static_socat(self, pod_name, namespace, target_path):
-        # Use bundled binary
-        local_binary = "/app/bin/socat_x64"
-        
-        # Fallback for local development (outside container)
-        if not os.path.exists(local_binary):
-            # Try path relative to current directory
-            local_binary = os.path.join(os.getcwd(), "bin", "socat_x64")
-            
-        if not os.path.exists(local_binary):
-             raise Exception(f"Bundled socat binary not found at {local_binary}")
-        
-        # Inject into pod
-        print(f"Injecting static socat from {local_binary} to {pod_name}:{target_path}...", file=sys.stderr)
-        # Use cat < local | kubectl exec ... "cat > target && chmod +x target"
-        inject_cmd = [
-            "kubectl", "exec", "-i", pod_name, "-n", namespace, "--",
-            "sh", "-c", f"cat > {target_path} && chmod +x {target_path}"
-        ]
-        
-        with open(local_binary, "rb") as f:
-            process = await asyncio.create_subprocess_exec(
-                *inject_cmd,
-                stdin=f,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                 raise Exception(f"Failed to inject socat: {stderr.decode()}")
 
 
 if __name__ == '__main__':

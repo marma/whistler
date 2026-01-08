@@ -294,9 +294,11 @@ class WhistlerSFTPServer(asyncssh.SFTPServer):
             if not self.username:
                 raise asyncssh.SFTPError(asyncssh.FX_NO_CONNECTION, "No username found in session")
 
+            loop = asyncio.get_running_loop()
+
             # Check for existing instance first
             try:
-                instances = self.config_manager.get_user_instances(self.username)
+                instances = await loop.run_in_executor(None, self.config_manager.get_user_instances, self.username)
             except Exception as e:
                 logger.error(f"SFTP Error: Failed to get user instances: {e}")
                 raise asyncssh.SFTPError(asyncssh.FX_FAILURE, f"Failed to list instances: {e}")
@@ -308,20 +310,21 @@ class WhistlerSFTPServer(asyncssh.SFTPServer):
                 template_name = getattr(self._session, 'template_name', None) or self.target_name
                 logger.debug(f"SFTP: Instance {self.target_name} not found, checking template {template_name}")
                 
-                templates = self.config_manager.get_user_templates(self.username)
+                templates = await loop.run_in_executor(None, self.config_manager.get_user_templates, self.username)
                 template_obj = next((t for t in templates if t["name"] == template_name), None)
                 
                 if template_obj:
                     template_ref = template_obj.get("fullName", template_name)
                     logger.info(f"SFTP: Creating anonymous instance {self.target_name} from template {template_ref}")
                     
-                    if not self.config_manager.add_instance(self.username, template_ref, self.target_name, preemptible=True):
+                    success = await loop.run_in_executor(None, lambda: self.config_manager.add_instance(self.username, template_ref, self.target_name, preemptible=True))
+                    if not success:
                         raise asyncssh.SFTPError(asyncssh.FX_FAILURE, "Failed to create instance from template")
                     
                     # Wait for instance to appear
                     start_time = time.time()
                     while time.time() - start_time < 30:
-                        instances = self.config_manager.get_user_instances(self.username)
+                        instances = await loop.run_in_executor(None, self.config_manager.get_user_instances, self.username)
                         instance = next((i for i in instances if i["name"] == self.target_name), None)
                         if instance:
                              break
@@ -344,10 +347,14 @@ class WhistlerSFTPServer(asyncssh.SFTPServer):
                 try:
                     full_cr_name = f"{self.username}-{self.target_name}"
                     logger.info(f"SFTP: Patching instance {full_cr_name} to start (namespace={self.namespace})...")
-                    self.config_manager.api.patch_namespaced_custom_object(
-                        self.config_manager.group, self.config_manager.version, self.namespace,
-                        "whistlerinstances", full_cr_name,
-                        {"metadata": {"annotations": {"whistler/last-connect": str(time.time())}}})
+                    
+                    def patch_instance():
+                        self.config_manager.api.patch_namespaced_custom_object(
+                            self.config_manager.group, self.config_manager.version, self.namespace,
+                            "whistlerinstances", full_cr_name,
+                            {"metadata": {"annotations": {"whistler/last-connect": str(time.time())}}})
+                    
+                    await loop.run_in_executor(None, patch_instance)
                 except Exception as e:
                     logger.error(f"SFTP Error: Failed to start instance {full_cr_name}: {e}")
                     raise asyncssh.SFTPError(asyncssh.FX_FAILURE, f"Failed to start instance: {e}")
@@ -356,7 +363,7 @@ class WhistlerSFTPServer(asyncssh.SFTPServer):
                 start_time = time.time()
                 while time.time() - start_time < 60:
                     try:
-                        instances = self.config_manager.get_user_instances(self.username)
+                        instances = await loop.run_in_executor(None, self.config_manager.get_user_instances, self.username)
                         instance = next((i for i in instances if i["name"] == self.target_name), None)
                         if instance:
                              status = instance.get("status")
