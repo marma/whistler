@@ -832,7 +832,16 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  pod_name = await task
                  
                  if pod_name:
-                     self._app = None # Clear app reference so input goes to shell
+                     self._app = None # Clear app reference SOONER
+                     
+                     # Force restore terminal state
+                     try:
+                          # Show cursor, exit alt screen
+                          self._chan.write(b"\x1b[?25h\x1b[?1049l")
+                          await asyncio.sleep(0.1)
+                     except Exception:
+                          pass
+
                      await self._run_pod_shell(pod_name, command=command)
              except asyncio.CancelledError:
                  print("Task cancelled in _create_and_connect_ephemeral", file=sys.stderr, flush=True)
@@ -926,22 +935,20 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 pod_name = instance.get("podName")
         
         if not pod_name or (instance and instance.get("status") != "Running"):
-            # Trigger operator to ensure pod exists
-            import time
-            try:
-                full_cr_name = f"{self.username}-{self.target_name}"
-                ns = instance.get("namespace", self.config_manager.namespace)
-                
-                def patch_ts():
-                     self.config_manager.api.patch_namespaced_custom_object(
-                        self.config_manager.group, self.config_manager.version, ns,
-                        "whistlerinstances", full_cr_name,
-                        {"metadata": {"annotations": {"whistler.example.com/last-connect": str(time.time())}}}
-                    )
-                await loop.run_in_executor(None, patch_ts)
-            except Exception as e:
-                print(f"Failed to patch instance: {e}", file=sys.stderr)
+            loading_app.update_status(f"Ensuring instance {self.target_name} is created...")
             
+            # Trigger pod creation via config manager
+            try:
+                def create_pod_sync():
+                    # Only available on KubeConfigManager
+                    if hasattr(self.config_manager, 'ensure_pod'):
+                        return self.config_manager.ensure_pod(self.username, self.target_name)
+                    return True # Fallback for non-k8s modes if any
+                
+                await loop.run_in_executor(None, create_pod_sync)
+            except Exception as e:
+                print(f"Failed to ensure pod: {e}", file=sys.stderr)
+                
             loading_app.update_status(f"Starting instance {self.target_name}...")
             pod_name = await self._wait_for_pod_with_app(self.target_name, loading_app)
         
@@ -980,6 +987,18 @@ class WhistlerSession(asyncssh.SSHServerSession):
             pass
             
         if self.term_type and not loading_screen:
+            # Check if already running to skip loading screen (avoid blackout)
+            pod_name_ready = None
+            if instance and instance.get("status") == "Running":
+                 pod_name_ready = instance.get("podName")
+                 # Verify? No, trust CR status for speed. If it fails, user can retry or we can fallback?
+                 # Assuming "Running" means ready.
+            
+            if pod_name_ready:
+                 print(f"Instance {self.target_name} already running, skipping loading screen.", file=sys.stderr)
+                 await self._run_pod_shell(pod_name_ready, command=command)
+                 return
+
             # PTY mode: use loading app
             loading_app = LoadingApp(self._chan, self.initial_term_size, f"Connecting to instance {self.target_name}...")
             loading_app.ssh_channel = self._chan
@@ -1000,7 +1019,16 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
                 pod_name = await task
                 if pod_name:
-                    self._app = None # Clear app reference so input goes to shell
+                    self._app = None # Clear app reference SOONER so input goes to shell
+                    
+                    # Force restore terminal state
+                    try:
+                         # Show cursor, exit alt screen
+                         self._chan.write(b"\x1b[?25h\x1b[?1049l")
+                         await asyncio.sleep(0.1) # Brief pause to let client process
+                    except Exception:
+                         pass
+
                     await self._run_pod_shell(pod_name, command=command)
             except asyncio.CancelledError:
                 task.cancel()
@@ -1009,6 +1037,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 self._app = None
                 try:
                     # Restore terminal state explicitly: Show Cursor, Disable Alt Screen
+                    # We do this again in finally block just in case
                     self._chan.write(b"\x1b[?25h\x1b[?1049l")
                 except:
                     pass
@@ -1219,11 +1248,25 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 master, slave = pty.openpty()
                 self._master_fd = master
                 
-                # Set initial size
+                # Set initial size logic:
+                # 1) If we have a pending size from a recent resize event (while app was closing?), use it.
+                # 2) Else use initial_term_size from pty_request.
+                cols, rows = 80, 24
                 if self.initial_term_size:
                     cols, rows = self.initial_term_size
+                
+                if self._pending_size:
+                     cols, rows = self._pending_size
+                     
+                try:
                     winsize = struct.pack("HHHH", rows, cols, 0, 0)
                     fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
+                    print(f"Set initial PTY size to {cols}x{rows}", file=sys.stderr)
+                except Exception as e:
+                    print(f"Failed to set initial PTY size: {e}", file=sys.stderr)
+
+                # Ensure non-blocking
+                os.set_blocking(master, False)
 
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -1242,8 +1285,12 @@ class WhistlerSession(asyncssh.SSHServerSession):
                             if not pty_closed.done():
                                 pty_closed.set_result(True)
                         else:
+                            # print(f"PTY read {len(data)} bytes", file=sys.stderr)
                             self._chan.write(data)
-                    except (OSError, Exception):
+                    except BlockingIOError:
+                        pass
+                    except (OSError, Exception) as e:
+                        # print(f"PTY read error: {e}", file=sys.stderr)
                         if not pty_closed.done():
                             pty_closed.set_result(True)
 
@@ -1447,9 +1494,10 @@ class WhistlerSession(asyncssh.SSHServerSession):
         return True # Return True to keep channel open/manual EOF handling
 
     def terminal_size_changed(self, width, height, pixwidth, pixheight):
+        # Always update pending size so whoever picks up next knows it
+        self._pending_size = (width, height)
+
         if self._app:
-            self._pending_size = (width, height)
-            
             if not self._resize_timer:
                 # Leading edge: process immediately
                 self._process_resize()
@@ -1457,9 +1505,14 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 loop = asyncio.get_running_loop()
                 self._resize_timer = loop.call_later(0.1, self._resize_cooldown_expired)
             
-        elif self._master_fd:
-             winsize = struct.pack("HHHH", height, width, 0, 0)
-             fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ, winsize)
+        if self._master_fd:
+             # If shell is active, apply immediately (kernel handles coalescence/buffering usually fine)
+             try:
+                 winsize = struct.pack("HHHH", height, width, 0, 0)
+                 fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ, winsize)
+                 print(f"Updated PTY size to {width}x{height}", file=sys.stderr)
+             except Exception as e:
+                 print(f"Failed to update PTY size: {e}", file=sys.stderr)
 
     def _process_resize(self):
         if self._app and self._pending_size:

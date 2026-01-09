@@ -7,6 +7,8 @@ from kubernetes import client, config as k8s_config
 from kubernetes.client import CoreV1Api, NetworkingV1Api
 from kubernetes.client.rest import ApiException
 from sys import stderr
+import os
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -56,20 +58,15 @@ class KubeConfigManager(ConfigManager):
                 k8s_config.load_incluster_config()
         except k8s_config.ConfigException:
             try:
-                 k8s_config.load_kube_config()
+                k8s_config.load_kube_config()
             except k8s_config.ConfigException:
-                logger.warning("Could not load kubernetes config")
-
-        self.api = client.CustomObjectsApi()
-        self.group = "whistler.example.com"
-        self.version = "v1"
-        self.api = client.CustomObjectsApi()
-        self.group = "whistler.example.com"
-        self.version = "v1"
+                logger.warning("Could not load KubeConfig, standard K8s calls will fail")
         
-        # Determine namespace
-        import os
+        self.api = client.CustomObjectsApi()
+        self.group = "whistler.example.com"
+        self.version = "v1"
         self.namespace = os.environ.get("POD_NAMESPACE")
+        
         if not self.namespace:
             try:
                 with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "r") as f:
@@ -77,13 +74,15 @@ class KubeConfigManager(ConfigManager):
             except FileNotFoundError:
                 self.namespace = "whistler" # Default fallback
 
-        self.users = {}
+        self.users = {} # Not really used in Kube mode but kept for compat if needed
         self._load_users()
 
-        self.selectors = []
+        # Initialize containers
+        self.selectors = {} 
         self._load_selectors()
-
+        
         self.volumes = []
+        self.volume_definitions = {}
         self._load_volumes()
 
     def _get_user_namespace(self, username: str) -> str:
@@ -412,12 +411,253 @@ class KubeConfigManager(ConfigManager):
             with open("/etc/whistler-config/volumes.yaml", "r") as f:
                 import yaml
                 data = yaml.safe_load(f)
-                if data:
+                if data and isinstance(data, list):
                     self.volumes = data
+                    self.volume_definitions = {v['name']: v for v in data}
+                else:
+                    self.volumes = []
+                    self.volume_definitions = {}
         except FileNotFoundError:
             logger.warning("No volumes.yaml found at /etc/whistler-config/volumes.yaml")
         except Exception as e:
             logger.error(f"Failed to load volumes: {e}")
+            self.volumes = []
+            self.volume_definitions = {}
 
-    def get_volumes(self) -> List[Dict[str, Any]]:
+    def get_volumes(self):
+        self._load_volumes()
         return self.volumes
+
+    def _ensure_pvc(self, user, namespace, logger=None):
+        pvc_name = f"whistler-data-{user}"
+        api = client.CoreV1Api()
+        
+        try:
+            api.read_namespaced_persistent_volume_claim(pvc_name, namespace)
+            return pvc_name
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        
+        # Create PVC
+        if logger: logger.info(f"Creating PVC {pvc_name} for user {user}")
+        
+        access_mode = os.environ.get("USER_VOLUME_ACCESS_MODE", "ReadWriteMany")
+        volume_size = os.environ.get("USER_VOLUME_SIZE", "10Gi")
+        pvc_body = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": pvc_name,
+                "labels": {
+                    "app": "whistler",
+                    "user": user
+                }
+            },
+            "spec": {
+                "accessModes": [access_mode],
+                "resources": {
+                    "requests": {
+                        "storage": volume_size
+                    }
+                }
+            }
+        }
+        
+        try:
+            api.create_namespaced_persistent_volume_claim(namespace, pvc_body)
+            if logger: logger.info(f"PVC {pvc_name} created")
+            return pvc_name
+        except ApiException as e:
+            if logger: logger.error(f"Failed to create PVC: {e}")
+            raise
+
+    def _load_volume_definitions_from_file(self):
+        try:
+            with open("/etc/whistler-config/volumes.yaml", "r") as f:
+                data = yaml.safe_load(f)
+                return {v['name']: v for v in data} if data else {}
+        except Exception:
+            return {}
+
+    def ensure_pod(self, username: str, instance_name: str) -> bool:
+        """
+        Ensure that the pod for the given instance exists.
+        Returns True if the pod exists or was created, False otherwise.
+        """
+        user_ns = self._ensure_user_namespace(username)
+        full_instance_name = f"{username}-{instance_name}"
+        
+        # Get the WhistlerInstance CR to get spec and owner UID
+        try:
+            cr = self.api.get_namespaced_custom_object(
+                self.group, self.version, user_ns, "whistlerinstances", full_instance_name
+            )
+        except ApiException as e:
+            logger.error(f"Instance {full_instance_name} not found: {e}")
+            return False
+            
+        spec = cr.get('spec', {})
+        uid = cr['metadata']['uid']
+        
+        template_ref = spec.get('templateRef')
+        preemptible = spec.get('preemptible', False)
+        
+        # Fetch template details
+        custom_api = client.CustomObjectsApi()
+        template = None
+        try:
+            template = custom_api.get_namespaced_custom_object(
+                group="whistler.example.com",
+                version="v1",
+                namespace=user_ns,
+                plural="whistlertemplates",
+                name=template_ref
+            )
+        except ApiException as e:
+            if e.status == 404:
+                # Try system namespace
+                system_ns = os.environ.get("POD_NAMESPACE", "whistler")
+                if system_ns != user_ns:
+                    try:
+                        template = custom_api.get_namespaced_custom_object(
+                            group="whistler.example.com",
+                            version="v1",
+                            namespace=system_ns,
+                            plural="whistlertemplates",
+                            name=template_ref
+                        )
+                    except ApiException:
+                        pass
+        
+        if not template:
+            logger.error(f"Template {template_ref} not found")
+            return False
+            
+        template_spec = template.get('spec', {})
+
+        image = template_spec.get('image', 'ubuntu:latest')
+        resources = template_spec.get('resources', {})
+        node_selector = template_spec.get('nodeSelector', {})
+        personal_mount_path = template_spec.get('personalMountPath', '/userdata')
+        
+        # Construct resource requirements
+        resource_reqs = {}
+        if resources:
+            requests = {}
+            limits = {}
+            
+            if 'cpu' in resources:
+                requests['cpu'] = resources['cpu']
+                limits['cpu'] = resources['cpu']
+            if 'memory' in resources:
+                requests['memory'] = resources['memory']
+                limits['memory'] = resources['memory']
+            if 'gpu' in resources:
+                limits['nvidia.com/gpu'] = resources['gpu']
+                
+            if requests:
+                resource_reqs['requests'] = requests
+            if limits:
+                resource_reqs['limits'] = limits
+        
+        # Use CR name as pod name
+        pod_name = full_instance_name
+        hostname = instance_name
+        
+        # Ensure PVC exists
+        try:
+            pvc_name = self._ensure_pvc(username, user_ns, logger)
+        except Exception:
+            return False
+        
+        # Load available volume definitions
+        available_volumes = self._load_volume_definitions_from_file()
+        requested_volumes = template_spec.get('volumes', {})
+
+        pod_volumes = [
+            {
+                "name": "data",
+                "persistentVolumeClaim": {
+                    "claimName": pvc_name
+                }
+            }
+        ]
+        
+        volume_mounts = [
+            {
+                "name": "data",
+                "mountPath": personal_mount_path
+            }
+        ]
+
+        # Process requested volumes
+        for vol_name, mount_path in requested_volumes.items():
+            if vol_name in available_volumes:
+                if vol_name == "data":
+                    continue
+                
+                pod_volumes.append(available_volumes[vol_name])
+                volume_mounts.append({
+                    "name": vol_name,
+                    "mountPath": mount_path
+                })
+
+        pod_body = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": pod_name,
+                "labels": {
+                    "app": "whistler-instance",
+                    "instance": full_instance_name,
+                    "user": username
+                },
+                "ownerReferences": [{
+                    "apiVersion": f"{self.group}/{self.version}",
+                    "kind": "WhistlerInstance",
+                    "name": full_instance_name,
+                    "uid": uid,
+                    "controller": True,
+                    "blockOwnerDeletion": True
+                }]
+            },
+            "spec": {
+                "containers": [
+                    {
+                        "name": "main",
+                        "image": image,
+                        "command": ["sleep", "3600"],
+                        "resources": resource_reqs,
+                        "volumeMounts": volume_mounts
+                    }
+                ],
+                "volumes": pod_volumes,
+                "nodeSelector": node_selector,
+                "hostname": hostname,
+                "subdomain": "whistler"
+            }
+        }
+        
+        if preemptible:
+            pod_body["spec"]["priorityClassName"] = "whistler-preemptible"
+        
+        core_api = client.CoreV1Api()
+        try:
+            core_api.create_namespaced_pod(user_ns, pod_body)
+            logger.info(f"Pod {pod_name} created")
+            return True
+        except ApiException as e:
+            if e.status == 409:
+                # Check if terminating
+                try:
+                    existing_pod = core_api.read_namespaced_pod(pod_name, user_ns)
+                    if existing_pod.metadata.deletion_timestamp:
+                         logger.info(f"Pod {pod_name} is terminating.")
+                         return False # Can't create yet
+                except ApiException:
+                    pass
+                return True # Already exists
+            else:
+                logger.error(f"Failed to create pod: {e}")
+                return False
