@@ -635,7 +635,8 @@ class KubeConfigManager(ConfigManager):
                 "volumes": pod_volumes,
                 "nodeSelector": node_selector,
                 "hostname": hostname,
-                "subdomain": "whistler"
+                "subdomain": "whistler",
+                "automountServiceAccountToken": False
             }
         }
         

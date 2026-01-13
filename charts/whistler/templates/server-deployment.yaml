@@ -15,7 +15,7 @@ spec:
       labels:
         app: whistler-server
     spec:
-      serviceAccountName: {{ .Release.Name }}-operator # Re-use operator SA for now as it needs similar permissions
+      serviceAccountName: {{ .Release.Name }}-server
       containers:
         - name: server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

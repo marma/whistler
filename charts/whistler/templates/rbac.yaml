@@ -56,3 +56,54 @@ subjects:
   - kind: ServiceAccount
     name: {{ .Release.Name }}-operator
     namespace: {{ .Release.Namespace }}
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-server
+  namespace: {{ .Release.Namespace }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-server
+rules:
+  # The server needs to manage namespaces and network policies for user isolation
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [create, get, list, watch]
+  
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [create, get, list, watch, update, patch]
+
+  # Managing user pods and PVCs
+  - apiGroups: [""]
+    resources: [pods, pods/exec, pods/log, persistentvolumeclaims]
+    verbs: [create, delete, get, list, watch, patch]
+
+  # Reading configuration
+  - apiGroups: [""]
+    resources: [secrets, configmaps]
+    verbs: [get, list]
+
+  # Managing custom resources
+  - apiGroups: [whistler.example.com]
+    resources: [whistlerinstances, whistlertemplates, whistlerinstances/status]
+    verbs: [create, delete, get, list, patch, update, watch]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-server
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-server
+    namespace: {{ .Release.Namespace }}
