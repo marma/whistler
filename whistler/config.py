@@ -380,6 +380,7 @@ class KubeConfigManager(ConfigManager):
             return False
 
     def delete_instance(self, username: str, instance_name: str) -> bool:
+        logger.info(f"Attempting to delete instance {username}-{instance_name}")
         print(f"Deleting instance {username}-{instance_name}", file=stderr, flush=True)
         user_ns = self._get_user_namespace(username)
         try:
