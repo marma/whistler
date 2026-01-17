@@ -13,6 +13,7 @@ operator:
     requests:
       cpu: 1000m
       memory: 512Mi
+  logLevel: ERROR
 
 server:
   enabled: true
@@ -28,7 +29,7 @@ server:
     requests:
       cpu: 2000m
       memory: 1Gi
-    logLevel: ERROR
+  logLevel: ERROR
 
 whistler:
   auth:
@@ -52,7 +53,7 @@ whistler:
   #volumes:
   #  - name: data
   #    persistentVolumeClaim:
-  #      claimName: whistler-data-pvc
+  #      claimName: data-pvc
 
 templates:
   small:
@@ -61,7 +62,6 @@ templates:
     resources:
       cpu: 500m
       memory: 2Gi
-
 
 userVolume:
   accessMode: ReadWriteMany

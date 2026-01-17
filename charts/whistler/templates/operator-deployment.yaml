@@ -28,6 +28,8 @@ spec:
               value: {{ .Values.userVolume.accessMode | quote }}
             - name: USER_VOLUME_SIZE
               value: {{ .Values.userVolume.size | quote }}
+            - name: OPERATOR_LOG_LEVEL
+              value: "{{ .Values.operator.logLevel }}"
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
           volumeMounts:

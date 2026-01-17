@@ -63,7 +63,7 @@ class KubeConfigManager(ConfigManager):
                 logger.warning("Could not load KubeConfig, standard K8s calls will fail")
         
         self.api = client.CustomObjectsApi()
-        self.group = "whistler.example.com"
+        self.group = "whistler.martinmalmsten.net"
         self.version = "v1"
         self.namespace = os.environ.get("POD_NAMESPACE")
         
@@ -105,8 +105,8 @@ class KubeConfigManager(ConfigManager):
                     "metadata": {
                         "name": ns_name,
                         "labels": {
-                            "whistler.example.com/user": username,
-                            "whistler.example.com/managed": "true"
+                            "whistler.martinmalmsten.net/user": username,
+                            "whistler.martinmalmsten.net/managed": "true"
                         }
                     }
                 }
@@ -509,7 +509,7 @@ class KubeConfigManager(ConfigManager):
         template = None
         try:
             template = custom_api.get_namespaced_custom_object(
-                group="whistler.example.com",
+                group="whistler.martinmalmsten.net",
                 version="v1",
                 namespace=user_ns,
                 plural="whistlertemplates",
@@ -522,7 +522,7 @@ class KubeConfigManager(ConfigManager):
                 if system_ns != user_ns:
                     try:
                         template = custom_api.get_namespaced_custom_object(
-                            group="whistler.example.com",
+                            group="whistler.martinmalmsten.net",
                             version="v1",
                             namespace=system_ns,
                             plural="whistlertemplates",

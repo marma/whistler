@@ -1,9 +1,9 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: whistlertemplates.whistler.example.com
+  name: whistlertemplates.whistler.martinmalmsten.net
 spec:
-  group: whistler.example.com
+  group: whistler.martinmalmsten.net
   versions:
     - name: v1
       served: true
@@ -52,9 +52,9 @@ spec:
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: whistlerinstances.whistler.example.com
+  name: whistlerinstances.whistler.martinmalmsten.net
 spec:
-  group: whistler.example.com
+  group: whistler.martinmalmsten.net
   versions:
     - name: v1
       served: true

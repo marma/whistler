@@ -3,9 +3,9 @@ import kubernetes
 import yaml
 from kubernetes import client, config
 
-@kopf.on.create('whistler.example.com', 'v1', 'whistlerinstances')
-@kopf.on.update('whistler.example.com', 'v1', 'whistlerinstances')
-@kopf.on.resume('whistler.example.com', 'v1', 'whistlerinstances')
+@kopf.on.create('whistler.martinmalmsten.net', 'v1', 'whistlerinstances')
+@kopf.on.update('whistler.martinmalmsten.net', 'v1', 'whistlerinstances')
+@kopf.on.resume('whistler.martinmalmsten.net', 'v1', 'whistlerinstances')
 def reconcile_fn(spec, name, namespace, logger, meta, **kwargs):
     if meta.get('deletionTimestamp'):
         logger.info(f"Skipping reconcile for deleting instance {name}")
@@ -15,7 +15,7 @@ def reconcile_fn(spec, name, namespace, logger, meta, **kwargs):
     # The pod will be created on demand when the user connects.
     logger.info(f"Reconciling instance {name} (lazy creation mode)")
 
-@kopf.on.delete('whistler.example.com', 'v1', 'whistlerinstances')
+@kopf.on.delete('whistler.martinmalmsten.net', 'v1', 'whistlerinstances')
 def delete_fn(spec, name, namespace, logger, **kwargs):
     logger.info(f"Deleting instance {name}")
     # Explicitly delete pod to ensure cleanup, even though GC should handle it
