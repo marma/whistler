@@ -23,8 +23,7 @@ Whistler has the following features:
 ### Installation through Helm Chart
 
 ```bash
-helm repo add whistler https://github.com/marma/whistler
-helm install whistler whistler/whistler
+helm install whistler oci://ghcr.io/marma/charts/whistler
 ```
 
 Example `values.yaml`:
