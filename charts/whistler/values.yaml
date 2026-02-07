@@ -38,6 +38,11 @@ whistler:
     # - name: someuser
     #   publicKeys:
     #     - "ssh-rsa ..."
+    #   securityContext:
+    #     fsGroup: 1001
+    #     runAsUser: 1001
+    #     ...
+
 
   node_selectors:
     - name: GPU type

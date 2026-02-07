@@ -641,6 +641,10 @@ class KubeConfigManager(ConfigManager):
             }
         }
         
+        user_details = self.get_user(username)
+        if user_details and "securityContext" in user_details:
+            pod_body["spec"]["securityContext"] = user_details["securityContext"]
+        
         if preemptible:
             pod_body["spec"]["priorityClassName"] = "whistler-preemptible"
         

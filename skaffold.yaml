@@ -17,13 +17,22 @@ deploy:
         createNamespace: true
         valuesFiles:
           - charts/whistler/values.yaml
-          - charts/whistler/values.dev.yaml
         setValues:
-          whistler.auth.allowAny: true
+          whistler.auth.allowAny: false
           server.service.type: NodePort
           server.service.nodePort: 30022
           userVolume.accessMode: ReadWriteOnce
           userVolume.size: 10Mi
+          whistler.volumes[0].name: data
+          whistler.volumes[0].persistentVolumeClaim.claimName: whistler-data-pvc
+          whistler.volumes[1].name: data2
+          whistler.volumes[1].persistentVolumeClaim.claimName: whistler-data2-pvc
+          # Example: Configure securityContext for a user
+          #whistler.users[0].name: someuser
+          #whistler.users[0].publicKeys[0]: "ssh-ed25519 ..."
+          #whistler.users[0].securityContext.fsGroup: 1001
+          #whistler.users[0].securityContext.runAsGroup: 1001
+          #whistler.users[0].securityContext.runAsUser: 1001
         setValueTemplates:
           image.repository: "{{.IMAGE_REPO_whistler}}"
           image.tag: "{{.IMAGE_TAG_whistler}}"
