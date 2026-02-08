@@ -1,7 +1,10 @@
 image:
   repository: ghcr.io/marma/whistler
   pullPolicy: IfNotPresent
-  tag: "latest"
+  tag: "dev"
+
+namespaceCreate: true
+
 
 operator:
   enabled: true

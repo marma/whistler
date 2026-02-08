@@ -76,18 +76,24 @@ jobs:
           sudo chmod +x /usr/local/bin/yq
         if: startsWith(github.ref, 'refs/tags/v')
 
-      - name: Update Chart.yaml with tag version
+      - name: Update Chart.yaml and values.yaml with tag version
         run: |
           # Extract version from tag (e.g., v0.2.0 -> 0.2.0)
           VERSION=$(echo ${{ github.ref_name }} | sed 's/^v//')
-          echo "Updating Chart.yaml to version: $VERSION"
+          echo "Updating Chart.yaml and values.yaml to version: $VERSION"
           
           # Update both version and appVersion in Chart.yaml
           yq eval ".version = \"$VERSION\"" -i charts/whistler/Chart.yaml
           yq eval ".appVersion = \"$VERSION\"" -i charts/whistler/Chart.yaml
           
-          # Display updated Chart.yaml for verification
+          # Update image.tag in values.yaml to match the release tag
+          yq eval ".image.tag = \"${{ github.ref_name }}\"" -i charts/whistler/values.yaml
+          
+          # Display updated files for verification
+          echo "=== Chart.yaml ==="
           cat charts/whistler/Chart.yaml
+          echo "=== values.yaml (image section) ==="
+          yq eval '.image' charts/whistler/values.yaml
         if: startsWith(github.ref, 'refs/tags/v')
 
       - name: Login to GHCR OCI
