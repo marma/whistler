@@ -3,9 +3,6 @@ image:
   pullPolicy: IfNotPresent
   tag: "dev"
 
-namespaceCreate: true
-
-
 operator:
   enabled: true
   replicaCount: 1
