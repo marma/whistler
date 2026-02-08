@@ -86,8 +86,8 @@ jobs:
           yq eval ".version = \"$VERSION\"" -i charts/whistler/Chart.yaml
           yq eval ".appVersion = \"$VERSION\"" -i charts/whistler/Chart.yaml
           
-          # Update image.tag in values.yaml to match the release tag
-          yq eval ".image.tag = \"${{ github.ref_name }}\"" -i charts/whistler/values.yaml
+          # Update image.tag in values.yaml to match the Docker image tag (without 'v' prefix)
+          yq eval ".image.tag = \"$VERSION\"" -i charts/whistler/values.yaml
           
           # Display updated files for verification
           echo "=== Chart.yaml ==="
