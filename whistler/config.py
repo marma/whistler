@@ -49,6 +49,14 @@ class ConfigManager(ABC):
     def get_volumes(self) -> List[Dict[str, Any]]:
         pass
 
+    @abstractmethod
+    def get_server_host_key(self, secret_name: str) -> Optional[bytes]:
+        pass
+
+    @abstractmethod
+    def save_server_host_key(self, secret_name: str, key_data: bytes) -> bool:
+        pass
+
 class KubeConfigManager(ConfigManager):
     def __init__(self, kubeconfig: str = None):
         try:
@@ -667,3 +675,62 @@ class KubeConfigManager(ConfigManager):
             else:
                 logger.error(f"Failed to create pod: {e}")
                 return False
+
+
+    def get_server_host_key(self, secret_name: str) -> Optional[bytes]:
+        try:
+            api = CoreV1Api()
+            secret = api.read_namespaced_secret(secret_name, self.namespace)
+            
+            # secret.data is a dictionary where values are base64-decoded bytes (if using client python models)
+            # Wait, kubernetes python client automatically decodes base64 data in .data?
+            # No, usually .data contains base64 encoded strings, but read_namespaced_secret returns a V1Secret object.
+            # let's check V1Secret.data type. It's dict(str, str).
+            # Actually, the python client MIGHT decode it if we access it a certain way, or we need to decode it.
+            # Let's verify. standard client returns base64 strings in .data.
+            # WAIT. CoreV1Api.read_namespaced_secret returns V1Secret.
+            # V1Secret.data -> 'The value is base64 encoded strings.'
+            
+            if secret.data and 'host_key' in secret.data:
+                import base64
+                return base64.b64decode(secret.data['host_key'])
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to get host key secret: {e}")
+        except Exception as e:
+            logger.error(f"Error reading host key: {e}")
+        return None
+
+    def save_server_host_key(self, secret_name: str, key_data: bytes) -> bool:
+        import base64
+        encoded = base64.b64encode(key_data).decode('utf-8')
+        
+        body = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": secret_name,
+                "namespace": self.namespace
+            },
+            "type": "Opaque",
+            "data": {
+                "host_key": encoded
+            }
+        }
+        
+        api = CoreV1Api()
+        try:
+            try:
+                api.read_namespaced_secret(secret_name, self.namespace)
+                # Update
+                api.patch_namespaced_secret(secret_name, self.namespace, body)
+            except ApiException as e:
+                if e.status == 404:
+                    # Create
+                    api.create_namespaced_secret(self.namespace, body)
+                else:
+                    raise e
+            return True
+        except ApiException as e:
+             logger.error(f"Failed to save host key secret: {e}")
+             return False

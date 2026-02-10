@@ -14,6 +14,9 @@ spec:
     metadata:
       labels:
         app: whistler-server
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/users: {{ include (print $.Template.BasePath "/users-secret.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ .Release.Name }}-server
       containers:
@@ -36,6 +39,8 @@ spec:
               value: "{{ .Values.whistler.auth.allowAny }}"
             - name: WHISTLER_LOG_LEVEL
               value: "{{ .Values.server.logLevel }}"
+            - name: WHISTLER_HOST_KEY_SECRET_NAME
+              value: "{{ .Release.Name }}-server-host-key"
           ports:
             - containerPort: 8022
               name: ssh

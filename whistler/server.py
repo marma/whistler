@@ -216,8 +216,44 @@ async def start_server():
     # Create a partial to pass config_manager to SSHServer
     server_factory = partial(SSHServer, config_manager=config_manager)
 
+    # Handle Host Key Persistence
+    host_key_path = 'ssh_host_key'
+    secret_name = os.environ.get("WHISTLER_HOST_KEY_SECRET_NAME")
+    
+    if secret_name:
+        logger.info(f"Checking for persisted host key in secret {secret_name}")
+        key_data = config_manager.get_server_host_key(secret_name)
+        
+        if key_data:
+            logger.info("Found persisted host key, using it.")
+            with open(host_key_path, 'wb') as f:
+                f.write(key_data)
+            # Ensure permissions
+            os.chmod(host_key_path, 0o600)
+        else:
+            logger.info("No persisted host key found or failed to load. Generating new one.")
+            # Generate new key
+            # asyncssh.create_server will generate one if file is missing, but we want to save it.
+            # So we generate it manually first if not present on disk either
+            if not os.path.exists(host_key_path):
+                 from asyncssh.public_key import generate_private_key
+                 key = generate_private_key('ssh-rsa')
+                 key_data = key.export_private_key()
+                 with open(host_key_path, 'wb') as f:
+                     f.write(key_data)
+                 os.chmod(host_key_path, 0o600)
+            
+            # Read it back to save to secret
+            with open(host_key_path, 'rb') as f:
+                key_data = f.read()
+            
+            if config_manager.save_server_host_key(secret_name, key_data):
+                logger.info(f"Persisted new host key to secret {secret_name}")
+            else:
+                logger.error(f"Failed to persist host key to secret {secret_name}")
+
     await asyncssh.create_server(server_factory, '', 8022,
-                                 server_host_keys=['ssh_host_key'],
+                                 server_host_keys=[host_key_path],
                                  line_editor=False,
                                  agent_forwarding=True,
                                  keepalive_interval=30,
