@@ -630,8 +630,6 @@ class KubeConfigManager(ConfigManager):
                     
                 volume_mounts.append(mount_def)
                 
-                logger.info(f"Volume Mount:\n{yaml.safe_dump(mount_def)}")
-
         pod_body = {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -676,6 +674,8 @@ class KubeConfigManager(ConfigManager):
         if preemptible:
             pod_body["spec"]["priorityClassName"] = "whistler-preemptible"
         
+        logger.debug(f"Creating Pod:\n{yaml.safe_dump(pod_body)}")
+
         core_api = client.CoreV1Api()
         try:
             core_api.create_namespaced_pod(user_ns, pod_body)
