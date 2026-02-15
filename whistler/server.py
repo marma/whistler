@@ -206,7 +206,8 @@ async def start_server():
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        stream=sys.stderr
+        stream=sys.stderr,
+        force=True
     )
     logger = logging.getLogger("whistler.server")
     logger.info(f"Starting in Kubernetes mode ({mode}) with log level {log_level}")
@@ -1649,8 +1650,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
 
 if __name__ == '__main__':
-    import logging
-    logging.basicConfig(level=logging.INFO)
+
     asyncssh.set_debug_level(2)
 
     # Generate a host key if it doesn't exist
