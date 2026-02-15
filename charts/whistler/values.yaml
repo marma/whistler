@@ -59,6 +59,10 @@ whistler:
   #  - name: data
   #    persistentVolumeClaim:
   #      claimName: data-pvc
+  #  - name: dataset
+  #    subPath: training_data
+  #    persistentVolumeClaim:
+  #      claimName: large-dataset-pvc
 
 templates:
   small:

@@ -606,11 +606,28 @@ class KubeConfigManager(ConfigManager):
                 if vol_name == "data":
                     continue
                 
-                pod_volumes.append(available_volumes[vol_name])
-                volume_mounts.append({
+                vol_def = available_volumes[vol_name]
+                
+                # Check for subPath
+                sub_path = vol_def.get("subPath")
+                
+                # Create a clean volume definition for the Pod spec (without subPath)
+                # We copy it to avoid modifying the original definition in available_volumes
+                clean_vol_def = vol_def.copy()
+                if "subPath" in clean_vol_def:
+                    del clean_vol_def["subPath"]
+                
+                pod_volumes.append(clean_vol_def)
+                
+                mount_def = {
                     "name": vol_name,
                     "mountPath": mount_path
-                })
+                }
+                
+                if sub_path:
+                    mount_def["subPath"] = sub_path
+                    
+                volume_mounts.append(mount_def)
 
         pod_body = {
             "apiVersion": "v1",
