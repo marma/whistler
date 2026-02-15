@@ -603,6 +603,7 @@ class KubeConfigManager(ConfigManager):
         # Process requested volumes
         for vol_name, mount_path in requested_volumes.items():
             if vol_name in available_volumes:
+                # TODO: Remove this hack, we should not have a hardcoded volume named "data"
                 if vol_name == "data":
                     continue
                 
@@ -628,6 +629,8 @@ class KubeConfigManager(ConfigManager):
                     mount_def["subPath"] = sub_path
                     
                 volume_mounts.append(mount_def)
+                
+                logger.info(f"Volume Mount:\n{yaml.safe_dump(mount_def)}")
 
         pod_body = {
             "apiVersion": "v1",
