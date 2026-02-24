@@ -42,6 +42,10 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
+    def delete_template(self, username: str, template_name: str) -> bool:
+        pass
+
+    @abstractmethod
     def get_selectors(self) -> Dict[str, Any]:
         pass
 
@@ -398,6 +402,19 @@ class KubeConfigManager(ConfigManager):
             return True
         except ApiException as e:
             logger.error(f"Failed to delete instance: {e}")
+            return False
+
+    def delete_template(self, username: str, template_name: str) -> bool:
+        logger.info(f"Attempting to delete template {username}-{template_name}")
+        print(f"Deleting template {username}-{template_name}", file=stderr, flush=True)
+        user_ns = self._get_user_namespace(username)
+        try:
+            self.api.delete_namespaced_custom_object(
+                self.group, self.version, user_ns, "whistlertemplates", f"{username}-{template_name}"
+            )
+            return True
+        except ApiException as e:
+            logger.error(f"Failed to delete template: {e}")
             return False
 
     def _load_selectors(self):

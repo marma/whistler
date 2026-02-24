@@ -627,7 +627,7 @@ class WhistlerApp(App):
         Binding("n", "create_template", "New Template"),
         Binding("c", "connect_instance", "Connect"),
         Binding("i", "instantiate", "Create Instance"),
-        Binding("D", "delete_instance", "Delete Instance"),
+        Binding("D", "delete", "Delete"),
         Binding("r", "refresh", "refresh"),
     ]
 
@@ -951,32 +951,60 @@ class WhistlerApp(App):
         except Exception:
             return None
 
-    def action_delete_instance(self) -> None:
+    def action_delete(self) -> None:
+        templates_table = self.query_one("#templates_table", DataTable)
         instances_table = self.query_one("#instances_table", DataTable)
-        if not instances_table.has_focus:
-            self.notify("Select an instance first.")
-            return
 
-        instance_name = self._get_selected_instance()
-        if not instance_name:
-            self.notify("No instance selected.")
-            return
+        if templates_table.has_focus:
+            template = self._get_selected_template()
+            if not template:
+                self.notify("No template selected.")
+                return
+            
+            if template.get("source") == "system":
+                self.notify("Cannot delete system templates.", severity="error")
+                return
 
-        self.notify(f"Deleting instance {instance_name}...")
-        
-        async def do_delete():
-            loop = asyncio.get_running_loop()
-            success = await loop.run_in_executor(
-                None,
-                lambda: self.config_manager.delete_instance(self.username, instance_name)
-            )
-            if success:
-                self.notify(f"Instance {instance_name} deleted.")
-                asyncio.create_task(self._refresh_async())
-            else:
-                self.notify(f"Failed to delete instance {instance_name}.", severity="error")
-        
-        asyncio.create_task(do_delete())
+            template_name = template["name"]
+            self.notify(f"Deleting template {template_name}...")
+            
+            async def do_delete():
+                loop = asyncio.get_running_loop()
+                success = await loop.run_in_executor(
+                    None,
+                    lambda: self.config_manager.delete_template(self.username, template_name)
+                )
+                if success:
+                    self.notify(f"Template {template_name} deleted.")
+                    asyncio.create_task(self._refresh_async())
+                else:
+                    self.notify(f"Failed to delete template {template_name}.", severity="error")
+            
+            asyncio.create_task(do_delete())
+
+        elif instances_table.has_focus:
+            instance_name = self._get_selected_instance()
+            if not instance_name:
+                self.notify("No instance selected.")
+                return
+
+            self.notify(f"Deleting instance {instance_name}...")
+            
+            async def do_delete():
+                loop = asyncio.get_running_loop()
+                success = await loop.run_in_executor(
+                    None,
+                    lambda: self.config_manager.delete_instance(self.username, instance_name)
+                )
+                if success:
+                    self.notify(f"Instance {instance_name} deleted.")
+                    asyncio.create_task(self._refresh_async())
+                else:
+                    self.notify(f"Failed to delete instance {instance_name}.", severity="error")
+            
+            asyncio.create_task(do_delete())
+        else:
+            self.notify("Select a template or instance first.")
 
     async def _refresh_async(self):
         await self._update_cache()
