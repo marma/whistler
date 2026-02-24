@@ -625,10 +625,10 @@ class WhistlerApp(App):
         Binding("q", "quit", "Quit"),
         Binding("d", "toggle_dark", "Toggle dark"),
         Binding("n", "create_template", "New Template"),
-        Binding("c", "connect_instance", "Connect"),
+        #Binding("c", "connect_instance", "Connect"),
         Binding("i", "instantiate", "Create Instance"),
         Binding("D", "delete", "Delete"),
-        Binding("r", "refresh", "refresh"),
+        Binding("r", "refresh", "Refresh"),
     ]
 
 
