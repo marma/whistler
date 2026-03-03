@@ -10,4 +10,6 @@ data:
 {{ toYaml .Values.whistler.node_selectors | indent 4 }}
   volumes.yaml: |
 {{ toYaml .Values.whistler.volumes | indent 4 }}
+  networkpolicy.yaml: |
+{{ toYaml .Values.whistler.networkPolicy | indent 4 }}
 

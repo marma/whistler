@@ -97,6 +97,9 @@ class KubeConfigManager(ConfigManager):
         self.volume_definitions = {}
         self._load_volumes()
 
+        self.network_policy_egress = {"allowCIDRs": [], "blockCIDRs": []}
+        self._load_network_policy()
+
     def _get_user_namespace(self, username: str) -> str:
         return f"whistler-user-{username}"
 
@@ -128,27 +131,30 @@ class KubeConfigManager(ConfigManager):
 
         # Ensure NetworkPolicy
         policy_name = "isolate-user-pods"
+        policy_body = {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": policy_name,
+                "namespace": ns_name
+            },
+            "spec": {
+                "podSelector": {},
+                "policyTypes": ["Ingress", "Egress"],
+                "ingress": [],  # Deny all ingress
+                "egress": self._build_egress_rules()
+            }
+        }
         try:
             net_api.read_namespaced_network_policy(policy_name, ns_name)
+            logger.info(f"Updating NetworkPolicy {policy_name} in {ns_name}")
+            net_api.replace_namespaced_network_policy(policy_name, ns_name, policy_body)
         except ApiException as e:
             if e.status == 404:
                 logger.info(f"Creating NetworkPolicy {policy_name} in {ns_name}")
-                policy_body = {
-                    "apiVersion": "networking.k8s.io/v1",
-                    "kind": "NetworkPolicy",
-                    "metadata": {
-                        "name": policy_name,
-                        "namespace": ns_name
-                    },
-                    "spec": {
-                        "podSelector": {},
-                        "policyTypes": ["Ingress"],
-                        "ingress": [] # Deny all ingress
-                    }
-                }
                 net_api.create_namespaced_network_policy(ns_name, policy_body)
             else:
-                pass # Ignore other errors or assume it exists
+                raise
         
         return ns_name
 
@@ -453,6 +459,44 @@ class KubeConfigManager(ConfigManager):
     def get_volumes(self):
         self._load_volumes()
         return self.volumes
+
+    def _load_network_policy(self):
+        try:
+            with open("/etc/whistler-config/networkpolicy.yaml", "r") as f:
+                data = yaml.safe_load(f)
+                if data and "egress" in data:
+                    self.network_policy_egress = data["egress"]
+        except FileNotFoundError:
+            pass  # Use defaults (deny-all egress except DNS)
+        except Exception as e:
+            logger.error(f"Failed to load networkpolicy.yaml: {e}")
+
+    def _build_egress_rules(self) -> list:
+        rules = []
+
+        # DNS is always allowed so pods can resolve hostnames
+        rules.append({
+            "ports": [
+                {"port": 53, "protocol": "UDP"},
+                {"port": 53, "protocol": "TCP"}
+            ]
+        })
+
+        # Whitelist: explicit allow rules per destination CIDR
+        for entry in self.network_policy_egress.get("allowCIDRs", []) or []:
+            rule = {"to": [{"ipBlock": {"cidr": entry["cidr"]}}]}
+            if "ports" in entry:
+                rule["ports"] = entry["ports"]
+            rules.append(rule)
+
+        # Blacklist: allow 0.0.0.0/0 except the specified CIDRs
+        block_cidrs = self.network_policy_egress.get("blockCIDRs", []) or []
+        if block_cidrs:
+            rules.append({
+                "to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": block_cidrs}}]
+            })
+
+        return rules
 
     def _ensure_pvc(self, user, namespace, logger=None):
         pvc_name = f"whistler-data-{user}"

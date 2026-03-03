@@ -56,6 +56,10 @@ spec:
               mountPath: "/etc/whistler-config/volumes.yaml"
               subPath: "volumes.yaml"
               readOnly: true
+            - name: selectors-config
+              mountPath: "/etc/whistler-config/networkpolicy.yaml"
+              subPath: "networkpolicy.yaml"
+              readOnly: true
 
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}

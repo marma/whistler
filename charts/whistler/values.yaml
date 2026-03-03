@@ -29,7 +29,7 @@ server:
     requests:
       cpu: 2000m
       memory: 1Gi
-  logLevel: ERROR
+  logLevel: DEBUG
 
 whistler:
   auth:
@@ -43,6 +43,29 @@ whistler:
     #     runAsUser: 1001
     #     ...
 
+
+  networkPolicy:
+    egress:
+      # allowCIDRs: whitelist specific destinations. Each entry becomes an egress rule.
+      # If ports is omitted, all ports are allowed to that CIDR.
+      # Use this for strict control (default-deny + explicit allows).
+      allowCIDRs: []
+      #   - cidr: 203.0.113.0/24          # allow all ports to this CIDR
+      #   - cidr: 0.0.0.0/0               # allow internet
+      #     ports:
+      #       - port: 443
+      #         protocol: TCP
+      #       - port: 80
+      #         protocol: TCP
+
+      # blockCIDRs: blacklist specific destinations.
+      # Generates a rule allowing 0.0.0.0/0 EXCEPT these CIDRs.
+      # Use this for broad access (allow internet but block internal ranges).
+      # Note: if allowCIDRs is also set, its rules are evaluated independently (OR logic).
+      blockCIDRs: []
+      #   - 10.0.0.0/8
+      #   - 172.16.0.0/12
+      #   - 192.168.0.0/16
 
   node_selectors:
     - name: GPU type
