@@ -28,11 +28,8 @@ deploy:
           whistler.volumes[1].name: data2
           whistler.volumes[1].persistentVolumeClaim.claimName: whistler-data2-pvc
           # Example: Configure securityContext for a user
-          #whistler.users[0].name: someuser
-          #whistler.users[0].publicKeys[0]: "ssh-ed25519 ..."
-          #whistler.users[0].securityContext.fsGroup: 1001
-          #whistler.users[0].securityContext.runAsGroup: 1001
-          #whistler.users[0].securityContext.runAsUser: 1001
+          whistler.users[0].name: marma
+          whistler.users[0].publicKeys[0]: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMNj07CelG2QAh7IogB+vlS4tRjuxOTr3mt0z3fX8jlX marma"
         setValueTemplates:
           image.repository: "{{.IMAGE_REPO_whistler}}"
           image.tag: "{{.IMAGE_TAG_whistler}}"
