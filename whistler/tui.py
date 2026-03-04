@@ -221,13 +221,16 @@ class TemplateEditScreen(ModalScreen):
                  options = [(v, v) for v in values]
                  
                  # Current value
-                 current_val = node_selector.get(key, Select.BLANK)
-                 
+                 current_val = node_selector.get(key)
+
                  # Widget ID
                  widget_id = f"sel_{i}"
-                 
+
                  dynamic_widgets.append(Label(f"{name}:"))
-                 dynamic_widgets.append(Select(options, value=current_val, prompt=f"Select {name}", id=widget_id))
+                 if current_val is not None and current_val in values:
+                     dynamic_widgets.append(Select(options, value=current_val, allow_blank=True, prompt=f"Select {name}", id=widget_id))
+                 else:
+                     dynamic_widgets.append(Select(options, allow_blank=True, prompt=f"Select {name}", id=widget_id))
 
         yield Container(
             Label("Template Details", classes="header"),
