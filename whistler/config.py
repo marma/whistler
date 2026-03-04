@@ -7,6 +7,7 @@ from kubernetes import client, config as k8s_config
 from kubernetes.client import CoreV1Api, NetworkingV1Api
 from kubernetes.client.rest import ApiException
 from sys import stderr
+import ipaddress
 import os
 import yaml
 
@@ -145,6 +146,7 @@ class KubeConfigManager(ConfigManager):
                 "egress": self._build_egress_rules()
             }
         }
+        logger.debug(f"Applying NetworkPolicy {policy_name} in {ns_name}:\n{yaml.dump(policy_body, default_flow_style=False)}")
         try:
             net_api.read_namespaced_network_policy(policy_name, ns_name)
             logger.info(f"Updating NetworkPolicy {policy_name} in {ns_name}")
@@ -489,12 +491,23 @@ class KubeConfigManager(ConfigManager):
                 rule["ports"] = entry["ports"]
             rules.append(rule)
 
-        # Blacklist: allow 0.0.0.0/0 except the specified CIDRs
+        # Blacklist: compute the complement CIDRs explicitly rather than using
+        # ipBlock.except, which is silently ignored by several CNI plugins.
         block_cidrs = self.network_policy_egress.get("blockCIDRs", []) or []
         if block_cidrs:
-            rules.append({
-                "to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": block_cidrs}}]
-            })
+            remaining = [ipaddress.IPv4Network("0.0.0.0/0")]
+            for block in block_cidrs:
+                block_net = ipaddress.IPv4Network(block, strict=False)
+                new_remaining = []
+                for net in remaining:
+                    if net.overlaps(block_net):
+                        new_remaining.extend(net.address_exclude(block_net))
+                    else:
+                        new_remaining.append(net)
+                remaining = new_remaining
+            allowed = [str(net) for net in remaining]
+            logger.debug(f"blockCIDRs {block_cidrs} → complement allowCIDRs: {allowed}")
+            rules.append({"to": [{"ipBlock": {"cidr": cidr}} for cidr in allowed]})
 
         return rules
 
