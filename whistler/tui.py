@@ -6,7 +6,7 @@ from textual.screen import ModalScreen, Screen
 import asyncio
 
 class InstanceCreateScreen(ModalScreen):
-    BINDINGS = [("escape", "app.pop_screen", "Close")]
+    BINDINGS = [("escape,q", "app.pop_screen", "Close")]
     
     CSS = """
     InstanceCreateScreen {
@@ -90,7 +90,7 @@ class InstanceCreateScreen(ModalScreen):
             self.dismiss(None)
 
 class TemplateEditScreen(ModalScreen):
-    BINDINGS = [("escape", "app.pop_screen", "Cancel")]
+    BINDINGS = [("escape,q", "app.pop_screen", "Cancel")]
     
     CSS = """
     TemplateEditScreen {
@@ -357,7 +357,7 @@ class TemplateEditScreen(ModalScreen):
             self.dismiss(None)
 
 class TemplateViewScreen(ModalScreen):
-    BINDINGS = [("escape", "app.pop_screen", "Close"), ("e", "edit", "Edit Template")]
+    BINDINGS = [("escape,q", "app.pop_screen", "Close"), ("e", "edit", "Edit Template")]
     
     CSS = """
     TemplateViewScreen {
@@ -1005,6 +1005,9 @@ class WhistlerApp(App):
             asyncio.create_task(do_delete())
         else:
             self.notify("Select a template or instance first.")
+
+    def action_refresh(self) -> None:
+        asyncio.create_task(self._refresh_async())
 
     async def _refresh_async(self):
         await self._update_cache()
