@@ -6,12 +6,21 @@ from abc import ABC, abstractmethod
 from kubernetes import client, config as k8s_config
 from kubernetes.client import CoreV1Api, NetworkingV1Api
 from kubernetes.client.rest import ApiException
-from sys import stderr
 import ipaddress
 import os
 import yaml
 
 logger = logging.getLogger(__name__)
+
+# Config file locations. Defaults match the in-cluster mount paths used by the
+# Helm chart; override via env so the server/operator can run as host processes
+# (e.g. local k3d integration testing) without writing to /etc.
+USERS_FILE = os.environ.get("WHISTLER_USERS_FILE", "/etc/whistler/users.yaml")
+CONFIG_DIR = os.environ.get("WHISTLER_CONFIG_DIR", "/etc/whistler-config")
+SELECTORS_FILE = os.path.join(CONFIG_DIR, "selectors.yaml")
+VOLUMES_FILE = os.path.join(CONFIG_DIR, "volumes.yaml")
+NETWORKPOLICY_FILE = os.path.join(CONFIG_DIR, "networkpolicy.yaml")
+
 
 class ConfigManager(ABC):
     @abstractmethod
@@ -162,14 +171,14 @@ class KubeConfigManager(ConfigManager):
 
     def _load_users(self):
         try:
-            with open("/etc/whistler/users.yaml", "r") as f:
+            with open(USERS_FILE, "r") as f:
                 import yaml
                 data = yaml.safe_load(f)
                 if data:
                     for u in data:
                         self.users[u["name"]] = u
         except FileNotFoundError:
-            logger.warning("No users.yaml found at /etc/whistler/users.yaml")
+            logger.warning(f"No users.yaml found at {USERS_FILE}")
         except Exception as e:
             logger.error(f"Failed to load users: {e}")
 
@@ -368,8 +377,7 @@ class KubeConfigManager(ConfigManager):
                 "volumes": template_data.get("volumes")
             }
         }
-        import sys
-        print(f"DEBUG: Saving template body: {body}", file=sys.stderr)
+        logger.debug(f"Saving template body: {body}")
         try:
             # Check if exists to update, or create
             try:
@@ -401,7 +409,6 @@ class KubeConfigManager(ConfigManager):
 
     def delete_instance(self, username: str, instance_name: str) -> bool:
         logger.info(f"Attempting to delete instance {username}-{instance_name}")
-        print(f"Deleting instance {username}-{instance_name}", file=stderr, flush=True)
         user_ns = self._get_user_namespace(username)
         try:
             self.api.delete_namespaced_custom_object(
@@ -414,7 +421,6 @@ class KubeConfigManager(ConfigManager):
 
     def delete_template(self, username: str, template_name: str) -> bool:
         logger.info(f"Attempting to delete template {username}-{template_name}")
-        print(f"Deleting template {username}-{template_name}", file=stderr, flush=True)
         user_ns = self._get_user_namespace(username)
         try:
             self.api.delete_namespaced_custom_object(
@@ -427,13 +433,13 @@ class KubeConfigManager(ConfigManager):
 
     def _load_selectors(self):
         try:
-            with open("/etc/whistler-config/selectors.yaml", "r") as f:
+            with open(SELECTORS_FILE, "r") as f:
                 import yaml
                 data = yaml.safe_load(f)
                 if data:
                     self.selectors = data
         except FileNotFoundError:
-            logger.warning("No selectors.yaml found at /etc/whistler-config/selectors.yaml")
+            logger.warning(f"No selectors.yaml found at {SELECTORS_FILE}")
         except Exception as e:
             logger.error(f"Failed to load selectors: {e}")
 
@@ -442,7 +448,7 @@ class KubeConfigManager(ConfigManager):
 
     def _load_volumes(self):
         try:
-            with open("/etc/whistler-config/volumes.yaml", "r") as f:
+            with open(VOLUMES_FILE, "r") as f:
                 import yaml
                 data = yaml.safe_load(f)
                 if data and isinstance(data, list):
@@ -452,7 +458,7 @@ class KubeConfigManager(ConfigManager):
                     self.volumes = []
                     self.volume_definitions = {}
         except FileNotFoundError:
-            logger.warning("No volumes.yaml found at /etc/whistler-config/volumes.yaml")
+            logger.warning(f"No volumes.yaml found at {VOLUMES_FILE}")
         except Exception as e:
             logger.error(f"Failed to load volumes: {e}")
             self.volumes = []
@@ -464,7 +470,7 @@ class KubeConfigManager(ConfigManager):
 
     def _load_network_policy(self):
         try:
-            with open("/etc/whistler-config/networkpolicy.yaml", "r") as f:
+            with open(NETWORKPOLICY_FILE, "r") as f:
                 data = yaml.safe_load(f)
                 if data and "egress" in data:
                     self.network_policy_egress = data["egress"]
@@ -557,11 +563,138 @@ class KubeConfigManager(ConfigManager):
 
     def _load_volume_definitions_from_file(self):
         try:
-            with open("/etc/whistler-config/volumes.yaml", "r") as f:
+            with open(VOLUMES_FILE, "r") as f:
                 data = yaml.safe_load(f)
                 return {v['name']: v for v in data} if data else {}
         except Exception:
             return {}
+
+    def _build_pod_spec(self, *, full_instance_name, hostname, username, uid,
+                        template_spec, pvc_name, available_volumes, user_details,
+                        preemptible):
+        """Build the Pod manifest for an instance from already-resolved inputs.
+
+        Pure function of its arguments (no Kubernetes API calls), so the
+        volume / securityContext / resource / ownerReference wiring can be
+        unit-tested without a cluster. ``ensure_pod`` does the API work and
+        delegates the manifest assembly here.
+        """
+        image = template_spec.get('image', 'ubuntu:latest')
+        resources = template_spec.get('resources', {})
+        node_selector = template_spec.get('nodeSelector', {})
+        personal_mount_path = template_spec.get('personalMountPath', '/userdata')
+        requested_volumes = template_spec.get('volumes', {}) or {}
+
+        # Construct resource requirements
+        resource_reqs = {}
+        if resources:
+            requests = {}
+            limits = {}
+
+            if 'cpu' in resources:
+                requests['cpu'] = resources['cpu']
+                limits['cpu'] = resources['cpu']
+            if 'memory' in resources:
+                requests['memory'] = resources['memory']
+                limits['memory'] = resources['memory']
+            if 'gpu' in resources:
+                limits['nvidia.com/gpu'] = resources['gpu']
+
+            if requests:
+                resource_reqs['requests'] = requests
+            if limits:
+                resource_reqs['limits'] = limits
+
+        pod_volumes = [
+            {
+                "name": "data",
+                "persistentVolumeClaim": {
+                    "claimName": pvc_name
+                }
+            }
+        ]
+
+        volume_mounts = [
+            {
+                "name": "data",
+                "mountPath": personal_mount_path
+            }
+        ]
+
+        # Process requested volumes
+        for vol_name, mount_path in requested_volumes.items():
+            if vol_name in available_volumes:
+                # TODO: Remove this hack, we should not have a hardcoded volume named "data"
+                if vol_name == "data":
+                    continue
+
+                vol_def = available_volumes[vol_name]
+
+                # Check for subPath
+                sub_path = vol_def.get("subPath")
+
+                # Create a clean volume definition for the Pod spec (without subPath)
+                # We copy it to avoid modifying the original definition in available_volumes
+                clean_vol_def = vol_def.copy()
+                if "subPath" in clean_vol_def:
+                    del clean_vol_def["subPath"]
+
+                pod_volumes.append(clean_vol_def)
+
+                mount_def = {
+                    "name": vol_name,
+                    "mountPath": mount_path
+                }
+
+                if sub_path:
+                    mount_def["subPath"] = sub_path
+
+                volume_mounts.append(mount_def)
+
+        pod_body = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": full_instance_name,
+                "labels": {
+                    "app": "whistler-instance",
+                    "instance": full_instance_name,
+                    "user": username
+                },
+                "ownerReferences": [{
+                    "apiVersion": f"{self.group}/{self.version}",
+                    "kind": "WhistlerInstance",
+                    "name": full_instance_name,
+                    "uid": uid,
+                    "controller": True,
+                    "blockOwnerDeletion": True
+                }]
+            },
+            "spec": {
+                "containers": [
+                    {
+                        "name": "main",
+                        "image": image,
+                        "command": ["sleep", "3600"],
+                        "resources": resource_reqs,
+                        "volumeMounts": volume_mounts
+                    }
+                ],
+                "volumes": pod_volumes,
+                "nodeSelector": node_selector,
+                "hostname": hostname,
+                "subdomain": "whistler",
+                "automountServiceAccountToken": False
+            }
+        }
+
+        if user_details and "securityContext" in user_details:
+            pod_body["spec"]["securityContext"] = user_details["securityContext"]
+
+        if preemptible:
+            pod_body["spec"]["priorityClassName"] = "whistler-preemptible"
+
+        return pod_body
 
     def ensure_pod(self, username: str, instance_name: str) -> bool:
         """
@@ -618,136 +751,26 @@ class KubeConfigManager(ConfigManager):
             return False
             
         template_spec = template.get('spec', {})
-
-        image = template_spec.get('image', 'ubuntu:latest')
-        resources = template_spec.get('resources', {})
-        node_selector = template_spec.get('nodeSelector', {})
-        personal_mount_path = template_spec.get('personalMountPath', '/userdata')
-        
-        # Construct resource requirements
-        resource_reqs = {}
-        if resources:
-            requests = {}
-            limits = {}
-            
-            if 'cpu' in resources:
-                requests['cpu'] = resources['cpu']
-                limits['cpu'] = resources['cpu']
-            if 'memory' in resources:
-                requests['memory'] = resources['memory']
-                limits['memory'] = resources['memory']
-            if 'gpu' in resources:
-                limits['nvidia.com/gpu'] = resources['gpu']
-                
-            if requests:
-                resource_reqs['requests'] = requests
-            if limits:
-                resource_reqs['limits'] = limits
-        
-        # Use CR name as pod name
         pod_name = full_instance_name
-        hostname = instance_name
-        
+
         # Ensure PVC exists
         try:
             pvc_name = self._ensure_pvc(username, user_ns, logger)
         except Exception:
             return False
-        
-        # Load available volume definitions
-        available_volumes = self._load_volume_definitions_from_file()
-        requested_volumes = template_spec.get('volumes', {})
 
-        pod_volumes = [
-            {
-                "name": "data",
-                "persistentVolumeClaim": {
-                    "claimName": pvc_name
-                }
-            }
-        ]
-        
-        volume_mounts = [
-            {
-                "name": "data",
-                "mountPath": personal_mount_path
-            }
-        ]
+        pod_body = self._build_pod_spec(
+            full_instance_name=full_instance_name,
+            hostname=instance_name,
+            username=username,
+            uid=uid,
+            template_spec=template_spec,
+            pvc_name=pvc_name,
+            available_volumes=self._load_volume_definitions_from_file(),
+            user_details=self.get_user(username),
+            preemptible=preemptible,
+        )
 
-        # Process requested volumes
-        for vol_name, mount_path in requested_volumes.items():
-            if vol_name in available_volumes:
-                # TODO: Remove this hack, we should not have a hardcoded volume named "data"
-                if vol_name == "data":
-                    continue
-                
-                vol_def = available_volumes[vol_name]
-                
-                # Check for subPath
-                sub_path = vol_def.get("subPath")
-                
-                # Create a clean volume definition for the Pod spec (without subPath)
-                # We copy it to avoid modifying the original definition in available_volumes
-                clean_vol_def = vol_def.copy()
-                if "subPath" in clean_vol_def:
-                    del clean_vol_def["subPath"]
-                
-                pod_volumes.append(clean_vol_def)
-                
-                mount_def = {
-                    "name": vol_name,
-                    "mountPath": mount_path
-                }
-                
-                if sub_path:
-                    mount_def["subPath"] = sub_path
-                    
-                volume_mounts.append(mount_def)
-                
-        pod_body = {
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": pod_name,
-                "labels": {
-                    "app": "whistler-instance",
-                    "instance": full_instance_name,
-                    "user": username
-                },
-                "ownerReferences": [{
-                    "apiVersion": f"{self.group}/{self.version}",
-                    "kind": "WhistlerInstance",
-                    "name": full_instance_name,
-                    "uid": uid,
-                    "controller": True,
-                    "blockOwnerDeletion": True
-                }]
-            },
-            "spec": {
-                "containers": [
-                    {
-                        "name": "main",
-                        "image": image,
-                        "command": ["sleep", "3600"],
-                        "resources": resource_reqs,
-                        "volumeMounts": volume_mounts
-                    }
-                ],
-                "volumes": pod_volumes,
-                "nodeSelector": node_selector,
-                "hostname": hostname,
-                "subdomain": "whistler",
-                "automountServiceAccountToken": False
-            }
-        }
-        
-        user_details = self.get_user(username)
-        if user_details and "securityContext" in user_details:
-            pod_body["spec"]["securityContext"] = user_details["securityContext"]
-        
-        if preemptible:
-            pod_body["spec"]["priorityClassName"] = "whistler-preemptible"
-        
         logger.debug(f"Creating Pod:\n{yaml.safe_dump(pod_body)}")
 
         core_api = client.CoreV1Api()

@@ -2,6 +2,10 @@ import asyncio
 import asyncssh
 import sys
 import os
+import logging
+import threading
+from kubernetes import client
+from kubernetes import watch as k8s_watch
 from asyncssh.process import SSHCompletedProcess
 import pty
 import fcntl
@@ -25,6 +29,8 @@ from whistler.config import ConfigManager, KubeConfigManager
 from asyncio import Event
 from textual.worker import Worker, WorkerState
 
+logger = logging.getLogger("whistler.server")
+
 class SubprocessTunnelProtocol(asyncssh.SSHServerSession):
     """Protocol to bridge an SSH channel to a subprocess (e.g. kubectl exec)."""
     def __init__(self, process):
@@ -47,7 +53,7 @@ class SubprocessTunnelProtocol(asyncssh.SSHServerSession):
                     break
                 self.transport.write(data)
         except Exception as e:
-            print(f"Tunnel pipe error: {e}", file=sys.stderr)
+            logger.error(f"Tunnel pipe error: {e}")
         finally:
             if self.transport:
                 self.transport.close()
@@ -69,7 +75,7 @@ class WhistlerDriver(Driver):
         super().__init__(next_driver, debug=debug, size=size)
         self._parser = XTermParser(debug=debug)
         self.exit_event = Event()
-        print("WhistlerDriver initialized", file=sys.stderr, flush=True)
+        logger.debug("WhistlerDriver initialized")
 
     def write(self, data: str | bytes) -> None:
         # print(f"WhistlerDriver.write: {len(data)} bytes: {repr(data)[:50]}", file=sys.stderr, flush=True)
@@ -83,16 +89,16 @@ class WhistlerDriver(Driver):
         pass
 
     def start_application_mode(self) -> None:
-        print("WhistlerDriver.start_application_mode", file=sys.stderr, flush=True)
+        logger.debug("WhistlerDriver.start_application_mode")
         
         # Send initial size event
         size = (80, 24) # Default fallback
         if self._app and hasattr(self._app, 'session') and self._app.session:
              size = self._app.session.initial_term_size
-             print(f"Using initial_term_size from session: {size}", file=sys.stderr, flush=True)
+             logger.info(f"Using initial_term_size from session: {size}")
         elif self._app and hasattr(self._app, 'initial_term_size'):
              size = self._app.initial_term_size
-             print(f"Using initial_term_size from app: {size}", file=sys.stderr, flush=True)
+             logger.info(f"Using initial_term_size from app: {size}")
         elif self._app and self._app.ssh_channel:
              term_size = self._app.ssh_channel.get_terminal_size()
              if term_size:
@@ -114,11 +120,11 @@ class WhistlerDriver(Driver):
         loop.call_later(0.05, self.process_message, event)
 
     def disable_input(self) -> None:
-        print("WhistlerDriver.disable_input", file=sys.stderr, flush=True)
+        logger.debug("WhistlerDriver.disable_input")
         self.exit_event.set()
 
     def stop_application_mode(self) -> None:
-        print("WhistlerDriver.stop_application_mode", file=sys.stderr, flush=True)
+        logger.debug("WhistlerDriver.stop_application_mode")
         self.write("\x1b[?1000l") # Disable mouse support
         self.write("\x1b[?1006l")
         self.write("\x1b[?1015l")
@@ -139,11 +145,11 @@ class WhistlerDriver(Driver):
             self._app.post_message(event)
 
     def disable_input(self) -> None:
-        print("WhistlerDriver.disable_input", file=sys.stderr, flush=True)
+        logger.debug("WhistlerDriver.disable_input")
         self.exit_event.set()
 
     def stop_application_mode(self) -> None:
-        print("WhistlerDriver.stop_application_mode", file=sys.stderr, flush=True)
+        logger.debug("WhistlerDriver.stop_application_mode")
         self.write("\x1b[?1000l") # Disable mouse support
         self.write("\x1b[?1006l")
         self.write("\x1b[?1015l")
@@ -176,7 +182,7 @@ class LoadingApp(App):
         self._should_exit = False
     
     def on_mount(self) -> None:
-        print("LoadingApp.on_mount", file=sys.stderr, flush=True)
+        logger.debug("LoadingApp.on_mount")
         self.loading_screen = LoadingScreen(initial_status=self.initial_status)
         self.push_screen(self.loading_screen)
     
@@ -187,7 +193,7 @@ class LoadingApp(App):
     
     def request_exit(self) -> None:
         """Request the app to exit."""
-        print("LoadingApp.request_exit", file=sys.stderr, flush=True)
+        logger.debug("LoadingApp.request_exit")
         self._should_exit = True
         self.exit()
 
@@ -201,7 +207,6 @@ async def start_server():
     mode = "in-cluster" if args.in_cluster else f"config: {args.kubeconfig}" if args.kubeconfig else "default"
     
     # Configure logging
-    import logging
     log_level = os.environ.get("WHISTLER_LOG_LEVEL", "DEBUG").upper()
     logging.basicConfig(
         level=log_level,
@@ -209,7 +214,6 @@ async def start_server():
         stream=sys.stderr,
         force=True
     )
-    logger = logging.getLogger("whistler.server")
     logger.info(f"Starting in Kubernetes mode ({mode}) with log level {log_level}")
     
     config_manager = KubeConfigManager(kubeconfig=args.kubeconfig)
@@ -268,15 +272,15 @@ class SSHServer(asyncssh.SSHServer):
         self.target_name = None
 
     def connection_made(self, conn):
-        print('SSH connection received from %s.' % conn.get_extra_info('peername')[0], file=sys.stderr)
+        logger.info('SSH connection received from %s.' % conn.get_extra_info('peername')[0])
         _CONN_SERVER_MAP[conn] = self
         self._conn = conn
 
     def connection_lost(self, exc):
         if exc:
-            print('SSH connection error: ' + str(exc), file=sys.stderr)
+            logger.error('SSH connection error: ' + str(exc))
         else:
-            print('SSH connection closed.', file=sys.stderr)
+            logger.info('SSH connection closed.')
         # Cleanup global map
         if hasattr(self, '_conn') and self._conn in _CONN_SERVER_MAP:
             del _CONN_SERVER_MAP[self._conn]
@@ -301,7 +305,7 @@ class SSHServer(asyncssh.SSHServer):
         if os.environ.get("WHISTLER_AUTH_ALLOW_ANY") != "true":
             return False
             
-        print(f"Dev mode: allowing {username} via password auth", file=sys.stderr)
+        logger.warning(f"Dev mode: allowing {username} via password auth")
         
         parts = username.split('-')
         real_user = parts[0]
@@ -325,66 +329,63 @@ class SSHServer(asyncssh.SSHServer):
         return True
         
 
+    def _resolve_target(self, real_user, parts):
+        """Set username/target_type/target_name from the SSH username segments.
+
+        username conventions: `user` -> TUI, `user-<template>` -> ephemeral
+        instance from template, `user-<instance>` -> existing instance.
+        """
+        self.username = real_user
+        if len(parts) == 1:
+            self.target_type = "tui"
+        else:
+            suffix = "-".join(parts[1:])
+            templates = self.config_manager.get_user_templates(real_user)
+            if any(t['name'] == suffix for t in templates):
+                self.target_type = "template"
+                self.target_name = suffix
+            else:
+                self.target_type = "instance"
+                self.target_name = suffix
+                self.active_instance_name = suffix
+
     def validate_public_key(self, username, key):
         parts = username.split('-')
         real_user = parts[0]
-        
+
         # Check for dev mode bypass
         if os.environ.get("WHISTLER_AUTH_ALLOW_ANY") == "true":
-             print(f"Dev mode: allowing {real_user} without key check", file=sys.stderr)
-             self.username = real_user
-             
-             # Determine target (same logic as before)
-             if len(parts) == 1:
-                 self.target_type = "tui"
-             elif len(parts) >= 2:
-                 suffix = "-".join(parts[1:])
-                 templates = self.config_manager.get_user_templates(real_user)
-                 if any(t['name'] == suffix for t in templates):
-                     self.target_type = "template"
-                     self.target_name = suffix
-                 else:
-                     self.target_type = "instance"
-                     self.target_name = suffix
-                     self.active_instance_name = suffix
-             return True
+            logger.warning(f"Dev mode: allowing {real_user} without key check")
+            self._resolve_target(real_user, parts)
+            return True
 
         # Check if user exists and key matches
         if not self.config_manager.user_exists(real_user):
-             print(f"User {real_user} not found", file=sys.stderr)
-             return False
-             
+            logger.warning(f"User {real_user} not found")
+            return False
+
         allowed_keys = self.config_manager.get_user_public_keys(real_user)
-        key_data = key.export_public_key().decode('utf-8').split()[1] # Extract base64 part
-        
-        # Simple check: is the key in the allowed list?
-        # Note: allowed_keys in values.yaml might be full "ssh-rsa AAA..." strings
+
+        # Compare canonical key material for exact equality. The previous
+        # substring check (`key_data in allowed`) could be fooled by a shorter
+        # key whose base64 happened to be a substring of an authorized one.
+        presented = key.public_data
         for allowed in allowed_keys:
-            if key_data in allowed:
-                self.username = real_user
-                
-                # Determine target (same logic as before)
-                if len(parts) == 1:
-                    self.target_type = "tui"
-                elif len(parts) >= 2:
-                    suffix = "-".join(parts[1:])
-                    templates = self.config_manager.get_user_templates(real_user)
-                    if any(t['name'] == suffix for t in templates):
-                        self.target_type = "template"
-                        self.target_name = suffix
-                    else:
-                        self.target_type = "instance"
-                        self.target_name = suffix
-                        self.active_instance_name = suffix
-                
-                print(f"User {real_user} authenticated via public key. Target: {self.target_type} {self.target_name}", file=sys.stderr)
+            try:
+                allowed_key = asyncssh.import_public_key(allowed)
+            except (asyncssh.KeyImportError, ValueError) as e:
+                logger.warning(f"Skipping malformed authorized key for {real_user}: {e}")
+                continue
+            if allowed_key.public_data == presented:
+                self._resolve_target(real_user, parts)
+                logger.info(f"User {real_user} authenticated via public key. Target: {self.target_type} {self.target_name}")
                 return True
-                
-        print(f"Public key validation failed for {real_user}", file=sys.stderr)
+
+        logger.warning(f"Public key validation failed for {real_user}")
         return False
 
     def session_requested(self):
-        print("SSHServer.session_requested", file=sys.stderr, flush=True)
+        logger.debug("SSHServer.session_requested")
         target_name = self.target_name
         template_name = None
         is_ephemeral = False
@@ -394,7 +395,7 @@ class SSHServer(asyncssh.SSHServer):
             template_name = self.target_name
             target_name = f"{self.target_name}-{secrets.token_hex(4)}"
             is_ephemeral = True
-            print(f"SSHServer: Generated ephemeral name {target_name} for template {template_name}", file=sys.stderr, flush=True)
+            logger.info(f"SSHServer: Generated ephemeral name {target_name} for template {template_name}")
 
         return WhistlerSession(
             server=self,
@@ -407,11 +408,11 @@ class SSHServer(asyncssh.SSHServer):
         )
     
     async def connection_requested(self, dest_host, dest_port, orig_host, orig_port):
-        print(f"Connection requested: {dest_host}:{dest_port} from {orig_host}:{orig_port}", file=sys.stderr)
+        logger.info(f"Connection requested: {dest_host}:{dest_port} from {orig_host}:{orig_port}")
         
         # Only allow forwarding to localhost (which maps to the container)
         if dest_host not in ("localhost", "127.0.0.1"):
-            print(f"Forwarding denied: destination {dest_host} not allowed (only localhost)", file=sys.stderr)
+            logger.warning(f"Forwarding denied: destination {dest_host} not allowed (only localhost)")
             raise asyncssh.ChannelOpenError(
                 asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED,
                 "Forwarding is only allowed to localhost (the container)"
@@ -419,7 +420,7 @@ class SSHServer(asyncssh.SSHServer):
             
         instance_name = getattr(self, "active_instance_name", None)
         if not instance_name:
-             print("Forwarding denied: no active instance", file=sys.stderr)
+             logger.warning("Forwarding denied: no active instance")
              raise asyncssh.ChannelOpenError(
                 asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED,
                 "No active container instance found for forwarding"
@@ -430,10 +431,10 @@ class SSHServer(asyncssh.SSHServer):
         instance = next((i for i in instances if i["name"] == instance_name), None)
         
         if instance and instance.get("podName") and instance.get("status") == "Running":
-            print(f"Tunneling {dest_host}:{dest_port} -> Pod {instance['podName']}:127.0.0.1:{dest_port}", file=sys.stderr)
+            logger.info(f"Tunneling {dest_host}:{dest_port} -> Pod {instance['podName']}:127.0.0.1:{dest_port}")
             return await self._create_pod_tunnel(instance['podName'], instance.get('namespace'), dest_port)
         else:
-            print(f"Forwarding failed: instance {instance_name} not running or not found", file=sys.stderr)
+            logger.error(f"Forwarding failed: instance {instance_name} not running or not found")
             raise asyncssh.ChannelOpenError(
                 asyncssh.OPEN_CONNECT_FAILED,
                 f"Container {instance_name} is not reachable"
@@ -448,16 +449,16 @@ class SSHServer(asyncssh.SSHServer):
              # Try fallback to nc?
              if await self._is_command_available(pod_name, namespace, "nc"):
                   cmd_str = f"nc 127.0.0.1 {port}"
-                  print(f"socat not found, falling back to nc for {pod_name}:{port}", file=sys.stderr)
+                  logger.warning(f"socat not found, falling back to nc for {pod_name}:{port}")
              else:
                   # Inject socat
                   socat_bin = "/tmp/socat-static"
                   if not await self._is_file_present(pod_name, namespace, socat_bin):
-                       print(f"Injecting static socat for tunnel {pod_name}:{port}...", file=sys.stderr)
+                       logger.info(f"Injecting static socat for tunnel {pod_name}:{port}...")
                        try:
                            await self._inject_static_socat(pod_name, namespace, socat_bin)
                        except Exception as e:
-                           print(f"Injection failed: {e}", file=sys.stderr)
+                           logger.error(f"Injection failed: {e}")
                            raise asyncssh.ChannelOpenError(
                              asyncssh.OPEN_CONNECT_FAILED,
                              f"Failed to inject socat: {e}"
@@ -470,7 +471,7 @@ class SSHServer(asyncssh.SSHServer):
         ]
         
         try:
-            print(f"Starting tunnel process: {cmd}", file=sys.stderr)
+            logger.info(f"Starting tunnel process: {cmd}")
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
@@ -486,7 +487,7 @@ class SSHServer(asyncssh.SSHServer):
                         if not line: break
                         msg = line.decode().strip()
                         if msg:
-                            print(f"Tunnel {pod_name}:{port} stderr: {msg}", file=sys.stderr)
+                            logger.info(f"Tunnel {pod_name}:{port} stderr: {msg}")
                 except Exception:
                     pass
 
@@ -495,7 +496,7 @@ class SSHServer(asyncssh.SSHServer):
             # Return protocol instance directly
             return SubprocessTunnelProtocol(process)
         except Exception as e:
-            print(f"Failed to create tunnel: {e}", file=sys.stderr)
+            logger.error(f"Failed to create tunnel: {e}")
             raise asyncssh.ChannelOpenError(
                 asyncssh.OPEN_CONNECT_FAILED,
                 f"Tunnel creation failed: {e}"
@@ -528,7 +529,7 @@ class SSHServer(asyncssh.SSHServer):
              raise Exception(f"Bundled socat binary not found at {local_binary}")
         
         # Inject into pod
-        print(f"Injecting static socat from {local_binary} to {pod_name}:{target_path}...", file=sys.stderr)
+        logger.info(f"Injecting static socat from {local_binary} to {pod_name}:{target_path}...")
         # Use cat < local | kubectl exec ... "cat > target && chmod +x target"
         inject_cmd = [
             "kubectl", "exec", "-i", pod_name, "-n", namespace, "--",
@@ -561,7 +562,7 @@ class SSHServer(asyncssh.SSHServer):
                  raise Exception(f"Failed to inject socat: {stderr.decode()}")
 
         except Exception as e:
-            print(f"Injection failed: {e}", file=sys.stderr)
+            logger.error(f"Injection failed: {e}")
             raise
 
 
@@ -595,34 +596,34 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self._stdin_queue = asyncio.Queue()
         self._cleanup_done = False
         self._cleanup_lock = asyncio.Lock()
-        print(f"WhistlerSession initialized: user={username}, type={target_type}, target={target_name}, ephemeral={is_ephemeral}", file=sys.stderr, flush=True)
+        logger.debug(f"WhistlerSession initialized: user={username}, type={target_type}, target={target_name}, ephemeral={is_ephemeral}")
 
     async def _cleanup_ephemeral(self):
         """Cleanup ephemeral instance if not already done."""
-        print(f"WhistlerSession._cleanup_ephemeral called. user={self.username}, target={self.target_name}, ephemeral={self.is_ephemeral}, done={self._cleanup_done}", file=sys.stderr, flush=True)
+        logger.debug(f"WhistlerSession._cleanup_ephemeral called. user={self.username}, target={self.target_name}, ephemeral={self.is_ephemeral}, done={self._cleanup_done}")
         async with self._cleanup_lock:
             if not self.is_ephemeral or self._cleanup_done:
-                print("WhistlerSession._cleanup_ephemeral: Skipping cleanup (already done or not ephemeral)", file=sys.stderr, flush=True)
+                logger.warning("WhistlerSession._cleanup_ephemeral: Skipping cleanup (already done or not ephemeral)")
                 return
 
             instance_name = self.target_name
             if not instance_name:
-                print("WhistlerSession._cleanup_ephemeral: No target name to delete", file=sys.stderr, flush=True)
+                logger.debug("WhistlerSession._cleanup_ephemeral: No target name to delete")
                 return
 
             try:
-                print(f"WhistlerSession._cleanup_ephemeral: Deleting instance {instance_name}", file=sys.stderr, flush=True)
+                logger.debug(f"WhistlerSession._cleanup_ephemeral: Deleting instance {instance_name}")
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(None, self.config_manager.delete_instance, self.username, instance_name)
-                print(f"WhistlerSession._cleanup_ephemeral: Successfully deleted {instance_name}", file=sys.stderr, flush=True)
+                logger.debug(f"WhistlerSession._cleanup_ephemeral: Successfully deleted {instance_name}")
             except Exception as e:
-                print(f"Error calling delete_instance: {e}", file=sys.stderr, flush=True)
+                logger.error(f"Error calling delete_instance: {e}")
                 traceback.print_exc(file=sys.stderr)
             
             self._cleanup_done = True
 
     def connection_made(self, chan):
-        print("WhistlerSession.connection_made", file=sys.stderr, flush=True)
+        logger.debug("WhistlerSession.connection_made")
         self._chan = chan
         self._chan.set_encoding(None)
 
@@ -636,7 +637,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
     def subsystem_requested(self, subsystem):
         if subsystem == "sftp":
-            print("WhistlerSession starting SFTP subsystem", file=sys.stderr, flush=True)
+            logger.debug("WhistlerSession starting SFTP subsystem")
             try:
                 from asyncssh.sftp import SFTPServerHandler
 
@@ -654,13 +655,13 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 self._sftp_reader.get_extra_info = get_extra_info
 
                 # Create WhistlerSFTPServer instance
-                print(f"Creating WhistlerSFTPServer instance", file=sys.stderr, flush=True)
+                logger.debug(f"Creating WhistlerSFTPServer instance")
                 sftp_server = WhistlerSFTPServer(self._chan)
-                print(f"WhistlerSFTPServer instance created", file=sys.stderr, flush=True)
+                logger.debug(f"WhistlerSFTPServer instance created")
 
                 # Create and start handler
                 self.sftp_handler = SFTPServerHandler(sftp_server, self._sftp_reader, self._chan, 3)
-                print("Starting SFTP handler", file=sys.stderr, flush=True)
+                logger.debug("Starting SFTP handler")
                 self._sftp_task = asyncio.create_task(self.sftp_handler.run())
 
                 def notify_done(future):
@@ -669,28 +670,28 @@ class WhistlerSession(asyncssh.SSHServerSession):
                     except asyncio.CancelledError:
                         pass
                     except Exception as e:
-                        print(f"SFTP handler failed: {e}", file=sys.stderr, flush=True)
+                        logger.error(f"SFTP handler failed: {e}")
                         traceback.print_exc(file=sys.stderr)
 
                 self._sftp_task.add_done_callback(notify_done)
-                print("SFTP handler running", file=sys.stderr, flush=True)
+                logger.debug("SFTP handler running")
 
                 return True
             except Exception as e:
-                print(f"Failed to start SFTP: {e}", file=sys.stderr, flush=True)
+                logger.error(f"Failed to start SFTP: {e}")
                 import traceback
                 traceback.print_exc(file=sys.stderr)
                 return False
         return False
 
     def pty_requested(self, term_type, term_size, term_modes):
-        print(f"WhistlerSession.pty_requested: {term_type} {term_size}", file=sys.stderr, flush=True)
+        logger.debug(f"WhistlerSession.pty_requested: {term_type} {term_size}")
         self.initial_term_size = (term_size[0], term_size[1])
         self.term_type = term_type
         return True
 
     def shell_requested(self):
-        print("WhistlerSession.shell_requested", file=sys.stderr, flush=True)
+        logger.debug("WhistlerSession.shell_requested")
         return True
 
     def data_received(self, data, datatype):
@@ -727,7 +728,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
              try:
                  self._stdin_queue.put_nowait(data.encode('utf-8') if isinstance(data, str) else data)
              except Exception as e:
-                 print(f"Error queuing input data: {e}", file=sys.stderr)
+                 logger.debug(f"Error queuing input data: {e}")
         elif self._process_stdin is not None:
              # Forward to process stdin (non-PTY)
              try:
@@ -745,7 +746,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  self._app.exit("cancelled")
 
     def break_received(self, msec):
-        print(f"WhistlerSession.break_received: {msec}", file=sys.stderr, flush=True)
+        logger.info(f"WhistlerSession.break_received: {msec}")
         # Treat break as Ctrl-C
         if self._app and hasattr(self._app, 'action_cancel'):
              asyncio.create_task(self._app.action_cancel())
@@ -753,17 +754,17 @@ class WhistlerSession(asyncssh.SSHServerSession):
              self._app.exit("cancelled")
 
     def exec_requested(self, command):
-        print(f"WhistlerSession.exec_requested: {command}", file=sys.stderr, flush=True)
+        logger.info(f"WhistlerSession.exec_requested: {command}")
         self.exec_command = command
         return True
     
     def session_started(self):
         # If SFTP is active, don't start a shell
         if getattr(self, '_sftp_active', False):
-             print("Session started in SFTP mode, bypassing shell startup", file=sys.stderr)
+             logger.debug("Session started in SFTP mode, bypassing shell startup")
              return
 
-        print("WhistlerSession.session_started", file=sys.stderr, flush=True)
+        logger.debug("WhistlerSession.session_started")
         
         # Check for agent forwarding
         self.local_agent_path = self._chan.get_agent_path()
@@ -771,7 +772,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
             import secrets
             # Generate a unique path for the pod socket
             self.pod_socket_path = f"/tmp/agent-{secrets.token_hex(4)}.sock"
-            print(f"Agent forwarding requested. Local: {self.local_agent_path}, Pod: {self.pod_socket_path}", file=sys.stderr)
+            logger.info(f"Agent forwarding requested. Local: {self.local_agent_path}, Pod: {self.pod_socket_path}")
 
         # Temporarily set TERM/COLORTERM based on client request so Textual/Rich picks it up
         old_term = os.environ.get('TERM')
@@ -801,7 +802,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
             elif self.target_type == "template":
                  self._shell_task = asyncio.create_task(self._create_and_connect_ephemeral(command=self.exec_command))
             else:
-                print(f"Target type {self.target_type} unknown, falling back to TUI", file=sys.stderr, flush=True)
+                logger.warning(f"Target type {self.target_type} unknown, falling back to TUI")
                 self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
                 self._app.ssh_channel = self._chan
                 self._app_task = asyncio.create_task(self._run_app())
@@ -814,15 +815,15 @@ class WhistlerSession(asyncssh.SSHServerSession):
             else: os.environ.pop('COLORTERM', None)
 
     async def _run_app(self):
-        print("WhistlerSession._run_app starting", file=sys.stderr, flush=True)
+        logger.debug("WhistlerSession._run_app starting")
         try:
             # Run the app with our custom driver
             await self._app.run_async()
         except Exception as e:
-            print(f"App error: {e}", file=sys.stderr, flush=True)
+            logger.error(f"App error: {e}")
             traceback.print_exc(file=sys.stderr)
         finally:
-            print("WhistlerSession._run_app finished", file=sys.stderr, flush=True)
+            logger.debug("WhistlerSession._run_app finished")
             self._chan.exit(0)
 
     async def _create_and_connect_ephemeral(self, command=None):
@@ -866,7 +867,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
              try:
                  result = await loading_app.run_async()
                  if result == "cancelled":
-                     print(f"User cancelled creation of {instance_name}", file=sys.stderr)
+                     logger.info(f"User cancelled creation of {instance_name}")
                      task.cancel()
                      try:
                          await task
@@ -890,12 +891,12 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
                      await self._run_pod_shell(pod_name, command=command)
              except asyncio.CancelledError:
-                 print("Task cancelled in _create_and_connect_ephemeral", file=sys.stderr, flush=True)
+                 logger.info("Task cancelled in _create_and_connect_ephemeral")
                  task.cancel()
                  raise
              finally:
                  # Cleanup
-                 print(f"Entering finally block for {instance_name}", file=sys.stderr, flush=True)
+                 logger.info(f"Entering finally block for {instance_name}")
                  if self.term_type:
                      try:
                          self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
@@ -926,16 +927,16 @@ class WhistlerSession(asyncssh.SSHServerSession):
                      self.target_name = instance_name
                      await self._connect_to_instance(command=command)
                  except Exception as e:
-                     print(f"Error in _create_and_connect_ephemeral: {e}", file=sys.stderr, flush=True)
+                     logger.error(f"Error in _create_and_connect_ephemeral: {e}")
                      try:
                          self._chan.write(f"Error connecting to instance: {e}\r\n".encode('utf-8'))
                      except Exception:
                          pass
                  except asyncio.CancelledError:
-                     print("Task cancelled in _create_and_connect_ephemeral", file=sys.stderr, flush=True)
+                     logger.info("Task cancelled in _create_and_connect_ephemeral")
                      raise
                  finally:
-                     print(f"Entering finally block for {instance_name}", file=sys.stderr, flush=True)
+                     logger.info(f"Entering finally block for {instance_name}")
                      if self.term_type and not command:
                          try:
                              self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
@@ -983,20 +984,15 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 pod_name = instance.get("podName")
         
         if not pod_name or (instance and instance.get("status") != "Running"):
-            loading_app.update_status(f"Ensuring instance {self.target_name} is created...")
-            
-            # Trigger pod creation via config manager
-            try:
-                def create_pod_sync():
-                    # Only available on KubeConfigManager
-                    if hasattr(self.config_manager, 'ensure_pod'):
-                        return self.config_manager.ensure_pod(self.username, self.target_name)
-                    return True # Fallback for non-k8s modes if any
-                
-                await loop.run_in_executor(None, create_pod_sync)
-            except Exception as e:
-                print(f"Failed to ensure pod: {e}", file=sys.stderr)
-                
+            loading_app.update_status(f"Ensuring instance {self.target_name} is running...")
+
+            # Pod creation is owned by the operator. Bump the CR so its reconcile
+            # handler fires and (re)creates the pod, then wait for it to come up.
+            ns = instance.get("namespace") if instance else self.config_manager._get_user_namespace(self.username)
+            await loop.run_in_executor(
+                None, self._trigger_reconcile, f"{self.username}-{self.target_name}", ns
+            )
+
             loading_app.update_status(f"Starting instance {self.target_name}...")
             pod_name = await self._wait_for_pod_with_app(self.target_name, loading_app)
         
@@ -1007,7 +1003,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
             # Update server context for forwarding
             if self.server:
                 self.server.active_instance_name = self.target_name
-                print(f"Updated server active_instance_name to {self.target_name}", file=sys.stderr)
+                logger.info(f"Updated server active_instance_name to {self.target_name}")
 
             # Start agent bridge if needed
             if self.local_agent_path and self.pod_socket_path:
@@ -1043,7 +1039,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  # Assuming "Running" means ready.
             
             if pod_name_ready:
-                 print(f"Instance {self.target_name} already running, skipping loading screen.", file=sys.stderr)
+                 logger.warning(f"Instance {self.target_name} already running, skipping loading screen.")
                  await self._run_pod_shell(pod_name_ready, command=command)
                  return
 
@@ -1057,7 +1053,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
             try:
                 result = await loading_app.run_async()
                 if result == "cancelled":
-                    print(f"User cancelled connection to {self.target_name}", file=sys.stderr)
+                    logger.info(f"User cancelled connection to {self.target_name}")
                     task.cancel()
                     try:
                         await task
@@ -1129,26 +1125,18 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 pod_name = instance.get("podName")
         
         if not pod_name or (instance and instance.get("status") != "Running"):
-            try:
-                # Trigger operator to ensure pod exists
-                import time
-                full_cr_name = f"{self.username}-{self.target_name}"
-                ns = instance.get("namespace", self.config_manager.namespace)
-                self.config_manager.api.patch_namespaced_custom_object(
-                    self.config_manager.group, self.config_manager.version, ns,
-                    "whistlerinstances", full_cr_name,
-                    {"metadata": {"annotations": {"whistler/last-connect": str(time.time())}}}
-                )
-            except Exception as e:
-                print(f"Failed to patch instance: {e}", file=sys.stderr)
-            
+            # Pod creation is owned by the operator; trigger its reconcile.
+            ns = instance.get("namespace", self.config_manager.namespace) if instance else self.config_manager._get_user_namespace(self.username)
+            await asyncio.get_running_loop().run_in_executor(
+                None, self._trigger_reconcile, f"{self.username}-{self.target_name}", ns
+            )
             pod_name = await self._wait_for_pod(self.target_name)
         
         if pod_name:
             # Update server context for forwarding
             if self.server:
                 self.server.active_instance_name = self.target_name
-                print(f"Updated server active_instance_name to {self.target_name}", file=sys.stderr)
+                logger.info(f"Updated server active_instance_name to {self.target_name}")
 
             # Start agent bridge if needed
             if self.local_agent_path and self.pod_socket_path:
@@ -1209,7 +1197,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
         return "\n".join(message) + "\n"
 
     async def _run_pod_shell(self, pod_name, command=None):
-        print(f"Starting shell for pod {pod_name}. Command: {command}", file=sys.stderr, flush=True)
+        logger.info(f"Starting shell for pod {pod_name}. Command: {command}")
         
         # Get instance and template info for MOTD (Only if not running a command and interactive)
         motd = ""
@@ -1228,9 +1216,9 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 
                 all_volumes = self.config_manager.get_volumes() # Global volume definitions if needed
                 motd = self._generate_motd(instance, template, all_volumes)
-                print(f"Generated MOTD for {self.username}: {len(motd)} chars", file=sys.stderr)
+                logger.info(f"Generated MOTD for {self.username}: {len(motd)} chars")
             else:
-                 print(f"MOTD: Instance {self.target_name} not found in {len(instances)} instances", file=sys.stderr)
+                 logger.warning(f"MOTD: Instance {self.target_name} not found in {len(instances)} instances")
                  motd = f"Connecting to {self.target_name}...\r\n(Instance details not found for MOTD)\r\n"
             
         if motd:
@@ -1241,7 +1229,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
             # self._chan.write(b"\x1b[2J\x1b[H") 
             
             self._chan.write(formatted_motd.encode('utf-8'))
-            print("MOTD sent to channel", file=sys.stderr)
+            logger.info("MOTD sent to channel")
             
             # Ensure the MOTD is sent before we hook up the PTY
             # asyncssh doesn't have drain on channel. buffer is managed.
@@ -1289,7 +1277,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 # Interactive shell
                 cmd.append("/bin/bash")
             
-            print(f"Executing subprocess: {cmd}", file=sys.stderr, flush=True)
+            logger.info(f"Executing subprocess: {cmd}")
             
             if use_pty:
                 # PTY Mode
@@ -1309,9 +1297,9 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 try:
                     winsize = struct.pack("HHHH", rows, cols, 0, 0)
                     fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
-                    print(f"Set initial PTY size to {cols}x{rows}", file=sys.stderr)
+                    logger.info(f"Set initial PTY size to {cols}x{rows}")
                 except Exception as e:
-                    print(f"Failed to set initial PTY size: {e}", file=sys.stderr)
+                    logger.error(f"Failed to set initial PTY size: {e}")
 
                 # Ensure non-blocking
                 os.set_blocking(master, False)
@@ -1353,7 +1341,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                         return_when=asyncio.FIRST_COMPLETED
                     )
                 except asyncio.CancelledError:
-                    print("Shell task cancelled, cleaning up...", file=sys.stderr)
+                    logger.info("Shell task cancelled, cleaning up...")
                     raise
                 finally:
                     # Clean up reader immediately 
@@ -1386,7 +1374,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                             writer.write(item)
                             await writer.drain()
                     except Exception as e:
-                        print(f"Stdin consumer error: {e}", file=sys.stderr)
+                        logger.error(f"Stdin consumer error: {e}")
 
                 stdin_task = asyncio.create_task(consume_stdin(self._process_stdin, self._stdin_queue))
                 
@@ -1398,7 +1386,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                                 break
                             channel_write_func(data)
                     except Exception as e:
-                        print(f"Output forwarder error: {e}", file=sys.stderr, flush=True)
+                        logger.error(f"Output forwarder error: {e}")
 
                 # Forward stdout -> channel stdout
                 stdout_task = asyncio.create_task(forward_output(process.stdout, self._chan.write))
@@ -1411,7 +1399,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                     # Wait for output forwarding to finish (drain pipes)
                     await asyncio.gather(stdout_task, stderr_task)
                 except asyncio.CancelledError:
-                    print("Shell task cancelled, cleaning up...", file=sys.stderr)
+                    logger.info("Shell task cancelled, cleaning up...")
                     stdout_task.cancel()
                     stderr_task.cancel()
                     stdin_task.cancel()
@@ -1424,9 +1412,9 @@ class WhistlerSession(asyncssh.SSHServerSession):
                          pass
 
         except Exception as e:
-            print(f"Shell error: {e}", file=sys.stderr)
+            logger.error(f"Shell error: {e}")
         finally:
-            print("Shell finished, cleaning up resources...", file=sys.stderr, flush=True)
+            logger.info("Shell finished, cleaning up resources...")
             loop = asyncio.get_running_loop()
             if self._master_fd:
                 # Ensure reader is removed if not already
@@ -1438,7 +1426,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 self._master_fd = None
             
             if process and process.returncode is None:
-                print("Terminating kubectl process...", file=sys.stderr)
+                logger.info("Terminating kubectl process...")
                 try:
                     process.terminate()
                 except ProcessLookupError:
@@ -1449,72 +1437,128 @@ class WhistlerSession(asyncssh.SSHServerSession):
             except Exception as e:
                 pass
 
-    async def _wait_for_pod_with_app(self, instance_name, loading_app, timeout=None):
-        """Wait for pod to be ready, updating the loading app."""
+    def _trigger_reconcile(self, instance_full_name, namespace):
+        """Bump an annotation on the WhistlerInstance so the operator's update
+        handler fires and (re)creates the pod. Pod creation is owned by the
+        operator; the server only declares intent and waits. Runs in an executor
+        (the kubernetes client is synchronous)."""
+        try:
+            self.config_manager.api.patch_namespaced_custom_object(
+                self.config_manager.group, self.config_manager.version, namespace,
+                "whistlerinstances", instance_full_name,
+                {"metadata": {"annotations": {"whistler/last-connect": str(time.time())}}}
+            )
+        except Exception as e:
+            logger.error(f"Failed to trigger reconcile for {instance_full_name}: {e}")
+
+    async def _watch_pod_ready(self, namespace, instance_full_name, status_cb=None, timeout=None):
+        """Wait until the instance's pod reaches the Running phase, driven by a
+        Kubernetes watch instead of polling.
+
+        The blocking watch runs in an executor thread and only ever marshals
+        plain event data back to the event loop via a queue; all UI work
+        (status_cb) happens here on the loop thread, so the SSH channel is never
+        touched from another thread. Returns the pod name, or None on timeout.
+        """
         loop = asyncio.get_running_loop()
-        start_time = loop.time()
+        queue: asyncio.Queue = asyncio.Queue()
+        stop = threading.Event()
+        label_selector = f"instance={instance_full_name}"
+
+        def run_watch():
+            core_api = client.CoreV1Api()
+            w = k8s_watch.Watch()
+            end = None if timeout is None else time.monotonic() + timeout
+            try:
+                while not stop.is_set():
+                    if end is not None and time.monotonic() >= end:
+                        break
+                    # Bound each watch chunk so we re-check the stop flag and
+                    # tolerate the pod not existing yet (operator creates it).
+                    remaining = None if end is None else max(1, int(end - time.monotonic()))
+                    chunk = 5 if remaining is None else min(5, remaining)
+                    try:
+                        for event in w.stream(
+                            core_api.list_namespaced_pod,
+                            namespace=namespace,
+                            label_selector=label_selector,
+                            timeout_seconds=chunk,
+                            _request_timeout=chunk + 5,
+                        ):
+                            if stop.is_set():
+                                break
+                            pod = event["object"]
+                            phase = getattr(pod.status, "phase", None)
+                            name = pod.metadata.name
+                            terminating = pod.metadata.deletion_timestamp is not None
+                            loop.call_soon_threadsafe(queue.put_nowait, ("status", phase, name, terminating))
+                            if phase == "Running" and not terminating:
+                                loop.call_soon_threadsafe(queue.put_nowait, ("ready", name))
+                                return
+                    except Exception as e:
+                        # Transient API/watch errors: report and re-establish.
+                        loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
+            finally:
+                w.stop()
+                loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+
+        watch_future = loop.run_in_executor(None, run_watch)
         last_status = None
-        
-        while timeout is None or loop.time() - start_time < timeout:
-            instances = await loop.run_in_executor(None, self.config_manager.get_user_instances, self.username)
-            instance = next((i for i in instances if i["name"] == instance_name), None)
-            
-            if instance:
-                status = instance.get("status")
-                pod_name = instance.get("podName")
-                
-                if status == "Running" and pod_name:
-                    return pod_name
-                
-                if status != last_status:
-                    loading_app.update_status(f"Instance status: {status}")
-                    last_status = status
-            
-            await asyncio.sleep(0.5)
-        return None
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if watch_future.done():
+                        return None
+                    continue
+
+                kind = msg[0]
+                if kind == "ready":
+                    return msg[1]
+                elif kind == "status":
+                    _, phase, _name, _terminating = msg
+                    if phase and phase != last_status:
+                        last_status = phase
+                        if status_cb:
+                            status_cb(phase)
+                elif kind == "error":
+                    logger.debug(f"Pod watch error for {instance_full_name}: {msg[1]}")
+                elif kind == "done":
+                    return None
+        except asyncio.CancelledError:
+            stop.set()
+            raise
+        finally:
+            stop.set()
+
+    async def _wait_for_pod_with_app(self, instance_name, loading_app, timeout=None):
+        """Wait for pod to be ready (PTY mode), updating the loading app."""
+        ns = self.config_manager._get_user_namespace(self.username)
+        full_name = f"{self.username}-{instance_name}"
+        return await self._watch_pod_ready(
+            ns, full_name,
+            status_cb=lambda phase: loading_app.update_status(f"Instance status: {phase}"),
+            timeout=timeout,
+        )
 
     async def _wait_for_pod(self, instance_name, timeout=None):
-        """Wait for pod (non-PTY mode)."""
-        start_time = asyncio.get_running_loop().time()
-        last_status = None
-        
-        while timeout is None or asyncio.get_running_loop().time() - start_time < timeout:
-            instances = self.config_manager.get_user_instances(self.username)
-            instance = next((i for i in instances if i["name"] == instance_name), None)
-            
-            if instance:
-                status = instance.get("status")
-                pod_name = instance.get("podName")
-                
-                if status == "Running" and pod_name:
-                    return pod_name
-                
-                if status != last_status:
-                    if last_status:
-                        try:
-                            if self.term_type and not self.exec_command:
-                                self._chan.write(b"\r\n")
-                        except Exception:
-                            pass
-                    try:
-                        if self.term_type and not self.exec_command:
-                            self._chan.write(f"Instance status: {status} ".encode('utf-8'))
-                    except Exception:
-                        pass
-                    last_status = status
-                else:
-                    try:
-                        if self.term_type and not self.exec_command:
-                            self._chan.write(b".")
-                    except Exception:
-                        pass
-            
-            await asyncio.sleep(0.5)
-        return None
+        """Wait for pod to be ready (non-PTY mode), writing status to the channel."""
+        ns = self.config_manager._get_user_namespace(self.username)
+        full_name = f"{self.username}-{instance_name}"
+
+        def status_cb(phase):
+            try:
+                if self.term_type and not self.exec_command:
+                    self._chan.write(f"\r\nInstance status: {phase} ".encode('utf-8'))
+            except Exception:
+                pass
+
+        return await self._watch_pod_ready(ns, full_name, status_cb=status_cb, timeout=timeout)
 
 
     def eof_received(self):
-        print("WhistlerSession.eof_received", file=sys.stderr, flush=True)
+        logger.debug("WhistlerSession.eof_received")
         if getattr(self, 'sftp_handler', None):
             self._sftp_reader.feed_eof()
             return
@@ -1524,13 +1568,13 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 # Send EOT (Ctrl-D) to PTY
                 os.write(self._master_fd, b'\x04')
             except Exception as e:
-                 print(f"Error sending EOT to PTY: {e}", file=sys.stderr)
+                 logger.debug(f"Error sending EOT to PTY: {e}")
         elif hasattr(self, '_stdin_queue'):
             # Signal EOF to queue consumer
             try:
                 self._stdin_queue.put_nowait(None)
             except Exception as e:
-                print(f"Error queuing EOF: {e}", file=sys.stderr)
+                logger.debug(f"Error queuing EOF: {e}")
         elif self._process_stdin:
             try:
                 if self._process_stdin.can_write_eof():
@@ -1538,7 +1582,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 else:
                      self._process_stdin.close()
             except Exception as e:
-                 print(f"Error closing stdin on EOF: {e}", file=sys.stderr)
+                 logger.debug(f"Error closing stdin on EOF: {e}")
         return True # Return True to keep channel open/manual EOF handling
 
     def terminal_size_changed(self, width, height, pixwidth, pixheight):
@@ -1558,9 +1602,9 @@ class WhistlerSession(asyncssh.SSHServerSession):
              try:
                  winsize = struct.pack("HHHH", height, width, 0, 0)
                  fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ, winsize)
-                 print(f"Updated PTY size to {width}x{height}", file=sys.stderr)
+                 logger.info(f"Updated PTY size to {width}x{height}")
              except Exception as e:
-                 print(f"Failed to update PTY size: {e}", file=sys.stderr)
+                 logger.error(f"Failed to update PTY size: {e}")
 
     def _process_resize(self):
         if self._app and self._pending_size:
@@ -1581,12 +1625,12 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
 
     async def _bridge_agent(self, pod_name, namespace):
-        print(f"Starting agent bridge: {self.local_agent_path} -> pod {pod_name}:{self.pod_socket_path}", file=sys.stderr)
+        logger.info(f"Starting agent bridge: {self.local_agent_path} -> pod {pod_name}:{self.pod_socket_path}")
         try:
             # Ensure socat is available in the pod
             socat_bin = "socat"
             if not await self.server._is_command_available(pod_name, namespace, "socat"):
-                print(f"socat not found in pod {pod_name}, attempting to inject static binary...", file=sys.stderr)
+                logger.warning(f"socat not found in pod {pod_name}, attempting to inject static binary...")
                 socat_bin = "/tmp/socat-static"
                 if not await self.server._is_file_present(pod_name, namespace, socat_bin):
                      await self.server._inject_static_socat(pod_name, namespace, socat_bin)
@@ -1613,12 +1657,12 @@ class WhistlerSession(asyncssh.SSHServerSession):
                     while True:
                         data = await reader.read(4096)
                         if not data:
-                            print(f"Bridge {name} closed (EOF)", file=sys.stderr)
+                            logger.info(f"Bridge {name} closed (EOF)")
                             break
                         writer.write(data)
                         await writer.drain()
                 except Exception as e:
-                    print(f"Bridge {name} error: {e}", file=sys.stderr)
+                    logger.error(f"Bridge {name} error: {e}")
                 finally:
                     try:
                         writer.close()
@@ -1630,7 +1674,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 while True:
                     line = await reader.readline()
                     if not line: break
-                    print(f"Agent bridge stderr: {line.decode().strip()}", file=sys.stderr)
+                    logger.info(f"Agent bridge stderr: {line.decode().strip()}")
 
             # local -> remote (process.stdin)
             t1 = asyncio.create_task(forward(local_reader, process.stdin, "local->remote"))
@@ -1642,9 +1686,9 @@ class WhistlerSession(asyncssh.SSHServerSession):
             await asyncio.gather(t1, t2)
             
         except Exception as e:
-             print(f"Agent bridge failed: {e}", file=sys.stderr)
+             logger.error(f"Agent bridge failed: {e}")
         finally:
-             print("Agent bridge finished", file=sys.stderr)
+             logger.info("Agent bridge finished")
 
 
 

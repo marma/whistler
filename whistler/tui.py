@@ -4,6 +4,9 @@ from textual.widgets import Header, Footer, Static, DataTable, Input, Button, La
 from textual.containers import Container
 from textual.screen import ModalScreen, Screen
 import asyncio
+import logging
+
+logger = logging.getLogger("whistler.tui")
 
 class InstanceCreateScreen(ModalScreen):
     BINDINGS = [("escape,q", "app.pop_screen", "Close")]
@@ -637,7 +640,7 @@ class WhistlerApp(App):
 
     def compose(self) -> ComposeResult:
         import sys
-        print("WhistlerApp.compose", file=sys.stderr, flush=True)
+        logger.debug("WhistlerApp.compose")
         yield Header()
         logo = r"""
 ██╗    ██╗██╗  ██╗██╗███████╗████████╗██╗     ███████╗██████╗ 
@@ -704,7 +707,7 @@ class WhistlerApp(App):
 
     async def on_mount(self) -> None:
         import sys
-        print("WhistlerApp.on_mount", file=sys.stderr, flush=True)
+        logger.debug("WhistlerApp.on_mount")
         self._setup_tables()
         # Initial fetch
         await self._update_cache()
@@ -737,7 +740,7 @@ class WhistlerApp(App):
             )
         except Exception as e:
             import sys
-            print(f"Failed to update cache: {e}", file=sys.stderr)
+            logger.error(f"Failed to update cache: {e}")
 
     def on_resize(self, event=None) -> None:
         if event:
@@ -1058,7 +1061,7 @@ if __name__ == "__main__":
         elif config_manager.config.get("users"):
             # Default to first user if not specified
             username = next(iter(config_manager.config["users"]))
-            print(f"No user specified, defaulting to: {username}")
+            logger.info(f"No user specified, defaulting to: {username}")
 
     app = WhistlerApp(config_manager=config_manager, username=username)
     app.run()

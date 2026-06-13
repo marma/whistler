@@ -12,6 +12,22 @@ dependencies = [
     "kubernetes>=29.0.0",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Integration tests need a cluster; they opt in via this marker and are
+# deselected by default. Run them with: pytest -m integration
+addopts = "-m 'not integration'"
+markers = [
+    "integration: requires a running Kubernetes cluster (k3d) and config env",
+]

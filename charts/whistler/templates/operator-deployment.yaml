@@ -14,6 +14,9 @@ spec:
     metadata:
       labels:
         app: whistler-operator
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/users: {{ include (print $.Template.BasePath "/users-secret.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ .Release.Name }}-operator
       containers:
@@ -24,6 +27,10 @@ spec:
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: USER_VOLUME_ACCESS_MODE
               value: {{ .Values.userVolume.accessMode | quote }}
             - name: USER_VOLUME_SIZE
@@ -32,12 +39,24 @@ spec:
               value: "{{ .Values.operator.logLevel }}"
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
+          # ensure_pod() runs here now, so the operator needs the same user and
+          # network-policy configuration the server has (securityContext, egress).
           volumeMounts:
+            - name: users-config
+              mountPath: "/etc/whistler"
+              readOnly: true
             - name: config
               mountPath: "/etc/whistler-config/volumes.yaml"
               subPath: "volumes.yaml"
               readOnly: true
+            - name: config
+              mountPath: "/etc/whistler-config/networkpolicy.yaml"
+              subPath: "networkpolicy.yaml"
+              readOnly: true
       volumes:
+        - name: users-config
+          secret:
+            secretName: {{ .Release.Name }}-users
         - name: config
           configMap:
             name: {{ .Release.Name }}-config

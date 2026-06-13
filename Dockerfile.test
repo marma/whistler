@@ -1,0 +1,17 @@
+# Image for running the unit-test suite (Tier A) in a container.
+# Integration tests (Tier C1) are NOT run here — they need a real cluster and
+# run from the host against k3d (see Makefile `integration`).
+FROM python:3.13-slim
+
+WORKDIR /app
+
+# Install the package with its test extras.
+COPY pyproject.toml README.md ./
+COPY whistler/ whistler/
+RUN pip install --no-cache-dir ".[test]"
+
+COPY tests/ tests/
+
+# Default: run only the unit tests (the `not integration` marker is applied via
+# pyproject addopts, so plain `pytest` already excludes integration).
+CMD ["pytest", "tests/unit", "-v"]
