@@ -8,7 +8,7 @@ My main interest in testing Antigravity for this project is finding out if it ca
 
 - It is fairly chatty, and I like that.
 - There is definitely a wall where you have to do **a lot** of hand-holding for it to be able to complete tasks.
-- At some point it started creating regressions in unreleated parts of the code when asked to implement a new feature.
+- At some point it started creating regressions in unrelated parts of the code when asked to implement a new feature.
 
 ## Thoughts on authorship
 I have "written" very little of this code-base. I have resisted the sometimes very strong urge to simply take over. I have landed in acting as a combo of senior developer, architect and product owner. I.e instead of telling Antigravity **what** to do when something does not work I instead ask for debug output or suggest the area where I **think** the solution lies. Antigravity often knows much more about specific frameworks than I do, but it sometime still makes very human mistakes (looking in the wrong place for a solution, missing imports, etc.)
@@ -17,7 +17,7 @@ This rasises one obvious question: what is my contribution and can I consider my
 
 ## Further evaluation
 
-While I have pointed out when things do not work as expected, I have not done a full review of the actual implmentation. There is simply no point at this stage since Antigravity often changes strategy when faced with new demands. I hope to learn a lot by reviewing the first stable version of Whistler :)
+While I have pointed out when things do not work as expected, I have not done a full review of the actual implementation. There is simply no point at this stage since Antigravity often changes strategy when faced with new demands. I hope to learn a lot by reviewing the first stable version of Whistler :)
 
 ## Good stuff
 
