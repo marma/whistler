@@ -19,10 +19,13 @@ class FakeConfigManager(ConfigManager):
     instances: {username: [{"name", "status", "podName", ...}]}
     """
 
-    def __init__(self, users=None, templates=None, instances=None):
+    def __init__(self, users=None, templates=None, instances=None,
+                 desktop_templates=None, desktop_sessions=None):
         self.users: Dict[str, Dict[str, Any]] = users or {}
         self._templates: Dict[str, List[Dict[str, Any]]] = templates or {}
         self._instances: Dict[str, List[Dict[str, Any]]] = instances or {}
+        self._desktop_templates: Dict[str, List[Dict[str, Any]]] = desktop_templates or {}
+        self._desktop_sessions: Dict[str, List[Dict[str, Any]]] = desktop_sessions or {}
 
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
         return self.users.get(username)
@@ -56,6 +59,25 @@ class FakeConfigManager(ConfigManager):
         return True
 
     def delete_template(self, username, template_name):
+        return True
+
+    def get_user_desktop_templates(self, username):
+        return list(self._desktop_templates.get(username, []))
+
+    def get_user_desktop_sessions(self, username):
+        return list(self._desktop_sessions.get(username, []))
+
+    def add_desktop_session(self, username, template_name, session_name):
+        self._desktop_sessions.setdefault(username, []).append({
+            "name": session_name,
+            "template": template_name,
+            "phase": "Provisioning",
+            "backend": None,
+            "podName": None,
+        })
+        return True
+
+    def delete_desktop_session(self, username, session_name):
         return True
 
     def get_selectors(self):

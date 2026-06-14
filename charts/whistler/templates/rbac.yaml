@@ -27,10 +27,17 @@ rules:
     resources: [networkpolicies]
     verbs: [list, watch, create, get, update, patch, delete]
 
-  # Application: watching & handling for the custom resource we declare.
+  # Application: watching & handling for the custom resources we declare.
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [whistlerinstances, whistlertemplates, whistlerinstances/status, whistlertemplates/status]
+    resources: [whistlerinstances, whistlertemplates, whistlerinstances/status, whistlertemplates/status,
+                desktopsessions, desktoptemplates, desktopsessions/status]
     verbs: [list, watch, patch, get, update, create, delete]
+
+  # KubeVirt VM desktop backend. The CRDs may be absent in a given cluster;
+  # the RBAC is harmless when the resource types do not exist.
+  - apiGroups: [kubevirt.io]
+    resources: [virtualmachines, virtualmachineinstances]
+    verbs: [create, delete, get, list, watch, patch, update]
 
   # Application: other resources it produces and manages.
   - apiGroups: [""]

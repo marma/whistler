@@ -21,6 +21,14 @@ SELECTORS_FILE = os.path.join(CONFIG_DIR, "selectors.yaml")
 VOLUMES_FILE = os.path.join(CONFIG_DIR, "volumes.yaml")
 NETWORKPOLICY_FILE = os.path.join(CONFIG_DIR, "networkpolicy.yaml")
 
+# KubeVirt API coordinates for the VM desktop backend. KubeVirt may be absent
+# from a given cluster; every call against these is guarded so the operator
+# runs cleanly without the CRDs installed.
+KUBEVIRT_GROUP = "kubevirt.io"
+KUBEVIRT_VERSION = "v1"
+KUBEVIRT_VM_PLURAL = "virtualmachines"
+KUBEVIRT_VMI_PLURAL = "virtualmachineinstances"
+
 
 class ConfigManager(ABC):
     @abstractmethod
@@ -53,6 +61,22 @@ class ConfigManager(ABC):
 
     @abstractmethod
     def delete_template(self, username: str, template_name: str) -> bool:
+        pass
+
+    @abstractmethod
+    def get_user_desktop_templates(self, username: str) -> List[Dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    def get_user_desktop_sessions(self, username: str) -> List[Dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    def add_desktop_session(self, username: str, template_name: str, session_name: str) -> bool:
+        pass
+
+    @abstractmethod
+    def delete_desktop_session(self, username: str, session_name: str) -> bool:
         pass
 
     @abstractmethod
@@ -585,25 +609,7 @@ class KubeConfigManager(ConfigManager):
         personal_mount_path = template_spec.get('personalMountPath', '/userdata')
         requested_volumes = template_spec.get('volumes', {}) or {}
 
-        # Construct resource requirements
-        resource_reqs = {}
-        if resources:
-            requests = {}
-            limits = {}
-
-            if 'cpu' in resources:
-                requests['cpu'] = resources['cpu']
-                limits['cpu'] = resources['cpu']
-            if 'memory' in resources:
-                requests['memory'] = resources['memory']
-                limits['memory'] = resources['memory']
-            if 'gpu' in resources:
-                limits['nvidia.com/gpu'] = resources['gpu']
-
-            if requests:
-                resource_reqs['requests'] = requests
-            if limits:
-                resource_reqs['limits'] = limits
+        resource_reqs = self._build_resource_reqs(resources)
 
         pod_volumes = [
             {
@@ -793,6 +799,499 @@ class KubeConfigManager(ConfigManager):
                 logger.error(f"Failed to create pod: {e}")
                 return False
 
+
+    # ------------------------------------------------------------------ #
+    # Desktop backends (DesktopTemplate / DesktopSession): a lightweight  #
+    # desktop pod or a KubeVirt VM. Provisioning + lifecycle only — the   #
+    # display tunnel (Guacamole) is a later round. These reuse the SSH    #
+    # spine (_ensure_user_namespace, _ensure_pvc, _build_egress_rules).   #
+    # ------------------------------------------------------------------ #
+
+    def _build_resource_reqs(self, resources: Dict[str, Any]) -> Dict[str, Any]:
+        """Map a template's resources{cpu,memory,gpu} to a Kubernetes
+        ResourceRequirements dict. Shared by the SSH and desktop pod specs."""
+        resource_reqs = {}
+        if resources:
+            requests = {}
+            limits = {}
+            if 'cpu' in resources:
+                requests['cpu'] = resources['cpu']
+                limits['cpu'] = resources['cpu']
+            if 'memory' in resources:
+                requests['memory'] = resources['memory']
+                limits['memory'] = resources['memory']
+            if 'gpu' in resources:
+                limits['nvidia.com/gpu'] = resources['gpu']
+            if requests:
+                resource_reqs['requests'] = requests
+            if limits:
+                resource_reqs['limits'] = limits
+        return resource_reqs
+
+    def _desktop_owner_reference(self, session_name: str, uid: str) -> Dict[str, Any]:
+        """ownerReference making a DesktopSession the controller of its child
+        pod / VM / Service, so Kubernetes GC reaps them when the CR is deleted."""
+        return {
+            "apiVersion": f"{self.group}/{self.version}",
+            "kind": "DesktopSession",
+            "name": session_name,
+            "uid": uid,
+            "controller": True,
+            "blockOwnerDeletion": True,
+        }
+
+    def _build_desktop_pod_spec(self, *, session_name, hostname, username, uid,
+                                template_spec, pvc_name, available_volumes,
+                                user_details, display_port, preemptible):
+        """Build the desktop Pod manifest from already-resolved inputs.
+
+        Pure function of its arguments (no Kubernetes API calls), mirroring
+        ``_build_pod_spec`` so it can be unit-tested without a cluster. Unlike
+        the SSH pod it does NOT override the entrypoint (the desktop image's
+        display server self-starts) and it exposes the display port.
+        """
+        image = template_spec.get('image', 'ubuntu:latest')
+        resources = template_spec.get('resources', {})
+        node_selector = template_spec.get('nodeSelector', {})
+        personal_mount_path = template_spec.get('personalMountPath', '/userdata')
+        requested_volumes = template_spec.get('volumes', {}) or {}
+
+        resource_reqs = self._build_resource_reqs(resources)
+
+        pod_volumes = [
+            {
+                "name": "data",
+                "persistentVolumeClaim": {
+                    "claimName": pvc_name
+                }
+            }
+        ]
+
+        volume_mounts = [
+            {
+                "name": "data",
+                "mountPath": personal_mount_path
+            }
+        ]
+
+        # Process requested volumes (same handling as _build_pod_spec, including
+        # the existing hardcoded "data" name guard — see the TODO there).
+        for vol_name, mount_path in requested_volumes.items():
+            if vol_name in available_volumes:
+                if vol_name == "data":
+                    continue
+
+                vol_def = available_volumes[vol_name]
+                sub_path = vol_def.get("subPath")
+
+                clean_vol_def = vol_def.copy()
+                if "subPath" in clean_vol_def:
+                    del clean_vol_def["subPath"]
+
+                pod_volumes.append(clean_vol_def)
+
+                mount_def = {
+                    "name": vol_name,
+                    "mountPath": mount_path
+                }
+                if sub_path:
+                    mount_def["subPath"] = sub_path
+
+                volume_mounts.append(mount_def)
+
+        pod_body = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": session_name,
+                "labels": {
+                    "app": "whistler-desktop",
+                    "session": session_name,
+                    "user": username
+                },
+                "ownerReferences": [self._desktop_owner_reference(session_name, uid)]
+            },
+            "spec": {
+                "containers": [
+                    {
+                        "name": "main",
+                        "image": image,
+                        "resources": resource_reqs,
+                        "ports": [{"containerPort": display_port, "name": "display"}],
+                        "volumeMounts": volume_mounts
+                    }
+                ],
+                "volumes": pod_volumes,
+                "nodeSelector": node_selector,
+                "hostname": hostname,
+                "subdomain": "whistler",
+                "automountServiceAccountToken": False
+            }
+        }
+
+        # user_details comes from get_user(); for users absent from users.yaml
+        # it is just {"name": username} (no securityContext) — same as SSH pods.
+        if user_details and "securityContext" in user_details:
+            pod_body["spec"]["securityContext"] = user_details["securityContext"]
+
+        if preemptible:
+            pod_body["spec"]["priorityClassName"] = "whistler-preemptible"
+
+        return pod_body
+
+    def _build_vm_spec(self, *, session_name, hostname, username, uid,
+                       template_spec, pvc_name, display_port, instancetype,
+                       preemptible):
+        """Build a KubeVirt VirtualMachine manifest from resolved inputs.
+
+        Pure (no API calls). KubeVirt is not available in any cluster we test
+        against, so this is unit-tested in isolation but treated as unverified
+        end-to-end. The VMI launcher pod inherits the template labels so the
+        per-session Service can select it.
+        """
+        image = template_spec.get('image', 'ubuntu:latest')
+        resources = template_spec.get('resources', {}) or {}
+        node_selector = template_spec.get('nodeSelector', {})
+
+        labels = {
+            "app": "whistler-desktop",
+            "session": session_name,
+            "user": username,
+        }
+
+        devices = {
+            "disks": [
+                {"name": "rootdisk", "disk": {"bus": "virtio"}},
+                {"name": "home", "disk": {"bus": "virtio"}},
+            ],
+            "interfaces": [{"name": "default", "masquerade": {}}],
+        }
+        if 'gpu' in resources:
+            devices["gpus"] = [{"name": "gpu0", "deviceName": "nvidia.com/gpu"}]
+
+        domain = {"devices": devices}
+        vm_spec = {
+            "running": True,
+            "template": {
+                "metadata": {"labels": labels},
+                "spec": {
+                    "nodeSelector": node_selector,
+                    "domain": domain,
+                    "networks": [{"name": "default", "pod": {}}],
+                    "volumes": [
+                        {"name": "rootdisk", "containerDisk": {"image": image}},
+                        {"name": "home", "persistentVolumeClaim": {"claimName": pvc_name}},
+                    ],
+                },
+            },
+        }
+
+        # instancetype supplies cpu/memory; KubeVirt rejects setting both it and
+        # domain.cpu/domain.resources, so they are mutually exclusive here.
+        if instancetype:
+            vm_spec["instancetype"] = {"name": instancetype}
+        else:
+            if 'cpu' in resources:
+                domain["cpu"] = {"cores": int(resources['cpu'])}
+            if 'memory' in resources:
+                domain["resources"] = {"requests": {"memory": resources['memory']}}
+
+        return {
+            "apiVersion": f"{KUBEVIRT_GROUP}/{KUBEVIRT_VERSION}",
+            "kind": "VirtualMachine",
+            "metadata": {
+                "name": session_name,
+                "labels": labels,
+                "ownerReferences": [self._desktop_owner_reference(session_name, uid)],
+            },
+            "spec": vm_spec,
+        }
+
+    def _build_session_service(self, *, session_name, username, uid, display_port):
+        """Build the per-session ClusterIP Service manifest (pure). It selects
+        the desktop pod / VMI launcher pod by the ``session`` label and exposes
+        the display port — the future Guacamole tunnel reaches a desktop here."""
+        return {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": session_name,
+                "labels": {
+                    "app": "whistler-desktop",
+                    "session": session_name,
+                    "user": username,
+                },
+                "ownerReferences": [self._desktop_owner_reference(session_name, uid)],
+            },
+            "spec": {
+                "type": "ClusterIP",
+                "selector": {"session": session_name},
+                "ports": [{
+                    "name": "display",
+                    "port": display_port,
+                    "targetPort": display_port,
+                }],
+            },
+        }
+
+    def _ensure_session_service(self, *, session_name, username, uid, namespace,
+                                display_port):
+        """Create the per-session ClusterIP Service (idempotent)."""
+        body = self._build_session_service(
+            session_name=session_name, username=username, uid=uid,
+            display_port=display_port,
+        )
+        core_api = client.CoreV1Api()
+        try:
+            core_api.create_namespaced_service(namespace, body)
+            logger.info(f"Service {session_name} created")
+            return True
+        except ApiException as e:
+            if e.status == 409:
+                return True  # Already exists
+            logger.error(f"Failed to create service {session_name}: {e}")
+            return False
+
+    def _resolve_desktop_template(self, user_ns: str, template_ref: str) -> Optional[Dict[str, Any]]:
+        """Resolve a DesktopTemplate from the user namespace, falling back to the
+        system namespace (mirrors ensure_pod's template lookup)."""
+        custom_api = client.CustomObjectsApi()
+        try:
+            return custom_api.get_namespaced_custom_object(
+                self.group, self.version, user_ns, "desktoptemplates", template_ref
+            )
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        system_ns = os.environ.get("POD_NAMESPACE", "whistler")
+        if system_ns != user_ns:
+            try:
+                return custom_api.get_namespaced_custom_object(
+                    self.group, self.version, system_ns, "desktoptemplates", template_ref
+                )
+            except ApiException:
+                pass
+        return None
+
+    def ensure_desktop(self, username: str, session_name: str) -> bool:
+        """Ensure the pod-or-VM (and the per-session Service) for a DesktopSession
+        exists. Dispatches on the template's ``backend``. Returns True on success
+        or if the resource already exists, False otherwise."""
+        user_ns = self._ensure_user_namespace(username)
+        full_session_name = f"{username}-{session_name}"
+
+        try:
+            cr = self.api.get_namespaced_custom_object(
+                self.group, self.version, user_ns, "desktopsessions", full_session_name
+            )
+        except ApiException as e:
+            logger.error(f"DesktopSession {full_session_name} not found: {e}")
+            return False
+
+        spec = cr.get('spec', {})
+        uid = cr['metadata']['uid']
+        template_ref = spec.get('templateRef')
+
+        template = self._resolve_desktop_template(user_ns, template_ref)
+        if not template:
+            logger.error(f"DesktopTemplate {template_ref} not found")
+            return False
+
+        template_spec = template.get('spec', {})
+        backend = template_spec.get('backend', 'pod')
+        display_port = template_spec.get('displayPort', 5901)
+        persistence = template_spec.get('persistence', 'ephemeral')
+        preemptible = persistence == 'preemptible'
+
+        try:
+            pvc_name = self._ensure_pvc(username, user_ns, logger)
+        except Exception:
+            return False
+
+        if backend == 'vm':
+            ok = self._create_desktop_vm(
+                user_ns, full_session_name, session_name, username, uid,
+                template_spec, pvc_name, display_port,
+                template_spec.get('instancetype'), preemptible,
+            )
+        else:
+            ok = self._create_desktop_pod(
+                user_ns, full_session_name, session_name, username, uid,
+                template_spec, pvc_name, display_port, preemptible,
+            )
+
+        if not ok:
+            return False
+
+        return self._ensure_session_service(
+            session_name=full_session_name, username=username, uid=uid,
+            namespace=user_ns, display_port=display_port,
+        )
+
+    def _create_desktop_pod(self, user_ns, full_session_name, session_name,
+                            username, uid, template_spec, pvc_name,
+                            display_port, preemptible) -> bool:
+        pod_body = self._build_desktop_pod_spec(
+            session_name=full_session_name,
+            hostname=session_name,
+            username=username,
+            uid=uid,
+            template_spec=template_spec,
+            pvc_name=pvc_name,
+            available_volumes=self._load_volume_definitions_from_file(),
+            user_details=self.get_user(username),
+            display_port=display_port,
+            preemptible=preemptible,
+        )
+        logger.debug(f"Creating desktop Pod:\n{yaml.safe_dump(pod_body)}")
+        core_api = client.CoreV1Api()
+        try:
+            core_api.create_namespaced_pod(user_ns, pod_body)
+            logger.info(f"Desktop pod {full_session_name} created")
+            return True
+        except ApiException as e:
+            if e.status == 409:
+                try:
+                    existing = core_api.read_namespaced_pod(full_session_name, user_ns)
+                    if existing.metadata.deletion_timestamp:
+                        logger.info(f"Desktop pod {full_session_name} is terminating.")
+                        return False
+                except ApiException:
+                    pass
+                return True  # Already exists
+            logger.error(f"Failed to create desktop pod: {e}")
+            return False
+
+    def _create_desktop_vm(self, user_ns, full_session_name, session_name,
+                           username, uid, template_spec, pvc_name, display_port,
+                           instancetype, preemptible) -> bool:
+        vm_body = self._build_vm_spec(
+            session_name=full_session_name,
+            hostname=session_name,
+            username=username,
+            uid=uid,
+            template_spec=template_spec,
+            pvc_name=pvc_name,
+            display_port=display_port,
+            instancetype=instancetype,
+            preemptible=preemptible,
+        )
+        logger.debug(f"Creating KubeVirt VM:\n{yaml.safe_dump(vm_body)}")
+        try:
+            self.api.create_namespaced_custom_object(
+                KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns, KUBEVIRT_VM_PLURAL, vm_body
+            )
+            logger.info(f"VirtualMachine {full_session_name} created")
+            return True
+        except ApiException as e:
+            if e.status == 409:
+                return True  # Already exists
+            # 404 here means the KubeVirt CRDs are not installed in this cluster.
+            logger.error(f"Failed to create VirtualMachine {full_session_name} "
+                         f"(is KubeVirt installed?): {e}")
+            return False
+
+    def get_user_desktop_templates(self, username: str) -> List[Dict[str, Any]]:
+        templates = []
+        user_ns = self._get_user_namespace(username)
+        namespaces_to_search = [self.namespace]
+        if user_ns != self.namespace:
+            namespaces_to_search.append(user_ns)
+
+        for ns in namespaces_to_search:
+            try:
+                resp = self.api.list_namespaced_custom_object(
+                    self.group, self.version, ns, "desktoptemplates"
+                )
+                for item in resp.get("items", []):
+                    t = item.get("spec", {})
+                    full_name = item["metadata"]["name"]
+                    owner = t.get("user", "system")
+                    if owner == "system":
+                        t["name"] = full_name
+                        t["fullName"] = full_name
+                        t["source"] = "system"
+                        templates.append(t)
+                    elif owner == username:
+                        display_name = full_name
+                        if full_name.startswith(f"{username}-"):
+                            display_name = full_name[len(username) + 1:]
+                        t["name"] = display_name
+                        t["fullName"] = full_name
+                        t["source"] = "user"
+                        templates.append(t)
+            except ApiException as e:
+                if e.status != 404:
+                    logger.error(f"Failed to list desktop templates in {ns}: {e}")
+
+        templates.sort(key=lambda x: x.get("source", ""))
+        return templates
+
+    def get_user_desktop_sessions(self, username: str) -> List[Dict[str, Any]]:
+        sessions = []
+        user_ns = self._get_user_namespace(username)
+        try:
+            resp = self.api.list_namespaced_custom_object(
+                self.group, self.version, user_ns, "desktopsessions"
+            )
+            for item in resp.get("items", []):
+                spec = item.get("spec", {})
+                status = item.get("status", {}) or {}
+                full_name = item["metadata"]["name"]
+                display_name = full_name
+                if full_name.startswith(f"{username}-"):
+                    display_name = full_name[len(username) + 1:]
+
+                sessions.append({
+                    "name": display_name,
+                    "template": spec.get("templateRef"),
+                    "namespace": user_ns,
+                    "phase": status.get("phase", "Unknown"),
+                    "backend": status.get("backend"),
+                    "podName": status.get("podName"),
+                    "vmiName": status.get("vmiName"),
+                    "address": status.get("address"),
+                    "displayPort": status.get("displayPort"),
+                })
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to list desktop sessions: {e}")
+        return sessions
+
+    def add_desktop_session(self, username: str, template_name: str, session_name: str) -> bool:
+        user_ns = self._ensure_user_namespace(username)
+        body = {
+            "apiVersion": f"{self.group}/{self.version}",
+            "kind": "DesktopSession",
+            "metadata": {
+                "name": f"{username}-{session_name}",
+                "namespace": user_ns
+            },
+            "spec": {
+                "templateRef": template_name,
+                "user": username,
+            }
+        }
+        try:
+            self.api.create_namespaced_custom_object(
+                self.group, self.version, user_ns, "desktopsessions", body
+            )
+            return True
+        except ApiException as e:
+            logger.error(f"Failed to create desktop session: {e}")
+            return False
+
+    def delete_desktop_session(self, username: str, session_name: str) -> bool:
+        logger.info(f"Attempting to delete desktop session {username}-{session_name}")
+        user_ns = self._get_user_namespace(username)
+        try:
+            self.api.delete_namespaced_custom_object(
+                self.group, self.version, user_ns, "desktopsessions", f"{username}-{session_name}"
+            )
+            return True
+        except ApiException as e:
+            logger.error(f"Failed to delete desktop session: {e}")
+            return False
 
     def get_server_host_key(self, secret_name: str) -> Optional[bytes]:
         try:

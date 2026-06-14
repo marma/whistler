@@ -84,7 +84,7 @@ else
 fi
 
 echo "==> Installing CRDs, PriorityClass, namespace and test template"
-kubectl apply -f manifests/crds.yaml
+kubectl apply -f charts/whistler/crds/crds.yaml
 kubectl apply -f charts/whistler/templates/priorityclass.yaml
 kubectl create namespace "$SYS_NS" --dry-run=client -o yaml | kubectl apply -f -
 
@@ -154,6 +154,7 @@ env \
   WHISTLER_TEST_SSH_PORT=8022 \
   WHISTLER_TEST_USER="$TEST_USER" \
   WHISTLER_TEST_TEMPLATE="$TEST_TEMPLATE" \
+  WHISTLER_TEST_SYS_NS="$SYS_NS" \
   WHISTLER_TEST_KEY="$WORK/id" \
   "$PYTHON" -m pytest tests/integration -m integration -v
 RC=$?

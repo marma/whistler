@@ -26,7 +26,7 @@ test-local: # Run unit tests in the local venv
 cluster-up: # Create the k3d cluster and install CRDs/PriorityClass
 	k3d cluster create $(CLUSTER) --wait
 	k3d kubeconfig merge $(CLUSTER) --kubeconfig-switch-context
-	kubectl apply -f manifests/crds.yaml
+	kubectl apply -f charts/whistler/crds/crds.yaml
 	kubectl apply -f charts/whistler/templates/priorityclass.yaml
 
 cluster-down: # Delete the k3d cluster

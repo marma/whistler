@@ -95,6 +95,28 @@ templates:
       cpu: 500m
       memory: 2Gi
 
+# Admin-curated catalog of desktop sessions (DesktopTemplate CRs, user: system).
+# backend: pod -> a lightweight desktop pod; backend: vm -> a KubeVirt VM.
+# persistence: ephemeral | persistent | preemptible. displayPort is where the
+# image's display server (e.g. VNC) listens; the per-session Service exposes it.
+desktopTemplates: {}
+  # xfce-vnc:
+  #   description: "XFCE desktop over VNC"
+  #   backend: pod
+  #   image: "consol/ubuntu-xfce-vnc:latest"
+  #   displayPort: 5901
+  #   persistence: ephemeral
+  #   resources:
+  #     cpu: 1000m
+  #     memory: 2Gi
+  # win-vm:
+  #   description: "Windows desktop (KubeVirt VM)"
+  #   backend: vm
+  #   image: "registry.example/desktops/win:latest"
+  #   displayPort: 5900
+  #   persistence: persistent
+  #   instancetype: "u1.medium"
+
 userVolume:
   accessMode: ReadWriteMany
   size: 10Gi
