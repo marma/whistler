@@ -31,6 +31,34 @@ server:
       memory: 1Gi
   logLevel: DEBUG
 
+# Shared, stateless guacd (Guacamole protocol daemon). The portal opens a
+# connection to it per session; guacd dials the desktop's display port.
+guacd:
+  enabled: true
+  image: "guacamole/guacd:1.5.5"
+  replicaCount: 1
+
+# Web portal: launch + connect to desktop sessions from a browser.
+portal:
+  enabled: true
+  replicaCount: 1
+  service:
+    type: NodePort
+    port: 8080
+    nodePort: 30080
+  logLevel: INFO
+  auth:
+    # Minimal/dev only this round. When false the portal returns 401 (real web
+    # SSO/OIDC is a follow-up). Mirrors whistler.auth.allowAny semantics.
+    allowAny: false
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+    requests:
+      cpu: 250m
+      memory: 256Mi
+
 whistler:
   auth:
     allowAny: false
@@ -98,22 +126,33 @@ templates:
 # Admin-curated catalog of desktop sessions (DesktopTemplate CRs, user: system).
 # backend: pod -> a lightweight desktop pod; backend: vm -> a KubeVirt VM.
 # persistence: ephemeral | persistent | preemptible. displayPort is where the
-# image's display server (e.g. VNC) listens; the per-session Service exposes it.
-desktopTemplates: {}
-  # xfce-vnc:
-  #   description: "XFCE desktop over VNC"
-  #   backend: pod
-  #   image: "consol/ubuntu-xfce-vnc:latest"
-  #   displayPort: 5901
-  #   persistence: ephemeral
-  #   resources:
-  #     cpu: 1000m
-  #     memory: 2Gi
+# image's display server (RDP/VNC) listens; the per-session Service exposes it
+# and guacd dials it. protocol + connectionParams are passed to guacd (RDP needs
+# a login, so the image's well-known creds live here — transport safety comes
+# from the locked-down NetworkPolicy, not the password).
+desktopTemplates:
+  rdp-desktop:
+    description: "Linux desktop over RDP"
+    backend: pod
+    image: "linuxserver/rdesktop:latest"
+    protocol: rdp
+    displayPort: 3389
+    persistence: ephemeral
+    connectionParams:
+      username: "abc"
+      password: "abc"
+      security: "any"
+      ignore-cert: "true"
+      resize-method: "display-update"
+    resources:
+      cpu: "1000m"
+      memory: 2Gi
   # win-vm:
   #   description: "Windows desktop (KubeVirt VM)"
   #   backend: vm
   #   image: "registry.example/desktops/win:latest"
-  #   displayPort: 5900
+  #   protocol: rdp
+  #   displayPort: 3389
   #   persistence: persistent
   #   instancetype: "u1.medium"
 

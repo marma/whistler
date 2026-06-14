@@ -146,6 +146,13 @@ spec:
                   type: integer
                 instancetype:
                   type: string
+                protocol:
+                  type: string
+                  enum: ["vnc", "rdp"]
+                connectionParams:
+                  type: object
+                  additionalProperties:
+                    type: string
   scope: Namespaced
   names:
     plural: desktoptemplates

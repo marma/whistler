@@ -140,3 +140,51 @@ subjects:
   - kind: ServiceAccount
     name: {{ .Release.Name }}-server
     namespace: {{ .Release.Namespace }}
+
+{{- if .Values.portal.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-portal
+  namespace: {{ .Release.Namespace }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-portal
+rules:
+  # List/launch/connect desktop sessions and read their templates + status.
+  - apiGroups: [whistler.martinmalmsten.net]
+    resources: [desktopsessions, desktoptemplates, desktopsessions/status]
+    verbs: [get, list, create, delete, watch]
+
+  # add_desktop_session -> _ensure_user_namespace ensures the per-user namespace
+  # and its NetworkPolicy exist.
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, create]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, create, update, patch]
+
+  # Resolving session targets, plus loading users/config like the other processes.
+  - apiGroups: [""]
+    resources: [services, secrets, configmaps]
+    verbs: [get, list]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-portal
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-portal
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-portal
+    namespace: {{ .Release.Namespace }}
+{{- end }}

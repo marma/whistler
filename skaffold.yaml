@@ -21,6 +21,9 @@ deploy:
           whistler.auth.allowAny: false
           server.service.type: NodePort
           server.service.nodePort: 30022
+          portal.auth.allowAny: true
+          portal.service.type: NodePort
+          portal.service.nodePort: 30080
           userVolume.accessMode: ReadWriteOnce
           userVolume.size: 10Mi
           whistler.volumes[0].name: data

@@ -9,8 +9,15 @@ spec:
   description: {{ $template.description | default "" | quote }}
   image: {{ $template.image }}
   backend: {{ $template.backend | default "pod" }}
+{{- if $template.protocol }}
+  protocol: {{ $template.protocol }}
+{{- end }}
 {{- if $template.displayPort }}
   displayPort: {{ $template.displayPort }}
+{{- end }}
+{{- if $template.connectionParams }}
+  connectionParams:
+{{ toYaml $template.connectionParams | indent 4 }}
 {{- end }}
 {{- if $template.persistence }}
   persistence: {{ $template.persistence }}

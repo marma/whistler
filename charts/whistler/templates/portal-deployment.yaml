@@ -1,0 +1,77 @@
+{{- if .Values.portal.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-portal
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: whistler-portal
+spec:
+  replicas: {{ .Values.portal.replicaCount }}
+  selector:
+    matchLabels:
+      app: whistler-portal
+  template:
+    metadata:
+      labels:
+        app: whistler-portal
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/users: {{ include (print $.Template.BasePath "/users-secret.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}-portal
+      containers:
+        - name: portal
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "whistler.portal"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: PORTAL_PORT
+              value: "8080"
+            - name: GUACD_HOST
+              value: "{{ .Release.Name }}-guacd"
+            - name: GUACD_PORT
+              value: "4822"
+            - name: WHISTLER_AUTH_ALLOW_ANY
+              value: "{{ .Values.portal.auth.allowAny }}"
+            - name: WHISTLER_LOG_LEVEL
+              value: "{{ .Values.portal.logLevel }}"
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          # KubeConfigManager loads users (securityContext) and networkpolicy
+          # egress config, same as the operator/server.
+          volumeMounts:
+            - name: users-config
+              mountPath: "/etc/whistler"
+              readOnly: true
+            - name: config
+              mountPath: "/etc/whistler-config/volumes.yaml"
+              subPath: "volumes.yaml"
+              readOnly: true
+            - name: config
+              mountPath: "/etc/whistler-config/networkpolicy.yaml"
+              subPath: "networkpolicy.yaml"
+              readOnly: true
+          resources:
+            {{- toYaml .Values.portal.resources | nindent 12 }}
+      volumes:
+        - name: users-config
+          secret:
+            secretName: {{ .Release.Name }}-users
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-config
+{{- end }}

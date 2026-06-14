@@ -1,0 +1,20 @@
+{{- if .Values.portal.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-portal
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: whistler-portal
+spec:
+  type: {{ .Values.portal.service.type }}
+  selector:
+    app: whistler-portal
+  ports:
+    - name: http
+      port: {{ .Values.portal.service.port }}
+      targetPort: 8080
+      {{- if and (eq .Values.portal.service.type "NodePort") .Values.portal.service.nodePort }}
+      nodePort: {{ .Values.portal.service.nodePort }}
+      {{- end }}
+{{- end }}

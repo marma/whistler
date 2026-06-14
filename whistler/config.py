@@ -175,7 +175,7 @@ class KubeConfigManager(ConfigManager):
             "spec": {
                 "podSelector": {},
                 "policyTypes": ["Ingress", "Egress"],
-                "ingress": [],  # Deny all ingress
+                "ingress": self._build_ingress_rules(),
                 "egress": self._build_egress_rules()
             }
         }
@@ -502,6 +502,27 @@ class KubeConfigManager(ConfigManager):
             pass  # Use defaults (deny-all egress except DNS)
         except Exception as e:
             logger.error(f"Failed to load networkpolicy.yaml: {e}")
+
+    def _build_ingress_rules(self) -> list:
+        """Ingress for a user namespace: deny everything except the shared guacd
+        pod reaching desktop pods (it dials the per-session Service to bridge the
+        display). Without this carve-out the round-1 deny-all-ingress policy would
+        block guacd and the desktop would never render.
+
+        The source is restricted to the single trusted guacd Deployment by
+        namespace + pod label; no port is pinned because the display port varies
+        per template and guacd only ever dials that port anyway."""
+        guacd_ns = os.environ.get("GUACD_NAMESPACE", self.namespace)
+        return [{
+            "from": [{
+                "namespaceSelector": {
+                    "matchLabels": {"kubernetes.io/metadata.name": guacd_ns}
+                },
+                "podSelector": {
+                    "matchLabels": {"app": "whistler-guacd"}
+                }
+            }]
+        }]
 
     def _build_egress_rules(self) -> list:
         rules = []
@@ -1099,7 +1120,7 @@ class KubeConfigManager(ConfigManager):
 
         template_spec = template.get('spec', {})
         backend = template_spec.get('backend', 'pod')
-        display_port = template_spec.get('displayPort', 5901)
+        display_port = template_spec.get('displayPort', 3389)
         persistence = template_spec.get('persistence', 'ephemeral')
         preemptible = persistence == 'preemptible'
 

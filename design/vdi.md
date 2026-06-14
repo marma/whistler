@@ -1,8 +1,9 @@
 # VDI: desktop-pod and KubeVirt-VM backends
 
-Status: **implemented (round 1 of 2)**. Display tunnel (Guacamole) is round 2 and not
-yet built. KubeVirt VM path is implemented behind the abstraction but **unverified
-end-to-end** (no KubeVirt in any cluster we can test against yet).
+Status: **rounds 1 and 2 implemented.** Round 1 = provisioning (desktop pods + KubeVirt
+VMs). Round 2 = the display path (RDP desktop + shared guacd + a Python WebSocket portal) —
+see [Round 2: the display path](#round-2-the-display-path) below. The KubeVirt VM path remains
+**unverified end-to-end** (no KubeVirt in any cluster we can test against yet).
 
 ## Why
 
@@ -164,19 +165,56 @@ starts cleanly without KubeVirt.
 
 ## Security notes (inherited + new)
 
-- Per-user namespace with default-deny ingress and locked-down egress (the existing
-  `_build_egress_rules` complement-CIDR math), reused unchanged.
+- Per-user namespace with deny-all ingress **except** a guacd carve-out (round 2,
+  `_build_ingress_rules`) and locked-down egress (the existing `_build_egress_rules`
+  complement-CIDR math).
 - `automountServiceAccountToken: false` on desktop pods; optional `securityContext` from the
   user record (users absent from `users.yaml` get none — same as SSH pods).
 - Ephemeral root + persistent home PVC limits the data-at-rest surface to one PVC per user.
 - VM backend is the answer to "I need nested containers / privileged workloads" — the
   hypervisor contains the blast radius. Do not try to make nested Docker safe in a pod.
 
-## What's deferred to round 2 (display path)
+## Round 2: the display path
 
-Per [../mother-design.md](../mother-design.md): keep `guacd` (protocol engine) +
-`guacamole-common-js` (browser renderer); replace the Guacamole Java web app with a thin
-WebSocket↔guacd tunnel fed connection params straight from the CR (the per-session Service
-address + ephemeral creds). Auth stays in the portal; CRs remain the single source of truth.
-Idle-teardown detection (no active tunnel for N minutes → stop) is the most-forgotten loop —
-without it, preemptible/vGPU licenses strand.
+Implemented. A browser reaches a desktop with no Guacamole Java web app:
+
+```
+browser (guacamole-common-js)  ──WS──▶  portal (Python/aiohttp)
+                                            │ guacd handshake, then byte relay
+                                            ▼
+                                     shared guacd (TCP 4822)
+                                            │ dials RDP
+                                            ▼
+                    per-session ClusterIP Service ──▶ desktop pod (xrdp)
+```
+
+- **Display protocol: RDP.** The sample `DesktopTemplate` uses an xrdp image
+  (`linuxserver/rdesktop`, port 3389). Two new template fields drive guacd generically:
+  `protocol` (`vnc`|`rdp`) and `connectionParams` (a string map merged into the guacd
+  `connect`). RDP needs a login, so well-known image creds + `ignore-cert`/`security` live in
+  `connectionParams` — **not** per-session secrets; transport safety is the NetworkPolicy +
+  per-session Service that only guacd can reach.
+- **Shared, stateless guacd** Deployment + Service (`whistler-guacd:4822`). One for all
+  sessions; it dials each session's per-session Service.
+- **Portal** (`whistler/portal/`, a third process from the same image,
+  `python -m whistler.portal`):
+  - `protocol.py` — pure Guacamole codec (`encode`/`parse_instruction`/`Decoder`); lengths are
+    Unicode-char counts, parsing is length-driven.
+  - `guacd.py` — the server-side handshake (`select`/`args`/`size`…/`connect`/`ready`) like
+    guacamole-lite; `build_connect_args` echoes guacd's `VERSION_*` pseudo-arg and positions
+    params; the browser's `Guacamole.Client` only streams after `ready`.
+  - `app.py` — aiohttp routes (`/`, `/launch`, `/connect/<id>`, `/status/<id>`, `/ws/<id>`,
+    `/healthz`); HTML inline, `guacamole-common-js` from a CDN; the `/ws` handler does the
+    handshake then a raw byte pump (incremental UTF-8 decode guacd→browser).
+- **NetworkPolicy carve-out** (`_build_ingress_rules`): round 1's deny-all ingress now allows
+  **only** the guacd pod (by namespace + `app: whistler-guacd` label) to reach desktop pods —
+  mandatory, or guacd's RDP dial is dropped and nothing renders.
+- **Auth is dev-only** this round (`WHISTLER_AUTH_ALLOW_ANY`, identity from header/query); real
+  web SSO/OIDC is a follow-up. **No idle-teardown yet** (no active tunnel for N minutes → stop)
+  — still the most-forgotten loop; without it preemptible/GPU sessions strand. Track next.
+- **Performance**: the codec-heavy work is in guacd (C); the portal is a stateless I/O pump
+  that scales by replica count — Python is not the bottleneck.
+- **Verification**: unit tests cover the codec + handshake (against a fake guacd) + the ingress
+  rule; the `select`/`args`/`VERSION_*` exchange was confirmed against a real guacd 1.5.5. The
+  full e2e test ([../tests/integration/test_display.py](../tests/integration/test_display.py))
+  needs an amd64 cluster (the sample xrdp image is amd64-only).
