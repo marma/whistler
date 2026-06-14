@@ -170,18 +170,12 @@ async function waitReady() {
 // browser to upscale, which is soft. We render at innerWidth*dpr and scale the
 // canvas back down by 1/dpr to fill the viewport, so one remote pixel == one
 // device pixel (crisp, no resampling).
-//
-// DIVISOR halves that on demand (the 100%/50% button): the remote renders at
-// half the device resolution and the canvas is upscaled to fill — far less to
-// encode/relay/draw, useful on big viewports, at the cost of sharpness.
-let DIVISOR = 1;
 function remoteSize() {
   const dpr = window.devicePixelRatio || 1;
-  const eff = dpr / DIVISOR;                       // remote px per CSS px
   return {
-    w: Math.max(640, Math.min(8192, Math.round(window.innerWidth  * eff))),
-    h: Math.max(480, Math.min(8192, Math.round(window.innerHeight * eff))),
-    scale: 1 / eff,                                // shrink remote canvas to the CSS viewport
+    w: Math.max(640, Math.min(8192, Math.round(window.innerWidth  * dpr))),
+    h: Math.max(480, Math.min(8192, Math.round(window.innerHeight * dpr))),
+    scale: 1 / dpr,
   };
 }
 function connect() {
@@ -200,32 +194,61 @@ function connect() {
   client.onerror = e => log("client error: " + (e && e.message || e));
   tunnel.onerror = e => log("tunnel error: " + (e && e.message || e));
 
-  // Apply the current target size: scale the canvas locally always, and (once
-  // connected) ask the server to re-render at the new resolution.
-  function applySize() {
-    const r = remoteSize();
-    try {
-      display.scale(r.scale);
-      if (connected) client.sendSize(r.w, r.h);
-      log('size -> ' + r.w + 'x' + r.h + ' @' + r.scale.toFixed(3));
-    } catch (e) { log('size error: ' + e); }
-  }
-  // Re-assert scale whenever guac resizes the display to a new remote size.
-  display.onresize = () => { try { display.scale(remoteSize().scale); } catch (e) {} };
-
   // Initial size travels in the connect data -> WS query -> guacd handshake, so
   // the RDP session starts at the right resolution (no fixed 1024x768 then resize).
   const r0 = remoteSize();
+  let remoteW = r0.w, remoteH = r0.h;   // actual remote size, updated by onresize
+  let halfMode = false;
+
+  // Compute the target remote resolution and the canvas scale needed for it to
+  // fill the viewport. halfMode requests half the device pixels (less to encode,
+  // visibly blurry but same viewport coverage).
+  function targetSize() {
+    const dpr = window.devicePixelRatio || 1;
+    const div = halfMode ? 2 : 1;
+    return {
+      w: Math.max(640, Math.min(8192, Math.round(window.innerWidth  * dpr / div))),
+      h: Math.max(480, Math.min(8192, Math.round(window.innerHeight * dpr / div))),
+      scale: div / dpr,
+    };
+  }
+
+  function applySize() {
+    const t = targetSize();
+    try {
+      // Optimistic: apply the scale for the requested target dimensions immediately.
+      // Correct for xrdp (honors sendSize). For grd (ignores sendSize), the
+      // fallback below re-fits using the actual fixed remote dimensions.
+      display.scale(t.scale);
+      if (connected) client.sendSize(t.w, t.h);
+      log('target ' + t.w + 'x' + t.h + ' @' + t.scale.toFixed(3));
+      clearTimeout(applySize._fix);
+      applySize._fix = setTimeout(() => {
+        try { display.scale(Math.min(window.innerWidth / remoteW, window.innerHeight / remoteH)); } catch (e) {}
+      }, 400);
+    } catch (e) { log('size error: ' + e); }
+  }
+
+  // When the remote actually resizes (xrdp), cancel the fallback and lock in the
+  // exact fit based on the real dimensions.
+  display.onresize = (width, height) => {
+    clearTimeout(applySize._fix);
+    remoteW = width; remoteH = height;
+    try { display.scale(Math.min(window.innerWidth / width, window.innerHeight / height)); } catch (e) {}
+  };
+
   display.scale(r0.scale);
   client.connect('user=' + encodeURIComponent(user) + '&w=' + r0.w + '&h=' + r0.h);
 
-  // Dynamic resize (debounced) + the 100%/50% quality toggle both re-target.
   let rt;
   window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(applySize, 300); });
+
+  // 50%/100%: both fill the viewport, but 50% sends half the remote pixels
+  // (lower quality, less bandwidth). Does NOT change the canvas size.
   const qBtn = document.getElementById('q');
   qBtn.onclick = () => {
-    DIVISOR = DIVISOR === 1 ? 2 : 1;
-    qBtn.textContent = DIVISOR === 1 ? '100%' : '50%';
+    halfMode = !halfMode;
+    qBtn.textContent = halfMode ? '50%' : '100%';
     applySize();
   };
 

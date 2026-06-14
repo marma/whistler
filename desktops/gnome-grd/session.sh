@@ -40,7 +40,9 @@ fi
 
 # --- headless GNOME Shell (Wayland compositor + virtual monitor) ---------------
 # --headless uses Mutter's headless backend (no DRM/KMS/seat; llvmpipe).
-gnome-shell --headless --virtual-monitor "$RES" &
+# Fix the socket name so apps always know which WAYLAND_DISPLAY to connect to.
+export WAYLAND_DISPLAY=wayland-0
+gnome-shell --headless --virtual-monitor "$RES" --wayland-display wayland-0 &
 
 # Wait for the Shell to own the Mutter RemoteDesktop/ScreenCast D-Bus names that
 # grd screen-shares through — configuring grd before they exist races (grd logs
@@ -51,6 +53,12 @@ gdbus wait --session --timeout 30 org.gnome.Mutter.RemoteDesktop \
 gdbus wait --session --timeout 10 org.gnome.Mutter.ScreenCast \
   || echo "WARN: timed out waiting for org.gnome.Mutter.ScreenCast" >&2
 sleep 1
+
+# Push WAYLAND_DISPLAY (and the rest of the session env) into the D-Bus
+# activation environment. Without this, apps launched via GNOME Shell's launcher
+# (D-Bus-activated) don't get WAYLAND_DISPLAY and silently fail to open windows —
+# the "bouncing" launch animation plays but no window ever appears.
+dbus-update-activation-environment --all || true
 
 # --- configure + run gnome-remote-desktop --------------------------------------
 grdctl rdp set-tls-cert "$CERT_DIR/cert.pem"
