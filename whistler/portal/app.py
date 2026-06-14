@@ -22,6 +22,7 @@ from aiohttp import web
 
 from whistler.portal import guacd
 from whistler.portal.guacd import handshake, resolve_session, _build_guacd_params
+from whistler.portal.protocol import take_complete_instructions
 
 logger = logging.getLogger("whistler.portal")
 
@@ -32,7 +33,7 @@ logger = logging.getLogger("whistler.portal")
 
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
-    if request.path == "/healthz":
+    if request.path == "/healthz" or request.path.startswith("/static/"):
         return await handler(request)
     if os.environ.get("WHISTLER_AUTH_ALLOW_ANY") != "true":
         return web.Response(
@@ -54,13 +55,28 @@ async def _run(request, func, *args):
 
 
 # --------------------------------------------------------------------------- #
-# Pages (inline; guacamole-common-js loaded from a CDN)                         #
+# Pages (inline; guacamole-common-js served locally from the portal)            #
 # --------------------------------------------------------------------------- #
 
-GUAC_JS_URL = os.environ.get(
-    "PORTAL_GUAC_JS_URL",
-    "https://cdn.jsdelivr.net/npm/guacamole-common-js@1.5.0/dist/guacamole-common.min.js",
-)
+# guacamole-common-js is vendored (whistler/portal/static/) and served by the
+# portal rather than pulled from a CDN. We pin 1.6.0: the npm-published builds
+# stop at 1.5.0, whose renderer mishandles guacd's save-under copy ops (the
+# selection-rectangle / drag artifacts). 1.6.0 must be advertised to guacd too —
+# see guacd._CLIENT_PROTOCOL_VERSION. Overridable to a URL for experiments.
+_STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+_GUAC_JS_FILENAME = "guacamole-common.min.js"
+GUAC_JS_URL = os.environ.get("PORTAL_GUAC_JS_URL", "/static/" + _GUAC_JS_FILENAME)
+
+_guac_js_cache = None
+
+
+async def guac_js(request):
+    global _guac_js_cache
+    if _guac_js_cache is None:
+        with open(os.path.join(_STATIC_DIR, _GUAC_JS_FILENAME), "rb") as f:
+            _guac_js_cache = f.read()
+    return web.Response(body=_guac_js_cache, content_type="application/javascript",
+                        charset="utf-8")
 
 
 def _render_index(user, templates, sessions):
@@ -92,41 +108,142 @@ def _render_index(user, templates, sessions):
 
 # Placeholders are replaced (not .format) so JS braces stay intact.
 _CONNECT_HTML = """<!doctype html><meta charset=utf-8><title>__ID__</title>
-<style>html,body{margin:0;height:100%;background:#000}#status{color:#ccc;font:14px sans-serif;padding:8px}</style>
-<div id=status>Waiting for session…</div><div id=display></div>
+<style>
+  html,body{margin:0;height:100%;background:#202020;overflow:hidden}
+  /* Guacamole gives its layer canvases z-index:-1, which paints them BEHIND the
+     page background — so the desktop renders but stays hidden under body's
+     background. Make #display its own stacking context (position + z-index, plus
+     isolation for good measure) so that -1 resolves inside #display, on top of
+     the body background, instead of behind the whole page. */
+  #display{position:absolute;inset:0;z-index:0;isolation:isolate}
+  /* No interpolation. On a hidpi screen the browser upscales the canvas from CSS
+     px to device px; the default bilinear filter makes that blurry (reads as
+     "compression"). pixelated/crisp-edges force nearest-neighbour -> jaggies
+     instead of blur. With 1:1 rendering (below) there's no resampling at all at
+     100%; this matters for the 2x mode and fractional DPRs. */
+  #display canvas{image-rendering:pixelated;image-rendering:crisp-edges}
+  #log{position:absolute;top:0;left:0;z-index:10;color:#0f0;font:12px/1.4 monospace;
+       background:rgba(0,0,0,.7);padding:6px;max-width:95%;white-space:pre-wrap;pointer-events:none}
+  #q{position:absolute;top:6px;right:6px;z-index:11;font:12px monospace;cursor:pointer;
+     background:rgba(0,0,0,.6);color:#0f0;border:1px solid #0f0;border-radius:3px;padding:2px 6px}
+</style>
+<div id=display></div><pre id=log></pre>
+<button id=q title="Toggle remote render resolution (1:1 physical vs half)">100%</button>
+<!-- guacamole-common-js ships a CommonJS bundle: it sets a global `var Guacamole`
+     but ends with an unguarded `module.exports`. Define a dummy `module` so that
+     last line is a harmless no-op instead of a ReferenceError. -->
+<script>var module = {};</script>
+<!-- guacamole-common-js prefers createImageBitmap when present, but Chrome's
+     createImageBitmap intermittently throws "source image could not be decoded"
+     on valid Blob input under load, and the rejected promise permanently stalls
+     guacamole's draw queue (updates freeze after the first such error). Disabling
+     it *before* the library loads forces the robust <img>-based decode path:
+     slower per image, but failures hit img.onerror instead of freezing the
+     session. Must run before the library script below. -->
+<script>try { window.createImageBitmap = undefined; } catch (e) {}</script>
 <script src="__GUAC_JS__"></script>
 <script>
 const id = "__ID__", user = "__USER__";
-const statusEl = document.getElementById('status');
+// The on-screen log is opt-in via ?debug; otherwise everything still goes to the
+// JS console, so the desktop fills the page cleanly during normal use.
+const DEBUG = new URLSearchParams(location.search).has('debug');
+const logEl = document.getElementById('log');
+if (!DEBUG) logEl.style.display = 'none';
+const NL = String.fromCharCode(10);
+function log(m) { if (DEBUG) logEl.textContent += m + NL; try { console.log("[whistler]", m); } catch (e) {} }
+const STATES = ["IDLE","CONNECTING","WAITING","CONNECTED","DISCONNECTING","DISCONNECTED"];
+if (!window.Guacamole) log("FATAL: Guacamole library not loaded");
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function waitReady() {
   for (;;) {
     try {
       const r = await fetch(`/status/${id}?user=${encodeURIComponent(user)}`);
-      if (r.ok) { const j = await r.json(); statusEl.textContent = 'Status: ' + j.phase;
-        if (j.phase === 'Ready') return; }
-    } catch (e) {}
+      if (r.ok) { const j = await r.json(); log("status: " + j.phase); if (j.phase === 'Ready') return; }
+      else log("status http " + r.status);
+    } catch (e) { log("status error: " + e); }
     await sleep(2000);
   }
 }
+// Size the remote in PHYSICAL device pixels, not CSS pixels: on a hidpi/scaled
+// display (e.g. 4K @ 150%) window.innerWidth is in CSS px, but the screen has
+// innerWidth*devicePixelRatio real pixels — rendering at CSS px then leaves the
+// browser to upscale, which is soft. We render at innerWidth*dpr and scale the
+// canvas back down by 1/dpr to fill the viewport, so one remote pixel == one
+// device pixel (crisp, no resampling).
+//
+// DIVISOR halves that on demand (the 100%/50% button): the remote renders at
+// half the device resolution and the canvas is upscaled to fill — far less to
+// encode/relay/draw, useful on big viewports, at the cost of sharpness.
+let DIVISOR = 1;
+function remoteSize() {
+  const dpr = window.devicePixelRatio || 1;
+  const eff = dpr / DIVISOR;                       // remote px per CSS px
+  return {
+    w: Math.max(640, Math.min(8192, Math.round(window.innerWidth  * eff))),
+    h: Math.max(480, Math.min(8192, Math.round(window.innerHeight * eff))),
+    scale: 1 / eff,                                // shrink remote canvas to the CSS viewport
+  };
+}
 function connect() {
+  log("connecting…");
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  const url = proto + location.host + '/ws/' + id + '?user=' + encodeURIComponent(user);
+  // No query string here: WebSocketTunnel appends `?`+connect-data itself, so a
+  // pre-existing query would produce a doubled `?` and corrupt the params.
+  const url = proto + location.host + '/ws/' + id;
   const tunnel = new Guacamole.WebSocketTunnel(url);
   const client = new Guacamole.Client(tunnel);
   const display = client.getDisplay();
   document.getElementById('display').appendChild(display.getElement());
-  tunnel.onerror = client.onerror = e => { statusEl.textContent = 'Error: ' + (e && e.message || e); };
-  client.onstatechange = s => { if (s === 3) statusEl.style.display = 'none'; };
-  client.connect('');
-  const el = display.getElement();
-  const mouse = new Guacamole.Mouse(el);
-  mouse.onmousedown = mouse.onmouseup = mouse.onmousemove = st => client.sendMouseState(st);
-  const kb = new Guacamole.Keyboard(document);
-  kb.onkeydown = k => client.sendKeyEvent(1, k);
-  kb.onkeyup = k => client.sendKeyEvent(0, k);
+
+  let connected = false;
+  client.onstatechange = s => { connected = (s === 3); log("state: " + (STATES[s] || s)); };
+  client.onerror = e => log("client error: " + (e && e.message || e));
+  tunnel.onerror = e => log("tunnel error: " + (e && e.message || e));
+
+  // Apply the current target size: scale the canvas locally always, and (once
+  // connected) ask the server to re-render at the new resolution.
+  function applySize() {
+    const r = remoteSize();
+    try {
+      display.scale(r.scale);
+      if (connected) client.sendSize(r.w, r.h);
+      log('size -> ' + r.w + 'x' + r.h + ' @' + r.scale.toFixed(3));
+    } catch (e) { log('size error: ' + e); }
+  }
+  // Re-assert scale whenever guac resizes the display to a new remote size.
+  display.onresize = () => { try { display.scale(remoteSize().scale); } catch (e) {} };
+
+  // Initial size travels in the connect data -> WS query -> guacd handshake, so
+  // the RDP session starts at the right resolution (no fixed 1024x768 then resize).
+  const r0 = remoteSize();
+  display.scale(r0.scale);
+  client.connect('user=' + encodeURIComponent(user) + '&w=' + r0.w + '&h=' + r0.h);
+
+  // Dynamic resize (debounced) + the 100%/50% quality toggle both re-target.
+  let rt;
+  window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(applySize, 300); });
+  const qBtn = document.getElementById('q');
+  qBtn.onclick = () => {
+    DIVISOR = DIVISOR === 1 ? 2 : 1;
+    qBtn.textContent = DIVISOR === 1 ? '100%' : '50%';
+    applySize();
+  };
+
+  try {
+    const el = display.getElement();
+    const mouse = new Guacamole.Mouse(el);
+    // sendMouseState(state, true): the `true` makes guac divide the coords by the
+    // display scale itself (and move the cursor to match). Do NOT pre-scale or
+    // mutate the state — guac reuses one state object across events and fires
+    // mousedown WITHOUT recomputing position, so mutating it double-scales the
+    // click anchor (correct on drag-move, 2x off on the initial press).
+    mouse.onmousedown = mouse.onmouseup = mouse.onmousemove = st => client.sendMouseState(st, true);
+    const kb = new Guacamole.Keyboard(document);
+    kb.onkeydown = k => client.sendKeyEvent(1, k);
+    kb.onkeyup = k => client.sendKeyEvent(0, k);
+  } catch (e) { log("input setup error: " + e); }
 }
-waitReady().then(connect);
+waitReady().then(connect).catch(e => log("fatal: " + e));
 </script>"""
 
 
@@ -197,7 +314,18 @@ async def ws(request):
     protocol = template.get("protocol") or "rdp"
     params = _build_guacd_params(template, sess["address"], sess["displayPort"])
 
-    wsr = web.WebSocketResponse()
+    # Initial display size from the browser viewport (?w/?h on the connect data),
+    # clamped; falls back to a sane default. Resizes after connect go via the
+    # client's `size` instruction, not here.
+    def _dim(key, default):
+        try:
+            return max(320, min(8192, int(request.query.get(key, ""))))
+        except (TypeError, ValueError):
+            return default
+    width, height = _dim("w", 1024), _dim("h", 768)
+
+    # guacamole-common-js connects with the "guacamole" subprotocol.
+    wsr = web.WebSocketResponse(protocols=("guacamole",))
     await wsr.prepare(request)
     logger.info(f"Opening relay for {user}/{session_id} -> guacd ({protocol} {sess['address']})")
 
@@ -208,10 +336,12 @@ async def ws(request):
         return wsr
 
     try:
-        _conn_id, leftover = await handshake(reader, writer, protocol=protocol, params=params)
-        if leftover:
-            await wsr.send_str(leftover.decode("utf-8"))
-        await _relay(wsr, reader, writer)
+        _conn_id, leftover = await handshake(reader, writer, protocol=protocol, params=params,
+                                             width=width, height=height)
+        # `leftover` may end mid-multibyte-char, so it must be fed through the
+        # relay's incremental decoder (not decoded standalone) or the partial
+        # tail corrupts/raises.
+        await _relay(wsr, reader, writer, initial=leftover)
     except Exception as e:
         logger.error(f"Relay for {user}/{session_id} failed: {e}")
         if not wsr.closed:
@@ -225,19 +355,36 @@ async def healthz(request):
     return web.Response(text="ok")
 
 
-async def _relay(wsr, reader, writer):
+async def _relay(wsr, reader, writer, initial=b""):
     """Bidirectional byte pump between the browser WS and the guacd socket.
-    Parses nothing — guacd<->browser is opaque after the handshake."""
+    Parses nothing — guacd<->browser is opaque after the handshake. ``initial``
+    is the bytes that arrived glued to ``ready`` during the handshake; it is fed
+    through the same incremental decoder so a multibyte char split at that
+    boundary is never lost or mis-decoded."""
     async def guacd_to_ws():
-        dec = codecs.getincrementaldecoder("utf-8")()
+        # guacamole-common-js parses each WS message independently and does NOT
+        # buffer a partial instruction across messages (it raises "Incomplete
+        # instruction" / corrupts its parse, hanging the page). So we must never
+        # split an instruction across messages: decode bytes, forward only whole
+        # instructions, and hold the partial tail for the next read.
+        utf8 = codecs.getincrementaldecoder("utf-8")()
+        buf = ""
+
+        async def forward(data: bytes):
+            nonlocal buf
+            buf += utf8.decode(data)
+            complete, buf = take_complete_instructions(buf)
+            if complete:
+                await wsr.send_str(complete)
+
         try:
+            if initial:
+                await forward(initial)
             while True:
                 data = await reader.read(65536)
                 if not data:
                     break
-                text = dec.decode(data)
-                if text:
-                    await wsr.send_str(text)
+                await forward(data)
         finally:
             if not wsr.closed:
                 await wsr.close()
@@ -272,5 +419,6 @@ def build_app(config_manager):
         web.get("/status/{id}", status),
         web.get("/ws/{id}", ws),
         web.get("/healthz", healthz),
+        web.get("/static/" + _GUAC_JS_FILENAME, guac_js),
     ])
     return app

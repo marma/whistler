@@ -8,6 +8,10 @@ build:
       context: .
       docker:
         dockerfile: Dockerfile
+    - image: whistler-desktop-xfce-rdp
+      context: desktops/xfce-rdp
+      docker:
+        dockerfile: Dockerfile
 deploy:
   helm:
     releases:
@@ -36,3 +40,18 @@ deploy:
         setValueTemplates:
           image.repository: "{{.IMAGE_REPO_whistler}}"
           image.tag: "{{.IMAGE_TAG_whistler}}"
+          # Use the locally-built desktop image for the sample template.
+          desktopTemplates.rdp-desktop.image: "{{.IMAGE_REPO_whistler_desktop_xfce_rdp}}:{{.IMAGE_TAG_whistler_desktop_xfce_rdp}}"
+# Forward both front doors to localhost on `skaffold dev` (NodePorts aren't
+# auto-published on kind/k3d the way they are on docker-desktop).
+portForward:
+  - resourceType: service
+    resourceName: whistler-portal
+    namespace: whistler
+    port: 8080
+    localPort: 30080
+  - resourceType: service
+    resourceName: whistler-server
+    namespace: whistler
+    port: 8022
+    localPort: 30022

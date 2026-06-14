@@ -96,7 +96,12 @@ async def test_handshake_drives_full_sequence_and_returns_id():
     assert opcodes == ["select", "size", "audio", "video", "image", "connect"]
     assert sent[0] == ["select", "rdp"]
     assert sent[1] == ["size", "1024", "768", "96"]
-    assert sent[-1] == ["connect", "VERSION_1_5_0", "h", "3389", "abc"]
+    # PNG only (lossless): JPEG's guacd-chosen quality has visible artifacts and
+    # there's no quality knob, so we force lossless. WebP decodes unreliably.
+    assert sent[4] == ["image", "image/png"]
+    # We echo OUR vendored client version (1.6.0), not whatever guacd advertised
+    # in `args` (here 1.5.0) — the version pseudo-arg position is replaced.
+    assert sent[-1] == ["connect", "VERSION_1_6_0", "h", "3389", "abc"]
 
 
 async def test_handshake_preserves_bytes_glued_to_ready():

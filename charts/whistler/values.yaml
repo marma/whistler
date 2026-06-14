@@ -35,8 +35,18 @@ server:
 # connection to it per session; guacd dials the desktop's display port.
 guacd:
   enabled: true
-  image: "guacamole/guacd:1.5.5"
+  # 1.6.0+ is multi-arch (amd64 + arm64); 1.5.x was amd64-only.
+  image: "guacamole/guacd:1.6.0"
   replicaCount: 1
+  # guacd does the RDP-decode -> Guacamole-encode (incl. image compression), so
+  # it's the CPU-heavy half of the pipeline.
+  resources:
+    limits:
+      cpu: "1000m"
+      memory: 4Gi
+    requests:
+      cpu: "250m"
+      memory: 512Mi
 
 # Web portal: launch + connect to desktop sessions from a browser.
 portal:
@@ -132,9 +142,11 @@ templates:
 # from the locked-down NetworkPolicy, not the password).
 desktopTemplates:
   rdp-desktop:
-    description: "Linux desktop over RDP"
+    description: "XFCE desktop over RDP"
     backend: pod
-    image: "linuxserver/rdesktop:latest"
+    # Built from desktops/xfce-rdp (multi-arch). For local dev, skaffold
+    # overrides this with the freshly-built image.
+    image: "ghcr.io/marma/whistler-desktop-xfce-rdp:latest"
     protocol: rdp
     displayPort: 3389
     persistence: ephemeral
@@ -144,9 +156,21 @@ desktopTemplates:
       security: "any"
       ignore-cert: "true"
       resize-method: "display-update"
+      # Full color over the RDP link (guacd often defaults to 16-bit, which
+      # bands). This is the RDP-link depth; separate from guacd's re-encoding to
+      # the browser (force-lossless below).
+      color-depth: "24"
+      # Force lossless (PNG) frames to the browser. guacd defaults to a lossy
+      # heuristic that sends JPEG for regions it deems "photographic" -- the
+      # JPEG ringing/mosquito-noise around sharp edges (text, window borders).
+      # Advertising only image/png in the handshake does NOT prevent this: PNG
+      # and JPEG are baseline formats guacd assumes every client supports, so it
+      # still emits JPEG. force-lossless is the actual lever (verified: drops
+      # guacd's image/jpeg frames to zero). Trade-off is bandwidth.
+      force-lossless: "true"
     resources:
       cpu: "1000m"
-      memory: 2Gi
+      memory: 4Gi
   # win-vm:
   #   description: "Windows desktop (KubeVirt VM)"
   #   backend: vm

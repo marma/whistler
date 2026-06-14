@@ -23,8 +23,29 @@ GUACD_HOST = os.environ.get("GUACD_HOST", "whistler-guacd")
 GUACD_PORT = int(os.environ.get("GUACD_PORT", "4822"))
 
 # guacd's `args` reply lists parameter names; in guacd >= 1.3 the first element
-# is a protocol-version pseudo-arg the client echoes back to negotiate.
+# is a protocol-version pseudo-arg. The client echoes back the version IT
+# supports and guacd operates at min(its version, ours). This MUST match the
+# version of the browser's guacamole-common-js: advertise too high and guacd
+# emits drawing instructions the client can't render (black screen). We now
+# vendor guacamole-common-js 1.6.0 (whistler/portal/static/, served by the
+# portal) instead of the npm-capped 1.5.0, because 1.5.0's renderer mishandles
+# guacd's save-under copy ops (the selection-rectangle / drag artifacts). So
+# advertise 1.6.0 to match the vendored client and guacd 1.6.x.
 _VERSION_PREFIX = "VERSION_"
+_CLIENT_PROTOCOL_VERSION = "VERSION_1_6_0"
+
+# Image formats we advertise to guacd on the browser's behalf (like
+# guacamole-lite), so guacd encodes screen updates in a format the browser
+# renders. Declaring none yields "source image could not be decoded" for every
+# frame.
+#
+# NOTE: this does NOT control lossiness. PNG and JPEG are baseline formats guacd
+# assumes every client supports, so even advertising only image/png, guacd still
+# emits JPEG for regions its lossy heuristic deems photographic (visible ringing
+# around edges). Lossless is forced by the connection param force-lossless=true
+# (set on the DesktopTemplate), not here. We still list only image/png (and omit
+# WebP, which decoded unreliably in browsers).
+_IMAGE_MIMETYPES = ("image/png",)
 
 
 def build_connect_args(arg_names: List[str], params: Dict[str, str],
@@ -84,12 +105,14 @@ async def handshake(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
     if not args or args[0] != "args":
         raise ProtocolError(f"expected 'args' from guacd, got {args!r}")
     arg_names = args[1:]
-    version = next((a for a in arg_names if a.startswith(_VERSION_PREFIX)), None)
+    # Advertise the vendored browser client's protocol version (not guacd's) so
+    # guacd emits instructions our guacamole-common-js (1.6.0) can render.
+    version = _CLIENT_PROTOCOL_VERSION
 
     writer.write(encode("size", str(width), str(height), str(dpi)))
-    writer.write(encode("audio"))
-    writer.write(encode("video"))
-    writer.write(encode("image"))
+    writer.write(encode("audio"))            # no audio
+    writer.write(encode("video"))            # no video
+    writer.write(encode("image", *_IMAGE_MIMETYPES))
     await writer.drain()
 
     writer.write(encode("connect", *build_connect_args(arg_names, params, version)))
@@ -101,5 +124,8 @@ async def handshake(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
     connection_id = ready[1] if len(ready) > 1 else ""
 
     # Recover any complete instructions and the partial tail read past `ready`.
-    leftover = b"".join(encode(*instr) for instr in pending) + decoder.pending.encode("utf-8")
+    # `pending_bytes` (not `pending`) so a multibyte char split across the read
+    # that delivered `ready` isn't dropped — that loss desyncs the stream and
+    # surfaces in the browser as "could not be decoded" / "Incomplete instruction".
+    leftover = b"".join(encode(*instr) for instr in pending) + decoder.pending_bytes
     return connection_id, leftover

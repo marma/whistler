@@ -18,7 +18,7 @@ help:
 
 test: # Build the test image and run unit tests inside the container
 	docker build -f Dockerfile.test -t $(TEST_IMAGE) .
-	docker run --rm $(TEST_IMAGE)
+	docker run -t --rm $(TEST_IMAGE)
 
 test-local: # Run unit tests in the local venv
 	$(PYTHON) -m pytest tests/unit -v

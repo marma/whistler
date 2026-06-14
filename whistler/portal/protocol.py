@@ -72,6 +72,19 @@ def _parse_buffer(buf: str) -> Tuple[List[List[str]], str]:
     return instructions, buf[pos:]
 
 
+def take_complete_instructions(buf: str) -> Tuple[str, str]:
+    """Split ``buf`` into ``(prefix, remainder)`` where ``prefix`` holds only
+    whole instructions (returned **verbatim**, original length fields intact) and
+    ``remainder`` is a trailing partial instruction, if any.
+
+    guacamole-common-js's WebSocketTunnel parses each WS message on its own and
+    does NOT buffer a partial instruction across messages — a message ending
+    mid-instruction makes it raise "Incomplete instruction." So the relay must
+    forward only the complete-instruction prefix per message and hold the rest."""
+    _instructions, remainder = _parse_buffer(buf)
+    return buf[:len(buf) - len(remainder)], remainder
+
+
 def parse_instruction(text: str) -> List[str]:
     """Parse exactly one complete instruction (trailing ``;`` required)."""
     instructions, remainder = _parse_buffer(text)
@@ -97,8 +110,17 @@ class Decoder:
 
     @property
     def pending(self) -> str:
-        """Decoded-but-incomplete tail not yet forming a full instruction.
-
-        Used by the handshake to recover bytes that arrived glued to ``ready``
-        so they can be flushed into the relay rather than dropped."""
+        """Decoded-but-incomplete tail not yet forming a full instruction."""
         return self._buf
+
+    @property
+    def pending_bytes(self) -> bytes:
+        """The full remaining byte tail: the decoded-but-unparsed chars **plus**
+        any incomplete multibyte sequence still buffered inside the UTF-8 decoder.
+
+        The handshake uses this to hand the bytes that arrived glued to ``ready``
+        to the relay's fresh decoder. ``pending`` alone would drop a multibyte
+        character split across the read that delivered ``ready``, orphaning its
+        continuation bytes and desyncing the stream (a rare image-corruption
+        / decode-error source)."""
+        return self._buf.encode("utf-8") + self._utf8.getstate()[0]

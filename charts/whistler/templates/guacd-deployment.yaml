@@ -24,4 +24,8 @@ spec:
           ports:
             - containerPort: 4822
               name: guacd
+          {{- with .Values.guacd.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
 {{- end }}

@@ -1,7 +1,13 @@
 """Guacamole wire protocol codec (whistler.portal.protocol)."""
 import pytest
 
-from whistler.portal.protocol import Decoder, ProtocolError, encode, parse_instruction
+from whistler.portal.protocol import (
+    Decoder,
+    ProtocolError,
+    encode,
+    parse_instruction,
+    take_complete_instructions,
+)
 
 
 def test_encode_basic():
@@ -64,3 +70,40 @@ def test_decoder_pending_holds_partial_tail():
     dec = Decoder()
     dec.feed(b"5.ready,1.x;4.syn")
     assert dec.pending == "4.syn"
+
+
+def test_take_complete_instructions_holds_partial_tail():
+    # The relay must forward only whole instructions per WS message (the browser
+    # tunnel doesn't buffer across messages), holding any partial tail.
+    complete, remainder = take_complete_instructions("5.ready,1.x;4.syn")
+    assert complete == "5.ready,1.x;"
+    assert remainder == "4.syn"
+
+
+def test_take_complete_instructions_is_verbatim_and_delimiter_safe():
+    # The prefix is returned unmodified, and values containing '.'/','/';' are
+    # not mis-split (length-driven, not delimiter-split).
+    full = encode("a", "x;y,z.q").decode("utf-8")  # "1.a,7.x;y,z.q;"
+    complete, remainder = take_complete_instructions(full + "3.ab")
+    assert complete == full
+    assert remainder == "3.ab"
+
+
+def test_take_complete_instructions_no_complete_yet():
+    complete, remainder = take_complete_instructions("10.partialdat")
+    assert complete == ""
+    assert remainder == "10.partialdat"
+
+
+def test_decoder_pending_bytes_includes_split_multibyte_tail():
+    # A multibyte char split at the end of a read must not be lost: `pending`
+    # (decoded chars) drops the buffered lead byte, but `pending_bytes` keeps it,
+    # so handing it to a fresh decoder reconstructs the stream byte-for-byte.
+    payload = encode("name", "café") + encode("sync", "9")
+    cut = payload.index(b"\xa9")          # split inside 'é' (0xc3 0xa9)
+    dec = Decoder()
+    assert dec.feed(payload[:cut]) == []  # nothing complete yet
+    relay = Decoder()
+    assert relay.feed(dec.pending_bytes + payload[cut:]) == [
+        ["name", "café"], ["sync", "9"],
+    ]

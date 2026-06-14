@@ -169,7 +169,7 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: guacd
-          image: guacamole/guacd:1.5.5
+          image: guacamole/guacd:1.6.0
           ports: [{ containerPort: 4822 }]
 ---
 apiVersion: v1
