@@ -86,6 +86,7 @@ Single source of truth: [../charts/whistler/crds/crds.yaml](../charts/whistler/c
 | `persistence` | `ephemeral` \| `persistent` \| `preemptible` | `preemptible` ⇒ `whistler-preemptible` priority class |
 | `displayPort` | integer | where the image's display server listens (default 5901) |
 | `instancetype` | string | VM-only; KubeVirt instancetype (supplies cpu/memory) |
+| `fuse` | boolean | grant the container `/dev/fuse` (see [FUSE / `/dev/fuse`](#fuse-devfuse) below) |
 
 ### `DesktopSession` (`ds`) — one live session (status subresource)
 
@@ -173,6 +174,24 @@ starts cleanly without KubeVirt.
 - Ephemeral root + persistent home PVC limits the data-at-rest surface to one PVC per user.
 - VM backend is the answer to "I need nested containers / privileged workloads" — the
   hypervisor contains the blast radius. Do not try to make nested Docker safe in a pod.
+
+### FUSE / `/dev/fuse`
+
+Some desktop images mount a FUSE filesystem at runtime. In particular the
+[`gnome-grd`](../desktops/gnome-grd/) image (GNOME via `gnome-remote-desktop`): grd's RDP
+clipboard channel mounts a FUSE fs, and its daemon **aborts** (`g_error`) the moment a client
+connects if `/dev/fuse` is absent — verified locally. The `fuse: true` field on a
+`DesktopTemplate` grants it.
+
+The implementation today (`_build_desktop_pod_spec`) runs that container **privileged**. This
+works on any cluster (incl. docker-desktop/k3d) with no prerequisites, at the cost of a
+privileged desktop pod. The least-privilege alternative is a **FUSE device plugin** — a
+DaemonSet (e.g. [`nextflow-io/k8s-fuse-plugin`](https://github.com/nextflow-io/k8s-fuse-plugin))
+that advertises a `github.com/fuse` resource so the pod gets `/dev/fuse` injected without
+elevated privileges. Switching is a change localized to the `fuse` block in
+`_build_desktop_pod_spec` (request the resource instead of setting `privileged`) plus
+installing the plugin. `gnome-grd` itself already runs the desktop as an unprivileged user
+internally (the entrypoint only needs root to start `systemd-logind`).
 
 ## Round 2: the display path
 

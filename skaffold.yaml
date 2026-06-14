@@ -12,6 +12,10 @@ build:
       context: desktops/xfce-rdp
       docker:
         dockerfile: Dockerfile
+    - image: whistler-desktop-gnome-grd
+      context: desktops/gnome-grd
+      docker:
+        dockerfile: Dockerfile
 deploy:
   helm:
     releases:
@@ -40,8 +44,9 @@ deploy:
         setValueTemplates:
           image.repository: "{{.IMAGE_REPO_whistler}}"
           image.tag: "{{.IMAGE_TAG_whistler}}"
-          # Use the locally-built desktop image for the sample template.
+          # Use the locally-built desktop images for the sample templates.
           desktopTemplates.rdp-desktop.image: "{{.IMAGE_REPO_whistler_desktop_xfce_rdp}}:{{.IMAGE_TAG_whistler_desktop_xfce_rdp}}"
+          desktopTemplates.gnome-grd.image: "{{.IMAGE_REPO_whistler_desktop_gnome_grd}}:{{.IMAGE_TAG_whistler_desktop_gnome_grd}}"
 # Forward both front doors to localhost on `skaffold dev` (NodePorts aren't
 # auto-published on kind/k3d the way they are on docker-desktop).
 portForward:

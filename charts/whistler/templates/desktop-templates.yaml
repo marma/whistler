@@ -19,6 +19,9 @@ spec:
   connectionParams:
 {{ toYaml $template.connectionParams | indent 4 }}
 {{- end }}
+{{- if $template.fuse }}
+  fuse: {{ $template.fuse }}
+{{- end }}
 {{- if $template.persistence }}
   persistence: {{ $template.persistence }}
 {{- end }}

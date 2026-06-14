@@ -107,6 +107,19 @@ def test_requested_volume_with_subpath_does_not_mutate_source():
     assert "subPath" not in vol
 
 
+def test_fuse_flag_runs_container_privileged():
+    pod = _build(template_spec={"image": "gnome-grd:latest", "fuse": True})
+    container = pod["spec"]["containers"][0]
+    assert container["securityContext"]["privileged"] is True
+
+
+def test_no_fuse_flag_leaves_container_unprivileged():
+    pod = _build(template_spec={"image": "vnc:latest"})
+    container = pod["spec"]["containers"][0]
+    # No securityContext at all, or at least not privileged.
+    assert "privileged" not in container.get("securityContext", {})
+
+
 def test_data_named_requested_volume_is_skipped():
     available = {"data": {"name": "data", "persistentVolumeClaim": {"claimName": "other"}}}
     pod = _build(template_spec={"image": "vnc:latest", "volumes": {"data": "/elsewhere"}},

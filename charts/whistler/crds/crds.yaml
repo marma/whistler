@@ -153,6 +153,14 @@ spec:
                   type: object
                   additionalProperties:
                     type: string
+                fuse:
+                  type: boolean
+                  description: >-
+                    Grant the desktop container access to /dev/fuse. Required by
+                    images whose display server mounts a FUSE filesystem (e.g.
+                    gnome-remote-desktop's clipboard). Implemented today by
+                    running the container privileged; the least-privilege
+                    alternative is a FUSE device plugin (see design/vdi.md).
   scope: Namespaced
   names:
     plural: desktoptemplates

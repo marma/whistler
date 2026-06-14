@@ -955,6 +955,21 @@ class KubeConfigManager(ConfigManager):
         if user_details and "securityContext" in user_details:
             pod_body["spec"]["securityContext"] = user_details["securityContext"]
 
+        # Some desktop images (e.g. gnome-grd) mount a FUSE filesystem at runtime
+        # — grd's RDP clipboard does, and its daemon aborts without /dev/fuse.
+        # Grant the device when the template asks for it.
+        #
+        # Today this runs the container privileged, which works on any cluster
+        # (incl. docker-desktop/k3d) with no prerequisites. The least-privilege
+        # alternative is a FUSE device plugin advertising a github.com/fuse
+        # resource (see design/vdi.md); switching to it means requesting that
+        # resource here instead of setting privileged — a change localized to
+        # this block.
+        if template_spec.get('fuse'):
+            container = pod_body["spec"]["containers"][0]
+            sec_ctx = container.setdefault("securityContext", {})
+            sec_ctx["privileged"] = True
+
         if preemptible:
             pod_body["spec"]["priorityClassName"] = "whistler-preemptible"
 

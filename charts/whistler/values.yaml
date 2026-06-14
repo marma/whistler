@@ -171,6 +171,36 @@ desktopTemplates:
     resources:
       cpu: "1000m"
       memory: 4Gi
+  gnome-grd:
+    description: "GNOME desktop over RDP (gnome-remote-desktop)"
+    backend: pod
+    # Built from desktops/gnome-grd (Wayland-native; gnome-remote-desktop, not
+    # xrdp). For local dev, skaffold overrides this with the freshly-built image.
+    # EXPERIMENTAL — see desktops/gnome-grd.
+    image: "ghcr.io/marma/whistler-desktop-gnome-grd:latest"
+    protocol: rdp
+    displayPort: 3389
+    persistence: ephemeral
+    # grd's RDP clipboard mounts a FUSE filesystem; without /dev/fuse the daemon
+    # aborts the moment a client connects. Grants the container /dev/fuse (runs
+    # privileged today — see design/vdi.md for the device-plugin alternative).
+    fuse: true
+    connectionParams:
+      username: "abc"
+      password: "abc"
+      # grd always negotiates TLS (and may require NLA); "any" lets guacd pick.
+      # ignore-cert because grd's cert is self-signed at startup. UNVERIFIED —
+      # may need security: "nla" against the real grd.
+      security: "nla"
+      ignore-cert: "true"
+      resize-method: "display-update"
+      color-depth: "24"
+      # See rdp-desktop above for why force-lossless is the real lever.
+      force-lossless: "true"
+    resources:
+      # GNOME Shell is heavier than XFCE.
+      cpu: "2000m"
+      memory: 8Gi
   # win-vm:
   #   description: "Windows desktop (KubeVirt VM)"
   #   backend: vm
