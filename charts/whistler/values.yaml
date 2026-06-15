@@ -181,9 +181,13 @@ desktopTemplates:
     protocol: rdp
     displayPort: 3389
     persistence: ephemeral
+    # gnome-grd runs systemd as PID 1, which requires a privileged container.
+    # In production, set runtimeClassName: kata to run inside a lightweight VM
+    # (Kata Containers) so --privileged is isolated from the host kernel.
+    privileged: true
+    # runtimeClassName: kata
     # grd's RDP clipboard mounts a FUSE filesystem; without /dev/fuse the daemon
-    # aborts the moment a client connects. Grants the container /dev/fuse (runs
-    # privileged today — see design/vdi.md for the device-plugin alternative).
+    # aborts the moment a client connects.
     fuse: true
     connectionParams:
       username: "abc"

@@ -85,8 +85,12 @@ Single source of truth: [../charts/whistler/crds/crds.yaml](../charts/whistler/c
 | `personalMountPath` | string | where the home PVC mounts (default `/userdata`) |
 | `persistence` | `ephemeral` \| `persistent` \| `preemptible` | `preemptible` ⇒ `whistler-preemptible` priority class |
 | `displayPort` | integer | where the image's display server listens (default 5901) |
+| `protocol` | `vnc` \| `rdp` | display protocol guacd uses to connect |
+| `connectionParams` | map | string params forwarded verbatim to guacd's `connect` (creds, `security`, `ignore-cert`, `resize-method`, etc.) |
 | `instancetype` | string | VM-only; KubeVirt instancetype (supplies cpu/memory) |
-| `fuse` | boolean | grant the container `/dev/fuse` (see [FUSE / `/dev/fuse`](#fuse-devfuse) below) |
+| `fuse` | boolean | grant the container `/dev/fuse` (see [Privileged containers](#privileged-containers-fuse-and-systemd) below) |
+| `privileged` | boolean | run the container with `securityContext.privileged=true`; required for images that run systemd as PID 1 (see below) |
+| `runtimeClassName` | string | Kubernetes RuntimeClass for the pod; set to `kata` (Kata Containers) to restore VM-level host isolation when `privileged: true` is set |
 
 ### `DesktopSession` (`ds`) — one live session (status subresource)
 
@@ -175,23 +179,52 @@ starts cleanly without KubeVirt.
 - VM backend is the answer to "I need nested containers / privileged workloads" — the
   hypervisor contains the blast radius. Do not try to make nested Docker safe in a pod.
 
-### FUSE / `/dev/fuse`
+### Privileged containers: FUSE and systemd
 
-Some desktop images mount a FUSE filesystem at runtime. In particular the
-[`gnome-grd`](../desktops/gnome-grd/) image (GNOME via `gnome-remote-desktop`): grd's RDP
-clipboard channel mounts a FUSE fs, and its daemon **aborts** (`g_error`) the moment a client
-connects if `/dev/fuse` is absent — verified locally. The `fuse: true` field on a
-`DesktopTemplate` grants it.
+Two distinct reasons a desktop pod may need `privileged: true`:
 
-The implementation today (`_build_desktop_pod_spec`) runs that container **privileged**. This
-works on any cluster (incl. docker-desktop/k3d) with no prerequisites, at the cost of a
-privileged desktop pod. The least-privilege alternative is a **FUSE device plugin** — a
-DaemonSet (e.g. [`nextflow-io/k8s-fuse-plugin`](https://github.com/nextflow-io/k8s-fuse-plugin))
-that advertises a `github.com/fuse` resource so the pod gets `/dev/fuse` injected without
-elevated privileges. Switching is a change localized to the `fuse` block in
-`_build_desktop_pod_spec` (request the resource instead of setting `privileged`) plus
-installing the plugin. `gnome-grd` itself already runs the desktop as an unprivileged user
-internally (the entrypoint only needs root to start `systemd-logind`).
+**1. FUSE (`fuse: true`)** — some desktop images mount a FUSE filesystem at runtime. In
+particular [`gnome-grd`](../desktops/gnome-grd/) (GNOME via `gnome-remote-desktop`): grd's RDP
+clipboard channel mounts a FUSE fs and its daemon **aborts** (`g_error`) the moment a client
+connects if `/dev/fuse` is absent. The `fuse: true` field on a `DesktopTemplate` grants it.
+
+The least-privilege alternative for FUSE is a **FUSE device plugin** — a DaemonSet (e.g.
+[`nextflow-io/k8s-fuse-plugin`](https://github.com/nextflow-io/k8s-fuse-plugin)) that advertises
+a `github.com/fuse` resource so the pod gets `/dev/fuse` without elevated privileges. Switching is
+a change localized to the `fuse` block in `_build_desktop_pod_spec` (request the resource instead
+of setting `privileged`) plus installing the plugin.
+
+**2. systemd as PID 1 (`privileged: true`)** — modern Ubuntu GNOME (26.04 / GNOME 50) is deeply
+integrated with systemd. D-Bus service files use `SystemdService=` for activation, user session
+registration (`user@UID.service`, `user-runtime-dir@UID.service`) goes through systemd, and logind
+session registration requires working user units. Running these components without systemd as PID 1
+produces a cascade of failures (`NoSuchUser` from logind, D-Bus-activated apps exit 8, etc.) that
+cannot be patched around one by one — it is the intended design of the distro.
+
+The [`gnome-grd`](../desktops/gnome-grd/) image therefore **runs systemd as PID 1**
+(`ENTRYPOINT ["/lib/systemd/systemd"]`, `STOPSIGNAL SIGRTMIN+3`). A systemd unit
+`gnome-desktop.service` with `PAMName=login` runs the session as the desktop user, giving it a
+proper logind session. This requires a privileged container. Set `privileged: true` on the
+`DesktopTemplate`; `fuse: true` (also set for gnome-grd) independently adds `/dev/fuse` — both
+merge into the same `securityContext.privileged=true` on the pod.
+
+#### Kata Containers: restoring isolation without full VM images
+
+Running a privileged pod means the container can interact with the host kernel. For a multi-tenant
+environment this is a significant security boundary reduction. **Kata Containers** restores that
+boundary without abandoning the container image workflow:
+
+- Each pod runs inside a lightweight VM (QEMU / Cloud Hypervisor / Firecracker), but the image is
+  a standard OCI container image — no VM disk image management, no separate build pipeline.
+- `--privileged` inside a Kata VM is contained within that VM; the host kernel is never exposed.
+- Startup overhead is modest (~100–200 MB RAM for the guest kernel + agent, seconds faster than
+  KubeVirt).
+- The only Kubernetes-side change is `runtimeClassName: kata` on the pod (set via the
+  `DesktopTemplate` field). The operator wires this into `pod.spec.runtimeClassName`.
+
+In **development / local clusters** (k3d, docker-desktop) run without Kata — `--privileged` is
+fine against a dev machine. In **production**, uncomment `runtimeClassName: kata` in the
+`DesktopTemplate` values and ensure the cluster has a `kata` RuntimeClass configured.
 
 ## Round 2: the display path
 
@@ -207,17 +240,28 @@ browser (guacamole-common-js)  ──WS──▶  portal (Python/aiohttp)
                     per-session ClusterIP Service ──▶ desktop pod (xrdp)
 ```
 
-- **Display protocol: RDP.** The sample `DesktopTemplate` uses an in-repo, arm64-native xrdp
-  image ([../desktops/xfce-rdp/](../desktops/xfce-rdp/), XFCE over xrdp, port 3389) — the public
-  `linuxserver/rdesktop` is amd64-only. Two new template fields drive guacd generically:
-  `protocol` (`vnc`|`rdp`) and `connectionParams` (a string map merged into the guacd
-  `connect`). RDP needs a login, so well-known image creds + `ignore-cert`/`security` +
-  `color-depth: 24` + `force-lossless: true` + `resize-method: display-update` live in
-  `connectionParams` — **not** per-session secrets; transport safety is the NetworkPolicy +
-  per-session Service that only guacd can reach. The image itself disables RemoteFX
-  (`desktops/xfce-rdp/xrdp.ini`, `xserverbpp=24`/`max_bpp=24`) so guacd receives lossless
-  bitmaps on the xrdp→guacd leg. See [Fidelity: lossless end-to-end](#fidelity-lossless-end-to-end)
-  for why all three levers are needed.
+- **Display protocol: RDP.** Two desktop images are provided:
+  - [`xfce-rdp`](../desktops/xfce-rdp/) — XFCE over xrdp (X11), arm64-native, port 3389.
+    Lightweight, no privileged container required. The public `linuxserver/rdesktop` is
+    amd64-only; this image is multi-arch. RemoteFX is disabled in `xrdp.ini`
+    (`xserverbpp=24`/`max_bpp=24`) so guacd receives lossless bitmaps on the xrdp→guacd leg.
+    See [Fidelity: lossless end-to-end](#fidelity-lossless-end-to-end) for why all three levers
+    are needed.
+  - [`gnome-grd`](../desktops/gnome-grd/) — full GNOME 50 (Wayland) over
+    `gnome-remote-desktop` (grd), port 3389. Runs systemd as PID 1 (requires `privileged: true`;
+    see [Privileged containers](#privileged-containers-fuse-and-systemd)). grd runs with
+    `--headless`, which creates a virtual monitor **per session** via the Mutter
+    `RemoteDesktop.Session.CreateVirtualMonitor` D-Bus API rather than capturing a pre-existing
+    monitor. This is what enables **true dynamic resize**: grd resizes the virtual monitor to match
+    the client's DisplayControl PDU on every window resize, so the desktop always fills the
+    browser viewport exactly. (xfce-rdp achieves the same via xrandr; both require
+    `resize-method: display-update` in `connectionParams`.)
+
+  Two new template fields drive guacd generically: `protocol` (`vnc`|`rdp`) and
+  `connectionParams` (a string map merged into the guacd `connect`). RDP needs a login, so
+  well-known image creds + `ignore-cert`/`security` + `color-depth: 24` + `force-lossless: true`
+  + `resize-method: display-update` live in `connectionParams` — **not** per-session secrets;
+  transport safety is the NetworkPolicy + per-session Service that only guacd can reach.
 - **Shared, stateless guacd** Deployment + Service (`whistler-guacd:4822`). One for all
   sessions; it dials each session's per-session Service.
 - **Portal** (`whistler/portal/`, a third process from the same image,

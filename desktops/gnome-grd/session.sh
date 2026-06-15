@@ -1,33 +1,35 @@
 #!/usr/bin/env bash
-# Unprivileged half: the actual GNOME session + grd, run as the desktop user.
+# Session script — runs as the desktop user via gnome-desktop.service.
 #
-# Pipeline:
-#   gnome-shell --headless --virtual-monitor  -> Mutter RemoteDesktop/ScreenCast
-#                                                 D-Bus API + a PipeWire stream
-#   gnome-remote-desktop-daemon               -> serves that stream as RDP/3389
+# With systemd as PID 1 and PAMName=login in the service unit:
+#   - pam_systemd calls logind CreateSession → gnome-shell gets a real login1 user
+#   - user@UID.service starts systemd --user, which provides the session D-Bus
+#     at $XDG_RUNTIME_DIR/bus and socket-activates pipewire/wireplumber
+#   - XDG_RUNTIME_DIR is set by pam_systemd before this script runs
+#
+# We wait for the session bus, then hand off to gnome-shell + grd.
 set -e
 
-RES="${WHISTLER_RESOLUTION:-1920x1080}"
+export NO_AT_BRIDGE=1
+export XDG_SESSION_TYPE=wayland
+export DISPLAY=:0
+export GDK_BACKEND=wayland,x11
+export GSK_RENDERER=cairo
+export WAYLAND_DISPLAY=wayland-0
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
-# --- runtime dir + session bus -------------------------------------------------
-# /run/user/<uid> is managed by logind/pam, but in a bare container it may not be
-# set up, so use a user-writable XDG_RUNTIME_DIR.
-export XDG_RUNTIME_DIR="/tmp/xdg-runtime-$(id -u)"
-mkdir -p "$XDG_RUNTIME_DIR"
-chmod 700 "$XDG_RUNTIME_DIR"
-eval "$(dbus-launch --sh-syntax)"
-export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
+# Wait for systemd --user to create the session bus socket. This also acts as a
+# gate: once the socket exists, logind has the user registered (NoSuchUser gone)
+# and pipewire.socket is active for socket activation.
+for _i in $(seq 60); do
+  [ -S "$XDG_RUNTIME_DIR/bus" ] && break
+  sleep 1
+done
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 
 # --- gnome-keyring (grd stores RDP creds via libsecret) ------------------------
-# Unlocked with an empty password — acceptable here, the password is not the
-# security boundary (the per-session NetworkPolicy is).
 eval "$(printf '\n' | gnome-keyring-daemon --unlock --components=secrets)"
 export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
-
-# --- PipeWire (ScreenCast transport grd relies on) -----------------------------
-pipewire &
-wireplumber &
-pipewire-pulse &
 
 # --- TLS cert (grd always uses TLS; guacd connects with ignore-cert=true) ------
 CERT_DIR="$HOME/.local/share/grd-tls"
@@ -38,47 +40,27 @@ if [ ! -f "$CERT_DIR/cert.pem" ]; then
     -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem"
 fi
 
-# --- headless GNOME Shell (Wayland compositor + virtual monitor) ---------------
-# --headless uses Mutter's headless backend (no DRM/KMS/seat; llvmpipe).
-# Fix the socket name so apps always know which WAYLAND_DISPLAY to connect to.
-export WAYLAND_DISPLAY=wayland-0
-gnome-shell --headless --virtual-monitor "$RES" --wayland-display wayland-0 &
+# --- headless GNOME Shell (Wayland compositor) ---------------------------------
+# No --virtual-monitor: grd --headless creates virtual monitors per-session at
+# the client's requested size, enabling dynamic resize via DisplayControl PDUs.
+gnome-shell --headless --wayland-display wayland-0 &
 
-# Wait for the Shell to own the Mutter RemoteDesktop/ScreenCast D-Bus names that
-# grd screen-shares through — configuring grd before they exist races (grd logs
-# "Error connecting to the screencast service"). gdbus wait blocks until the name
-# appears; the trailing sleep gives ScreenCast a beat to follow RemoteDesktop.
 gdbus wait --session --timeout 30 org.gnome.Mutter.RemoteDesktop \
   || echo "WARN: timed out waiting for org.gnome.Mutter.RemoteDesktop" >&2
 gdbus wait --session --timeout 10 org.gnome.Mutter.ScreenCast \
   || echo "WARN: timed out waiting for org.gnome.Mutter.ScreenCast" >&2
 sleep 1
 
-# Push WAYLAND_DISPLAY (and the rest of the session env) into the D-Bus
-# activation environment. Without this, apps launched via GNOME Shell's launcher
-# (D-Bus-activated) don't get WAYLAND_DISPLAY and silently fail to open windows —
-# the "bouncing" launch animation plays but no window ever appears.
 dbus-update-activation-environment --all || true
 
-# --- configure + run gnome-remote-desktop --------------------------------------
-grdctl rdp set-tls-cert "$CERT_DIR/cert.pem"
-grdctl rdp set-tls-key  "$CERT_DIR/key.pem"
-grdctl rdp set-credentials "$DESKTOP_USER" "$DESKTOP_PASSWORD"
-grdctl rdp disable-view-only   # allow remote control, not just viewing
-# `grdctl rdp enable` also tries to flip a systemd *user* unit on, which aborts
-# before it sets the gsettings switch when there's no systemd user manager (our
-# case). Set the switch directly — that's what the daemon actually reads to open
-# the RDP listener.
-gsettings set org.gnome.desktop.remote-desktop.rdp enable true
 
-# Daemon in the foreground so the container lifecycle tracks it. Shares the
-# headless gnome-shell session started above (same session bus).
-#
-# VERIFIED locally: grd opens the RDP listener on 3389 and completes the RDP
-# X.224 negotiation handshake. NOT yet verified: the actual pixel path — grd
-# capturing the headless monitor via the Mutter ScreenCast/PipeWire stream and a
-# real client (guacd) rendering a desktop. A "Error connecting to the screencast
-# service" line in the log before the first client connect is expected (grd binds
-# the stream lazily); if the desktop stays black once guacd connects, that's the
-# place to look (PipeWire / Mutter ScreenCast availability in this session).
-exec /usr/libexec/gnome-remote-desktop-daemon
+# --- gnome-remote-desktop (headless mode) --------------------------------------
+grdctl --headless rdp set-tls-cert "$CERT_DIR/cert.pem"
+grdctl --headless rdp set-tls-key  "$CERT_DIR/key.pem"
+grdctl --headless rdp set-credentials "$DESKTOP_USER" "$DESKTOP_PASSWORD"
+grdctl --headless rdp disable-view-only
+gsettings set org.gnome.desktop.remote-desktop.rdp.headless enable true
+gsettings set org.gnome.desktop.remote-desktop.rdp tls-cert "$CERT_DIR/cert.pem"
+gsettings set org.gnome.desktop.remote-desktop.rdp tls-key  "$CERT_DIR/key.pem"
+
+exec /usr/libexec/gnome-remote-desktop-daemon --headless

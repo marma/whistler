@@ -965,10 +965,13 @@ class KubeConfigManager(ConfigManager):
         # resource (see design/vdi.md); switching to it means requesting that
         # resource here instead of setting privileged — a change localized to
         # this block.
-        if template_spec.get('fuse'):
+        if template_spec.get('fuse') or template_spec.get('privileged'):
             container = pod_body["spec"]["containers"][0]
             sec_ctx = container.setdefault("securityContext", {})
             sec_ctx["privileged"] = True
+
+        if template_spec.get('runtimeClassName'):
+            pod_body["spec"]["runtimeClassName"] = template_spec["runtimeClassName"]
 
         if preemptible:
             pod_body["spec"]["priorityClassName"] = "whistler-preemptible"

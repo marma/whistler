@@ -161,6 +161,20 @@ spec:
                     gnome-remote-desktop's clipboard). Implemented today by
                     running the container privileged; the least-privilege
                     alternative is a FUSE device plugin (see design/vdi.md).
+                privileged:
+                  type: boolean
+                  description: >-
+                    Run the desktop container with securityContext.privileged=true.
+                    Required for images that run systemd as PID 1 (e.g. gnome-grd).
+                    In production, pair with runtimeClassName: kata to restore
+                    VM-level isolation without full VM image management.
+                runtimeClassName:
+                  type: string
+                  description: >-
+                    Kubernetes RuntimeClass for the desktop pod. Set to "kata" (or
+                    another Kata Containers runtime) to run the privileged container
+                    inside a lightweight VM, restoring host isolation without the
+                    overhead of managing full VM disk images.
   scope: Namespaced
   names:
     plural: desktoptemplates

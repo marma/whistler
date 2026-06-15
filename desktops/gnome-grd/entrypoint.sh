@@ -23,6 +23,13 @@ mkdir -p /run/systemd/seats /run/systemd/sessions /run/systemd/users /run/system
 # starts querying them.
 sleep 1
 
+# user-runtime-dir@UID.service would normally create /run/user/UID but can't
+# run without systemd as PID 1. Pre-create it so XDG_RUNTIME_DIR is standard.
+DESKTOP_UID=$(id -u "$DESKTOP_USER")
+mkdir -p "/run/user/$DESKTOP_UID"
+chown "$DESKTOP_UID:$DESKTOP_UID" "/run/user/$DESKTOP_UID"
+chmod 700 "/run/user/$DESKTOP_UID"
+
 # Drop to the desktop user. `runuser -l` runs the PAM stack (pam_systemd) so the
 # user gets a registered login1 session. Env that session.sh needs is passed
 # explicitly because the login shell resets the environment.
