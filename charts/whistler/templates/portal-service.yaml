@@ -17,4 +17,10 @@ spec:
       {{- if and (eq .Values.portal.service.type "NodePort") .Values.portal.service.nodePort }}
       nodePort: {{ .Values.portal.service.nodePort }}
       {{- end }}
+    - name: management
+      port: {{ .Values.portal.managementService.port }}
+      targetPort: 8081
+      {{- if and (eq .Values.portal.service.type "NodePort") .Values.portal.managementService.nodePort }}
+      nodePort: {{ .Values.portal.managementService.nodePort }}
+      {{- end }}
 {{- end }}

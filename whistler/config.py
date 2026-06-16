@@ -20,6 +20,7 @@ CONFIG_DIR = os.environ.get("WHISTLER_CONFIG_DIR", "/etc/whistler-config")
 SELECTORS_FILE = os.path.join(CONFIG_DIR, "selectors.yaml")
 VOLUMES_FILE = os.path.join(CONFIG_DIR, "volumes.yaml")
 NETWORKPOLICY_FILE = os.path.join(CONFIG_DIR, "networkpolicy.yaml")
+IMAGES_FILE = os.path.join(CONFIG_DIR, "images.yaml")
 
 # KubeVirt API coordinates for the VM desktop backend. KubeVirt may be absent
 # from a given cluster; every call against these is guarded so the operator
@@ -88,11 +89,69 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
+    def get_available_images(self) -> List[str]:
+        pass
+
+    @abstractmethod
     def get_server_host_key(self, secret_name: str) -> Optional[bytes]:
         pass
 
     @abstractmethod
     def save_server_host_key(self, secret_name: str, key_data: bytes) -> bool:
+        pass
+
+    # ------------------------------------------------------------------ #
+    # Admin / management operations                                        #
+    # ------------------------------------------------------------------ #
+
+    @abstractmethod
+    def list_all_users(self) -> List[Dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    def save_user(self, user_data: Dict[str, Any]) -> bool:
+        pass
+
+    @abstractmethod
+    def delete_user(self, username: str) -> bool:
+        pass
+
+    @abstractmethod
+    def get_all_templates(self) -> List[Dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    def get_all_instances(self) -> List[Dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    def save_system_template(self, template_data: Dict[str, Any]) -> bool:
+        pass
+
+    @abstractmethod
+    def save_volume(self, volume_data: Dict[str, Any]) -> bool:
+        pass
+
+    @abstractmethod
+    def delete_volume(self, volume_name: str) -> bool:
+        pass
+
+    @abstractmethod
+    def get_user_allowed_volumes(self, username: str) -> List[str]:
+        pass
+
+    @abstractmethod
+    def set_user_allowed_volumes(self, username: str, volume_names: List[str]) -> bool:
+        pass
+
+    @abstractmethod
+    def stop_instance(self, username: str, instance_name: str) -> bool:
+        """Delete the pod but keep the WhistlerInstance CR (stops compute, preserves state)."""
+        pass
+
+    @abstractmethod
+    def trigger_instance_start(self, username: str, instance_name: str) -> bool:
+        """Bump an annotation on the WhistlerInstance CR to fire the operator's reconcile."""
         pass
 
 class KubeConfigManager(ConfigManager):
@@ -256,6 +315,7 @@ class KubeConfigManager(ConfigManager):
                     if owner == "system":
                         t["name"] = full_name
                         t["fullName"] = full_name
+                        t["displayName"] = t.get("displayName") or full_name
                         t["source"] = "system"
                         templates.append(t)
                     elif owner == username:
@@ -265,6 +325,7 @@ class KubeConfigManager(ConfigManager):
                             display_name = full_name[len(username)+1:]
                         t["name"] = display_name
                         t["fullName"] = full_name
+                        t["displayName"] = t.get("displayName") or display_name
                         t["source"] = "user"
                         templates.append(t)
                     # Else: ignore other users' templates
@@ -491,6 +552,18 @@ class KubeConfigManager(ConfigManager):
     def get_volumes(self):
         self._load_volumes()
         return self.volumes
+
+    def get_available_images(self) -> List[str]:
+        try:
+            with open(IMAGES_FILE, "r") as f:
+                data = yaml.safe_load(f)
+                if isinstance(data, list):
+                    return [str(i) for i in data if i]
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.error(f"Failed to load images.yaml: {e}")
+        return []
 
     def _load_network_policy(self):
         try:
@@ -1359,7 +1432,7 @@ class KubeConfigManager(ConfigManager):
     def save_server_host_key(self, secret_name: str, key_data: bytes) -> bool:
         import base64
         encoded = base64.b64encode(key_data).decode('utf-8')
-        
+
         body = {
             "apiVersion": "v1",
             "kind": "Secret",
@@ -1372,7 +1445,7 @@ class KubeConfigManager(ConfigManager):
                 "host_key": encoded
             }
         }
-        
+
         api = CoreV1Api()
         try:
             try:
@@ -1389,3 +1462,243 @@ class KubeConfigManager(ConfigManager):
         except ApiException as e:
              logger.error(f"Failed to save host key secret: {e}")
              return False
+
+    # ------------------------------------------------------------------ #
+    # Admin / management operations                                        #
+    # ------------------------------------------------------------------ #
+
+    def _write_users_file(self, users_dict: Dict[str, Any]):
+        users_list = list(users_dict.values())
+        with open(USERS_FILE, "w") as f:
+            yaml.safe_dump(users_list, f, default_flow_style=False, allow_unicode=True)
+
+    def list_all_users(self) -> List[Dict[str, Any]]:
+        self._load_users()
+        return list(self.users.values())
+
+    def save_user(self, user_data: Dict[str, Any]) -> bool:
+        try:
+            self._load_users()
+            username = user_data.get("name")
+            if not username:
+                return False
+            self.users[username] = user_data
+            self._write_users_file(self.users)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save user: {e}")
+            return False
+
+    def delete_user(self, username: str) -> bool:
+        try:
+            self._load_users()
+            if username not in self.users:
+                return False
+            del self.users[username]
+            self._write_users_file(self.users)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete user: {e}")
+            return False
+
+    def get_user_allowed_volumes(self, username: str) -> List[str]:
+        self._load_users()
+        user = self.users.get(username, {})
+        return user.get("allowedVolumes", [])
+
+    def set_user_allowed_volumes(self, username: str, volume_names: List[str]) -> bool:
+        try:
+            self._load_users()
+            if username not in self.users:
+                self.users[username] = {"name": username}
+            self.users[username]["allowedVolumes"] = volume_names
+            self._write_users_file(self.users)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set user allowed volumes: {e}")
+            return False
+
+    def get_all_templates(self) -> List[Dict[str, Any]]:
+        """List all WhistlerTemplates across the system namespace."""
+        templates = []
+        try:
+            resp = self.api.list_namespaced_custom_object(
+                self.group, self.version, self.namespace, "whistlertemplates"
+            )
+            for item in resp.get("items", []):
+                t = dict(item.get("spec", {}))
+                slug = item["metadata"]["name"]
+                t["fullName"] = slug
+                t["name"] = slug
+                t["displayName"] = t.get("displayName") or slug
+                t["namespace"] = item["metadata"]["namespace"]
+                templates.append(t)
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to list all templates: {e}")
+        return templates
+
+    def get_all_instances(self) -> List[Dict[str, Any]]:
+        """List all WhistlerInstances across all user namespaces."""
+        instances = []
+        core_api = client.CoreV1Api()
+        try:
+            nss = core_api.list_namespace(label_selector="whistler.martinmalmsten.net/managed=true")
+            user_namespaces = [ns.metadata.name for ns in nss.items]
+        except ApiException:
+            user_namespaces = []
+
+        for ns in user_namespaces:
+            username = ns.removeprefix("whistler-user-")
+            try:
+                resp = self.api.list_namespaced_custom_object(
+                    self.group, self.version, ns, "whistlerinstances"
+                )
+                try:
+                    pods = core_api.list_namespaced_pod(ns, label_selector=f"user={username}")
+                    pod_map = {p.metadata.labels.get("instance"): p for p in pods.items}
+                except ApiException:
+                    pod_map = {}
+
+                for item in resp.get("items", []):
+                    spec = item.get("spec", {})
+                    full_name = item["metadata"]["name"]
+                    display_name = full_name.removeprefix(f"{username}-")
+                    pod = pod_map.get(full_name)
+                    pod_status = "Stopped"
+                    pod_name = None
+                    if pod:
+                        pod_name = pod.metadata.name
+                        pod_status = pod.status.phase or "Unknown"
+                        if pod.metadata.deletion_timestamp:
+                            pod_status = "Terminating"
+                    instances.append({
+                        "username": username,
+                        "name": display_name,
+                        "fullName": full_name,
+                        "template": spec.get("templateRef"),
+                        "status": pod_status,
+                        "podName": pod_name,
+                        "namespace": ns,
+                        "preemptible": spec.get("preemptible", False),
+                    })
+            except ApiException as e:
+                if e.status != 404:
+                    logger.error(f"Failed to list instances in {ns}: {e}")
+        return instances
+
+    def save_system_template(self, template_data: Dict[str, Any]) -> bool:
+        name = template_data.get("name")
+        if not name:
+            return False
+        body = {
+            "apiVersion": f"{self.group}/{self.version}",
+            "kind": "WhistlerTemplate",
+            "metadata": {"name": name, "namespace": self.namespace},
+            "spec": {
+                "user": "system",
+                "displayName": template_data.get("displayName") or name,
+                "image": template_data.get("image"),
+                "description": template_data.get("description"),
+                "resources": template_data.get("resources") or {},
+                "nodeSelector": template_data.get("nodeSelector") or {},
+                "personalMountPath": template_data.get("personalMountPath", "/userdata"),
+                "volumes": template_data.get("volumes") or {},
+            },
+        }
+        try:
+            try:
+                existing = self.api.get_namespaced_custom_object(
+                    self.group, self.version, self.namespace, "whistlertemplates", name
+                )
+                body["metadata"]["resourceVersion"] = existing["metadata"]["resourceVersion"]
+                self.api.replace_namespaced_custom_object(
+                    self.group, self.version, self.namespace, "whistlertemplates", name, body
+                )
+            except ApiException as e:
+                if e.status == 404:
+                    self.api.create_namespaced_custom_object(
+                        self.group, self.version, self.namespace, "whistlertemplates", body
+                    )
+                else:
+                    raise
+            return True
+        except ApiException as e:
+            logger.error(f"Failed to save system template: {e}")
+            return False
+
+    def delete_system_template(self, template_name: str) -> bool:
+        try:
+            self.api.delete_namespaced_custom_object(
+                self.group, self.version, self.namespace, "whistlertemplates", template_name
+            )
+            return True
+        except ApiException as e:
+            logger.error(f"Failed to delete system template {template_name}: {e}")
+            return False
+
+    def save_volume(self, volume_data: Dict[str, Any]) -> bool:
+        try:
+            self._load_volumes()
+            name = volume_data.get("name")
+            if not name:
+                return False
+            self.volume_definitions[name] = volume_data
+            self.volumes = list(self.volume_definitions.values())
+            with open(VOLUMES_FILE, "w") as f:
+                yaml.safe_dump(self.volumes, f, default_flow_style=False, allow_unicode=True)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save volume: {e}")
+            return False
+
+    def delete_volume(self, volume_name: str) -> bool:
+        try:
+            self._load_volumes()
+            if volume_name not in self.volume_definitions:
+                return False
+            del self.volume_definitions[volume_name]
+            self.volumes = list(self.volume_definitions.values())
+            with open(VOLUMES_FILE, "w") as f:
+                yaml.safe_dump(self.volumes, f, default_flow_style=False, allow_unicode=True)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete volume: {e}")
+            return False
+
+    def stop_instance(self, username: str, instance_name: str) -> bool:
+        """Delete the running pod but leave the WhistlerInstance CR in place."""
+        user_ns = self._get_user_namespace(username)
+        full_name = f"{username}-{instance_name}"
+        core_api = client.CoreV1Api()
+        try:
+            core_api.delete_namespaced_pod(full_name, user_ns)
+            logger.info(f"Stopped pod {full_name} in {user_ns}")
+            return True
+        except ApiException as e:
+            if e.status == 404:
+                return True  # Already stopped
+            logger.error(f"Failed to stop pod {full_name}: {e}")
+            return False
+
+    def trigger_instance_start(self, username: str, instance_name: str) -> bool:
+        """Bump the whistler/last-connect annotation to fire the operator's reconcile."""
+        import datetime
+        user_ns = self._get_user_namespace(username)
+        full_name = f"{username}-{instance_name}"
+        patch = {
+            "metadata": {
+                "annotations": {
+                    "whistler/last-connect": datetime.datetime.utcnow().isoformat()
+                }
+            }
+        }
+        try:
+            self.api.patch_namespaced_custom_object(
+                self.group, self.version, user_ns, "whistlerinstances", full_name, patch
+            )
+            logger.info(f"Triggered reconcile for {full_name}")
+            return True
+        except ApiException as e:
+            logger.error(f"Failed to trigger start for {full_name}: {e}")
+            return False

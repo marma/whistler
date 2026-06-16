@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}My Instances — Whistler{% endblock %}
+{% block content %}
+
+<div class="ui stackable grid">
+  <div class="row">
+    <div class="twelve wide column">
+      <h2 class="ui header">
+        <i class="th icon"></i>
+        <div class="content">My Instances</div>
+      </h2>
+    </div>
+    <div class="four wide column" style="text-align:right;padding-top:1.2rem">
+      <a href="/instances/new?user={{ current_user }}" class="ui primary button">
+        <i class="plus icon"></i> New Instance
+      </a>
+    </div>
+  </div>
+</div>
+
+{% if instances %}
+<table class="ui selectable celled table">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Template</th>
+      <th>Status</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for inst in instances %}
+    <tr>
+      <td>
+        <a href="/instances/{{ inst.name }}?user={{ current_user }}">
+          <strong>{{ inst.name }}</strong>
+        </a>
+      </td>
+      <td>{{ inst.template or "—" }}</td>
+      <td>
+        <span id="status-{{ inst.name }}"
+              class="ui {{ status_color(inst.status) }} label"
+              hx-get="/instances/{{ inst.name }}/status-badge?user={{ current_user }}"
+              hx-trigger="every 5s"
+              hx-swap="outerHTML">
+          {{ inst.status }}
+        </span>
+      </td>
+      <td>
+        {% if inst.status == "Running" %}
+        <form method="post" action="/instances/{{ inst.name }}/stop?user={{ current_user }}" style="display:inline">
+          <button class="ui yellow tiny button"><i class="stop icon"></i> Stop</button>
+        </form>
+        {% else %}
+        <form method="post" action="/instances/{{ inst.name }}/connect?user={{ current_user }}" style="display:inline">
+          <button class="ui green tiny button"><i class="play icon"></i> Connect</button>
+        </form>
+        {% endif %}
+        <a href="/instances/{{ inst.name }}?user={{ current_user }}" class="ui tiny button">
+          <i class="info circle icon"></i> Details
+        </a>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="ui placeholder segment">
+  <div class="ui icon header">
+    <i class="server icon"></i>
+    No instances yet
+  </div>
+  <a href="/instances/new?user={{ current_user }}" class="ui primary button">
+    Create your first instance
+  </a>
+</div>
+{% endif %}
+
+{% if tpls %}
+<h3 class="ui header" style="margin-top:2rem">
+  <i class="copy outline icon"></i>
+  <div class="content">Available Templates</div>
+</h3>
+<div class="ui three stackable cards">
+  {% for t in tpls %}
+  <div class="card">
+    <div class="content">
+      <div class="header">
+        {{ t.displayName or t.name }}
+        <span class="ui {{ 'blue' if t.source == 'system' else 'teal' }} tiny label" style="float:right">
+          {{ t.source }}
+        </span>
+      </div>
+      {% if t.description %}
+      <div class="meta">{{ t.description }}</div>
+      {% endif %}
+      <div class="description">
+        <code>{{ t.image or "" }}</code>
+        {% if t.resources %}
+        <div class="ui mini horizontal divided list" style="margin-top:.5em">
+          {% if t.resources.cpu %}<div class="item"><i class="microchip icon"></i>{{ t.resources.cpu }}</div>{% endif %}
+          {% if t.resources.memory %}<div class="item"><i class="database icon"></i>{{ t.resources.memory }}</div>{% endif %}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+    <div class="extra content">
+      <a href="/instances/new?user={{ current_user }}&template={{ t.fullName }}" class="ui primary fluid button">
+        <i class="plus icon"></i> Use Template
+      </a>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% endblock %}

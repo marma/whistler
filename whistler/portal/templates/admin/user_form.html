@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}New User — Admin — Whistler{% endblock %}
+{% block content %}
+
+<h2 class="ui header">
+  <i class="user plus icon"></i>
+  <div class="content">New User</div>
+</h2>
+
+<div class="ui segment" style="max-width:640px">
+  <form class="ui form" method="post" action="/admin/users?user={{ current_user }}">
+    <div class="field">
+      <label>Username</label>
+      <input name="name" type="text" required placeholder="alice"
+             pattern="[a-z][a-z0-9_\-]*">
+      <div class="ui pointing label">Lowercase letters, numbers, hyphens, underscores.</div>
+    </div>
+
+    <div class="field">
+      <label>SSH Public Keys</label>
+      <textarea name="public_keys" rows="5"
+                placeholder="ssh-ed25519 AAAA... user@host&#10;ssh-rsa AAAA... user@host"></textarea>
+      <div class="ui pointing label">One key per line (OpenSSH format).</div>
+    </div>
+
+    <div class="ui segment">
+      <h4 class="ui header">Security Context <span class="ui grey tiny label">optional</span></h4>
+      <div class="three fields">
+        <div class="field">
+          <label>runAsUser</label>
+          <input name="run_as_user" type="number" placeholder="1000">
+        </div>
+        <div class="field">
+          <label>runAsGroup</label>
+          <input name="run_as_group" type="number" placeholder="1000">
+        </div>
+        <div class="field">
+          <label>fsGroup</label>
+          <input name="fs_group" type="number" placeholder="1000">
+        </div>
+      </div>
+    </div>
+
+    <div class="ui divider"></div>
+    <button type="submit" class="ui primary button"><i class="save icon"></i> Create User</button>
+    <a href="/admin/users?user={{ current_user }}" class="ui button">Cancel</a>
+  </form>
+</div>
+
+{% endblock %}

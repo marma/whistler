@@ -1,0 +1,23 @@
+{% for inst in all_instances %}
+<tr>
+  <td>{{ inst.username }}</td>
+  <td><strong>{{ inst.name }}</strong></td>
+  <td>{{ inst.template or "—" }}</td>
+  <td><span class="ui {{ status_color(inst.status) }} label">{{ inst.status }}</span></td>
+  <td><code>{{ inst.podName or "none" }}</code></td>
+  <td>{{ "Yes" if inst.preemptible else "No" }}</td>
+  <td class="collapsing">
+    {% if inst.status == "Running" %}
+    <form method="post" action="/admin/sessions/{{ inst.username }}/{{ inst.name }}/stop?user={{ current_user }}" style="display:inline">
+      <button class="ui yellow tiny button"><i class="stop icon"></i> Stop</button>
+    </form>
+    {% endif %}
+    <form method="post" action="/admin/sessions/{{ inst.username }}/{{ inst.name }}/delete?user={{ current_user }}"
+          style="display:inline" onsubmit="return confirm('Delete {{ inst.name }}?')">
+      <button class="ui red tiny button"><i class="trash icon"></i> Delete</button>
+    </form>
+  </td>
+</tr>
+{% else %}
+<tr><td colspan="7" style="text-align:center;color:#aaa">No instances found.</td></tr>
+{% endfor %}

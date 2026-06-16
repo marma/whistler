@@ -34,17 +34,27 @@ spec:
                   fieldPath: metadata.namespace
             - name: PORTAL_PORT
               value: "8080"
+            - name: MANAGEMENT_PORT
+              value: "8081"
             - name: GUACD_HOST
               value: "{{ .Release.Name }}-guacd"
             - name: GUACD_PORT
               value: "4822"
             - name: WHISTLER_AUTH_ALLOW_ANY
               value: "{{ .Values.portal.auth.allowAny }}"
+            - name: WHISTLER_AUTH_ALLOW_ADMIN
+              value: "{{ .Values.portal.auth.allowAdmin }}"
+            {{- if .Values.portal.auth.adminUsers }}
+            - name: WHISTLER_ADMIN_USERS
+              value: "{{ .Values.portal.auth.adminUsers }}"
+            {{- end }}
             - name: WHISTLER_LOG_LEVEL
               value: "{{ .Values.portal.logLevel }}"
           ports:
             - containerPort: 8080
               name: http
+            - containerPort: 8081
+              name: management
           readinessProbe:
             httpGet:
               path: /healthz
@@ -64,6 +74,10 @@ spec:
             - name: config
               mountPath: "/etc/whistler-config/networkpolicy.yaml"
               subPath: "networkpolicy.yaml"
+              readOnly: true
+            - name: config
+              mountPath: "/etc/whistler-config/images.yaml"
+              subPath: "images.yaml"
               readOnly: true
           resources:
             {{- toYaml .Values.portal.resources | nindent 12 }}

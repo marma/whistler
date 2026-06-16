@@ -56,11 +56,18 @@ portal:
     type: NodePort
     port: 8080
     nodePort: 30080
+  managementService:
+    port: 8081
+    nodePort: 30081
   logLevel: INFO
   auth:
     # Minimal/dev only this round. When false the portal returns 401 (real web
     # SSO/OIDC is a follow-up). Mirrors whistler.auth.allowAny semantics.
     allowAny: false
+    # Grant every authenticated user admin access (dev only).
+    allowAdmin: false
+    # Comma-separated list of usernames with admin access in production.
+    adminUsers: ""
   resources:
     limits:
       cpu: 1000m
@@ -116,6 +123,14 @@ whistler:
       values:
         - node_1
         - node_2
+  availableImages:
+    - ubuntu:22.04
+    - ubuntu:20.04
+    - python:3.12-slim
+    - python:3.11-slim
+    - debian:12-slim
+    - alpine:3.19
+
   #volumes:
   #  - name: data
   #    persistentVolumeClaim:

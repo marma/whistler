@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Volumes — Admin — Whistler{% endblock %}
+{% block content %}
+
+<div class="ui stackable grid">
+  <div class="twelve wide column">
+    <h2 class="ui header"><i class="database icon"></i> Volumes</h2>
+  </div>
+  <div class="four wide column" style="text-align:right;padding-top:1.2rem">
+    <a href="/admin/volumes/new?user={{ current_user }}" class="ui primary button">
+      <i class="plus icon"></i> New Volume
+    </a>
+  </div>
+</div>
+
+{% if volumes %}
+<table class="ui selectable celled table">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>PVC</th>
+      <th>Sub-path</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for vol in volumes %}
+    <tr>
+      <td><strong>{{ vol.name }}</strong></td>
+      <td><code>{{ (vol.persistentVolumeClaim or {}).get("claimName", "—") }}</code></td>
+      <td>{{ vol.subPath or "—" }}</td>
+      <td class="collapsing">
+        <form method="post" action="/admin/volumes/{{ vol.name }}/delete?user={{ current_user }}"
+              style="display:inline" onsubmit="return confirm('Delete volume {{ vol.name }}?')">
+          <button class="ui red tiny button"><i class="trash icon"></i> Delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="ui placeholder segment">
+  <div class="ui icon header">
+    <i class="database icon"></i>
+    No volumes defined yet
+  </div>
+  <a href="/admin/volumes/new?user={{ current_user }}" class="ui primary button">Create first volume</a>
+</div>
+{% endif %}
+
+{% endblock %}

@@ -12,4 +12,6 @@ data:
 {{ toYaml .Values.whistler.volumes | indent 4 }}
   networkpolicy.yaml: |
 {{ toYaml .Values.whistler.networkPolicy | indent 4 }}
+  images.yaml: |
+{{ toYaml .Values.whistler.availableImages | indent 4 }}
 

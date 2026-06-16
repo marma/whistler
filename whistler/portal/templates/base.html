@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Whistler{% endblock %}</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fomantic-ui@2.9.3/dist/semantic.min.css">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="ui inverted menu" style="border-radius:0;margin-bottom:0">
+  <div class="ui container">
+    <a class="header item" href="/?user={{ current_user }}">
+      <i class="server icon"></i> Whistler
+    </a>
+    <a class="item {% if request.url.path == '/' %}active{% endif %}"
+       href="/?user={{ current_user }}">
+      <i class="th icon"></i> My Instances
+    </a>
+    {% if is_admin %}
+    <a class="item {% if request.url.path.startswith('/admin') %}active{% endif %}"
+       href="/admin?user={{ current_user }}">
+      <i class="shield alternate icon"></i> Admin
+    </a>
+    {% endif %}
+    <div class="right menu">
+      <div class="item">
+        <i class="user circle icon"></i> {{ current_user }}
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="ui container" style="margin-top:2rem;margin-bottom:4rem">
+  {% block content %}{% endblock %}
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/fomantic-ui@2.9.3/dist/semantic.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.0/dist/htmx.min.js"></script>
+</body>
+</html>

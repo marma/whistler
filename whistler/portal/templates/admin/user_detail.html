@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% block title %}{{ user_obj.name }} — Admin — Whistler{% endblock %}
+{% block content %}
+
+<div class="ui stackable grid">
+  <div class="ten wide column">
+    <h2 class="ui header">
+      <i class="user icon"></i>
+      <div class="content">{{ user_obj.name }}</div>
+    </h2>
+  </div>
+  <div class="six wide column" style="text-align:right;padding-top:1.2rem">
+    <form method="post" action="/admin/users/{{ user_obj.name }}/delete?user={{ current_user }}"
+          style="display:inline"
+          onsubmit="return confirm('Delete user {{ user_obj.name }}? This also removes their config.')">
+      <button class="ui red button"><i class="trash icon"></i> Delete User</button>
+    </form>
+  </div>
+</div>
+
+<div class="ui stackable two column grid">
+
+  {# ---- Left: profile + volume access ---- #}
+  <div class="column">
+    <div class="ui segment">
+      <h4 class="ui header"><i class="info icon"></i> Profile</h4>
+      <table class="ui definition table">
+        <tbody>
+          <tr><td>Username</td><td>{{ user_obj.name }}</td></tr>
+          <tr><td>SSH Keys</td><td>{{ user_obj.publicKeys | length }} key(s)</td></tr>
+          {% if user_obj.securityContext %}
+          <tr><td>runAsUser</td><td>{{ user_obj.securityContext.get("runAsUser", "—") }}</td></tr>
+          <tr><td>runAsGroup</td><td>{{ user_obj.securityContext.get("runAsGroup", "—") }}</td></tr>
+          <tr><td>fsGroup</td><td>{{ user_obj.securityContext.get("fsGroup", "—") }}</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+
+      {% if user_obj.publicKeys %}
+      <h5 class="ui header" style="margin-top:1rem">SSH Keys</h5>
+      {% for k in user_obj.publicKeys %}
+      <div class="ui secondary segment" style="font-family:monospace;font-size:.78rem;word-break:break-all;padding:.6rem">{{ k }}</div>
+      {% endfor %}
+      {% endif %}
+    </div>
+
+    <div class="ui segment">
+      <h4 class="ui header"><i class="database icon"></i> Volume Access</h4>
+      <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/volumes?user={{ current_user }}">
+        {% for vol in volumes %}
+        <div class="field">
+          <div class="ui checkbox">
+            <input type="checkbox" name="volume_names" value="{{ vol.name }}"
+                   id="vol-{{ vol.name }}"
+                   {% if vol.name in allowed_volumes %}checked{% endif %}>
+            <label for="vol-{{ vol.name }}">
+              {{ vol.name }}
+              {% if vol.persistentVolumeClaim %}
+                <span class="ui grey mini label">{{ vol.persistentVolumeClaim.claimName }}</span>
+              {% endif %}
+            </label>
+          </div>
+        </div>
+        {% else %}
+        <p class="ui grey text">No volumes defined. <a href="/admin/volumes/new?user={{ current_user }}">Create one</a>.</p>
+        {% endfor %}
+        {% if volumes %}
+        <div class="ui divider"></div>
+        <button type="submit" class="ui teal button"><i class="save icon"></i> Save Volume Access</button>
+        {% endif %}
+      </form>
+    </div>
+  </div>
+
+  {# ---- Right: instances + edit profile ---- #}
+  <div class="column">
+    <div class="ui segment">
+      <h4 class="ui header"><i class="server icon"></i> Instances</h4>
+      {% if instances %}
+      <table class="ui compact celled table">
+        <thead><tr><th>Name</th><th>Template</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+          {% for inst in instances %}
+          <tr>
+            <td>{{ inst.name }}</td>
+            <td>{{ inst.template or "—" }}</td>
+            <td>
+              <span class="ui {{ status_color(inst.status) }} label">{{ inst.status }}</span>
+            </td>
+            <td class="collapsing">
+              {% if inst.status == "Running" %}
+              <form method="post" action="/admin/sessions/{{ user_obj.name }}/{{ inst.name }}/stop?user={{ current_user }}" style="display:inline">
+                <button class="ui yellow mini button"><i class="stop icon"></i></button>
+              </form>
+              {% endif %}
+              <form method="post" action="/admin/sessions/{{ user_obj.name }}/{{ inst.name }}/delete?user={{ current_user }}"
+                    style="display:inline" onsubmit="return confirm('Delete {{ inst.name }}?')">
+                <button class="ui red mini button"><i class="trash icon"></i></button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="ui grey text">No instances.</p>
+      {% endif %}
+    </div>
+
+    <div class="ui segment">
+      <h4 class="ui header"><i class="edit icon"></i> Edit Profile</h4>
+      <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/update?user={{ current_user }}">
+        <div class="field">
+          <label>SSH Public Keys</label>
+          <textarea name="public_keys" rows="4">{{ (user_obj.publicKeys or []) | join("\n") }}</textarea>
+          <div class="ui pointing label">One key per line.</div>
+        </div>
+        <div class="three fields">
+          <div class="field">
+            <label>runAsUser</label>
+            <input name="run_as_user" type="number"
+                   value="{{ (user_obj.securityContext or {}).get('runAsUser', '') }}">
+          </div>
+          <div class="field">
+            <label>runAsGroup</label>
+            <input name="run_as_group" type="number"
+                   value="{{ (user_obj.securityContext or {}).get('runAsGroup', '') }}">
+          </div>
+          <div class="field">
+            <label>fsGroup</label>
+            <input name="fs_group" type="number"
+                   value="{{ (user_obj.securityContext or {}).get('fsGroup', '') }}">
+          </div>
+        </div>
+        <div class="ui divider"></div>
+        <button type="submit" class="ui primary button"><i class="save icon"></i> Save Changes</button>
+      </form>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  $(document).ready(function() {
+    $('.ui.checkbox').checkbox();
+  });
+</script>
+{% endblock %}

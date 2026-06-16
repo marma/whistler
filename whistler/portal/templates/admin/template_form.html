@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}{% if tpl %}Edit {{ tpl.displayName or tpl.name }}{% else %}New Template{% endif %} — Admin — Whistler{% endblock %}
+{% block content %}
+
+<h2 class="ui header">
+  <i class="copy outline icon"></i>
+  <div class="content">
+    {% if tpl %}Edit: {{ tpl.displayName or tpl.name }}{% else %}New System Template{% endif %}
+  </div>
+</h2>
+
+<div class="ui segment" style="max-width:680px">
+  {% if tpl %}
+  <form class="ui form" method="post" action="/admin/templates/{{ tpl.name }}/update?user={{ current_user }}">
+  {% else %}
+  <form class="ui form" method="post" action="/admin/templates?user={{ current_user }}">
+  {% endif %}
+
+    <div class="two fields">
+      <div class="field">
+        <label for="display_name">Name</label>
+        <input id="display_name" name="display_name" type="text" required
+               placeholder="Ubuntu 22 Base"
+               value="{{ tpl.displayName if tpl else '' }}">
+        <div class="ui pointing label">Human-readable name, anything goes.</div>
+      </div>
+      <div class="field">
+        <label for="slug">Slug</label>
+        <input id="slug" name="slug" type="text" required
+               placeholder="ubuntu-22-base"
+               pattern="[a-z0-9][a-z0-9\-]*"
+               value="{{ tpl.name if tpl else '' }}"
+               readonly>
+        <div class="ui pointing label">
+          {% if tpl %}Slug is fixed after creation.{% else %}Auto-filled from Name — used as the Kubernetes resource name.{% endif %}
+        </div>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="image">Container Image</label>
+      <input id="image" name="image" type="text" required
+             list="image-list"
+             placeholder="ubuntu:22.04"
+             autocomplete="off"
+             value="{{ tpl.image if tpl else '' }}">
+      <datalist id="image-list">
+        {% for img in available_images %}
+        <option value="{{ img }}">
+        {% endfor %}
+      </datalist>
+      {% if available_images %}
+      <div class="ui pointing label">Select from the list or type a custom image.</div>
+      {% endif %}
+    </div>
+
+    <div class="field">
+      <label>Description</label>
+      <input name="description" type="text" placeholder="Brief description"
+             value="{{ tpl.description if tpl else '' }}">
+    </div>
+
+    <div class="two fields">
+      <div class="field">
+        <label>CPU</label>
+        <input name="cpu" type="text" placeholder="500m"
+               value="{{ (tpl.resources or {}).get('cpu', '') if tpl else '' }}">
+        <div class="ui pointing label">e.g. 500m, 2</div>
+      </div>
+      <div class="field">
+        <label>Memory</label>
+        <input name="memory" type="text" placeholder="512Mi"
+               value="{{ (tpl.resources or {}).get('memory', '') if tpl else '' }}">
+        <div class="ui pointing label">e.g. 512Mi, 4Gi</div>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>Personal Home Mount Path</label>
+      <input name="personal_mount" type="text" placeholder="/userdata"
+             value="{{ tpl.personalMountPath if tpl else '/userdata' }}">
+    </div>
+
+    <div class="ui divider"></div>
+    <button type="submit" class="ui primary button">
+      <i class="save icon"></i> {% if tpl %}Save Changes{% else %}Create Template{% endif %}
+    </button>
+    <a href="/admin/templates?user={{ current_user }}" class="ui button">Cancel</a>
+  </form>
+</div>
+
+{% if not tpl %}
+<script>
+(function () {
+  const nameInput = document.getElementById('display_name');
+  const slugInput = document.getElementById('slug');
+  let slugEdited = false;
+
+  slugInput.addEventListener('input', function () {
+    slugEdited = true;
+  });
+
+  nameInput.addEventListener('input', function () {
+    if (slugEdited) return;
+    slugInput.value = this.value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/, '');
+  });
+})();
+</script>
+{% endif %}
+
+{% endblock %}

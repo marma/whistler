@@ -155,13 +155,17 @@ kind: ClusterRole
 metadata:
   name: {{ .Release.Name }}-portal
 rules:
-  # List/launch/connect desktop sessions and read their templates + status.
+  # Desktop sessions (portal / Guacamole flow).
   - apiGroups: [whistler.martinmalmsten.net]
     resources: [desktopsessions, desktoptemplates, desktopsessions/status]
     verbs: [get, list, create, delete, watch]
 
-  # add_desktop_session -> _ensure_user_namespace ensures the per-user namespace
-  # and its NetworkPolicy exist.
+  # Management UI: SSH templates + instances (CRUD) and instance trigger (patch).
+  - apiGroups: [whistler.martinmalmsten.net]
+    resources: [whistlertemplates, whistlerinstances, whistlerinstances/status]
+    verbs: [get, list, create, update, patch, delete, watch]
+
+  # add_desktop_session / _ensure_user_namespace.
   - apiGroups: [""]
     resources: [namespaces]
     verbs: [get, list, create]
@@ -169,9 +173,23 @@ rules:
     resources: [networkpolicies]
     verbs: [get, list, create, update, patch]
 
-  # Resolving session targets, plus loading users/config like the other processes.
+  # stop_instance deletes the pod (keeps the CR); list pods for status.
   - apiGroups: [""]
-    resources: [services, secrets, configmaps]
+    resources: [pods]
+    verbs: [get, list, watch, delete]
+
+  # PVCs: list for volume management display.
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, list]
+
+  # Read services and configmaps cluster-wide; secrets are read-only here
+  # (write access to the users Secret is granted by the namespaced Role below).
+  - apiGroups: [""]
+    resources: [services, configmaps]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [secrets]
     verbs: [get, list]
 
 ---
@@ -183,6 +201,34 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: {{ .Release.Name }}-portal
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-portal
+    namespace: {{ .Release.Namespace }}
+
+---
+# Namespaced role: allows the portal to update the users Secret so that
+# admin user management (save_user / delete_user) can persist changes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-portal-secrets
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch, update, patch]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-portal-secrets
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-portal-secrets
 subjects:
   - kind: ServiceAccount
     name: {{ .Release.Name }}-portal

@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Templates — Admin — Whistler{% endblock %}
+{% block content %}
+
+<div class="ui stackable grid">
+  <div class="twelve wide column">
+    <h2 class="ui header"><i class="copy outline icon"></i> System Templates</h2>
+  </div>
+  <div class="four wide column" style="text-align:right;padding-top:1.2rem">
+    <a href="/admin/templates/new?user={{ current_user }}" class="ui primary button">
+      <i class="plus icon"></i> New Template
+    </a>
+  </div>
+</div>
+
+{% if tpls %}
+<table class="ui selectable celled table">
+  <thead>
+    <tr>
+      <th>Name / Slug</th>
+      <th>Image</th>
+      <th>CPU</th>
+      <th>Memory</th>
+      <th>Mount</th>
+      <th>Description</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for t in tpls %}
+    <tr>
+      <td>
+        <strong>{{ t.displayName or t.name }}</strong>
+        {% if t.displayName and t.displayName != t.name %}
+        <div><code style="font-size:.8em;color:#888">{{ t.name }}</code></div>
+        {% endif %}
+      </td>
+      <td><code>{{ t.image or "—" }}</code></td>
+      <td>{{ (t.resources or {}).get("cpu") or "—" }}</td>
+      <td>{{ (t.resources or {}).get("memory") or "—" }}</td>
+      <td><code>{{ t.personalMountPath or "/userdata" }}</code></td>
+      <td class="collapsing">{{ t.description or "" }}</td>
+      <td class="collapsing">
+        <a href="/admin/templates/{{ t.name }}/edit?user={{ current_user }}"
+           class="ui tiny button"><i class="edit icon"></i> Edit</a>
+        <form method="post" action="/admin/templates/{{ t.name }}/delete?user={{ current_user }}"
+              style="display:inline" onsubmit="return confirm('Delete template {{ t.name }}?')">
+          <button class="ui red tiny button"><i class="trash icon"></i> Delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="ui placeholder segment">
+  <div class="ui icon header">
+    <i class="copy outline icon"></i>
+    No system templates defined yet
+  </div>
+  <a href="/admin/templates/new?user={{ current_user }}" class="ui primary button">
+    Create first template
+  </a>
+</div>
+{% endif %}
+
+{% endblock %}

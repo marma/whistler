@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}New Instance — Whistler{% endblock %}
+{% block content %}
+
+<h2 class="ui header">
+  <i class="plus circle icon"></i>
+  <div class="content">New Instance</div>
+</h2>
+
+<div class="ui segment" style="max-width:640px">
+  <form class="ui form" method="post" action="/instances?user={{ current_user }}">
+
+    <div class="field">
+      <label>Instance name</label>
+      <input name="instance_name" type="text" required placeholder="my-workspace"
+             pattern="[a-z0-9][a-z0-9\-]*">
+      <div class="ui pointing label">Lowercase letters, numbers, and hyphens only.</div>
+    </div>
+
+    <div class="field">
+      <label>Template</label>
+      <select name="template_name" class="ui dropdown" required>
+        <option value="">— select a template —</option>
+        {% for t in tpls %}
+        <option value="{{ t.fullName }}"
+          {% if request.query_params.get('template') == t.fullName %}selected{% endif %}>
+          {{ t.name }}{% if t.source == 'system' %} (system){% endif %}{% if t.image %} — {{ t.image }}{% endif %}
+        </option>
+        {% endfor %}
+      </select>
+    </div>
+
+    {% set user_volumes = [] %}
+    {% for vol in volumes %}
+      {% if vol.name in allowed_volumes %}{% set _ = user_volumes.append(vol) %}{% endif %}
+    {% endfor %}
+
+    {% if user_volumes %}
+    <div class="field">
+      <label>Volumes to mount</label>
+      {% for vol in user_volumes %}
+      <div class="ui segment" style="padding:.75rem;margin-bottom:.5rem">
+        <div class="two fields">
+          <div class="field">
+            <div class="ui checkbox">
+              <input type="checkbox" name="volume_names" value="{{ vol.name }}" id="vol-{{ vol.name }}">
+              <label for="vol-{{ vol.name }}">
+                <strong>{{ vol.name }}</strong>
+                {% if vol.persistentVolumeClaim %}
+                  <span class="ui grey mini label">{{ vol.persistentVolumeClaim.claimName }}</span>
+                {% endif %}
+              </label>
+            </div>
+          </div>
+          <div class="field">
+            <input type="text" name="mount_paths" placeholder="/mnt/{{ vol.name }}">
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <div class="field">
+      <div class="ui checkbox">
+        <input type="checkbox" name="preemptible" value="on" id="preemptible">
+        <label for="preemptible">Preemptible (lower priority, may be evicted)</label>
+      </div>
+    </div>
+
+    <div class="ui divider"></div>
+    <button type="submit" class="ui primary button">
+      <i class="plus icon"></i> Create Instance
+    </button>
+    <a href="/?user={{ current_user }}" class="ui button">Cancel</a>
+  </form>
+</div>
+
+<script>
+  $(document).ready(function() {
+    $('.ui.dropdown').dropdown();
+    $('.ui.checkbox').checkbox();
+  });
+</script>
+{% endblock %}

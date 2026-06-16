@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Admin — Whistler{% endblock %}
+{% block content %}
+
+<h2 class="ui header">
+  <i class="shield alternate icon"></i>
+  <div class="content">Admin Overview</div>
+</h2>
+
+<div class="ui four statistics" style="margin-bottom:2rem">
+  <div class="statistic">
+    <div class="value">{{ all_users | length }}</div>
+    <div class="label">Users</div>
+  </div>
+  <div class="statistic">
+    <div class="value">{{ all_templates | length }}</div>
+    <div class="label">Templates</div>
+  </div>
+  <div class="statistic">
+    <div class="value">{{ all_instances | length }}</div>
+    <div class="label">Instances</div>
+  </div>
+  <div class="green statistic">
+    <div class="value">{{ all_instances | selectattr("status", "equalto", "Running") | list | length }}</div>
+    <div class="label">Running</div>
+  </div>
+</div>
+
+<div class="ui four stackable cards">
+  <div class="card">
+    <div class="content">
+      <div class="header"><i class="copy outline icon"></i> Templates</div>
+      <div class="description">Manage system-wide instance templates</div>
+    </div>
+    <div class="extra content">
+      <a href="/admin/templates?user={{ current_user }}" class="ui primary fluid button">Manage Templates</a>
+    </div>
+  </div>
+  <div class="card">
+    <div class="content">
+      <div class="header"><i class="users icon"></i> Users</div>
+      <div class="description">Manage users, SSH keys, and volume access</div>
+    </div>
+    <div class="extra content">
+      <a href="/admin/users?user={{ current_user }}" class="ui primary fluid button">Manage Users</a>
+    </div>
+  </div>
+  <div class="card">
+    <div class="content">
+      <div class="header"><i class="database icon"></i> Volumes</div>
+      <div class="description">Define PVC-backed volumes available to users</div>
+    </div>
+    <div class="extra content">
+      <a href="/admin/volumes?user={{ current_user }}" class="ui primary fluid button">Manage Volumes</a>
+    </div>
+  </div>
+  <div class="card">
+    <div class="content">
+      <div class="header"><i class="list icon"></i> All Sessions</div>
+      <div class="description">View and stop instances across all users</div>
+    </div>
+    <div class="extra content">
+      <a href="/admin/sessions?user={{ current_user }}" class="ui primary fluid button">View Sessions</a>
+    </div>
+  </div>
+</div>
+
+{% endblock %}

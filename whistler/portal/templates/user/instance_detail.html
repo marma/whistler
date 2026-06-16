@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}{{ inst.name }} — Whistler{% endblock %}
+{% block content %}
+
+<div class="ui stackable grid">
+  <div class="row">
+    <div class="twelve wide column">
+      <h2 class="ui header">
+        <i class="server icon"></i>
+        <div class="content">
+          {{ inst.name }}
+          <div class="sub header">{{ inst.template or "no template" }}</div>
+        </div>
+      </h2>
+    </div>
+    <div class="four wide column" style="padding-top:1.2rem;text-align:right">
+      <span id="status-{{ inst.name }}"
+            class="ui {{ status_color(inst.status) }} large label"
+            hx-get="/instances/{{ inst.name }}/status-badge?user={{ current_user }}"
+            hx-trigger="every 3s"
+            hx-swap="outerHTML">
+        {{ inst.status }}
+      </span>
+    </div>
+  </div>
+</div>
+
+<div class="ui stackable two column grid">
+  <div class="column">
+    <div class="ui segment">
+      <h4 class="ui header"><i class="info icon"></i> Details</h4>
+      <table class="ui definition table">
+        <tbody>
+          <tr><td>Template</td><td>{{ inst.template or "—" }}</td></tr>
+          <tr><td>Pod</td><td><code>{{ inst.podName or "none" }}</code></td></tr>
+          {% if inst.ip %}<tr><td>IP</td><td><code>{{ inst.ip }}</code></td></tr>{% endif %}
+          <tr><td>Namespace</td><td><code>{{ inst.namespace }}</code></td></tr>
+          <tr><td>Preemptible</td><td>{{ "Yes" if inst.preemptible else "No" }}</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    {% if inst.mounts %}
+    <div class="ui segment">
+      <h4 class="ui header"><i class="folder icon"></i> Mounted Volumes</h4>
+      <table class="ui compact table">
+        <thead><tr><th>Volume</th><th>Mount Path</th></tr></thead>
+        <tbody>
+          {% for m in inst.mounts %}
+          <tr><td>{{ m.name }}</td><td><code>{{ m.mountPath }}</code></td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="column">
+    <div class="ui segment">
+      <h4 class="ui header"><i class="lightning icon"></i> Actions</h4>
+
+      {% if inst.status == "Running" %}
+      <form method="post" action="/instances/{{ inst.name }}/stop?user={{ current_user }}">
+        <button class="ui yellow fluid button" style="margin-bottom:.75rem">
+          <i class="stop icon"></i> Stop Instance
+        </button>
+      </form>
+      {% else %}
+      <form method="post" action="/instances/{{ inst.name }}/connect?user={{ current_user }}">
+        <button class="ui green fluid button" style="margin-bottom:.75rem">
+          <i class="play icon"></i>
+          {% if inst.status == "Stopped" %}Start &amp; Connect{% else %}Connect{% endif %}
+        </button>
+      </form>
+      {% endif %}
+
+      <form method="post" action="/instances/{{ inst.name }}/delete?user={{ current_user }}"
+            onsubmit="return confirm('Delete instance {{ inst.name }}? This cannot be undone.')">
+        <button class="ui red fluid button" style="margin-bottom:.75rem">
+          <i class="trash icon"></i> Delete Instance
+        </button>
+      </form>
+
+      <a href="/?user={{ current_user }}" class="ui fluid button">
+        <i class="arrow left icon"></i> Back to Dashboard
+      </a>
+    </div>
+
+    {% if inst.status == "Pending" or inst.status == "Running" %}
+    <div class="ui info message">
+      <i class="info circle icon"></i>
+      Status updates automatically every few seconds.
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+{% endblock %}

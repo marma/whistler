@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}All Sessions — Admin — Whistler{% endblock %}
+{% block content %}
+
+<h2 class="ui header">
+  <i class="list icon"></i>
+  <div class="content">All Sessions</div>
+</h2>
+
+{% if all_instances %}
+<table class="ui selectable celled table"
+       id="sessions-table"
+       hx-get="/admin/sessions/rows?user={{ current_user }}"
+       hx-trigger="every 15s"
+       hx-target="#sessions-tbody"
+       hx-swap="innerHTML">
+  <thead>
+    <tr>
+      <th>User</th>
+      <th>Instance</th>
+      <th>Template</th>
+      <th>Status</th>
+      <th>Pod</th>
+      <th>Preemptible</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody id="sessions-tbody">
+    {% for inst in all_instances %}
+    <tr>
+      <td>{{ inst.username }}</td>
+      <td><strong>{{ inst.name }}</strong></td>
+      <td>{{ inst.template or "—" }}</td>
+      <td>
+        <span class="ui {{ status_color(inst.status) }} label">{{ inst.status }}</span>
+      </td>
+      <td><code>{{ inst.podName or "none" }}</code></td>
+      <td>{{ "Yes" if inst.preemptible else "No" }}</td>
+      <td class="collapsing">
+        {% if inst.status == "Running" %}
+        <form method="post" action="/admin/sessions/{{ inst.username }}/{{ inst.name }}/stop?user={{ current_user }}" style="display:inline">
+          <button class="ui yellow tiny button"><i class="stop icon"></i> Stop</button>
+        </form>
+        {% endif %}
+        <form method="post" action="/admin/sessions/{{ inst.username }}/{{ inst.name }}/delete?user={{ current_user }}"
+              style="display:inline" onsubmit="return confirm('Delete {{ inst.name }}?')">
+          <button class="ui red tiny button"><i class="trash icon"></i> Delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p class="ui grey text" style="font-size:.85rem">
+  <i class="refresh icon"></i> Table refreshes automatically every 15 seconds.
+</p>
+{% else %}
+<div class="ui placeholder segment">
+  <div class="ui icon header">
+    <i class="server icon"></i>
+    No instances found
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

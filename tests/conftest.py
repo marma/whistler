@@ -86,10 +86,62 @@ class FakeConfigManager(ConfigManager):
     def get_volumes(self):
         return []
 
+    def get_available_images(self):
+        return []
+
     def get_server_host_key(self, secret_name):
         return None
 
     def save_server_host_key(self, secret_name, key_data):
+        return True
+
+    def list_all_users(self):
+        return list(self.users.values())
+
+    def save_user(self, user_data):
+        username = user_data.get("name")
+        if username:
+            self.users[username] = user_data
+        return bool(username)
+
+    def delete_user(self, username):
+        self.users.pop(username, None)
+        return True
+
+    def get_all_templates(self):
+        result = []
+        for templates in self._templates.values():
+            result.extend(templates)
+        return result
+
+    def get_all_instances(self):
+        result = []
+        for username, instances in self._instances.items():
+            for inst in instances:
+                result.append({"username": username, **inst})
+        return result
+
+    def save_system_template(self, template_data):
+        return True
+
+    def save_volume(self, volume_data):
+        return True
+
+    def delete_volume(self, volume_name):
+        return True
+
+    def get_user_allowed_volumes(self, username):
+        return (self.users.get(username) or {}).get("allowedVolumes", [])
+
+    def set_user_allowed_volumes(self, username, volume_names):
+        if username in self.users:
+            self.users[username]["allowedVolumes"] = volume_names
+        return True
+
+    def stop_instance(self, username, instance_name):
+        return True
+
+    def trigger_instance_start(self, username, instance_name):
         return True
 
 
