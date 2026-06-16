@@ -19,8 +19,17 @@ spec:
   connectionParams:
 {{ toYaml $template.connectionParams | indent 4 }}
 {{- end }}
+{{- if $template.rdpSecurity }}
+  rdpSecurity: {{ $template.rdpSecurity }}
+{{- end }}
 {{- if $template.fuse }}
   fuse: {{ $template.fuse }}
+{{- end }}
+{{- if $template.privileged }}
+  privileged: {{ $template.privileged }}
+{{- end }}
+{{- if $template.runtimeClassName }}
+  runtimeClassName: {{ $template.runtimeClassName | quote }}
 {{- end }}
 {{- if $template.persistence }}
   persistence: {{ $template.persistence }}

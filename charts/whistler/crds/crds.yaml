@@ -175,6 +175,16 @@ spec:
                     another Kata Containers runtime) to run the privileged container
                     inside a lightweight VM, restoring host isolation without the
                     overhead of managing full VM disk images.
+                rdpSecurity:
+                  type: string
+                  enum: ["any", "nla", "tls", "rdp", "vmconnect"]
+                  description: >-
+                    RDP security/authentication mode passed to guacd as the
+                    ``security`` connection parameter. "any" lets guacd negotiate;
+                    "nla" forces Network Level Authentication (required by
+                    gnome-remote-desktop); "tls" forces TLS without NLA; "rdp"
+                    uses classic RDP encryption. Overrides a ``security`` key in
+                    connectionParams if both are set.
   scope: Namespaced
   names:
     plural: desktoptemplates

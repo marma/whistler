@@ -150,10 +150,10 @@ desktopTemplates:
     protocol: rdp
     displayPort: 3389
     persistence: ephemeral
+    rdpSecurity: "any"
     connectionParams:
       username: "abc"
       password: "abc"
-      security: "any"
       ignore-cert: "true"
       resize-method: "display-update"
       # Full color over the RDP link (guacd often defaults to 16-bit, which
@@ -189,13 +189,12 @@ desktopTemplates:
     # grd's RDP clipboard mounts a FUSE filesystem; without /dev/fuse the daemon
     # aborts the moment a client connects.
     fuse: true
+    # gnome-remote-desktop mandates NLA; "any" fails because grd refuses the
+    # fallback security modes guacd tries first when negotiating.
+    rdpSecurity: "nla"
     connectionParams:
       username: "abc"
       password: "abc"
-      # grd always negotiates TLS (and may require NLA); "any" lets guacd pick.
-      # ignore-cert because grd's cert is self-signed at startup. UNVERIFIED —
-      # may need security: "nla" against the real grd.
-      security: "nla"
       ignore-cert: "true"
       resize-method: "display-update"
       color-depth: "24"

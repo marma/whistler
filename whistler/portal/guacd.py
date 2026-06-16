@@ -71,8 +71,12 @@ def resolve_session(sessions: List[Dict], short_name: str) -> Optional[Dict]:
 def _build_guacd_params(template_spec: Dict, address: str, display_port) -> Dict[str, str]:
     """Merge a template's ``connectionParams`` with the resolved target. The CR
     is the source of truth: hostname/port always come from the live session, so
-    they win over anything in the template."""
+    they win over anything in the template. ``rdpSecurity`` (a first-class field)
+    is injected as the guacd ``security`` param and takes precedence over a raw
+    ``security`` key in ``connectionParams``."""
     params = {str(k): str(v) for k, v in (template_spec.get("connectionParams") or {}).items()}
+    if rdp_security := template_spec.get("rdpSecurity"):
+        params["security"] = rdp_security
     params["hostname"] = address
     params["port"] = str(display_port)
     return params
