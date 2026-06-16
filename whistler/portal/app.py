@@ -124,10 +124,18 @@ _CONNECT_HTML = """<!doctype html><meta charset=utf-8><title>__ID__</title>
   #display canvas{image-rendering:pixelated;image-rendering:crisp-edges}
   #log{position:absolute;top:0;left:0;z-index:10;color:#0f0;font:12px/1.4 monospace;
        background:rgba(0,0,0,.7);padding:6px;max-width:95%;white-space:pre-wrap;pointer-events:none}
-  #q{position:absolute;top:6px;right:6px;z-index:11;font:12px monospace;cursor:pointer;
+  #q{position:absolute;bottom:6px;right:6px;z-index:21;font:12px monospace;cursor:pointer;
      background:rgba(0,0,0,.6);color:#0f0;border:1px solid #0f0;border-radius:3px;padding:2px 6px}
+  #overlay{position:absolute;inset:0;z-index:20;background:rgba(0,0,0,.65);
+           display:flex;align-items:center;justify-content:center;
+           transition:opacity .4s}
+  #overlay.hidden{opacity:0;pointer-events:none}
+  #overlay-msg{color:#e0e0e0;font:bold 2rem/1.5 system-ui,sans-serif;text-align:center;
+               text-shadow:0 2px 8px rgba(0,0,0,.9);max-width:80%}
 </style>
-<div id=display></div><pre id=log></pre>
+<div id=display></div>
+<div id=overlay><div id=overlay-msg>Connecting…</div></div>
+<pre id=log></pre>
 <button id=q title="Toggle remote render resolution (1:1 physical vs half)">100%</button>
 <!-- guacamole-common-js ships a CommonJS bundle: it sets a global `var Guacamole`
      but ends with an unguarded `module.exports`. Define a dummy `module` so that
@@ -154,12 +162,22 @@ function log(m) { if (DEBUG) logEl.textContent += m + NL; try { console.log("[wh
 const STATES = ["IDLE","CONNECTING","WAITING","CONNECTED","DISCONNECTING","DISCONNECTED"];
 if (!window.Guacamole) log("FATAL: Guacamole library not loaded");
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+const overlayEl = document.getElementById('overlay');
+const overlayMsg = document.getElementById('overlay-msg');
+function setStatus(msg) { overlayMsg.textContent = msg; overlayEl.classList.remove('hidden'); }
+function hideStatus() { overlayEl.classList.add('hidden'); }
+
 async function waitReady() {
+  setStatus('Waiting for session…');
   for (;;) {
     try {
       const r = await fetch(`/status/${id}?user=${encodeURIComponent(user)}`);
-      if (r.ok) { const j = await r.json(); log("status: " + j.phase); if (j.phase === 'Ready') return; }
-      else log("status http " + r.status);
+      if (r.ok) {
+        const j = await r.json(); log("status: " + j.phase);
+        setStatus(j.phase === 'Ready' ? 'Opening display…' : 'Session: ' + j.phase);
+        if (j.phase === 'Ready') return;
+      } else { log("status http " + r.status); }
     } catch (e) { log("status error: " + e); }
     await sleep(2000);
   }
@@ -190,15 +208,19 @@ function connect() {
   document.getElementById('display').appendChild(display.getElement());
 
   let connected = false;
-  client.onstatechange = s => { connected = (s === 3); log("state: " + (STATES[s] || s)); };
-  client.onerror = e => log("client error: " + (e && e.message || e));
-  tunnel.onerror = e => log("tunnel error: " + (e && e.message || e));
+  client.onstatechange = s => {
+    connected = (s === 3); log("state: " + (STATES[s] || s));
+    if (s === 3) hideStatus();
+    else if (s === 5) setStatus('Disconnected');
+  };
+  client.onerror = e => { log("client error: " + (e && e.message || e)); setStatus('Error: ' + (e && e.message || String(e))); };
+  tunnel.onerror = e => { log("tunnel error: " + (e && e.message || e)); setStatus('Connection error'); };
 
   // Initial size travels in the connect data -> WS query -> guacd handshake, so
   // the RDP session starts at the right resolution (no fixed 1024x768 then resize).
   const r0 = remoteSize();
   let remoteW = r0.w, remoteH = r0.h;   // actual remote size, updated by onresize
-  let halfMode = false;
+  let halfMode = (window.devicePixelRatio || 1) > 1;
 
   // Compute the target remote resolution and the canvas scale needed for it to
   // fill the viewport. halfMode requests half the device pixels (less to encode,
@@ -237,8 +259,9 @@ function connect() {
     try { display.scale(Math.min(window.innerWidth / width, window.innerHeight / height)); } catch (e) {}
   };
 
-  display.scale(r0.scale);
-  client.connect('user=' + encodeURIComponent(user) + '&w=' + r0.w + '&h=' + r0.h);
+  const t0 = targetSize();
+  display.scale(t0.scale);
+  client.connect('user=' + encodeURIComponent(user) + '&w=' + t0.w + '&h=' + t0.h);
 
   let rt;
   window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(applySize, 300); });
@@ -246,6 +269,7 @@ function connect() {
   // 50%/100%: both fill the viewport, but 50% sends half the remote pixels
   // (lower quality, less bandwidth). Does NOT change the canvas size.
   const qBtn = document.getElementById('q');
+  qBtn.textContent = halfMode ? '50%' : '100%';
   qBtn.onclick = () => {
     halfMode = !halfMode;
     qBtn.textContent = halfMode ? '50%' : '100%';
@@ -266,7 +290,7 @@ function connect() {
     kb.onkeyup = k => client.sendKeyEvent(0, k);
   } catch (e) { log("input setup error: " + e); }
 }
-waitReady().then(connect).catch(e => log("fatal: " + e));
+waitReady().then(connect).catch(e => { log("fatal: " + e); setStatus('Fatal error: ' + e); });
 </script>"""
 
 

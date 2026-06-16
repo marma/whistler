@@ -166,7 +166,6 @@ def _probe_vmi(namespace, name, logger):
 
 @kopf.on.create('whistler.martinmalmsten.net', 'v1', 'desktopsessions')
 @kopf.on.update('whistler.martinmalmsten.net', 'v1', 'desktopsessions')
-@kopf.on.resume('whistler.martinmalmsten.net', 'v1', 'desktopsessions')
 def reconcile_desktop_fn(spec, name, namespace, meta, patch, logger, **kwargs):
     """Own desktop lifecycle: ensure the pod/VM (and per-session Service) exist.
     The phase machine itself is driven by desktop_phase_timer."""
