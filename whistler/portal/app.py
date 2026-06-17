@@ -446,8 +446,13 @@ async def launch(request):
 
 
 async def connect(request):
-    return web.Response(text=_render_connect(request["user"], request.match_info["id"]),
-                        content_type="text/html")
+    """Serve the desktop viewer page and nudge the session's pod awake (same
+    reconcile trigger the SSH server / web terminal fire on connect) so it
+    becomes Ready while the page polls /status."""
+    cm, user = request.app["cm"], request["user"]
+    name = request.match_info["id"]
+    await _run(request, cm.trigger_instance_start, user, name)
+    return web.Response(text=_render_connect(user, name), content_type="text/html")
 
 
 async def status(request):

@@ -1,0 +1,5 @@
+<span id="status-{{ name }}"
+      class="ui {{ status_color(status) }} label"
+      hx-get="/instances/{{ name }}/status-badge?user={{ user }}{% if controls %}&controls=1{% endif %}"
+      hx-trigger="every 5s"
+      hx-swap="outerHTML">{{ status_label(status) }}</span>

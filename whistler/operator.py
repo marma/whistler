@@ -83,9 +83,12 @@ def _probe_pod(namespace, name, logger):
     except client.rest.ApiException as e:
         if e.status != 404:
             logger.warning(f"Error reading pod {name}: {e}")
-        return ("Provisioning", None, None)  # not created yet
+        # No pod: reconcile creates it synchronously, so by the time the timer
+        # probes, an absent pod means the session was stopped (pod deleted, CR
+        # kept), not "still provisioning".
+        return ("Stopped", None, None)
     if pod.metadata.deletion_timestamp:
-        return ("Booting", name, None)
+        return ("Terminating", name, None)
     phase = getattr(pod.status, "phase", None)
     statuses = pod.status.container_statuses or []
     all_ready = bool(statuses) and all(cs.ready for cs in statuses)
@@ -117,14 +120,16 @@ def _probe_vmi(namespace, name, logger):
 
 @kopf.on.create('whistler.martinmalmsten.net', 'v1', 'sessions')
 @kopf.on.update('whistler.martinmalmsten.net', 'v1', 'sessions')
-@kopf.on.resume('whistler.martinmalmsten.net', 'v1', 'sessions')
 def reconcile_session_fn(spec, name, namespace, meta, patch, logger, **kwargs):
     """Own session lifecycle: ensure the pod/VM (and, for desktop, the
     per-session Service) exist. The phase machine itself runs in the timer.
 
     Consumers create/patch the Session CR rather than creating pods directly,
-    making this the single owner of pod creation and letting pods be (re)created
-    on resume (e.g. an operator restart)."""
+    making this the single owner of pod creation. Note there is deliberately no
+    `@kopf.on.resume` handler: pods are created on-demand (CR creation, or the
+    `whistler/last-connect` annotation bump when a user connects), not when the
+    operator/cluster (re)starts — a session whose pod was stopped stays stopped
+    until someone connects again. The phase timer still resumes on its own."""
     if meta.get('deletionTimestamp'):
         logger.info(f"Skipping reconcile for deleting session {name}")
         return

@@ -1,0 +1,24 @@
+{% set state = status_label(status) %}
+{% set can_connect = state in ("Stopped", "Running") %}
+{% set can_start = state == "Stopped" %}
+{% set can_stop = state not in ("Stopped", "Stopping …") %}
+{% if connect_url %}
+<a class="ui blue tiny icon button{% if not can_connect %} disabled{% endif %}" title="Connect to desktop"
+   {% if can_connect %}href="{{ connect_url }}" target="_blank"{% endif %}>
+  <i class="desktop icon"></i>
+</a>
+{% endif %}
+{% if term_url %}
+<a class="ui teal tiny icon button{% if not can_connect %} disabled{% endif %}" title="Connect using SSH"
+   {% if can_connect %}href="{{ term_url }}" target="_blank"{% endif %}>
+  <i class="terminal icon"></i>
+</a>
+{% endif %}
+<button class="ui yellow tiny icon button{% if not can_stop %} disabled{% endif %}" title="Stop"
+        {% if can_stop %}hx-post="/instances/{{ name }}/stop?user={{ user }}" hx-target="#status-{{ name }}" hx-swap="outerHTML"{% else %}disabled{% endif %}>
+  <i class="stop icon"></i>
+</button>
+<button class="ui green tiny icon button{% if not can_start %} disabled{% endif %}" title="Start"
+        {% if can_start %}hx-post="/instances/{{ name }}/connect?user={{ user }}" hx-target="#status-{{ name }}" hx-swap="outerHTML"{% else %}disabled{% endif %}>
+  <i class="play icon"></i>
+</button>

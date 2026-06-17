@@ -19,62 +19,34 @@
 </div>
 
 {% if instances %}
-<table class="ui selectable celled table">
+<table class="ui celled table">
   <thead>
     <tr>
       <th>Name</th>
       <th>Template</th>
-      <th>Status</th>
-      <th class="center aligned">Connect</th>
-      <th class="right aligned">Actions</th>
+      <th class="collapsing right aligned">Status</th>
+      <th class="collapsing right aligned">Actions</th>
     </tr>
   </thead>
   <tbody>
     {% for inst in instances %}
     <tr>
       <td>
-        {% if inst.mode == "ssh" %}
         <a href="/instances/{{ inst.name }}?user={{ current_user }}"><strong>{{ inst.name }}</strong></a>
-        {% else %}
-        <strong>{{ inst.name }}</strong>
-        {% endif %}
-        <span class="ui {{ 'purple' if inst.mode == 'desktop' else 'grey' }} mini label">{{ inst.mode }}</span>
       </td>
       <td>{{ inst.template or "—" }}</td>
-      <td>
-        <span id="status-{{ inst.name }}"
-              class="ui {{ status_color(inst.status) }} label"
-              hx-get="/instances/{{ inst.name }}/status-badge?user={{ current_user }}"
-              hx-trigger="every 5s"
-              hx-swap="outerHTML">
-          {{ inst.status }}
+      <td class="collapsing right aligned">
+        {% with name=inst.name, status=inst.status, user=current_user, controls=True %}
+        {% include "user/_status_badge.html" %}
+        {% endwith %}
+      </td>
+      <td class="collapsing right aligned">
+        <span id="actions-{{ inst.name }}">
+          {% with name=inst.name, status=inst.status, user=current_user,
+                  connect_url=inst.connect_url, term_url=inst.term_url %}
+          {% include "user/_instance_buttons.html" %}
+          {% endwith %}
         </span>
-      </td>
-      <td class="center aligned">
-        {% if inst.mode == "desktop" %}
-        <a href="{{ inst.connect_url }}" target="_blank" class="ui tiny blue button"
-           title="Open desktop viewer">
-          <i class="external alternate icon"></i> Open
-        </a>
-        {% endif %}
-        {% if inst.term_url %}
-        <a href="{{ inst.term_url }}" target="_blank" class="ui tiny teal button"
-           title="Open web terminal">
-          <i class="terminal icon"></i> Terminal
-        </a>
-        {% endif %}
-      </td>
-      <td class="right aligned">
-        <form method="post" action="/instances/{{ inst.name }}/connect?user={{ current_user }}" style="display:inline">
-          <button class="ui green tiny icon button" title="Start"><i class="play icon"></i></button>
-        </form>
-        <form method="post" action="/instances/{{ inst.name }}/stop?user={{ current_user }}" style="display:inline">
-          <button class="ui yellow tiny icon button" title="Stop"><i class="stop icon"></i></button>
-        </form>
-        <form method="post" action="/instances/{{ inst.name }}/delete?user={{ current_user }}" style="display:inline"
-              onsubmit="return confirm('Delete {{ inst.name }}?');">
-          <button class="ui red tiny icon button" title="Delete"><i class="trash icon"></i></button>
-        </form>
       </td>
     </tr>
     {% endfor %}

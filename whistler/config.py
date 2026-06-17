@@ -1250,6 +1250,23 @@ class KubeConfigManager(ConfigManager):
         templates.sort(key=lambda x: x.get("source", ""))
         return templates
 
+    @staticmethod
+    def _pod_session_phase(pod) -> str:
+        """Map a live pod to a desktop session phase (mirrors the operator's
+        probe). An absent pod means the session was stopped."""
+        if pod is None:
+            return "Stopped"
+        if pod.metadata.deletion_timestamp:
+            return "Terminating"
+        phase = getattr(pod.status, "phase", None)
+        statuses = pod.status.container_statuses or []
+        all_ready = bool(statuses) and all(cs.ready for cs in statuses)
+        if phase == "Running" and all_ready:
+            return "Ready"
+        if phase == "Failed":
+            return "Failed"
+        return "Booting"
+
     def get_user_desktop_sessions(self, username: str) -> List[Dict[str, Any]]:
         sessions = []
         user_ns = self._get_user_namespace(username)
@@ -1258,6 +1275,19 @@ class KubeConfigManager(ConfigManager):
                 self.group, self.version, user_ns, SESSION_PLURAL,
                 label_selector="whistler.martinmalmsten.net/mode=desktop",
             )
+
+            # The CR's status.phase is only refreshed by the operator's ~10s timer,
+            # so it lags reality (e.g. stays "Ready" for seconds after a stop). For
+            # container/kata sessions derive the phase from the live pod instead, so
+            # the dashboard reacts immediately. VM-runtime sessions have no pod, so
+            # they keep the operator-reported phase.
+            core_api = client.CoreV1Api()
+            try:
+                pods = core_api.list_namespaced_pod(user_ns)
+                pod_map = {p.metadata.name: p for p in pods.items}
+            except ApiException:
+                pod_map = {}
+
             for item in resp.get("items", []):
                 spec = item.get("spec", {})
                 status = item.get("status", {}) or {}
@@ -1266,11 +1296,15 @@ class KubeConfigManager(ConfigManager):
                 if full_name.startswith(f"{username}-"):
                     display_name = full_name[len(username) + 1:]
 
+                phase = status.get("phase", "Unknown")
+                if status.get("runtime") != "vm":
+                    phase = self._pod_session_phase(pod_map.get(full_name))
+
                 sessions.append({
                     "name": display_name,
                     "template": spec.get("templateRef"),
                     "namespace": user_ns,
-                    "phase": status.get("phase", "Unknown"),
+                    "phase": phase,
                     # The unified runtime (container/kata/vm) replaces the old
                     # backend; keep the "backend" key as an alias for templates.
                     "runtime": status.get("runtime"),

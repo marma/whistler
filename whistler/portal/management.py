@@ -29,20 +29,37 @@ _STATIC_DIR   = os.path.join(os.path.dirname(__file__), "static")
 
 templates = Jinja2Templates(directory=_TEMPLATE_DIR)
 
-# Jinja2 global: map instance/session status → Fomantic UI label color
-_STATUS_COLORS = {
-    "running":      "green",
-    "ready":        "green",
-    "stopped":      "grey",
-    "unknown":      "grey",
-    "pending":      "yellow",
-    "initializing": "yellow",
-    "provisioning": "yellow",
-    "booting":      "yellow",
-    "terminating":  "red",
-    "failed":       "red",
+# The various raw pod/CR phases are consolidated into a few user-facing states.
+_STATUS_GROUPS = {
+    "running":      "Running",
+    "ready":        "Running",
+    "pending":      "Starting",
+    "initializing": "Starting",
+    "provisioning": "Starting",
+    "booting":      "Starting",
+    "stopping":     "Stopping …",
+    "terminating":  "Stopping …",
+    "stopped":      "Stopped",
+    "unknown":      "Stopped",
+    "failed":       "Error",
 }
-templates.env.globals["status_color"] = lambda s: _STATUS_COLORS.get((s or "").lower(), "grey")
+_GROUP_COLORS = {
+    "Running":    "green",
+    "Starting":   "yellow",
+    "Stopping …": "orange",
+    "Stopped":    "grey",
+    "Error":      "red",
+}
+
+
+def _status_group(status: str) -> str:
+    """Collapse a raw pod/CR phase into one of the user-facing states."""
+    return _STATUS_GROUPS.get((status or "").lower(), "Stopped")
+
+
+# Jinja2 globals: consolidated status label + its Fomantic UI label color.
+templates.env.globals["status_label"] = _status_group
+templates.env.globals["status_color"] = lambda s: _GROUP_COLORS[_status_group(s)]
 
 _ADMIN_USERS: set[str] = set(
     u.strip() for u in os.environ.get("WHISTLER_ADMIN_USERS", "").split(",") if u.strip()
@@ -102,12 +119,16 @@ def _tr(url: str, user: str) -> RedirectResponse:
     return RedirectResponse(f"{url}{sep}user={user}", status_code=303)
 
 
-def _status_badge_html(name: str, status: str, user: str, poll_url: str) -> str:
-    color = _STATUS_COLORS.get((status or "").lower(), "grey")
-    return (
-        f'<span id="status-{name}" class="ui {color} label" '
-        f'hx-get="{poll_url}" hx-trigger="every 5s" hx-swap="outerHTML">'
-        f'{status}</span>'
+def _render_status_html(name: str, status: str, user: str, controls: bool,
+                        connect_url: str = None, term_url: str = None) -> str:
+    """Render the polling status badge. With `controls`, also emit an out-of-band
+    swap that re-renders the action buttons (connect/ssh/start/stop) so they stay
+    enabled/disabled in step with the status (used on the dashboard; the detail
+    view omits it)."""
+    tpl = "user/_status_controls.html" if controls else "user/_status_badge.html"
+    return templates.env.get_template(tpl).render(
+        name=name, status=status, user=user, controls=controls,
+        connect_url=connect_url, term_url=term_url,
     )
 
 
@@ -221,8 +242,17 @@ async def instance_create(
 
 
 async def instance_detail(request: Request, cm: CM, user: User, name: str):
-    instances = await request.app.state.run(cm.get_user_instances, user)
+    instances, desktop_sessions = await asyncio.gather(
+        request.app.state.run(cm.get_user_instances, user),
+        request.app.state.run(cm.get_user_desktop_sessions, user),
+    )
     inst = next((i for i in instances if i["name"] == name), None)
+    if inst is None:
+        # Desktop sessions carry their state under "phase"; normalise to "status"
+        # so the shared detail template renders them too.
+        sess = next((s for s in desktop_sessions if s["name"] == name), None)
+        if sess is not None:
+            inst = {**sess, "status": sess.get("phase")}
     if not inst:
         raise HTTPException(status_code=404, detail="Instance not found.")
     return templates.TemplateResponse(
@@ -231,32 +261,53 @@ async def instance_detail(request: Request, cm: CM, user: User, name: str):
     )
 
 
-async def instance_status_badge(request: Request, cm: CM, user: User, name: str):
-    """HTMX polling endpoint — returns just the status badge span. Covers both
-    ssh instances (pod phase) and desktop sessions (CR status phase)."""
+async def _status_badge_response(request: Request, cm, user: str, name: str,
+                                 controls: bool) -> HTMLResponse:
+    """Look up the current consolidated status (ssh pod phase or desktop CR phase)
+    and render the polling badge (with Start/Stop buttons when `controls`)."""
     instances, desktop_sessions = await asyncio.gather(
         request.app.state.run(cm.get_user_instances, user),
         request.app.state.run(cm.get_user_desktop_sessions, user),
     )
     inst = next((i for i in instances if i["name"] == name), None)
     if inst:
-        status = inst["status"]
+        status, connect_url = inst["status"], None
+        term_url = _terminal_url(user, name)
     else:
         sess = next((s for s in desktop_sessions if s["name"] == name), None)
-        status = sess["phase"] if sess else "Unknown"
-    poll_url = f"/instances/{name}/status-badge?user={user}"
-    return HTMLResponse(_status_badge_html(name, status, user, poll_url))
+        if sess:
+            status = sess["phase"]
+            connect_url = _desktop_viewer_url(user, name)
+            term_url = None if sess.get("runtime") == "vm" else _terminal_url(user, name)
+        else:
+            status, connect_url, term_url = "Unknown", None, None
+    return HTMLResponse(
+        _render_status_html(name, status, user, controls, connect_url, term_url))
+
+
+async def instance_status_badge(request: Request, cm: CM, user: User, name: str):
+    """HTMX polling endpoint — returns the status badge span. The dashboard passes
+    ?controls=1 to also refresh the Start/Stop buttons (out-of-band); the detail
+    view polls without it and gets just the badge."""
+    controls = request.query_params.get("controls") == "1"
+    return await _status_badge_response(request, cm, user, name, controls)
 
 
 async def instance_connect(request: Request, cm: CM, user: User, name: str):
     ok = await request.app.state.run(cm.trigger_instance_start, user, name)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to start instance.")
+    # Dashboard buttons post via HTMX: swap the status badge (and buttons) in place
+    # instead of navigating to the detail view. Plain form posts (detail) redirect.
+    if request.headers.get("HX-Request"):
+        return await _status_badge_response(request, cm, user, name, controls=True)
     return _tr(f"/instances/{name}", user)
 
 
 async def instance_stop(request: Request, cm: CM, user: User, name: str):
     await request.app.state.run(cm.stop_instance, user, name)
+    if request.headers.get("HX-Request"):
+        return await _status_badge_response(request, cm, user, name, controls=True)
     return _tr(f"/instances/{name}", user)
 
 
