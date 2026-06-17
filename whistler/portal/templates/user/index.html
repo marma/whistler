@@ -25,16 +25,20 @@
       <th>Name</th>
       <th>Template</th>
       <th>Status</th>
-      <th>Actions</th>
+      <th class="center aligned">Connect</th>
+      <th class="right aligned">Actions</th>
     </tr>
   </thead>
   <tbody>
     {% for inst in instances %}
     <tr>
       <td>
-        <a href="/instances/{{ inst.name }}?user={{ current_user }}">
-          <strong>{{ inst.name }}</strong>
-        </a>
+        {% if inst.mode == "ssh" %}
+        <a href="/instances/{{ inst.name }}?user={{ current_user }}"><strong>{{ inst.name }}</strong></a>
+        {% else %}
+        <strong>{{ inst.name }}</strong>
+        {% endif %}
+        <span class="ui {{ 'purple' if inst.mode == 'desktop' else 'grey' }} mini label">{{ inst.mode }}</span>
       </td>
       <td>{{ inst.template or "—" }}</td>
       <td>
@@ -46,19 +50,31 @@
           {{ inst.status }}
         </span>
       </td>
-      <td>
-        {% if inst.status == "Running" %}
-        <form method="post" action="/instances/{{ inst.name }}/stop?user={{ current_user }}" style="display:inline">
-          <button class="ui yellow tiny button"><i class="stop icon"></i> Stop</button>
-        </form>
-        {% else %}
-        <form method="post" action="/instances/{{ inst.name }}/connect?user={{ current_user }}" style="display:inline">
-          <button class="ui green tiny button"><i class="play icon"></i> Connect</button>
-        </form>
-        {% endif %}
-        <a href="/instances/{{ inst.name }}?user={{ current_user }}" class="ui tiny button">
-          <i class="info circle icon"></i> Details
+      <td class="center aligned">
+        {% if inst.mode == "desktop" %}
+        <a href="{{ inst.connect_url }}" target="_blank" class="ui tiny blue button"
+           title="Open desktop viewer">
+          <i class="external alternate icon"></i> Open
         </a>
+        {% endif %}
+        {% if inst.term_url %}
+        <a href="{{ inst.term_url }}" target="_blank" class="ui tiny teal button"
+           title="Open web terminal">
+          <i class="terminal icon"></i> Terminal
+        </a>
+        {% endif %}
+      </td>
+      <td class="right aligned">
+        <form method="post" action="/instances/{{ inst.name }}/connect?user={{ current_user }}" style="display:inline">
+          <button class="ui green tiny icon button" title="Start"><i class="play icon"></i></button>
+        </form>
+        <form method="post" action="/instances/{{ inst.name }}/stop?user={{ current_user }}" style="display:inline">
+          <button class="ui yellow tiny icon button" title="Stop"><i class="stop icon"></i></button>
+        </form>
+        <form method="post" action="/instances/{{ inst.name }}/delete?user={{ current_user }}" style="display:inline"
+              onsubmit="return confirm('Delete {{ inst.name }}?');">
+          <button class="ui red tiny icon button" title="Delete"><i class="trash icon"></i></button>
+        </form>
       </td>
     </tr>
     {% endfor %}
@@ -90,6 +106,10 @@
         <span class="ui {{ 'blue' if t.source == 'system' else 'teal' }} tiny label" style="float:right">
           {{ t.source }}
         </span>
+      </div>
+      <div class="meta">
+        <span class="ui {{ 'purple' if t.mode == 'desktop' else 'grey' }} mini label">{{ t.mode or 'ssh' }}</span>
+        <span class="ui grey mini label">{{ t.runtime or 'container' }}</span>
       </div>
       {% if t.description %}
       <div class="meta">{{ t.description }}</div>

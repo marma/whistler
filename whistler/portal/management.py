@@ -38,6 +38,7 @@ _STATUS_COLORS = {
     "pending":      "yellow",
     "initializing": "yellow",
     "provisioning": "yellow",
+    "booting":      "yellow",
     "terminating":  "red",
     "failed":       "red",
 }
@@ -110,16 +111,63 @@ def _status_badge_html(name: str, status: str, user: str, poll_url: str) -> str:
     )
 
 
+# Both kinds of session are now one `Session` CR (ssh / desktop mode); the user
+# dashboard lists them in a single table. Desktop sessions connect in the browser
+# through the guacd relay (whistler.portal.app), which runs on its own port — so
+# the "Connect" link needs that relay's base URL. WHISTLER_DESKTOP_PORTAL_URL
+# overrides it (e.g. "https://desktops.example.com"); empty means same-origin
+# (works when the relay is reachable on the same host, e.g. behind one ingress).
+_DESKTOP_PORTAL_URL = os.environ.get("WHISTLER_DESKTOP_PORTAL_URL", "").rstrip("/")
+
+
+def _desktop_viewer_url(user: str, name: str) -> str:
+    return f"{_DESKTOP_PORTAL_URL}/connect/{name}?user={user}"
+
+
+def _terminal_url(user: str, name: str) -> str:
+    """Web-terminal (xterm.js) page, served by the same viewer app as the desktop
+    relay — so it shares _DESKTOP_PORTAL_URL (empty = same-origin via the proxy)."""
+    return f"{_DESKTOP_PORTAL_URL}/term/{name}?user={user}"
+
+
+def _merge_sessions(instances: list, desktop_sessions: list, user: str) -> list[dict]:
+    """Flatten ssh instances + desktop sessions into one list of rows with a
+    common shape (name/template/status/mode), so the dashboard can render them in
+    a single table. Desktop rows carry the browser viewer URL. Every row gets a
+    web-terminal URL except VM-runtime desktops (no pod to exec into)."""
+    rows: list[dict] = []
+    for i in instances:
+        rows.append({
+            "name": i["name"], "template": i.get("template"),
+            "status": i.get("status"), "mode": "ssh", "connect_url": None,
+            "term_url": _terminal_url(user, i["name"]),
+        })
+    for s in desktop_sessions:
+        rows.append({
+            "name": s["name"], "template": s.get("template"),
+            "status": s.get("phase"), "mode": "desktop",
+            "connect_url": _desktop_viewer_url(user, s["name"]),
+            "term_url": None if s.get("runtime") == "vm" else _terminal_url(user, s["name"]),
+        })
+    rows.sort(key=lambda r: r["name"])
+    return rows
+
+
 # --------------------------------------------------------------------------- #
 # User — dashboard                                                             #
 # --------------------------------------------------------------------------- #
 
 async def user_index(request: Request, cm: CM, user: User):
-    instances = await request.app.state.run(cm.get_user_instances, user)
-    tpls      = await request.app.state.run(cm.get_user_templates, user)
+    instances, ssh_tpls, desk_tpls, desktop_sessions = await asyncio.gather(
+        request.app.state.run(cm.get_user_instances, user),
+        request.app.state.run(cm.get_user_templates, user),
+        request.app.state.run(cm.get_user_desktop_templates, user),
+        request.app.state.run(cm.get_user_desktop_sessions, user),
+    )
     return templates.TemplateResponse(
         request=request, name="user/index.html",
-        context=_ctx(user, instances=instances, tpls=tpls),
+        context=_ctx(user, instances=_merge_sessions(instances, desktop_sessions, user),
+                     tpls=ssh_tpls + desk_tpls),
     )
 
 
@@ -128,12 +176,16 @@ async def user_index(request: Request, cm: CM, user: User):
 # --------------------------------------------------------------------------- #
 
 async def instance_create_form(request: Request, cm: CM, user: User):
-    tpls    = await request.app.state.run(cm.get_user_templates, user)
-    volumes = await request.app.state.run(cm.get_volumes)
-    allowed = await request.app.state.run(cm.get_user_allowed_volumes, user)
+    ssh_tpls, desk_tpls, volumes, allowed = await asyncio.gather(
+        request.app.state.run(cm.get_user_templates, user),
+        request.app.state.run(cm.get_user_desktop_templates, user),
+        request.app.state.run(cm.get_volumes),
+        request.app.state.run(cm.get_user_allowed_volumes, user),
+    )
     return templates.TemplateResponse(
         request=request, name="user/create_instance.html",
-        context=_ctx(user, tpls=tpls, volumes=volumes, allowed_volumes=allowed),
+        context=_ctx(user, tpls=ssh_tpls + desk_tpls, volumes=volumes,
+                     allowed_volumes=allowed),
     )
 
 
@@ -143,12 +195,29 @@ async def instance_create(
     instance_name: Annotated[str, Form()],
     preemptible:   Annotated[Optional[str], Form()] = None,
 ):
+    name = instance_name.strip()
+    # The template carries the access mode; create the matching Session. Desktop
+    # sessions are connected from the desktop portal, ssh ones via the SSH bridge.
+    ssh_tpls, desk_tpls = await asyncio.gather(
+        request.app.state.run(cm.get_user_templates, user),
+        request.app.state.run(cm.get_user_desktop_templates, user),
+    )
+    tpl = next((t for t in (ssh_tpls + desk_tpls)
+                if t.get("fullName") == template_name or t.get("name") == template_name), None)
+    mode = (tpl or {}).get("mode", "ssh")
+
+    if mode == "desktop":
+        ok = await request.app.state.run(cm.add_desktop_session, user, template_name, name)
+        if not ok:
+            raise HTTPException(status_code=500, detail="Failed to create desktop session.")
+        return _tr("/", user)
+
     ok = await request.app.state.run(
-        cm.add_instance, user, template_name, instance_name.strip(), preemptible == "on",
+        cm.add_instance, user, template_name, name, preemptible == "on",
     )
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to create instance.")
-    return _tr(f"/instances/{instance_name.strip()}", user)
+    return _tr(f"/instances/{name}", user)
 
 
 async def instance_detail(request: Request, cm: CM, user: User, name: str):
@@ -163,10 +232,18 @@ async def instance_detail(request: Request, cm: CM, user: User, name: str):
 
 
 async def instance_status_badge(request: Request, cm: CM, user: User, name: str):
-    """HTMX polling endpoint — returns just the status badge span."""
-    instances = await request.app.state.run(cm.get_user_instances, user)
+    """HTMX polling endpoint — returns just the status badge span. Covers both
+    ssh instances (pod phase) and desktop sessions (CR status phase)."""
+    instances, desktop_sessions = await asyncio.gather(
+        request.app.state.run(cm.get_user_instances, user),
+        request.app.state.run(cm.get_user_desktop_sessions, user),
+    )
     inst = next((i for i in instances if i["name"] == name), None)
-    status = inst["status"] if inst else "Unknown"
+    if inst:
+        status = inst["status"]
+    else:
+        sess = next((s for s in desktop_sessions if s["name"] == name), None)
+        status = sess["phase"] if sess else "Unknown"
     poll_url = f"/instances/{name}/status-badge?user={user}"
     return HTMLResponse(_status_badge_html(name, status, user, poll_url))
 
@@ -232,15 +309,19 @@ async def admin_template_create(
     cpu:            Annotated[Optional[str], Form()] = None,
     memory:         Annotated[Optional[str], Form()] = None,
     personal_mount: Annotated[Optional[str], Form()] = "/userdata",
+    mode:           Annotated[str, Form()] = "ssh",
+    runtime:        Annotated[str, Form()] = "container",
+    privileged:     Annotated[Optional[str], Form()] = None,
+    fuse:           Annotated[Optional[str], Form()] = None,
+    display_port:   Annotated[Optional[str], Form()] = None,
+    protocol:       Annotated[Optional[str], Form()] = None,
 ):
-    data = {
-        "name": slug.strip(),
-        "displayName": display_name.strip(),
-        "image": image.strip(),
-        "description": (description or "").strip(),
-        "resources": _nonempty({"cpu": cpu, "memory": memory}),
-        "personalMountPath": personal_mount or "/userdata",
-    }
+    data = _template_form_data(
+        name=slug.strip(), display_name=display_name, image=image,
+        description=description, cpu=cpu, memory=memory, personal_mount=personal_mount,
+        mode=mode, runtime=runtime, privileged=privileged, fuse=fuse,
+        display_port=display_port, protocol=protocol,
+    )
     ok = await request.app.state.run(cm.save_system_template, data)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to create template.")
@@ -269,15 +350,19 @@ async def admin_template_update(
     cpu:            Annotated[Optional[str], Form()] = None,
     memory:         Annotated[Optional[str], Form()] = None,
     personal_mount: Annotated[Optional[str], Form()] = "/userdata",
+    mode:           Annotated[str, Form()] = "ssh",
+    runtime:        Annotated[str, Form()] = "container",
+    privileged:     Annotated[Optional[str], Form()] = None,
+    fuse:           Annotated[Optional[str], Form()] = None,
+    display_port:   Annotated[Optional[str], Form()] = None,
+    protocol:       Annotated[Optional[str], Form()] = None,
 ):
-    data = {
-        "name": name,
-        "displayName": display_name.strip(),
-        "image": image.strip(),
-        "description": (description or "").strip(),
-        "resources": _nonempty({"cpu": cpu, "memory": memory}),
-        "personalMountPath": personal_mount or "/userdata",
-    }
+    data = _template_form_data(
+        name=name, display_name=display_name, image=image,
+        description=description, cpu=cpu, memory=memory, personal_mount=personal_mount,
+        mode=mode, runtime=runtime, privileged=privileged, fuse=fuse,
+        display_port=display_port, protocol=protocol,
+    )
     ok = await request.app.state.run(cm.save_system_template, data)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to update template.")
@@ -443,6 +528,32 @@ async def healthz():
 
 def _nonempty(d: dict) -> dict:
     return {k: v.strip() for k, v in d.items() if v and v.strip()}
+
+
+def _template_form_data(*, name, display_name, image, description, cpu, memory,
+                        personal_mount, mode, runtime, privileged, fuse,
+                        display_port, protocol) -> dict:
+    """Assemble a save_system_template payload from the admin template form,
+    including the access mode / runtime / privileged toggles. Desktop-only
+    fields are only included when mode == 'desktop'."""
+    data = {
+        "name": name,
+        "displayName": display_name.strip(),
+        "image": image.strip(),
+        "description": (description or "").strip(),
+        "resources": _nonempty({"cpu": cpu, "memory": memory}),
+        "personalMountPath": personal_mount or "/userdata",
+        "mode": mode if mode in ("ssh", "desktop") else "ssh",
+        "runtime": runtime if runtime in ("container", "kata", "vm") else "container",
+        "privileged": privileged == "on",
+        "fuse": fuse == "on",
+    }
+    if data["mode"] == "desktop":
+        if display_port and display_port.strip():
+            data["displayPort"] = int(display_port)
+        if protocol:
+            data["protocol"] = protocol
+    return data
 
 
 def _build_user_data(name, public_keys, run_as_user, run_as_group, fs_group) -> dict:

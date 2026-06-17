@@ -50,6 +50,10 @@ spec:
             {{- end }}
             - name: WHISTLER_LOG_LEVEL
               value: "{{ .Values.portal.logLevel }}"
+            - name: WHISTLER_FORCE_KATA_FOR_PRIVILEGED
+              value: {{ .Values.whistler.security.forceKataForPrivileged | quote }}
+            - name: WHISTLER_KATA_RUNTIME_CLASS
+              value: {{ .Values.whistler.security.kataRuntimeClass | quote }}
           ports:
             - containerPort: 8080
               name: http

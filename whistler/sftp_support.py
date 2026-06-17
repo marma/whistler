@@ -351,7 +351,7 @@ class WhistlerSFTPServer(asyncssh.SFTPServer):
                     def patch_instance():
                         self.config_manager.api.patch_namespaced_custom_object(
                             self.config_manager.group, self.config_manager.version, self.namespace,
-                            "whistlerinstances", full_cr_name,
+                            "sessions", full_cr_name,
                             {"metadata": {"annotations": {"whistler/last-connect": str(time.time())}}})
                     
                     await loop.run_in_executor(None, patch_instance)

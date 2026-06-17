@@ -1,7 +1,7 @@
 """C1 integration test for the display path: portal -> guacd -> RDP pod.
 
 End-to-end proof of round 2:
-  create an RDP DesktopTemplate (backend: pod) + DesktopSession -> operator
+  create an RDP Template (mode: desktop, runtime: container) + Session -> operator
   provisions an xrdp pod + per-session Service and drives phase to Ready ->
   open the portal's WebSocket -> the portal performs the guacd handshake (guacd
   dials the desktop pod through the round-2 NetworkPolicy ingress carve-out) ->
@@ -58,14 +58,14 @@ def _wait_phase_ready(custom, deadline):
     last = None
     while time.time() < deadline:
         ds = custom.get_namespaced_custom_object(
-            GROUP, VERSION, USER_NS, "desktopsessions", SESSION)
+            GROUP, VERSION, USER_NS, "sessions", SESSION)
         last = (ds.get("status") or {}).get("phase")
         if last == "Ready":
             return
         if last == "Failed":
-            pytest.fail(f"DesktopSession reached Failed: {ds.get('status')}")
+            pytest.fail(f"Session reached Failed: {ds.get('status')}")
         time.sleep(3)
-    pytest.fail(f"DesktopSession not Ready within budget (last phase: {last})")
+    pytest.fail(f"Session not Ready within budget (last phase: {last})")
 
 
 async def _expect_ready_over_ws(deadline):
@@ -113,12 +113,13 @@ async def test_display_path_reaches_ready():
 
     template = {
         "apiVersion": f"{GROUP}/{VERSION}",
-        "kind": "DesktopTemplate",
+        "kind": "Template",
         "metadata": {"name": TEMPLATE, "namespace": SYS_NS},
         "spec": {
             "user": "system",
+            "mode": "desktop",
+            "runtime": "container",
             "image": IMAGE,
-            "backend": "pod",
             "protocol": "rdp",
             "displayPort": DISPLAY_PORT,
             "persistence": "ephemeral",
@@ -131,20 +132,23 @@ async def test_display_path_reaches_ready():
     }
     session = {
         "apiVersion": f"{GROUP}/{VERSION}",
-        "kind": "DesktopSession",
-        "metadata": {"name": SESSION, "namespace": USER_NS},
+        "kind": "Session",
+        "metadata": {
+            "name": SESSION, "namespace": USER_NS,
+            "labels": {"whistler.martinmalmsten.net/mode": "desktop"},
+        },
         "spec": {"templateRef": TEMPLATE, "user": USER},
     }
 
     try:
         try:
             custom.create_namespaced_custom_object(
-                GROUP, VERSION, SYS_NS, "desktoptemplates", template)
+                GROUP, VERSION, SYS_NS, "templates", template)
         except ApiException as e:
             if e.status != 409:
                 raise
         custom.create_namespaced_custom_object(
-            GROUP, VERSION, USER_NS, "desktopsessions", session)
+            GROUP, VERSION, USER_NS, "sessions", session)
 
         deadline = time.time() + READY_TIMEOUT
         _wait_phase_ready(custom, deadline)
@@ -153,9 +157,9 @@ async def test_display_path_reaches_ready():
     finally:
         for delete in (
             lambda: custom.delete_namespaced_custom_object(
-                GROUP, VERSION, USER_NS, "desktopsessions", SESSION),
+                GROUP, VERSION, USER_NS, "sessions", SESSION),
             lambda: custom.delete_namespaced_custom_object(
-                GROUP, VERSION, SYS_NS, "desktoptemplates", TEMPLATE),
+                GROUP, VERSION, SYS_NS, "templates", TEMPLATE),
         ):
             try:
                 delete()

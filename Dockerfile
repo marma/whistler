@@ -9,8 +9,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install kubectl
-RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && \
+# Install kubectl for the image's target architecture. TARGETARCH is set
+# automatically by BuildKit (amd64/arm64); without it a fixed amd64 binary
+# fails with "Exec format error" on arm64 nodes (e.g. Apple-silicon
+# docker-desktop), breaking every `kubectl exec` bridge.
+ARG TARGETARCH
+RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${TARGETARCH}/kubectl" && \
     install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl && \
     rm kubectl
 

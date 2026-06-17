@@ -20,7 +20,7 @@ import secrets
 
 from aiohttp import web
 
-from whistler.portal import guacd
+from whistler.portal import guacd, terminal
 from whistler.portal.guacd import handshake, resolve_session, _build_guacd_params
 from whistler.portal.protocol import take_complete_instructions
 
@@ -79,12 +79,35 @@ async def guac_js(request):
                         charset="utf-8")
 
 
+# Vendored web-terminal assets (xterm.js + fit addon), served locally like the
+# guacamole bundle above rather than from a CDN. Whitelisted by name so the
+# dynamic /static/{filename} route can't be used to read arbitrary files.
+_STATIC_FILES = {
+    "xterm.min.js": "application/javascript",
+    "xterm.min.css": "text/css",
+    "xterm-addon-fit.min.js": "application/javascript",
+    "style.css": "text/css",
+}
+_static_cache: dict[str, bytes] = {}
+
+
+async def static_file(request):
+    name = request.match_info["filename"]
+    content_type = _STATIC_FILES.get(name)
+    if content_type is None:
+        return web.Response(status=404, text="not found")
+    if name not in _static_cache:
+        with open(os.path.join(_STATIC_DIR, name), "rb") as f:
+            _static_cache[name] = f.read()
+    return web.Response(body=_static_cache[name], content_type=content_type, charset="utf-8")
+
+
 def _render_index(user, templates, sessions):
     tpl_rows = "".join(
         f"<li><form method=post action='/launch'>"
         f"<input type=hidden name=template value='{html.escape(t['fullName'])}'>"
         f"<input type=hidden name=user value='{html.escape(user)}'>"
-        f"{html.escape(t['name'])} ({html.escape(t.get('backend','pod'))}/"
+        f"{html.escape(t['name'])} ({html.escape(t.get('runtime','container'))}/"
         f"{html.escape(t.get('protocol','rdp'))}) "
         f"<input name=name placeholder='session name'>"
         f"<button>Launch</button></form></li>"
@@ -94,7 +117,7 @@ def _render_index(user, templates, sessions):
     sess_rows = "".join(
         f"<li><a href='/connect/{html.escape(s['name'])}?user={html.escape(user)}'>"
         f"{html.escape(s['name'])}</a> — {html.escape(str(s.get('phase')))} "
-        f"({html.escape(str(s.get('backend')))})</li>"
+        f"({html.escape(str(s.get('runtime')))})</li>"
         for s in sessions
     ) or "<li><em>no sessions</em></li>"
 
@@ -301,6 +324,103 @@ def _render_connect(user, session_id):
             .replace("__GUAC_JS__", html.escape(GUAC_JS_URL)))
 
 
+# Web terminal page: xterm.js + fit addon over a plain WebSocket to /ws-term.
+# Mirrors the connect page's wait-for-ready pattern. Placeholders replaced (not
+# .format) so JS braces survive.
+_TERM_HTML = """<!doctype html><meta charset=utf-8><title>__ID__ — terminal</title>
+<link rel=stylesheet href="/static/xterm.min.css">
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  #term{position:absolute;inset:0;padding:4px;box-sizing:border-box}
+  #overlay{position:absolute;inset:0;z-index:20;background:rgba(0,0,0,.85);
+           display:flex;align-items:center;justify-content:center;transition:opacity .4s}
+  #overlay.hidden{opacity:0;pointer-events:none}
+  #overlay-msg{color:#e0e0e0;font:bold 1.5rem/1.5 system-ui,sans-serif;text-align:center;max-width:80%}
+</style>
+<div id=term></div>
+<div id=overlay><div id=overlay-msg>Connecting…</div></div>
+<script src="/static/xterm.min.js"></script>
+<script src="/static/xterm-addon-fit.min.js"></script>
+<script>
+const id = "__ID__", user = "__USER__";
+const overlayEl = document.getElementById('overlay');
+const overlayMsg = document.getElementById('overlay-msg');
+const setStatus = m => { overlayMsg.textContent = m; overlayEl.classList.remove('hidden'); };
+const hideStatus = () => overlayEl.classList.add('hidden');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+const term = new Terminal({ cursorBlink: true, fontFamily: 'monospace', fontSize: 14,
+                            theme: { background: '#000000' } });
+const fit = new FitAddon.FitAddon();
+term.loadAddon(fit);
+term.open(document.getElementById('term'));
+fit.fit();
+
+async function waitReady() {
+  setStatus('Waiting for session…');
+  for (;;) {
+    try {
+      const r = await fetch(`/term-status/${id}?user=${encodeURIComponent(user)}`);
+      if (r.ok) {
+        const j = await r.json();
+        if (j.unsupported) { setStatus('Terminal not available for this session'); return false; }
+        setStatus(j.ready ? 'Opening shell…' : 'Session: ' + j.phase);
+        if (j.ready) return true;
+      }
+    } catch (e) {}
+    await sleep(2000);
+  }
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  const ws = new WebSocket(proto + location.host + '/ws-term/' + id +
+                           '?user=' + encodeURIComponent(user));
+  ws.binaryType = 'arraybuffer';
+  const sendResize = () => { if (ws.readyState === 1) ws.send(JSON.stringify({ resize: [term.cols, term.rows] })); };
+  ws.onopen = () => { hideStatus(); fit.fit(); sendResize(); term.focus(); };
+  ws.onmessage = e => term.write(typeof e.data === 'string' ? e.data : new Uint8Array(e.data));
+  ws.onclose = e => setStatus(e.reason ? 'Session closed: ' + e.reason : 'Session closed');
+  ws.onerror = () => setStatus('Connection error');
+  term.onData(d => { if (ws.readyState === 1) ws.send(d); });
+  let rt; window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { fit.fit(); sendResize(); }, 150); });
+}
+
+waitReady().then(ok => { if (ok) connect(); });
+</script>"""
+
+
+def _render_term(user, session_id):
+    return (_TERM_HTML
+            .replace("__ID__", html.escape(session_id))
+            .replace("__USER__", html.escape(user)))
+
+
+def _resolve_target(instances, desktop_sessions, name):
+    """Locate a Session by its short name across ssh instances and desktop
+    sessions, returning a uniform dict for the terminal: pod/namespace to exec
+    into, readiness, and whether a terminal is even possible (VM-runtime desktop
+    sessions have no pod to exec into)."""
+    for i in instances:
+        if i["name"] == name:
+            return {
+                "podName": i.get("podName"), "namespace": i.get("namespace"),
+                "phase": i.get("status"), "runtime": "container",
+                "ready": i.get("status") == "Running" and bool(i.get("podName")),
+                "supported": True,
+            }
+    for s in desktop_sessions:
+        if s["name"] == name:
+            runtime = s.get("runtime")
+            return {
+                "podName": s.get("podName"), "namespace": s.get("namespace"),
+                "phase": s.get("phase"), "runtime": runtime,
+                "ready": s.get("phase") == "Ready" and bool(s.get("podName")),
+                "supported": runtime != "vm",
+            }
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Handlers                                                                      #
 # --------------------------------------------------------------------------- #
@@ -398,6 +518,58 @@ async def ws(request):
     return wsr
 
 
+async def term(request):
+    """Serve the web-terminal page and nudge the session's pod awake (same
+    reconcile trigger the SSH server fires on connect) so it's Ready by the time
+    the page finishes polling."""
+    cm, user = request.app["cm"], request["user"]
+    name = request.match_info["id"]
+    await _run(request, cm.trigger_instance_start, user, name)
+    return web.Response(text=_render_term(user, name), content_type="text/html")
+
+
+async def term_status(request):
+    cm, user = request.app["cm"], request["user"]
+    instances, desktop_sessions = await asyncio.gather(
+        _run(request, cm.get_user_instances, user),
+        _run(request, cm.get_user_desktop_sessions, user),
+    )
+    target = _resolve_target(instances, desktop_sessions, request.match_info["id"])
+    if not target:
+        return web.json_response({"error": "not found"}, status=404)
+    if not target["supported"]:
+        return web.json_response({"unsupported": True, "phase": target["phase"]})
+    return web.json_response({"phase": target["phase"], "ready": target["ready"]})
+
+
+async def ws_term(request):
+    cm, user = request.app["cm"], request["user"]
+    name = request.match_info["id"]
+
+    instances, desktop_sessions = await asyncio.gather(
+        _run(request, cm.get_user_instances, user),
+        _run(request, cm.get_user_desktop_sessions, user),
+    )
+    target = _resolve_target(instances, desktop_sessions, name)
+    if not target:
+        return web.Response(status=404, text="unknown session")
+    if not target["supported"]:
+        return web.Response(status=400, text="terminal not available for this session")
+    if not target["ready"] or not target["podName"]:
+        return web.Response(status=409, text=f"session not ready (phase={target['phase']})")
+
+    wsr = web.WebSocketResponse()
+    await wsr.prepare(request)
+    logger.info(f"Opening terminal for {user}/{name} -> {target['podName']}")
+    try:
+        await terminal.relay_terminal(wsr, target["podName"], target["namespace"])
+    except Exception as e:
+        logger.error(f"Terminal for {user}/{name} failed: {e}")
+        if not wsr.closed:
+            await wsr.close(message=str(e).encode())
+    return wsr
+
+
 async def healthz(request):
     return web.Response(text="ok")
 
@@ -465,7 +637,11 @@ def build_app(config_manager):
         web.get("/connect/{id}", connect),
         web.get("/status/{id}", status),
         web.get("/ws/{id}", ws),
+        web.get("/term/{id}", term),
+        web.get("/term-status/{id}", term_status),
+        web.get("/ws-term/{id}", ws_term),
         web.get("/healthz", healthz),
         web.get("/static/" + _GUAC_JS_FILENAME, guac_js),
+        web.get("/static/{filename}", static_file),
     ])
     return app

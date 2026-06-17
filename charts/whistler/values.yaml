@@ -59,6 +59,29 @@ portal:
   managementService:
     port: 8081
     nodePort: 30081
+  # Bundled Traefik reverse proxy: fronts both portal apps (viewer :8080 +
+  # management :8081) on one origin via path routing, so they share a host and
+  # the management UI's desktop "Connect" links resolve same-origin. Ships its
+  # own Traefik pod configured via the file provider — no CRDs, no RBAC, no
+  # cluster ingress controller needed (works on vanilla Kind). Off by default;
+  # the portal NodePorts above still work when this is disabled.
+  ingress:
+    enabled: false
+    image: "traefik:v3.3"
+    # Restrict routing to this host; empty matches any host (path-only routing).
+    host: ""
+    service:
+      # ClusterIP + a port-forward (dev) or NodePort/LoadBalancer (real cluster).
+      type: ClusterIP
+      port: 80
+      nodePort: ""
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 64Mi
   logLevel: INFO
   auth:
     # Minimal/dev only this round. When false the portal returns 401 (real web
@@ -123,13 +146,35 @@ whistler:
       values:
         - node_1
         - node_2
-  availableImages:
-    - ubuntu:22.04
-    - ubuntu:20.04
-    - python:3.12-slim
-    - python:3.11-slim
-    - debian:12-slim
-    - alpine:3.19
+  # Image allow-lists, by template category. Enforced operator-side at pod/VM
+  # build time (see whistler/config.py _apply_policy):
+  #   - ssh:     SUGGESTIONS only. An empty list means "allow any image"; ssh
+  #              container/kata templates may use any image regardless.
+  #   - desktop: ENFORCED. mode=desktop templates must use an image in this list.
+  #   - vm:      ENFORCED. runtime=vm templates must use an image/ISO in this list.
+  images:
+    ssh:
+      - ubuntu:22.04
+      - ubuntu:20.04
+      - python:3.12-slim
+      - python:3.11-slim
+      - debian:12-slim
+      - alpine:3.19
+    desktop:
+      - ghcr.io/marma/whistler-desktop-xfce-rdp:latest
+      - ghcr.io/marma/whistler-desktop-gnome-grd:latest
+    vm: []
+
+  # Security policy enforced by the operator.
+  security:
+    # When true, a template requesting privileged with runtime=container is
+    # coerced to runtime=kata so the privileged workload runs inside a
+    # lightweight VM (Kata Containers) rather than directly on the host kernel.
+    # skaffold overrides this to false (k3d/docker-desktop have no kata
+    # RuntimeClass, so coerced pods would be unschedulable).
+    forceKataForPrivileged: true
+    # RuntimeClass name applied to pods with runtime=kata.
+    kataRuntimeClass: kata
 
   #volumes:
   #  - name: data
@@ -140,25 +185,30 @@ whistler:
   #    persistentVolumeClaim:
   #      claimName: large-dataset-pvc
 
+# Admin-curated catalog of system templates (Template CRs, user: system).
+#
+#   mode:    ssh | desktop  — ssh templates are reached over SSH; desktop
+#            templates expose a display server consumed by the web portal.
+#   runtime: container | kata | vm — plain pod, Kata-isolated pod, or KubeVirt VM.
+#
+# For desktop templates: displayPort is where the image's display server
+# (RDP/VNC) listens; the per-session Service exposes it and guacd dials it.
+# protocol + connectionParams are passed to guacd (RDP needs a login, so the
+# image's well-known creds live here — transport safety comes from the
+# locked-down NetworkPolicy, not the password).
 templates:
   small:
-    description: "Small instance"
+    description: "Small SSH instance"
+    mode: ssh
+    runtime: container
     image: "ubuntu:latest"
     resources:
       cpu: 500m
       memory: 2Gi
-
-# Admin-curated catalog of desktop sessions (DesktopTemplate CRs, user: system).
-# backend: pod -> a lightweight desktop pod; backend: vm -> a KubeVirt VM.
-# persistence: ephemeral | persistent | preemptible. displayPort is where the
-# image's display server (RDP/VNC) listens; the per-session Service exposes it
-# and guacd dials it. protocol + connectionParams are passed to guacd (RDP needs
-# a login, so the image's well-known creds live here — transport safety comes
-# from the locked-down NetworkPolicy, not the password).
-desktopTemplates:
   rdp-desktop:
     description: "XFCE desktop over RDP"
-    backend: pod
+    mode: desktop
+    runtime: container
     # Built from desktops/xfce-rdp (multi-arch). For local dev, skaffold
     # overrides this with the freshly-built image.
     image: "ghcr.io/marma/whistler-desktop-xfce-rdp:latest"
@@ -188,7 +238,8 @@ desktopTemplates:
       memory: 4Gi
   gnome-grd:
     description: "GNOME desktop over RDP (gnome-remote-desktop)"
-    backend: pod
+    mode: desktop
+    runtime: container
     # Built from desktops/gnome-grd (Wayland-native; gnome-remote-desktop, not
     # xrdp). For local dev, skaffold overrides this with the freshly-built image.
     # EXPERIMENTAL — see desktops/gnome-grd.
@@ -197,10 +248,10 @@ desktopTemplates:
     displayPort: 3389
     persistence: ephemeral
     # gnome-grd runs systemd as PID 1, which requires a privileged container.
-    # In production, set runtimeClassName: kata to run inside a lightweight VM
-    # (Kata Containers) so --privileged is isolated from the host kernel.
+    # In production (whistler.security.forceKataForPrivileged=true) this is
+    # automatically coerced to runtime=kata so --privileged runs inside a
+    # lightweight VM, isolated from the host kernel.
     privileged: true
-    # runtimeClassName: kata
     # grd's RDP clipboard mounts a FUSE filesystem; without /dev/fuse the daemon
     # aborts the moment a client connects.
     fuse: true
@@ -221,7 +272,8 @@ desktopTemplates:
       memory: 8Gi
   # win-vm:
   #   description: "Windows desktop (KubeVirt VM)"
-  #   backend: vm
+  #   mode: desktop
+  #   runtime: vm
   #   image: "registry.example/desktops/win:latest"
   #   protocol: rdp
   #   displayPort: 3389

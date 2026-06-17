@@ -27,13 +27,18 @@ deploy:
           - charts/whistler/values.yaml
         setValues:
           whistler.auth.allowAny: false
+          # k3d/docker-desktop have no "kata" RuntimeClass, so coercing
+          # privileged templates to kata would leave pods unschedulable.
+          whistler.security.forceKataForPrivileged: false
           server.service.type: NodePort
           server.service.nodePort: 30022
           portal.auth.allowAny: true
           portal.auth.allowAdmin: true
-          portal.service.type: NodePort
-          portal.service.nodePort: 30080
-          portal.managementService.nodePort: 30081
+          # Front both portal apps through the chart's bundled Traefik pod on one
+          # origin instead of two NodePorts. host left empty -> path-only routing,
+          # so it works regardless of the localhost:30080 the port-forward uses.
+          portal.service.type: ClusterIP
+          portal.ingress.enabled: true
           userVolume.accessMode: ReadWriteOnce
           userVolume.size: 10Mi
           whistler.volumes[0].name: data
@@ -47,26 +52,23 @@ deploy:
           image.repository: "{{.IMAGE_REPO_whistler}}"
           image.tag: "{{.IMAGE_TAG_whistler}}"
           # Use the locally-built desktop images for the sample templates.
-          desktopTemplates.rdp-desktop.image: "{{.IMAGE_REPO_whistler_desktop_xfce_rdp}}:{{.IMAGE_TAG_whistler_desktop_xfce_rdp}}"
-          desktopTemplates.gnome-grd.image: "{{.IMAGE_REPO_whistler_desktop_gnome_grd}}:{{.IMAGE_TAG_whistler_desktop_gnome_grd}}"
-          # Expose locally-built desktop images in the management UI image picker.
-          # This replaces the production default list (values.yaml) with the actual
-          # build outputs so admins see the right tags when creating templates.
-          whistler.availableImages[0]: "{{.IMAGE_REPO_whistler_desktop_xfce_rdp}}:{{.IMAGE_TAG_whistler_desktop_xfce_rdp}}"
-          whistler.availableImages[1]: "{{.IMAGE_REPO_whistler_desktop_gnome_grd}}:{{.IMAGE_TAG_whistler_desktop_gnome_grd}}"
-# Forward all front doors to localhost on `skaffold dev` (NodePorts aren't
-# auto-published on kind/k3d the way they are on docker-desktop).
+          templates.rdp-desktop.image: "{{.IMAGE_REPO_whistler_desktop_xfce_rdp}}:{{.IMAGE_TAG_whistler_desktop_xfce_rdp}}"
+          templates.gnome-grd.image: "{{.IMAGE_REPO_whistler_desktop_gnome_grd}}:{{.IMAGE_TAG_whistler_desktop_gnome_grd}}"
+          # Use the locally-built desktop images as the enforced desktop allow-list,
+          # so the operator accepts them and the management UI picker shows the
+          # actual build outputs (replaces the production defaults in values.yaml).
+          whistler.images.desktop[0]: "{{.IMAGE_REPO_whistler_desktop_xfce_rdp}}:{{.IMAGE_TAG_whistler_desktop_xfce_rdp}}"
+          whistler.images.desktop[1]: "{{.IMAGE_REPO_whistler_desktop_gnome_grd}}:{{.IMAGE_TAG_whistler_desktop_gnome_grd}}"
+# Forward the front doors to localhost on `skaffold dev` (NodePorts aren't
+# auto-published on kind the way they are on docker-desktop). The portal now goes
+# through the chart's bundled Traefik proxy (whistler-portal-proxy :80): both
+# portal apps share http://localhost:30080. SSH stays direct.
 portForward:
   - resourceType: service
-    resourceName: whistler-portal
+    resourceName: whistler-portal-proxy
     namespace: whistler
-    port: 8080
+    port: 80
     localPort: 30080
-  - resourceType: service
-    resourceName: whistler-portal
-    namespace: whistler
-    port: 8081
-    localPort: 30081
   - resourceType: service
     resourceName: whistler-server
     namespace: whistler

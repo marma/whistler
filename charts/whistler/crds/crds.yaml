@@ -1,7 +1,7 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: whistlertemplates.whistler.martinmalmsten.net
+  name: templates.whistler.martinmalmsten.net
 spec:
   group: whistler.martinmalmsten.net
   versions:
@@ -17,7 +17,27 @@ spec:
               properties:
                 user:
                   type: string
+                mode:
+                  type: string
+                  enum: ["ssh", "desktop"]
+                  default: ssh
+                  description: >-
+                    Access type. "ssh" templates are reached over SSH (TUI or
+                    direct shell); "desktop" templates expose a display server
+                    consumed by the web portal via guacamole.
+                runtime:
+                  type: string
+                  enum: ["container", "kata", "vm"]
+                  default: container
+                  description: >-
+                    Execution backend. "container" is a plain pod; "kata" is a
+                    pod pinned to the Kata RuntimeClass (lightweight VM isolation);
+                    "vm" is a full KubeVirt VirtualMachine. Replaces the old
+                    backend + runtimeClassName fields. The Kata RuntimeClass name
+                    is operator-configured, not set here.
                 image:
+                  type: string
+                displayName:
                   type: string
                 description:
                   type: string
@@ -40,19 +60,60 @@ spec:
                     type: string
                 personalMountPath:
                   type: string
+                privileged:
+                  type: boolean
+                  description: >-
+                    Run the container with securityContext.privileged=true.
+                    Required for images that run systemd as PID 1 (e.g. gnome-grd).
+                    In production this can force the Kata runtime (see operator
+                    config whistler.security.forceKataForPrivileged).
+                fuse:
+                  type: boolean
+                  description: >-
+                    Grant the container access to /dev/fuse. Required by images
+                    whose display server mounts a FUSE filesystem (e.g.
+                    gnome-remote-desktop's clipboard). Implemented today by running
+                    the container privileged.
+                displayPort:
+                  type: integer
+                  description: Desktop-only. Port the display server listens on (ignored for ssh).
+                protocol:
+                  type: string
+                  enum: ["vnc", "rdp"]
+                  description: Desktop-only. Guacamole protocol used by the portal.
+                connectionParams:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  description: Desktop-only. Extra guacamole connection parameters.
+                rdpSecurity:
+                  type: string
+                  enum: ["any", "nla", "tls", "rdp", "vmconnect"]
+                  description: >-
+                    Desktop-only. RDP security/authentication mode passed to guacd
+                    as the ``security`` connection parameter. "nla" is required by
+                    gnome-remote-desktop. Overrides a ``security`` key in
+                    connectionParams if both are set.
+                instancetype:
+                  type: string
+                  description: VM-only. KubeVirt instancetype name (e.g. "u1.medium").
+                persistence:
+                  type: string
+                  enum: ["ephemeral", "persistent", "preemptible"]
+                  default: ephemeral
   scope: Namespaced
   names:
-    plural: whistlertemplates
-    singular: whistlertemplate
-    kind: WhistlerTemplate
+    plural: templates
+    singular: template
+    kind: Template
     shortNames:
-    - wt
+    - tpl
 
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: whistlerinstances.whistler.martinmalmsten.net
+  name: sessions.whistler.martinmalmsten.net
 spec:
   group: whistler.martinmalmsten.net
   versions:
@@ -79,151 +140,15 @@ spec:
               properties:
                 phase:
                   type: string
-                podName:
+                mode:
                   type: string
-                sshHost:
-                  type: string
-                sshPort:
-                  type: integer
-  scope: Namespaced
-  names:
-    plural: whistlerinstances
-    singular: whistlerinstance
-    kind: WhistlerInstance
-    shortNames:
-    - wi
-
----
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: desktoptemplates.whistler.martinmalmsten.net
-spec:
-  group: whistler.martinmalmsten.net
-  versions:
-    - name: v1
-      served: true
-      storage: true
-      schema:
-        openAPIV3Schema:
-          type: object
-          properties:
-            spec:
-              type: object
-              properties:
-                user:
-                  type: string
-                image:
-                  type: string
-                backend:
-                  type: string
-                  enum: ["pod", "vm"]
-                description:
-                  type: string
-                resources:
-                  type: object
-                  properties:
-                    cpu:
-                      type: string
-                    memory:
-                      type: string
-                    gpu:
-                      type: string
-                nodeSelector:
-                  type: object
-                  additionalProperties:
-                    type: string
-                volumes:
-                  type: object
-                  additionalProperties:
-                    type: string
-                personalMountPath:
-                  type: string
-                persistence:
-                  type: string
-                  enum: ["ephemeral", "persistent", "preemptible"]
-                displayPort:
-                  type: integer
-                instancetype:
-                  type: string
-                protocol:
-                  type: string
-                  enum: ["vnc", "rdp"]
-                connectionParams:
-                  type: object
-                  additionalProperties:
-                    type: string
-                fuse:
-                  type: boolean
-                  description: >-
-                    Grant the desktop container access to /dev/fuse. Required by
-                    images whose display server mounts a FUSE filesystem (e.g.
-                    gnome-remote-desktop's clipboard). Implemented today by
-                    running the container privileged; the least-privilege
-                    alternative is a FUSE device plugin (see design/vdi.md).
-                privileged:
-                  type: boolean
-                  description: >-
-                    Run the desktop container with securityContext.privileged=true.
-                    Required for images that run systemd as PID 1 (e.g. gnome-grd).
-                    In production, pair with runtimeClassName: kata to restore
-                    VM-level isolation without full VM image management.
-                runtimeClassName:
+                  description: Denormalized from the referenced template.
+                runtime:
                   type: string
                   description: >-
-                    Kubernetes RuntimeClass for the desktop pod. Set to "kata" (or
-                    another Kata Containers runtime) to run the privileged container
-                    inside a lightweight VM, restoring host isolation without the
-                    overhead of managing full VM disk images.
-                rdpSecurity:
-                  type: string
-                  enum: ["any", "nla", "tls", "rdp", "vmconnect"]
-                  description: >-
-                    RDP security/authentication mode passed to guacd as the
-                    ``security`` connection parameter. "any" lets guacd negotiate;
-                    "nla" forces Network Level Authentication (required by
-                    gnome-remote-desktop); "tls" forces TLS without NLA; "rdp"
-                    uses classic RDP encryption. Overrides a ``security`` key in
-                    connectionParams if both are set.
-  scope: Namespaced
-  names:
-    plural: desktoptemplates
-    singular: desktoptemplate
-    kind: DesktopTemplate
-    shortNames:
-    - dt
-
----
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: desktopsessions.whistler.martinmalmsten.net
-spec:
-  group: whistler.martinmalmsten.net
-  versions:
-    - name: v1
-      served: true
-      storage: true
-      subresources:
-        status: {}
-      schema:
-        openAPIV3Schema:
-          type: object
-          properties:
-            spec:
-              type: object
-              properties:
-                templateRef:
-                  type: string
-                user:
-                  type: string
-            status:
-              type: object
-              properties:
-                phase:
-                  type: string
-                backend:
-                  type: string
+                    The coerced runtime actually built (container/kata/vm). Used by
+                    the operator probe/delete logic so it need not re-resolve the
+                    template.
                 podName:
                   type: string
                 vmiName:
@@ -232,10 +157,14 @@ spec:
                   type: string
                 displayPort:
                   type: integer
+                sshHost:
+                  type: string
+                sshPort:
+                  type: integer
   scope: Namespaced
   names:
-    plural: desktopsessions
-    singular: desktopsession
-    kind: DesktopSession
+    plural: sessions
+    singular: session
+    kind: Session
     shortNames:
-    - ds
+    - ses

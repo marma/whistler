@@ -1,8 +1,8 @@
-"""C1 integration test for the desktop POD backend.
+"""C1 integration test for the desktop pod runtime.
 
 Exercises the provisioning path with no SSH/Guacamole in the loop:
-  create DesktopTemplate (backend: pod) + DesktopSession -> operator
-  reconcile_desktop_fn ensures the pod + per-session Service -> the phase
+  create Template (mode: desktop, runtime: container) + Session -> operator
+  reconcile_session_fn ensures the pod + per-session Service -> the phase
   timer drives status.phase to Ready.
 
 The VM backend is NOT exercised here: KubeVirt is not installed in k3d/CI, so
@@ -53,15 +53,15 @@ def _wait_phase_ready(custom, deadline):
     last = None
     while time.time() < deadline:
         ds = custom.get_namespaced_custom_object(
-            GROUP, VERSION, USER_NS, "desktopsessions", SESSION
+            GROUP, VERSION, USER_NS, "sessions", SESSION
         )
         last = (ds.get("status") or {}).get("phase")
         if last == "Ready":
             return ds
         if last == "Failed":
-            pytest.fail(f"DesktopSession reached Failed: {ds.get('status')}")
+            pytest.fail(f"Session reached Failed: {ds.get('status')}")
         time.sleep(3)
-    pytest.fail(f"DesktopSession did not reach Ready within {READY_TIMEOUT}s (last phase: {last})")
+    pytest.fail(f"Session did not reach Ready within {READY_TIMEOUT}s (last phase: {last})")
 
 
 def test_desktop_pod_session_reaches_ready():
@@ -77,12 +77,13 @@ def test_desktop_pod_session_reaches_ready():
 
     desktop_template = {
         "apiVersion": f"{GROUP}/{VERSION}",
-        "kind": "DesktopTemplate",
+        "kind": "Template",
         "metadata": {"name": TEMPLATE, "namespace": SYS_NS},
         "spec": {
             "user": "system",
+            "mode": "desktop",
+            "runtime": "container",
             "image": IMAGE,
-            "backend": "pod",
             "displayPort": DISPLAY_PORT,
             "persistence": "ephemeral",
             "resources": {"cpu": "100m", "memory": "64Mi"},
@@ -90,20 +91,23 @@ def test_desktop_pod_session_reaches_ready():
     }
     desktop_session = {
         "apiVersion": f"{GROUP}/{VERSION}",
-        "kind": "DesktopSession",
-        "metadata": {"name": SESSION, "namespace": USER_NS},
+        "kind": "Session",
+        "metadata": {
+            "name": SESSION, "namespace": USER_NS,
+            "labels": {"whistler.martinmalmsten.net/mode": "desktop"},
+        },
         "spec": {"templateRef": TEMPLATE, "user": USER},
     }
 
     try:
         try:
             custom.create_namespaced_custom_object(
-                GROUP, VERSION, SYS_NS, "desktoptemplates", desktop_template)
+                GROUP, VERSION, SYS_NS, "templates", desktop_template)
         except ApiException as e:
             if e.status != 409:
                 raise
         custom.create_namespaced_custom_object(
-            GROUP, VERSION, USER_NS, "desktopsessions", desktop_session)
+            GROUP, VERSION, USER_NS, "sessions", desktop_session)
 
         _wait_phase_ready(custom, time.time() + READY_TIMEOUT)
 
@@ -123,9 +127,9 @@ def test_desktop_pod_session_reaches_ready():
         from kubernetes.client.rest import ApiException as _ApiException
         for delete in (
             lambda: custom.delete_namespaced_custom_object(
-                GROUP, VERSION, USER_NS, "desktopsessions", SESSION),
+                GROUP, VERSION, USER_NS, "sessions", SESSION),
             lambda: custom.delete_namespaced_custom_object(
-                GROUP, VERSION, SYS_NS, "desktoptemplates", TEMPLATE),
+                GROUP, VERSION, SYS_NS, "templates", TEMPLATE),
         ):
             try:
                 delete()

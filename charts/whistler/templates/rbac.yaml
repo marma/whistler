@@ -29,8 +29,7 @@ rules:
 
   # Application: watching & handling for the custom resources we declare.
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [whistlerinstances, whistlertemplates, whistlerinstances/status, whistlertemplates/status,
-                desktopsessions, desktoptemplates, desktopsessions/status]
+    resources: [sessions, templates, sessions/status]
     verbs: [list, watch, patch, get, update, create, delete]
 
   # KubeVirt VM desktop backend. The CRDs may be absent in a given cluster;
@@ -98,7 +97,7 @@ rules:
 
   # Managing custom resources
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [whistlerinstances, whistlertemplates, whistlerinstances/status]
+    resources: [sessions, templates, sessions/status]
     verbs: [create, delete, get, list, patch, update, watch]
 
 ---
@@ -155,14 +154,10 @@ kind: ClusterRole
 metadata:
   name: {{ .Release.Name }}-portal
 rules:
-  # Desktop sessions (portal / Guacamole flow).
+  # Unified templates + sessions (desktop portal/Guacamole flow AND the
+  # management UI's SSH template/instance CRUD + trigger).
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [desktopsessions, desktoptemplates, desktopsessions/status]
-    verbs: [get, list, create, delete, watch]
-
-  # Management UI: SSH templates + instances (CRUD) and instance trigger (patch).
-  - apiGroups: [whistler.martinmalmsten.net]
-    resources: [whistlertemplates, whistlerinstances, whistlerinstances/status]
+    resources: [sessions, templates, sessions/status]
     verbs: [get, list, create, update, patch, delete, watch]
 
   # add_desktop_session / _ensure_user_namespace.
@@ -177,6 +172,13 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch, delete]
+
+  # Web terminal: the portal shells out to `kubectl exec` into the session pod
+  # (whistler.portal.terminal), so it needs the pods/exec subresource — same
+  # grant the SSH server has for its interactive shells.
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create, get]
 
   # PVCs: list for volume management display.
   - apiGroups: [""]

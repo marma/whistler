@@ -1,15 +1,44 @@
 {{- range $name, $template := .Values.templates }}
 apiVersion: whistler.martinmalmsten.net/v1
-kind: WhistlerTemplate
+kind: Template
 metadata:
   name: {{ $name }}
   namespace: {{ $.Release.Namespace }}
 spec:
   user: system
+  mode: {{ $template.mode | default "ssh" }}
+  runtime: {{ $template.runtime | default "container" }}
   description: {{ $template.description | default "" | quote }}
   image: {{ $template.image }}
+{{- if $template.protocol }}
+  protocol: {{ $template.protocol }}
+{{- end }}
+{{- if $template.displayPort }}
+  displayPort: {{ $template.displayPort }}
+{{- end }}
+{{- if $template.connectionParams }}
+  connectionParams:
+{{ toYaml $template.connectionParams | indent 4 }}
+{{- end }}
+{{- if $template.rdpSecurity }}
+  rdpSecurity: {{ $template.rdpSecurity }}
+{{- end }}
+{{- if $template.fuse }}
+  fuse: {{ $template.fuse }}
+{{- end }}
+{{- if $template.privileged }}
+  privileged: {{ $template.privileged }}
+{{- end }}
+{{- if $template.persistence }}
+  persistence: {{ $template.persistence }}
+{{- end }}
+{{- if $template.instancetype }}
+  instancetype: {{ $template.instancetype | quote }}
+{{- end }}
+{{- if $template.resources }}
   resources:
 {{ toYaml $template.resources | indent 4 }}
+{{- end }}
 {{- if $template.nodeSelector }}
   nodeSelector:
 {{ toYaml $template.nodeSelector | indent 4 }}

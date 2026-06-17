@@ -1438,14 +1438,14 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 pass
 
     def _trigger_reconcile(self, instance_full_name, namespace):
-        """Bump an annotation on the WhistlerInstance so the operator's update
-        handler fires and (re)creates the pod. Pod creation is owned by the
-        operator; the server only declares intent and waits. Runs in an executor
-        (the kubernetes client is synchronous)."""
+        """Bump an annotation on the Session so the operator's update handler
+        fires and (re)creates the pod. Pod creation is owned by the operator; the
+        server only declares intent and waits. Runs in an executor (the
+        kubernetes client is synchronous)."""
         try:
             self.config_manager.api.patch_namespaced_custom_object(
                 self.config_manager.group, self.config_manager.version, namespace,
-                "whistlerinstances", instance_full_name,
+                "sessions", instance_full_name,
                 {"metadata": {"annotations": {"whistler/last-connect": str(time.time())}}}
             )
         except Exception as e:

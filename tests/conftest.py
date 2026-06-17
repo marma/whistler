@@ -72,6 +72,7 @@ class FakeConfigManager(ConfigManager):
             "name": session_name,
             "template": template_name,
             "phase": "Provisioning",
+            "runtime": None,
             "backend": None,
             "podName": None,
         })
@@ -86,7 +87,7 @@ class FakeConfigManager(ConfigManager):
     def get_volumes(self):
         return []
 
-    def get_available_images(self):
+    def get_available_images(self, category=None):
         return []
 
     def get_server_host_key(self, secret_name):

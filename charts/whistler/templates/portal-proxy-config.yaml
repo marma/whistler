@@ -1,0 +1,58 @@
+{{- if and .Values.portal.enabled .Values.portal.ingress.enabled }}
+{{- /*
+Traefik file-provider config for the bundled portal proxy (see portal-proxy.yaml
+for the Deployment/Service and the routing rationale). Static config + dynamic
+routers/services in one ConfigMap.
+*/}}
+{{- $host := .Values.portal.ingress.host }}
+{{- /* /term + /term-status (page + readiness poll) and /ws-term (terminal WS)
+       are served by the viewer app alongside the guacd relay. */}}
+{{- $viewerPaths := "PathPrefix(`/connect`) || PathPrefix(`/launch`) || PathPrefix(`/status`) || PathPrefix(`/ws`) || PathPrefix(`/term`) || PathPrefix(`/ws-term`)" }}
+{{- $viewerRule := $viewerPaths }}
+{{- $mgmtRule := "PathPrefix(`/`)" }}
+{{- if $host }}
+{{- $viewerRule = printf "Host(`%s`) && (%s)" $host $viewerPaths }}
+{{- $mgmtRule = printf "Host(`%s`)" $host }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-portal-proxy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: whistler-portal-proxy
+data:
+  traefik.yml: |
+    entryPoints:
+      web:
+        address: ":80"
+    providers:
+      file:
+        filename: /config/dynamic.yml
+        watch: true
+    log:
+      level: {{ .Values.portal.logLevel | default "INFO" }}
+  dynamic.yml: |
+    http:
+      routers:
+        # Viewer paths win over the catch-all via higher priority.
+        portal-viewer:
+          rule: "{{ $viewerRule }}"
+          priority: 100
+          entryPoints: [web]
+          service: portal-viewer
+        portal-mgmt:
+          rule: "{{ $mgmtRule }}"
+          priority: 10
+          entryPoints: [web]
+          service: portal-mgmt
+      services:
+        portal-viewer:
+          loadBalancer:
+            servers:
+              - url: "http://{{ .Release.Name }}-portal:{{ .Values.portal.service.port }}"
+        portal-mgmt:
+          loadBalancer:
+            servers:
+              - url: "http://{{ .Release.Name }}-portal:{{ .Values.portal.managementService.port }}"
+{{- end }}

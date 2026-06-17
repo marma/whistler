@@ -67,7 +67,7 @@ cleanup() {
   elif [[ "$PROVIDER" == "existing" ]]; then
     # Only remove what we created; leave the cluster itself alone.
     echo "==> Cleaning up test namespaces and template"
-    kubectl delete whistlertemplate "$TEST_TEMPLATE" -n "$SYS_NS" --ignore-not-found >/dev/null 2>&1
+    kubectl delete template "$TEST_TEMPLATE" -n "$SYS_NS" --ignore-not-found >/dev/null 2>&1
     kubectl delete deployment,service whistler-guacd -n "$SYS_NS" --ignore-not-found >/dev/null 2>&1
     kubectl delete namespace "$USER_NS" "$SYS_NS" --ignore-not-found --wait=false >/dev/null 2>&1
   fi
@@ -96,11 +96,13 @@ kubectl create namespace "$SYS_NS" --dry-run=client -o yaml | kubectl apply -f -
 # A lightweight system template so ephemeral sessions schedule fast.
 kubectl apply -f - <<EOF
 apiVersion: whistler.martinmalmsten.net/v1
-kind: WhistlerTemplate
+kind: Template
 metadata:
   name: ${TEST_TEMPLATE}
   namespace: ${SYS_NS}
 spec:
+  mode: ssh
+  runtime: container
   # Needs a real userland: the server bridges sessions via `bash -c` with an
   # inner `sh -l` + `base64`, so busybox is not enough.
   image: ubuntu:24.04
@@ -124,6 +126,18 @@ cat > "$WORK/networkpolicy.yaml" <<EOF
 egress:
   allowCIDRs: []
   blockCIDRs: []
+EOF
+# Image allow-lists. ssh is unrestricted (empty); desktop/vm are enforced by the
+# operator, so every desktop test image must be listed here or provisioning
+# fails (test_desktop.py uses the pause image; test_display.py uses an RDP image).
+DESKTOP_IMAGE="${WHISTLER_TEST_DESKTOP_IMAGE:-registry.k8s.io/pause:3.9}"
+RDP_IMAGE="${WHISTLER_TEST_RDP_IMAGE:-linuxserver/rdesktop:latest}"
+cat > "$WORK/images.yaml" <<EOF
+ssh: []
+desktop:
+  - ${DESKTOP_IMAGE}
+  - ${RDP_IMAGE}
+vm: []
 EOF
 
 COMMON_ENV=(

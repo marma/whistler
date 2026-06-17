@@ -41,6 +41,10 @@ spec:
               value: "{{ .Values.server.logLevel }}"
             - name: WHISTLER_HOST_KEY_SECRET_NAME
               value: "{{ .Release.Name }}-server-host-key"
+            - name: WHISTLER_FORCE_KATA_FOR_PRIVILEGED
+              value: {{ .Values.whistler.security.forceKataForPrivileged | quote }}
+            - name: WHISTLER_KATA_RUNTIME_CLASS
+              value: {{ .Values.whistler.security.kataRuntimeClass | quote }}
           ports:
             - containerPort: 8022
               name: ssh
@@ -59,6 +63,10 @@ spec:
             - name: selectors-config
               mountPath: "/etc/whistler-config/networkpolicy.yaml"
               subPath: "networkpolicy.yaml"
+              readOnly: true
+            - name: selectors-config
+              mountPath: "/etc/whistler-config/images.yaml"
+              subPath: "images.yaml"
               readOnly: true
 
           resources:

@@ -37,6 +37,10 @@ spec:
               value: {{ .Values.userVolume.size | quote }}
             - name: OPERATOR_LOG_LEVEL
               value: "{{ .Values.operator.logLevel }}"
+            - name: WHISTLER_FORCE_KATA_FOR_PRIVILEGED
+              value: {{ .Values.whistler.security.forceKataForPrivileged | quote }}
+            - name: WHISTLER_KATA_RUNTIME_CLASS
+              value: {{ .Values.whistler.security.kataRuntimeClass | quote }}
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
           # ensure_pod() runs here now, so the operator needs the same user and
@@ -52,6 +56,10 @@ spec:
             - name: config
               mountPath: "/etc/whistler-config/networkpolicy.yaml"
               subPath: "networkpolicy.yaml"
+              readOnly: true
+            - name: config
+              mountPath: "/etc/whistler-config/images.yaml"
+              subPath: "images.yaml"
               readOnly: true
       volumes:
         - name: users-config

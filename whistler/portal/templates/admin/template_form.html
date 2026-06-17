@@ -37,8 +37,60 @@
       </div>
     </div>
 
+    <div class="two fields">
+      <div class="field">
+        <label for="mode">Access mode</label>
+        <select id="mode" name="mode" class="ui dropdown">
+          <option value="ssh"     {% if not tpl or tpl.mode != 'desktop' %}selected{% endif %}>SSH</option>
+          <option value="desktop" {% if tpl and tpl.mode == 'desktop' %}selected{% endif %}>Desktop</option>
+        </select>
+        <div class="ui pointing label">SSH = reached over SSH; Desktop = display server via the web portal.</div>
+      </div>
+      <div class="field">
+        <label for="runtime">Runtime</label>
+        <select id="runtime" name="runtime" class="ui dropdown">
+          <option value="container" {% if not tpl or tpl.runtime != 'kata' and tpl.runtime != 'vm' %}selected{% endif %}>Container (plain pod)</option>
+          <option value="kata"      {% if tpl and tpl.runtime == 'kata' %}selected{% endif %}>Kata (VM-isolated pod)</option>
+          <option value="vm"        {% if tpl and tpl.runtime == 'vm' %}selected{% endif %}>Full VM (KubeVirt)</option>
+        </select>
+        <div class="ui pointing label">Privileged templates are auto-promoted to Kata in production.</div>
+      </div>
+    </div>
+
+    <div class="two fields">
+      <div class="field">
+        <div class="ui checkbox">
+          <input type="checkbox" id="privileged" name="privileged" value="on"
+                 {% if tpl and tpl.privileged %}checked{% endif %}>
+          <label for="privileged">Privileged (host capabilities; e.g. systemd as PID 1)</label>
+        </div>
+      </div>
+      <div class="field">
+        <div class="ui checkbox">
+          <input type="checkbox" id="fuse" name="fuse" value="on"
+                 {% if tpl and tpl.fuse %}checked{% endif %}>
+          <label for="fuse">FUSE (/dev/fuse; e.g. clipboard mounts)</label>
+        </div>
+      </div>
+    </div>
+
+    <div id="desktop-fields" class="two fields" style="display:none">
+      <div class="field">
+        <label for="display_port">Display port</label>
+        <input id="display_port" name="display_port" type="number" placeholder="3389"
+               value="{{ tpl.displayPort if tpl and tpl.displayPort else '' }}">
+      </div>
+      <div class="field">
+        <label for="protocol">Protocol</label>
+        <select id="protocol" name="protocol" class="ui dropdown">
+          <option value="rdp" {% if not tpl or tpl.protocol != 'vnc' %}selected{% endif %}>RDP</option>
+          <option value="vnc" {% if tpl and tpl.protocol == 'vnc' %}selected{% endif %}>VNC</option>
+        </select>
+      </div>
+    </div>
+
     <div class="field">
-      <label for="image">Container Image</label>
+      <label for="image">Container Image / VM disk</label>
       <input id="image" name="image" type="text" required
              list="image-list"
              placeholder="ubuntu:22.04"
@@ -88,6 +140,22 @@
     <a href="/admin/templates?user={{ current_user }}" class="ui button">Cancel</a>
   </form>
 </div>
+
+<script>
+// Show desktop-only fields (display port / protocol) only when mode == desktop.
+$(document).ready(function () {
+  const desktopFields = document.getElementById('desktop-fields');
+  function sync(value) {
+    desktopFields.style.display = (value === 'desktop') ? '' : 'none';
+  }
+  $('#mode').closest('.ui.dropdown').dropdown({
+    onChange: function (value) { sync(value); }
+  });
+  $('.ui.dropdown').dropdown();
+  $('.ui.checkbox').checkbox();
+  sync(document.getElementById('mode').value);
+});
+</script>
 
 {% if not tpl %}
 <script>

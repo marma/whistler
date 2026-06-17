@@ -24,7 +24,7 @@
         {% for t in tpls %}
         <option value="{{ t.fullName }}"
           {% if request.query_params.get('template') == t.fullName %}selected{% endif %}>
-          {{ t.name }}{% if t.source == 'system' %} (system){% endif %}{% if t.image %} — {{ t.image }}{% endif %}
+          {{ t.name }} [{{ t.mode or 'ssh' }}/{{ t.runtime or 'container' }}]{% if t.source == 'system' %} (system){% endif %}{% if t.image %} — {{ t.image }}{% endif %}
         </option>
         {% endfor %}
       </select>

@@ -30,6 +30,18 @@ KUBEVIRT_VERSION = "v1"
 KUBEVIRT_VM_PLURAL = "virtualmachines"
 KUBEVIRT_VMI_PLURAL = "virtualmachineinstances"
 
+# Custom-resource plurals for the unified Template/Session model (group
+# whistler.martinmalmsten.net/v1). One Template kind covers ssh + desktop; one
+# Session kind covers what used to be WhistlerInstance + DesktopSession.
+TEMPLATE_PLURAL = "templates"
+SESSION_PLURAL = "sessions"
+
+
+class PolicyError(Exception):
+    """A template violates an operator-enforced policy (image allow-list,
+    privileged/runtime rules). Raised by _apply_policy; ensure_session turns it
+    into a failed provision."""
+
 
 class ConfigManager(ABC):
     @abstractmethod
@@ -89,7 +101,7 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
-    def get_available_images(self) -> List[str]:
+    def get_available_images(self, category: Optional[str] = None) -> List[str]:
         pass
 
     @abstractmethod
@@ -146,12 +158,12 @@ class ConfigManager(ABC):
 
     @abstractmethod
     def stop_instance(self, username: str, instance_name: str) -> bool:
-        """Delete the pod but keep the WhistlerInstance CR (stops compute, preserves state)."""
+        """Delete the pod but keep the Session CR (stops compute, preserves state)."""
         pass
 
     @abstractmethod
     def trigger_instance_start(self, username: str, instance_name: str) -> bool:
-        """Bump an annotation on the WhistlerInstance CR to fire the operator's reconcile."""
+        """Bump an annotation on the Session CR to fire the operator's reconcile."""
         pass
 
 class KubeConfigManager(ConfigManager):
@@ -192,6 +204,15 @@ class KubeConfigManager(ConfigManager):
 
         self.network_policy_egress = {"allowCIDRs": [], "blockCIDRs": []}
         self._load_network_policy()
+
+        # Image allow-lists (by template category) + security policy. Enforced
+        # operator-side at pod/VM build time (see _apply_policy).
+        self.images = {"ssh": [], "desktop": [], "vm": []}
+        self._load_images()
+        self.force_kata_for_privileged = os.environ.get(
+            "WHISTLER_FORCE_KATA_FOR_PRIVILEGED", "false"
+        ).strip().lower() in ("1", "true", "yes")
+        self.kata_runtime_class = os.environ.get("WHISTLER_KATA_RUNTIME_CLASS", "kata")
 
     def _get_user_namespace(self, username: str) -> str:
         return f"whistler-user-{username}"
@@ -293,14 +314,17 @@ class KubeConfigManager(ConfigManager):
 
         for ns in namespaces_to_search:
             try:
-                # List WhistlerTemplates
+                # List Templates (ssh access mode only — desktop templates are
+                # surfaced separately via get_user_desktop_templates).
                 resp = self.api.list_namespaced_custom_object(
-                    self.group, self.version, ns, "whistlertemplates"
+                    self.group, self.version, ns, TEMPLATE_PLURAL
                 )
                 for item in resp.get("items", []):
                     t = item.get("spec", {})
+                    if t.get("mode", "ssh") != "ssh":
+                        continue
                     full_name = item["metadata"]["name"]
-                    
+
                     # Determine source and display name
                     owner = t.get("user", "system")
                     
@@ -345,11 +369,13 @@ class KubeConfigManager(ConfigManager):
         user_ns = self._get_user_namespace(username)
         
         try:
-            # List WhistlerInstances in user namespace
+            # List ssh Sessions in user namespace (desktop sessions are listed
+            # by get_user_desktop_sessions).
             resp = self.api.list_namespaced_custom_object(
-                self.group, self.version, user_ns, "whistlerinstances"
+                self.group, self.version, user_ns, SESSION_PLURAL,
+                label_selector="whistler.martinmalmsten.net/mode=ssh",
             )
-            
+
             # List Pods for this user
             core_api = client.CoreV1Api()
             try:
@@ -413,10 +439,13 @@ class KubeConfigManager(ConfigManager):
         
         body = {
             "apiVersion": f"{self.group}/{self.version}",
-            "kind": "WhistlerInstance",
+            "kind": "Session",
             "metadata": {
                 "name": f"{username}-{instance_name}",
-                "namespace": user_ns
+                "namespace": user_ns,
+                # Denormalize access mode onto the CR so listing can filter
+                # ssh vs desktop sessions cheaply (without resolving templates).
+                "labels": {"whistler.martinmalmsten.net/mode": "ssh"},
             },
             "spec": {
                 "templateRef": template_name,
@@ -426,7 +455,7 @@ class KubeConfigManager(ConfigManager):
         }
         try:
             self.api.create_namespaced_custom_object(
-                self.group, self.version, user_ns, "whistlerinstances", body
+                self.group, self.version, user_ns, SESSION_PLURAL, body
             )
             return True
         except ApiException as e:
@@ -447,13 +476,15 @@ class KubeConfigManager(ConfigManager):
         
         body = {
             "apiVersion": f"{self.group}/{self.version}",
-            "kind": "WhistlerTemplate",
+            "kind": "Template",
             "metadata": {
                 "name": full_name,
                 "namespace": user_ns
             },
             "spec": {
                 "user": username,
+                "mode": template_data.get("mode", "ssh"),
+                "runtime": template_data.get("runtime", "container"),
                 "image": template_data.get("image"),
                 "description": template_data.get("description"),
                 "resources": template_data.get("resources"),
@@ -466,24 +497,20 @@ class KubeConfigManager(ConfigManager):
         try:
             # Check if exists to update, or create
             try:
-                self.api.get_namespaced_custom_object(
-                    self.group, self.version, user_ns, "whistlertemplates", full_name
-                )
-                # Update (replace)
-                # We need to preserve resourceVersion to update
+                # Preserve resourceVersion to update (replace).
                 existing = self.api.get_namespaced_custom_object(
-                    self.group, self.version, user_ns, "whistlertemplates", full_name
+                    self.group, self.version, user_ns, TEMPLATE_PLURAL, full_name
                 )
                 body["metadata"]["resourceVersion"] = existing["metadata"]["resourceVersion"]
-                
+
                 self.api.replace_namespaced_custom_object(
-                    self.group, self.version, user_ns, "whistlertemplates", full_name, body
+                    self.group, self.version, user_ns, TEMPLATE_PLURAL, full_name, body
                 )
             except ApiException as e:
                 if e.status == 404:
                     # Create
                     self.api.create_namespaced_custom_object(
-                        self.group, self.version, user_ns, "whistlertemplates", body
+                        self.group, self.version, user_ns, TEMPLATE_PLURAL, body
                     )
                 else:
                     raise e
@@ -497,7 +524,7 @@ class KubeConfigManager(ConfigManager):
         user_ns = self._get_user_namespace(username)
         try:
             self.api.delete_namespaced_custom_object(
-                self.group, self.version, user_ns, "whistlerinstances", f"{username}-{instance_name}"
+                self.group, self.version, user_ns, SESSION_PLURAL, f"{username}-{instance_name}"
             )
             return True
         except ApiException as e:
@@ -509,7 +536,7 @@ class KubeConfigManager(ConfigManager):
         user_ns = self._get_user_namespace(username)
         try:
             self.api.delete_namespaced_custom_object(
-                self.group, self.version, user_ns, "whistlertemplates", f"{username}-{template_name}"
+                self.group, self.version, user_ns, TEMPLATE_PLURAL, f"{username}-{template_name}"
             )
             return True
         except ApiException as e:
@@ -553,17 +580,71 @@ class KubeConfigManager(ConfigManager):
         self._load_volumes()
         return self.volumes
 
-    def get_available_images(self) -> List[str]:
+    def _load_images(self):
+        """Load the image allow-lists from images.yaml into self.images.
+
+        New shape is a map keyed by template category ({ssh, desktop, vm}). A
+        legacy flat list is accepted and treated as ssh suggestions. A missing
+        file leaves the (empty) defaults — fine for host-process runs that don't
+        mount it, and for ssh templates (unrestricted)."""
+        self.images = {"ssh": [], "desktop": [], "vm": []}
         try:
             with open(IMAGES_FILE, "r") as f:
                 data = yaml.safe_load(f)
-                if isinstance(data, list):
-                    return [str(i) for i in data if i]
         except FileNotFoundError:
-            pass
+            return
         except Exception as e:
             logger.error(f"Failed to load images.yaml: {e}")
-        return []
+            return
+        if isinstance(data, dict):
+            for cat in ("ssh", "desktop", "vm"):
+                self.images[cat] = [str(i) for i in (data.get(cat) or []) if i]
+        elif isinstance(data, list):
+            self.images["ssh"] = [str(i) for i in data if i]
+
+    def get_available_images(self, category: Optional[str] = None) -> List[str]:
+        """Image suggestions for UX. With a category, returns that list;
+        otherwise the de-duplicated union across all categories."""
+        self._load_images()
+        if category:
+            return list(self.images.get(category, []))
+        union: List[str] = []
+        for cat in ("ssh", "desktop", "vm"):
+            for img in self.images.get(cat, []):
+                if img not in union:
+                    union.append(img)
+        return union
+
+    def _apply_policy(self, template_spec: Dict[str, Any], mode: str, runtime: str) -> str:
+        """Authoritative, operator-side policy applied at build time.
+
+        Returns the effective runtime (possibly coerced) and raises PolicyError
+        when the template is not allowed:
+          - privileged (or fuse) + runtime=container is coerced to kata when
+            whistler.security.forceKataForPrivileged is on, so the privileged
+            workload runs inside a lightweight VM rather than on the host kernel.
+          - image allow-list is enforced when mode=desktop OR runtime=vm. SSH
+            container/kata templates may use any image (the check is skipped)."""
+        effective_runtime = runtime
+        wants_privileged = bool(template_spec.get("privileged") or template_spec.get("fuse"))
+        if self.force_kata_for_privileged and wants_privileged and effective_runtime == "container":
+            logger.warning(
+                "Coercing runtime container -> kata for privileged template "
+                "(image=%s); forceKataForPrivileged is enabled",
+                template_spec.get("image"),
+            )
+            effective_runtime = "kata"
+
+        if mode == "desktop" or effective_runtime == "vm":
+            category = "vm" if effective_runtime == "vm" else "desktop"
+            allowed = self.images.get(category, []) or []
+            image = template_spec.get("image")
+            if image not in allowed:
+                raise PolicyError(
+                    f"image {image!r} is not in the allowed {category} image list "
+                    f"(whistler.images.{category}); allowed: {allowed}"
+                )
+        return effective_runtime
 
     def _load_network_policy(self):
         try:
@@ -687,15 +768,69 @@ class KubeConfigManager(ConfigManager):
         except Exception:
             return {}
 
-    def _build_pod_spec(self, *, full_instance_name, hostname, username, uid,
-                        template_spec, pvc_name, available_volumes, user_details,
-                        preemptible):
-        """Build the Pod manifest for an instance from already-resolved inputs.
+    def _build_volume_wiring(self, *, pvc_name, personal_mount_path,
+                             requested_volumes, available_volumes):
+        """Build (pod_volumes, volume_mounts) for the home PVC plus any requested
+        named volumes. Pure; the single source shared by every pod backend
+        (ssh / desktop, container / kata)."""
+        pod_volumes = [{
+            "name": "data",
+            "persistentVolumeClaim": {"claimName": pvc_name},
+        }]
+        volume_mounts = [{
+            "name": "data",
+            "mountPath": personal_mount_path,
+        }]
 
-        Pure function of its arguments (no Kubernetes API calls), so the
-        volume / securityContext / resource / ownerReference wiring can be
-        unit-tested without a cluster. ``ensure_pod`` does the API work and
-        delegates the manifest assembly here.
+        for vol_name, mount_path in (requested_volumes or {}).items():
+            if vol_name in available_volumes:
+                # TODO: Remove this hack, we should not have a hardcoded volume named "data"
+                if vol_name == "data":
+                    continue
+
+                vol_def = available_volumes[vol_name]
+                sub_path = vol_def.get("subPath")
+
+                # Copy so the source definition in available_volumes is not mutated;
+                # subPath belongs on the mount, not the volume.
+                clean_vol_def = vol_def.copy()
+                clean_vol_def.pop("subPath", None)
+                pod_volumes.append(clean_vol_def)
+
+                mount_def = {"name": vol_name, "mountPath": mount_path}
+                if sub_path:
+                    mount_def["subPath"] = sub_path
+                volume_mounts.append(mount_def)
+
+        return pod_volumes, volume_mounts
+
+    def _session_owner_reference(self, full_name: str, uid: str) -> Dict[str, Any]:
+        """ownerReference making a Session the controller of its child pod / VM /
+        Service, so Kubernetes GC reaps them when the CR is deleted."""
+        return {
+            "apiVersion": f"{self.group}/{self.version}",
+            "kind": "Session",
+            "name": full_name,
+            "uid": uid,
+            "controller": True,
+            "blockOwnerDeletion": True,
+        }
+
+    def _build_pod_spec(self, *, full_name, hostname, username, uid, mode, runtime,
+                        template_spec, pvc_name, available_volumes, user_details,
+                        preemptible, display_port=None):
+        """Build the Pod manifest for a session from already-resolved inputs.
+
+        Pure function of its arguments (no Kubernetes API calls) so it is
+        unit-tested without a cluster; ``ensure_session`` does the API work.
+        Handles both access modes (ssh / desktop) and the container/kata runtimes
+        (runtime=vm is built by ``_build_vm_spec`` instead):
+          - ssh overrides the entrypoint with ``sleep`` (the image must stay
+            alive for the exec bridge); desktop does not (the display server
+            self-starts) and exposes the display port.
+          - both ``instance`` and ``session`` labels are emitted so the SSH
+            server's pod-watch and the desktop Service selector both resolve.
+          - runtime=kata pins the configured Kata RuntimeClass.
         """
         image = template_spec.get('image', 'ubuntu:latest')
         resources = template_spec.get('resources', {})
@@ -704,201 +839,77 @@ class KubeConfigManager(ConfigManager):
         requested_volumes = template_spec.get('volumes', {}) or {}
 
         resource_reqs = self._build_resource_reqs(resources)
+        pod_volumes, volume_mounts = self._build_volume_wiring(
+            pvc_name=pvc_name,
+            personal_mount_path=personal_mount_path,
+            requested_volumes=requested_volumes,
+            available_volumes=available_volumes,
+        )
 
-        pod_volumes = [
-            {
-                "name": "data",
-                "persistentVolumeClaim": {
-                    "claimName": pvc_name
-                }
-            }
-        ]
+        container = {
+            "name": "main",
+            "image": image,
+            "resources": resource_reqs,
+            "volumeMounts": volume_mounts,
+        }
+        if mode == "ssh":
+            # SSH images are bridged via `kubectl exec`; keep the pod alive.
+            container["command"] = ["sleep", "3600"]
+        else:
+            # Desktop images self-start their display server; expose its port.
+            if display_port is not None:
+                container["ports"] = [{"containerPort": display_port, "name": "display"}]
 
-        volume_mounts = [
-            {
-                "name": "data",
-                "mountPath": personal_mount_path
-            }
-        ]
-
-        # Process requested volumes
-        for vol_name, mount_path in requested_volumes.items():
-            if vol_name in available_volumes:
-                # TODO: Remove this hack, we should not have a hardcoded volume named "data"
-                if vol_name == "data":
-                    continue
-
-                vol_def = available_volumes[vol_name]
-
-                # Check for subPath
-                sub_path = vol_def.get("subPath")
-
-                # Create a clean volume definition for the Pod spec (without subPath)
-                # We copy it to avoid modifying the original definition in available_volumes
-                clean_vol_def = vol_def.copy()
-                if "subPath" in clean_vol_def:
-                    del clean_vol_def["subPath"]
-
-                pod_volumes.append(clean_vol_def)
-
-                mount_def = {
-                    "name": vol_name,
-                    "mountPath": mount_path
-                }
-
-                if sub_path:
-                    mount_def["subPath"] = sub_path
-
-                volume_mounts.append(mount_def)
-
+        app_label = "whistler-instance" if mode == "ssh" else "whistler-desktop"
         pod_body = {
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {
-                "name": full_instance_name,
+                "name": full_name,
                 "labels": {
-                    "app": "whistler-instance",
-                    "instance": full_instance_name,
-                    "user": username
+                    "app": app_label,
+                    # Both label keys so the SSH watch (instance=) and the desktop
+                    # Service selector (session=) resolve regardless of mode.
+                    "instance": full_name,
+                    "session": full_name,
+                    "user": username,
                 },
-                "ownerReferences": [{
-                    "apiVersion": f"{self.group}/{self.version}",
-                    "kind": "WhistlerInstance",
-                    "name": full_instance_name,
-                    "uid": uid,
-                    "controller": True,
-                    "blockOwnerDeletion": True
-                }]
+                "ownerReferences": [self._session_owner_reference(full_name, uid)],
             },
             "spec": {
-                "containers": [
-                    {
-                        "name": "main",
-                        "image": image,
-                        "command": ["sleep", "3600"],
-                        "resources": resource_reqs,
-                        "volumeMounts": volume_mounts
-                    }
-                ],
+                "containers": [container],
                 "volumes": pod_volumes,
                 "nodeSelector": node_selector,
                 "hostname": hostname,
                 "subdomain": "whistler",
-                "automountServiceAccountToken": False
-            }
+                "automountServiceAccountToken": False,
+            },
         }
 
         if user_details and "securityContext" in user_details:
             pod_body["spec"]["securityContext"] = user_details["securityContext"]
+
+        # Some images (e.g. gnome-grd) mount a FUSE filesystem at runtime or run
+        # systemd as PID 1; grant privileged when the template asks. In production
+        # _apply_policy will have coerced runtime to kata so this is host-isolated.
+        if template_spec.get('fuse') or template_spec.get('privileged'):
+            sec_ctx = container.setdefault("securityContext", {})
+            sec_ctx["privileged"] = True
+
+        if runtime == "kata":
+            pod_body["spec"]["runtimeClassName"] = getattr(self, "kata_runtime_class", "kata")
 
         if preemptible:
             pod_body["spec"]["priorityClassName"] = "whistler-preemptible"
 
         return pod_body
 
-    def ensure_pod(self, username: str, instance_name: str) -> bool:
-        """
-        Ensure that the pod for the given instance exists.
-        Returns True if the pod exists or was created, False otherwise.
-        """
-        user_ns = self._ensure_user_namespace(username)
-        full_instance_name = f"{username}-{instance_name}"
-        
-        # Get the WhistlerInstance CR to get spec and owner UID
-        try:
-            cr = self.api.get_namespaced_custom_object(
-                self.group, self.version, user_ns, "whistlerinstances", full_instance_name
-            )
-        except ApiException as e:
-            logger.error(f"Instance {full_instance_name} not found: {e}")
-            return False
-            
-        spec = cr.get('spec', {})
-        uid = cr['metadata']['uid']
-        
-        template_ref = spec.get('templateRef')
-        preemptible = spec.get('preemptible', False)
-        
-        # Fetch template details
-        custom_api = client.CustomObjectsApi()
-        template = None
-        try:
-            template = custom_api.get_namespaced_custom_object(
-                group="whistler.martinmalmsten.net",
-                version="v1",
-                namespace=user_ns,
-                plural="whistlertemplates",
-                name=template_ref
-            )
-        except ApiException as e:
-            if e.status == 404:
-                # Try system namespace
-                system_ns = os.environ.get("POD_NAMESPACE", "whistler")
-                if system_ns != user_ns:
-                    try:
-                        template = custom_api.get_namespaced_custom_object(
-                            group="whistler.martinmalmsten.net",
-                            version="v1",
-                            namespace=system_ns,
-                            plural="whistlertemplates",
-                            name=template_ref
-                        )
-                    except ApiException:
-                        pass
-        
-        if not template:
-            logger.error(f"Template {template_ref} not found")
-            return False
-            
-        template_spec = template.get('spec', {})
-        pod_name = full_instance_name
-
-        # Ensure PVC exists
-        try:
-            pvc_name = self._ensure_pvc(username, user_ns, logger)
-        except Exception:
-            return False
-
-        pod_body = self._build_pod_spec(
-            full_instance_name=full_instance_name,
-            hostname=instance_name,
-            username=username,
-            uid=uid,
-            template_spec=template_spec,
-            pvc_name=pvc_name,
-            available_volumes=self._load_volume_definitions_from_file(),
-            user_details=self.get_user(username),
-            preemptible=preemptible,
-        )
-
-        logger.debug(f"Creating Pod:\n{yaml.safe_dump(pod_body)}")
-
-        core_api = client.CoreV1Api()
-        try:
-            core_api.create_namespaced_pod(user_ns, pod_body)
-            logger.info(f"Pod {pod_name} created")
-            return True
-        except ApiException as e:
-            if e.status == 409:
-                # Check if terminating
-                try:
-                    existing_pod = core_api.read_namespaced_pod(pod_name, user_ns)
-                    if existing_pod.metadata.deletion_timestamp:
-                         logger.info(f"Pod {pod_name} is terminating.")
-                         return False # Can't create yet
-                except ApiException:
-                    pass
-                return True # Already exists
-            else:
-                logger.error(f"Failed to create pod: {e}")
-                return False
-
 
     # ------------------------------------------------------------------ #
-    # Desktop backends (DesktopTemplate / DesktopSession): a lightweight  #
-    # desktop pod or a KubeVirt VM. Provisioning + lifecycle only — the   #
-    # display tunnel (Guacamole) is a later round. These reuse the SSH    #
-    # spine (_ensure_user_namespace, _ensure_pvc, _build_egress_rules).   #
+    # Session backends: plain pod, Kata pod, or a KubeVirt VM — shared by  #
+    # ssh and desktop access modes. Provisioning + lifecycle; the desktop  #
+    # display tunnel (Guacamole) lives in the portal. These reuse the      #
+    # common spine (_ensure_user_namespace, _ensure_pvc, _build_egress).   #
     # ------------------------------------------------------------------ #
 
     def _build_resource_reqs(self, resources: Dict[str, Any]) -> Dict[str, Any]:
@@ -921,135 +932,6 @@ class KubeConfigManager(ConfigManager):
             if limits:
                 resource_reqs['limits'] = limits
         return resource_reqs
-
-    def _desktop_owner_reference(self, session_name: str, uid: str) -> Dict[str, Any]:
-        """ownerReference making a DesktopSession the controller of its child
-        pod / VM / Service, so Kubernetes GC reaps them when the CR is deleted."""
-        return {
-            "apiVersion": f"{self.group}/{self.version}",
-            "kind": "DesktopSession",
-            "name": session_name,
-            "uid": uid,
-            "controller": True,
-            "blockOwnerDeletion": True,
-        }
-
-    def _build_desktop_pod_spec(self, *, session_name, hostname, username, uid,
-                                template_spec, pvc_name, available_volumes,
-                                user_details, display_port, preemptible):
-        """Build the desktop Pod manifest from already-resolved inputs.
-
-        Pure function of its arguments (no Kubernetes API calls), mirroring
-        ``_build_pod_spec`` so it can be unit-tested without a cluster. Unlike
-        the SSH pod it does NOT override the entrypoint (the desktop image's
-        display server self-starts) and it exposes the display port.
-        """
-        image = template_spec.get('image', 'ubuntu:latest')
-        resources = template_spec.get('resources', {})
-        node_selector = template_spec.get('nodeSelector', {})
-        personal_mount_path = template_spec.get('personalMountPath', '/userdata')
-        requested_volumes = template_spec.get('volumes', {}) or {}
-
-        resource_reqs = self._build_resource_reqs(resources)
-
-        pod_volumes = [
-            {
-                "name": "data",
-                "persistentVolumeClaim": {
-                    "claimName": pvc_name
-                }
-            }
-        ]
-
-        volume_mounts = [
-            {
-                "name": "data",
-                "mountPath": personal_mount_path
-            }
-        ]
-
-        # Process requested volumes (same handling as _build_pod_spec, including
-        # the existing hardcoded "data" name guard — see the TODO there).
-        for vol_name, mount_path in requested_volumes.items():
-            if vol_name in available_volumes:
-                if vol_name == "data":
-                    continue
-
-                vol_def = available_volumes[vol_name]
-                sub_path = vol_def.get("subPath")
-
-                clean_vol_def = vol_def.copy()
-                if "subPath" in clean_vol_def:
-                    del clean_vol_def["subPath"]
-
-                pod_volumes.append(clean_vol_def)
-
-                mount_def = {
-                    "name": vol_name,
-                    "mountPath": mount_path
-                }
-                if sub_path:
-                    mount_def["subPath"] = sub_path
-
-                volume_mounts.append(mount_def)
-
-        pod_body = {
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": session_name,
-                "labels": {
-                    "app": "whistler-desktop",
-                    "session": session_name,
-                    "user": username
-                },
-                "ownerReferences": [self._desktop_owner_reference(session_name, uid)]
-            },
-            "spec": {
-                "containers": [
-                    {
-                        "name": "main",
-                        "image": image,
-                        "resources": resource_reqs,
-                        "ports": [{"containerPort": display_port, "name": "display"}],
-                        "volumeMounts": volume_mounts
-                    }
-                ],
-                "volumes": pod_volumes,
-                "nodeSelector": node_selector,
-                "hostname": hostname,
-                "subdomain": "whistler",
-                "automountServiceAccountToken": False
-            }
-        }
-
-        # user_details comes from get_user(); for users absent from users.yaml
-        # it is just {"name": username} (no securityContext) — same as SSH pods.
-        if user_details and "securityContext" in user_details:
-            pod_body["spec"]["securityContext"] = user_details["securityContext"]
-
-        # Some desktop images (e.g. gnome-grd) mount a FUSE filesystem at runtime
-        # — grd's RDP clipboard does, and its daemon aborts without /dev/fuse.
-        # Grant the device when the template asks for it.
-        #
-        # Today this runs the container privileged, which works on any cluster
-        # (incl. docker-desktop/k3d) with no prerequisites. The least-privilege
-        # alternative is a FUSE device plugin advertising a github.com/fuse
-        # resource (see design/vdi.md); switching to it means requesting that
-        # resource here instead of setting privileged — a change localized to
-        # this block.
-        if template_spec.get('fuse') or template_spec.get('privileged'):
-            container = pod_body["spec"]["containers"][0]
-            sec_ctx = container.setdefault("securityContext", {})
-            sec_ctx["privileged"] = True
-
-        if template_spec.get('runtimeClassName'):
-            pod_body["spec"]["runtimeClassName"] = template_spec["runtimeClassName"]
-
-        if preemptible:
-            pod_body["spec"]["priorityClassName"] = "whistler-preemptible"
-
-        return pod_body
 
     def _build_vm_spec(self, *, session_name, hostname, username, uid,
                        template_spec, pvc_name, display_port, instancetype,
@@ -1114,7 +996,7 @@ class KubeConfigManager(ConfigManager):
             "metadata": {
                 "name": session_name,
                 "labels": labels,
-                "ownerReferences": [self._desktop_owner_reference(session_name, uid)],
+                "ownerReferences": [self._session_owner_reference(session_name, uid)],
             },
             "spec": vm_spec,
         }
@@ -1133,7 +1015,7 @@ class KubeConfigManager(ConfigManager):
                     "session": session_name,
                     "user": username,
                 },
-                "ownerReferences": [self._desktop_owner_reference(session_name, uid)],
+                "ownerReferences": [self._session_owner_reference(session_name, uid)],
             },
             "spec": {
                 "type": "ClusterIP",
@@ -1164,13 +1046,13 @@ class KubeConfigManager(ConfigManager):
             logger.error(f"Failed to create service {session_name}: {e}")
             return False
 
-    def _resolve_desktop_template(self, user_ns: str, template_ref: str) -> Optional[Dict[str, Any]]:
-        """Resolve a DesktopTemplate from the user namespace, falling back to the
-        system namespace (mirrors ensure_pod's template lookup)."""
+    def _resolve_template(self, user_ns: str, template_ref: str) -> Optional[Dict[str, Any]]:
+        """Resolve a Template from the user namespace, falling back to the system
+        namespace. Shared by every session backend (ssh + desktop)."""
         custom_api = client.CustomObjectsApi()
         try:
             return custom_api.get_namespaced_custom_object(
-                self.group, self.version, user_ns, "desktoptemplates", template_ref
+                self.group, self.version, user_ns, TEMPLATE_PLURAL, template_ref
             )
         except ApiException as e:
             if e.status != 404:
@@ -1179,106 +1061,133 @@ class KubeConfigManager(ConfigManager):
         if system_ns != user_ns:
             try:
                 return custom_api.get_namespaced_custom_object(
-                    self.group, self.version, system_ns, "desktoptemplates", template_ref
+                    self.group, self.version, system_ns, TEMPLATE_PLURAL, template_ref
                 )
             except ApiException:
                 pass
         return None
 
-    def ensure_desktop(self, username: str, session_name: str) -> bool:
-        """Ensure the pod-or-VM (and the per-session Service) for a DesktopSession
-        exists. Dispatches on the template's ``backend``. Returns True on success
-        or if the resource already exists, False otherwise."""
+    def ensure_session(self, username: str, session_name: str) -> Dict[str, Any]:
+        """Ensure the pod-or-VM (and, for desktop, the per-session Service) for a
+        Session exists. Resolves the referenced Template, applies operator policy
+        (image allow-list + privileged->kata coercion), then dispatches on the
+        effective runtime.
+
+        Returns a dict ``{ok, mode, runtime, displayPort}`` the operator writes
+        into Session status. Raises ``PolicyError`` for a hard, non-retryable
+        policy violation; returns ``ok=False`` for transient failures (template
+        not yet present, pod terminating) so the operator retries."""
         user_ns = self._ensure_user_namespace(username)
-        full_session_name = f"{username}-{session_name}"
+        full_name = f"{username}-{session_name}"
+        result = {"ok": False, "mode": None, "runtime": None, "displayPort": None}
 
         try:
             cr = self.api.get_namespaced_custom_object(
-                self.group, self.version, user_ns, "desktopsessions", full_session_name
+                self.group, self.version, user_ns, SESSION_PLURAL, full_name
             )
         except ApiException as e:
-            logger.error(f"DesktopSession {full_session_name} not found: {e}")
-            return False
+            logger.error(f"Session {full_name} not found: {e}")
+            return result
 
         spec = cr.get('spec', {})
         uid = cr['metadata']['uid']
         template_ref = spec.get('templateRef')
 
-        template = self._resolve_desktop_template(user_ns, template_ref)
+        template = self._resolve_template(user_ns, template_ref)
         if not template:
-            logger.error(f"DesktopTemplate {template_ref} not found")
-            return False
+            logger.error(f"Template {template_ref} not found")
+            return result
 
         template_spec = template.get('spec', {})
-        backend = template_spec.get('backend', 'pod')
+        mode = template_spec.get('mode', 'ssh')
+        runtime = template_spec.get('runtime', 'container')
         display_port = template_spec.get('displayPort', 3389)
         persistence = template_spec.get('persistence', 'ephemeral')
-        preemptible = persistence == 'preemptible'
+        # SSH ephemeral sessions carry preemptible on the Session spec; desktop
+        # templates express it via persistence. Honor either.
+        preemptible = bool(spec.get('preemptible')) or persistence == 'preemptible'
+
+        # Authoritative policy (may raise PolicyError, may coerce runtime->kata).
+        effective_runtime = self._apply_policy(template_spec, mode, runtime)
+        result["mode"] = mode
+        result["runtime"] = effective_runtime
+        if mode == 'desktop':
+            result["displayPort"] = display_port
 
         try:
             pvc_name = self._ensure_pvc(username, user_ns, logger)
         except Exception:
-            return False
+            return result
 
-        if backend == 'vm':
-            ok = self._create_desktop_vm(
-                user_ns, full_session_name, session_name, username, uid,
+        if effective_runtime == 'vm':
+            ok = self._create_vm(
+                user_ns, full_name, session_name, username, uid,
                 template_spec, pvc_name, display_port,
                 template_spec.get('instancetype'), preemptible,
             )
         else:
-            ok = self._create_desktop_pod(
-                user_ns, full_session_name, session_name, username, uid,
-                template_spec, pvc_name, display_port, preemptible,
+            ok = self._create_pod(
+                user_ns, full_name, session_name, username, uid, mode,
+                effective_runtime, template_spec, pvc_name, display_port,
+                preemptible,
             )
 
         if not ok:
-            return False
+            return result
 
-        return self._ensure_session_service(
-            session_name=full_session_name, username=username, uid=uid,
-            namespace=user_ns, display_port=display_port,
-        )
+        # Desktop sessions are reached through a per-session Service (guacd dials
+        # it); SSH sessions are bridged via `kubectl exec` and need no Service.
+        if mode == 'desktop':
+            if not self._ensure_session_service(
+                session_name=full_name, username=username, uid=uid,
+                namespace=user_ns, display_port=display_port,
+            ):
+                return result
 
-    def _create_desktop_pod(self, user_ns, full_session_name, session_name,
-                            username, uid, template_spec, pvc_name,
-                            display_port, preemptible) -> bool:
-        pod_body = self._build_desktop_pod_spec(
-            session_name=full_session_name,
+        result["ok"] = True
+        return result
+
+    def _create_pod(self, user_ns, full_name, session_name, username, uid, mode,
+                    runtime, template_spec, pvc_name, display_port,
+                    preemptible) -> bool:
+        pod_body = self._build_pod_spec(
+            full_name=full_name,
             hostname=session_name,
             username=username,
             uid=uid,
+            mode=mode,
+            runtime=runtime,
             template_spec=template_spec,
             pvc_name=pvc_name,
             available_volumes=self._load_volume_definitions_from_file(),
             user_details=self.get_user(username),
-            display_port=display_port,
             preemptible=preemptible,
+            display_port=display_port if mode == 'desktop' else None,
         )
-        logger.debug(f"Creating desktop Pod:\n{yaml.safe_dump(pod_body)}")
+        logger.debug(f"Creating Pod:\n{yaml.safe_dump(pod_body)}")
         core_api = client.CoreV1Api()
         try:
             core_api.create_namespaced_pod(user_ns, pod_body)
-            logger.info(f"Desktop pod {full_session_name} created")
+            logger.info(f"Pod {full_name} created")
             return True
         except ApiException as e:
             if e.status == 409:
                 try:
-                    existing = core_api.read_namespaced_pod(full_session_name, user_ns)
+                    existing = core_api.read_namespaced_pod(full_name, user_ns)
                     if existing.metadata.deletion_timestamp:
-                        logger.info(f"Desktop pod {full_session_name} is terminating.")
+                        logger.info(f"Pod {full_name} is terminating.")
                         return False
                 except ApiException:
                     pass
                 return True  # Already exists
-            logger.error(f"Failed to create desktop pod: {e}")
+            logger.error(f"Failed to create pod: {e}")
             return False
 
-    def _create_desktop_vm(self, user_ns, full_session_name, session_name,
-                           username, uid, template_spec, pvc_name, display_port,
-                           instancetype, preemptible) -> bool:
+    def _create_vm(self, user_ns, full_name, session_name, username, uid,
+                   template_spec, pvc_name, display_port, instancetype,
+                   preemptible) -> bool:
         vm_body = self._build_vm_spec(
-            session_name=full_session_name,
+            session_name=full_name,
             hostname=session_name,
             username=username,
             uid=uid,
@@ -1293,13 +1202,13 @@ class KubeConfigManager(ConfigManager):
             self.api.create_namespaced_custom_object(
                 KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns, KUBEVIRT_VM_PLURAL, vm_body
             )
-            logger.info(f"VirtualMachine {full_session_name} created")
+            logger.info(f"VirtualMachine {full_name} created")
             return True
         except ApiException as e:
             if e.status == 409:
                 return True  # Already exists
             # 404 here means the KubeVirt CRDs are not installed in this cluster.
-            logger.error(f"Failed to create VirtualMachine {full_session_name} "
+            logger.error(f"Failed to create VirtualMachine {full_name} "
                          f"(is KubeVirt installed?): {e}")
             return False
 
@@ -1313,10 +1222,12 @@ class KubeConfigManager(ConfigManager):
         for ns in namespaces_to_search:
             try:
                 resp = self.api.list_namespaced_custom_object(
-                    self.group, self.version, ns, "desktoptemplates"
+                    self.group, self.version, ns, TEMPLATE_PLURAL
                 )
                 for item in resp.get("items", []):
                     t = item.get("spec", {})
+                    if t.get("mode") != "desktop":
+                        continue
                     full_name = item["metadata"]["name"]
                     owner = t.get("user", "system")
                     if owner == "system":
@@ -1344,7 +1255,8 @@ class KubeConfigManager(ConfigManager):
         user_ns = self._get_user_namespace(username)
         try:
             resp = self.api.list_namespaced_custom_object(
-                self.group, self.version, user_ns, "desktopsessions"
+                self.group, self.version, user_ns, SESSION_PLURAL,
+                label_selector="whistler.martinmalmsten.net/mode=desktop",
             )
             for item in resp.get("items", []):
                 spec = item.get("spec", {})
@@ -1359,7 +1271,10 @@ class KubeConfigManager(ConfigManager):
                     "template": spec.get("templateRef"),
                     "namespace": user_ns,
                     "phase": status.get("phase", "Unknown"),
-                    "backend": status.get("backend"),
+                    # The unified runtime (container/kata/vm) replaces the old
+                    # backend; keep the "backend" key as an alias for templates.
+                    "runtime": status.get("runtime"),
+                    "backend": status.get("runtime"),
                     "podName": status.get("podName"),
                     "vmiName": status.get("vmiName"),
                     "address": status.get("address"),
@@ -1374,10 +1289,11 @@ class KubeConfigManager(ConfigManager):
         user_ns = self._ensure_user_namespace(username)
         body = {
             "apiVersion": f"{self.group}/{self.version}",
-            "kind": "DesktopSession",
+            "kind": "Session",
             "metadata": {
                 "name": f"{username}-{session_name}",
-                "namespace": user_ns
+                "namespace": user_ns,
+                "labels": {"whistler.martinmalmsten.net/mode": "desktop"},
             },
             "spec": {
                 "templateRef": template_name,
@@ -1386,7 +1302,7 @@ class KubeConfigManager(ConfigManager):
         }
         try:
             self.api.create_namespaced_custom_object(
-                self.group, self.version, user_ns, "desktopsessions", body
+                self.group, self.version, user_ns, SESSION_PLURAL, body
             )
             return True
         except ApiException as e:
@@ -1398,7 +1314,7 @@ class KubeConfigManager(ConfigManager):
         user_ns = self._get_user_namespace(username)
         try:
             self.api.delete_namespaced_custom_object(
-                self.group, self.version, user_ns, "desktopsessions", f"{username}-{session_name}"
+                self.group, self.version, user_ns, SESSION_PLURAL, f"{username}-{session_name}"
             )
             return True
         except ApiException as e:
@@ -1519,11 +1435,11 @@ class KubeConfigManager(ConfigManager):
             return False
 
     def get_all_templates(self) -> List[Dict[str, Any]]:
-        """List all WhistlerTemplates across the system namespace."""
+        """List all Templates (ssh + desktop) across the system namespace."""
         templates = []
         try:
             resp = self.api.list_namespaced_custom_object(
-                self.group, self.version, self.namespace, "whistlertemplates"
+                self.group, self.version, self.namespace, TEMPLATE_PLURAL
             )
             for item in resp.get("items", []):
                 t = dict(item.get("spec", {}))
@@ -1539,7 +1455,7 @@ class KubeConfigManager(ConfigManager):
         return templates
 
     def get_all_instances(self) -> List[Dict[str, Any]]:
-        """List all WhistlerInstances across all user namespaces."""
+        """List all ssh Sessions across all user namespaces."""
         instances = []
         core_api = client.CoreV1Api()
         try:
@@ -1552,7 +1468,8 @@ class KubeConfigManager(ConfigManager):
             username = ns.removeprefix("whistler-user-")
             try:
                 resp = self.api.list_namespaced_custom_object(
-                    self.group, self.version, ns, "whistlerinstances"
+                    self.group, self.version, ns, SESSION_PLURAL,
+                    label_selector="whistler.martinmalmsten.net/mode=ssh",
                 )
                 try:
                     pods = core_api.list_namespaced_pod(ns, label_selector=f"user={username}")
@@ -1591,34 +1508,48 @@ class KubeConfigManager(ConfigManager):
         name = template_data.get("name")
         if not name:
             return False
-        body = {
-            "apiVersion": f"{self.group}/{self.version}",
-            "kind": "WhistlerTemplate",
-            "metadata": {"name": name, "namespace": self.namespace},
-            "spec": {
-                "user": "system",
-                "displayName": template_data.get("displayName") or name,
-                "image": template_data.get("image"),
-                "description": template_data.get("description"),
-                "resources": template_data.get("resources") or {},
-                "nodeSelector": template_data.get("nodeSelector") or {},
-                "personalMountPath": template_data.get("personalMountPath", "/userdata"),
-                "volumes": template_data.get("volumes") or {},
-            },
-        }
+        # Build the spec only from the fields the caller actually provided, so an
+        # update merges over the existing spec rather than clobbering fields the
+        # admin form doesn't carry (e.g. a desktop template's connectionParams /
+        # rdpSecurity / nodeSelector / volumes).
+        spec = {"user": "system"}
+        for key in ("mode", "runtime", "displayName", "image", "description",
+                    "resources", "nodeSelector", "personalMountPath", "volumes",
+                    "displayPort", "protocol", "connectionParams", "rdpSecurity",
+                    "privileged", "fuse", "instancetype", "persistence"):
+            if template_data.get(key) is not None:
+                spec[key] = template_data[key]
         try:
             try:
                 existing = self.api.get_namespaced_custom_object(
-                    self.group, self.version, self.namespace, "whistlertemplates", name
+                    self.group, self.version, self.namespace, TEMPLATE_PLURAL, name
                 )
-                body["metadata"]["resourceVersion"] = existing["metadata"]["resourceVersion"]
+                merged = {**(existing.get("spec") or {}), **spec}
+                body = {
+                    "apiVersion": f"{self.group}/{self.version}",
+                    "kind": "Template",
+                    "metadata": {"name": name, "namespace": self.namespace,
+                                 "resourceVersion": existing["metadata"]["resourceVersion"]},
+                    "spec": merged,
+                }
                 self.api.replace_namespaced_custom_object(
-                    self.group, self.version, self.namespace, "whistlertemplates", name, body
+                    self.group, self.version, self.namespace, TEMPLATE_PLURAL, name, body
                 )
             except ApiException as e:
                 if e.status == 404:
+                    # Create: apply sensible defaults for fields the form omitted.
+                    spec.setdefault("mode", "ssh")
+                    spec.setdefault("runtime", "container")
+                    spec.setdefault("displayName", name)
+                    spec.setdefault("personalMountPath", "/userdata")
+                    body = {
+                        "apiVersion": f"{self.group}/{self.version}",
+                        "kind": "Template",
+                        "metadata": {"name": name, "namespace": self.namespace},
+                        "spec": spec,
+                    }
                     self.api.create_namespaced_custom_object(
-                        self.group, self.version, self.namespace, "whistlertemplates", body
+                        self.group, self.version, self.namespace, TEMPLATE_PLURAL, body
                     )
                 else:
                     raise
@@ -1630,7 +1561,7 @@ class KubeConfigManager(ConfigManager):
     def delete_system_template(self, template_name: str) -> bool:
         try:
             self.api.delete_namespaced_custom_object(
-                self.group, self.version, self.namespace, "whistlertemplates", template_name
+                self.group, self.version, self.namespace, TEMPLATE_PLURAL, template_name
             )
             return True
         except ApiException as e:
@@ -1667,7 +1598,7 @@ class KubeConfigManager(ConfigManager):
             return False
 
     def stop_instance(self, username: str, instance_name: str) -> bool:
-        """Delete the running pod but leave the WhistlerInstance CR in place."""
+        """Delete the running pod but leave the Session CR in place."""
         user_ns = self._get_user_namespace(username)
         full_name = f"{username}-{instance_name}"
         core_api = client.CoreV1Api()
@@ -1695,7 +1626,7 @@ class KubeConfigManager(ConfigManager):
         }
         try:
             self.api.patch_namespaced_custom_object(
-                self.group, self.version, user_ns, "whistlerinstances", full_name, patch
+                self.group, self.version, user_ns, SESSION_PLURAL, full_name, patch
             )
             logger.info(f"Triggered reconcile for {full_name}")
             return True

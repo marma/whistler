@@ -36,9 +36,9 @@ def test_kind_apiversion_and_running():
     assert vm["spec"]["running"] is True
 
 
-def test_owner_reference_to_desktop_session():
+def test_owner_reference_to_session():
     owner = _build()["metadata"]["ownerReferences"][0]
-    assert owner["kind"] == "DesktopSession"
+    assert owner["kind"] == "Session"
     assert owner["apiVersion"] == "whistler.martinmalmsten.net/v1"
     assert owner["uid"] == "uid-123"
     assert owner["controller"] is True

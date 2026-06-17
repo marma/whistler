@@ -1,4 +1,4 @@
-"""Desktop pod manifest construction (KubeConfigManager._build_desktop_pod_spec)."""
+"""Desktop pod manifest construction (KubeConfigManager._build_pod_spec, mode=desktop)."""
 from whistler.config import KubeConfigManager
 
 
@@ -6,16 +6,19 @@ def _manager():
     cm = KubeConfigManager.__new__(KubeConfigManager)  # skip __init__ (no cluster)
     cm.group = "whistler.martinmalmsten.net"
     cm.version = "v1"
+    cm.kata_runtime_class = "kata"
     return cm
 
 
 def _build(**overrides):
     cm = _manager()
     args = dict(
-        session_name="alice-desk",
+        full_name="alice-desk",
         hostname="desk",
         username="alice",
         uid="uid-123",
+        mode="desktop",
+        runtime="container",
         template_spec={"image": "vnc:latest"},
         pvc_name="whistler-data-alice",
         available_volumes={},
@@ -24,21 +27,31 @@ def _build(**overrides):
         preemptible=False,
     )
     args.update(overrides)
-    return cm._build_desktop_pod_spec(**args)
+    return cm._build_pod_spec(**args)
 
 
 def test_metadata_labels_and_owner_reference():
     pod = _build()
     meta = pod["metadata"]
     assert meta["name"] == "alice-desk"
-    assert meta["labels"] == {"app": "whistler-desktop", "session": "alice-desk", "user": "alice"}
+    assert meta["labels"]["app"] == "whistler-desktop"
+    assert meta["labels"]["session"] == "alice-desk"
+    assert meta["labels"]["instance"] == "alice-desk"
+    assert meta["labels"]["user"] == "alice"
 
     owner = meta["ownerReferences"][0]
-    assert owner["kind"] == "DesktopSession"
+    assert owner["kind"] == "Session"
     assert owner["name"] == "alice-desk"
     assert owner["uid"] == "uid-123"
     assert owner["controller"] is True
     assert owner["apiVersion"] == "whistler.martinmalmsten.net/v1"
+
+
+def test_kata_runtime_sets_runtime_class():
+    pod = _build(runtime="kata")
+    assert pod["spec"]["runtimeClassName"] == "kata"
+    pod = _build(runtime="container")
+    assert "runtimeClassName" not in pod["spec"]
 
 
 def test_display_port_wired_as_named_container_port():

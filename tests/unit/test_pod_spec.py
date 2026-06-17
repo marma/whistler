@@ -12,10 +12,12 @@ def _manager():
 def _build(**overrides):
     cm = _manager()
     args = dict(
-        full_instance_name="alice-box",
+        full_name="alice-box",
         hostname="box",
         username="alice",
         uid="uid-123",
+        mode="ssh",
+        runtime="container",
         template_spec={"image": "ubuntu:22.04"},
         pvc_name="whistler-data-alice",
         available_volumes={},
@@ -30,13 +32,36 @@ def test_basic_metadata_and_owner_reference():
     pod = _build()
     meta = pod["metadata"]
     assert meta["name"] == "alice-box"
-    assert meta["labels"] == {"app": "whistler-instance", "instance": "alice-box", "user": "alice"}
+    # ssh pods carry app=whistler-instance, and BOTH instance + session labels
+    # (the dual-label scheme keeps the SSH watch and desktop Service selecting).
+    assert meta["labels"]["app"] == "whistler-instance"
+    assert meta["labels"]["instance"] == "alice-box"
+    assert meta["labels"]["session"] == "alice-box"
+    assert meta["labels"]["user"] == "alice"
 
     owner = meta["ownerReferences"][0]
+    assert owner["kind"] == "Session"
     assert owner["name"] == "alice-box"
     assert owner["uid"] == "uid-123"
     assert owner["controller"] is True
     assert owner["apiVersion"] == "whistler.martinmalmsten.net/v1"
+
+
+def test_ssh_pod_has_no_display_port_and_kata_sets_runtime_class():
+    pod = _build()
+    assert "ports" not in pod["spec"]["containers"][0]
+    assert "runtimeClassName" not in pod["spec"]
+
+    cm = _manager()
+    cm.kata_runtime_class = "kata"
+    kata = cm._build_pod_spec(
+        full_name="alice-box", hostname="box", username="alice", uid="u",
+        mode="ssh", runtime="kata", template_spec={"image": "ubuntu:22.04"},
+        pvc_name="pvc", available_volumes={}, user_details=None, preemptible=False,
+    )
+    assert kata["spec"]["runtimeClassName"] == "kata"
+    # ssh kata may still run privileged (mode-agnostic securityContext).
+    assert kata["spec"]["containers"][0]["command"] == ["sleep", "3600"]
 
 
 def test_container_image_and_default_command():

@@ -1,9 +1,9 @@
 """C1 round-trip integration test.
 
 Exercises the full path the Step 1-3 refactor changed:
-  auth -> server creates the WhistlerInstance CR -> operator reconcile creates
-  the pod -> server's pod watch sees it reach Running -> session is bridged into
-  the pod via `kubectl exec`.
+  auth -> server creates the Session CR (mode: ssh) -> operator reconcile
+  creates the pod -> server's pod watch sees it reach Running -> session is
+  bridged into the pod via `kubectl exec`.
 
 Requires a running cluster, a running whistler server + operator, and a key the
 test user is authorised with. The Makefile `integration` target wires this up
