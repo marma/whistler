@@ -69,8 +69,36 @@ pactl set-default-source virtual_speaker.monitor 2>/dev/null || \
   echo "[entrypoint] warning: could not set default pulse source (audio track may not connect)"
 
 # Headless X server (software framebuffer) that Selkies' ximagesrc captures.
-Xvfb "${DISPLAY}" -screen 0 "${RES}x24" -ac +extension RANDR &
+# Started at Selkies' own dynamic-resize ceiling (see resize.py's `max_res` for
+# non-DVI screens), not at RES: Xvfb bakes both its *current* and *maximum*
+# RandR size in from this `-screen` argument at startup and can never grow past
+# it afterwards, so starting at RES alone would permanently cap any later
+# resize (e.g. the browser's "resize remote" toggle) to RES, failing every
+# larger request with "X Error ... BadMatch ... RRAddOutputMode". Start big,
+# then shrink to the actual default via Selkies' own resize_display() (needs
+# `cvt`, see Dockerfile) so the initial visible size still matches RES.
+XVFB_MAX_RES="7680x4320"
+Xvfb "${DISPLAY}" -screen 0 "${XVFB_MAX_RES}x24" -ac +extension RANDR &
 for i in $(seq 1 30); do xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1 && break; sleep 0.2; done
+# Shrink from XVFB_MAX_RES down to the actual default (RES) in the background:
+# a just-started Xvfb reliably rejects --newmode/--addmode for ~15-20s (Xvfb's
+# RandR provider taking time to settle — unrelated to XFCE, which starts after
+# this point anyway) before working exactly like it does once the container has
+# been up a while, so retrying inline here would stall Selkies' own startup
+# (and the whole connect flow) by that same 15-20s for a cosmetic nicety.
+# Runs detached; worst case, the desktop stays at XVFB_MAX_RES until it lands.
+( python3 -c "
+import os, sys, time
+import selkies_gstreamer
+sys.path.insert(0, os.path.dirname(selkies_gstreamer.__file__))
+from resize import resize_display
+for attempt in range(60):
+    if resize_display('${RES}'):
+        break
+    time.sleep(1)
+else:
+    print('[entrypoint] warning: could not set initial resolution to ${RES} (staying at ${XVFB_MAX_RES})', file=sys.stderr)
+" & )
 
 # XFCE on that display, as the desktop user.
 su - "${USER_NAME}" -c "env DISPLAY=${DISPLAY} dbus-launch --exit-with-session startxfce4" &

@@ -44,6 +44,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       pulseaudio-utils \
       xvfb \
       x11-xserver-utils \
+      # Selkies' dynamic-resize path shells out to `cvt` to generate an xrandr
+      # modeline for the browser's requested resolution; without it `cvt` isn't
+      # found, the modeline comes back empty, and every resize silently fails
+      # ("xrandr: failed to parse '<res> ' as a mode specification" — note the
+      # trailing space from the empty modeline). xcvt is the small standalone
+      # package providing it (not the full xserver-xorg-core, which drags in
+      # systemd/udev).
+      xcvt \
       # Selkies shells out to `xsel` for clipboard sync between the browser and
       # the X session; without it Selkies logs FileNotFoundError: 'xsel' and
       # clipboard support is silently disabled.
@@ -98,6 +106,17 @@ RUN curl -fsSL -o /tmp/web.tar.gz \
  # Nested like the GStreamer tarball — strip so the web root is /opt/gst-web.
  && tar -xzf /tmp/web.tar.gz -C /opt/gst-web --strip-components=1 \
  && rm /tmp/web.tar.gz
+
+# Local patches on top of the vendored client bundle above (app.js + index.html):
+# adds a "Pixel-doubled (half resolution)" toggle next to Selkies' own resize
+# switch — requests half the physical resolution from the server (normal-sized
+# UI, no HiDPI upscale of the desktop) and stretches that smaller stream to
+# fill the window with nearest-neighbor scaling (crisp 2x2 blocks) instead of
+# native full-resolution rendering. Vendored as full files rather than a diff/
+# sed patch since a SELKIES_VERSION bump can freely change surrounding text —
+# re-derive gst-web-overrides/ by hand against the new bundle when that happens
+# (same version-lock caveat as the client JS itself, see README).
+COPY gst-web-overrides/app.js gst-web-overrides/index.html /opt/gst-web/
 
 # Well-known desktop user (no login prompt — Selkies captures this X session).
 ARG DESKTOP_USER=abc
