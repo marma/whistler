@@ -159,6 +159,8 @@ def reconcile_session_fn(spec, name, namespace, meta, patch, logger, **kwargs):
         patch.status['runtime'] = result['runtime']
     if result.get('displayPort') is not None:
         patch.status['displayPort'] = result['displayPort']
+    if result.get('viewer'):
+        patch.status['viewer'] = result['viewer']
 
     if result['ok']:
         patch.status['phase'] = 'Provisioning'

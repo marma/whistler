@@ -1,9 +1,15 @@
 # Desktop images
 
 Container images that provide a graphical desktop reachable by the Whistler
-portal (browser → portal → guacd → this image). Each subdirectory is one catalog
-entry; a `DesktopTemplate` references the built image and tells guacd how to
-reach it (`protocol`, `displayPort`, `connectionParams`).
+portal. Each subdirectory is one catalog entry; a `DesktopTemplate` references the
+built image and selects a **viewer**:
+
+- `viewer: guacd` (default) — browser → portal → guacd → image over RDP/VNC.
+  guacd re-rasterizes frames to a canvas. Template gives `protocol`,
+  `displayPort`, `connectionParams`.
+- `viewer: webrtc` — browser ⇄ coturn ⇄ image (Selkies); the portal relays only
+  signaling and H.264 reaches the browser's decoder. Template gives `signalPort`;
+  requires `coturn.enabled`. See `design/vdi.md` → Round 3.
 
 Over time this grows into a catalog for different use-cases (minimal vs full DE,
 CPU vs GPU, different toolchains). Add a new image either by copying an existing
@@ -15,6 +21,7 @@ subdirectory, or — for an RDP desktop — by building `FROM` [`base-rdp`](base
 |-------|----------|------|-------|-------|
 | [`base-rdp`](base-rdp/) | rdp | 3389 | `abc` / `abc` | **Base layer**, not a catalog entry. xrdp/xorgxrdp plumbing on Ubuntu 26.04, no DE. Build X11 desktop images `FROM` it. Multi-arch (amd64 + arm64). |
 | [`xfce-rdp`](xfce-rdp/) | rdp | 3389 | `abc` / `abc` | XFCE over xrdp (Ubuntu 22.04). Multi-arch (amd64 + arm64). |
+| [`xfce-webrtc`](xfce-webrtc/) | **webrtc** | 8082 | none | XFCE over **WebRTC** (Selkies, software x264, **amd64-only**). The `viewer: webrtc` path — H.264 reaches the browser's decoder, not re-rasterized. Needs `coturn.enabled`. Media e2e verified manually. |
 | [`gnome-grd`](gnome-grd/) | rdp | 3389 | `abc` / `abc` | GNOME over **gnome-remote-desktop** (Wayland-native, headless gnome-shell). Does *not* use xrdp/base-rdp. Ubuntu 26.04. RDP handshake verified; full guacd pixel path not yet. |
 
 ### Building an RDP desktop on `base-rdp`

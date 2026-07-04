@@ -1,9 +1,13 @@
 # VDI: desktop-pod and KubeVirt-VM backends
 
-Status: **rounds 1 and 2 implemented.** Round 1 = provisioning (desktop pods + KubeVirt
-VMs). Round 2 = the display path (RDP desktop + shared guacd + a Python WebSocket portal) —
-see [Round 2: the display path](#round-2-the-display-path) below. The KubeVirt VM path remains
-**unverified end-to-end** (no KubeVirt in any cluster we can test against yet).
+Status: **rounds 1–3 implemented** (round 3 partially — see below). Round 1 = provisioning
+(desktop pods + KubeVirt VMs). Round 2 = the **guacd** display path (RDP desktop + shared
+guacd + a Python WebSocket portal) — see [Round 2: the display path](#round-2-the-display-path).
+Round 3 = a parallel **WebRTC** display path (Selkies + coturn) for hardware-class H.264 to
+the browser — see [Round 3: the WebRTC display path](#round-3-the-webrtc-display-path). The
+KubeVirt VM path remains **unverified end-to-end** (no KubeVirt in any cluster we can test
+against yet); the WebRTC media path is likewise **verified only manually** (a headed browser +
+real TURN can't run in k3d/CI).
 
 ## Why
 
@@ -408,3 +412,108 @@ cleanly restore it, so the old outline lingers. A native client implements save/
 which is why it's crisp — and is the high-fidelity fallback if a session needs pixel-perfect drag.
 Residual banding/edge fuzz some viewers still report after the fidelity fixes above is most likely
 the same relay-leg ceiling.
+
+## Round 3: the WebRTC display path
+
+**Why a second path.** Round 2's guacd leg has a hard ceiling: guacd decodes the remote and
+**re-rasterizes every frame to PNG/JPEG tiles on a canvas** — so any hardware H.264/H.265 on
+the wire is thrown away (this is also why RustDesk can't help: guacd can't speak its protocol,
+and even if it could the codec would die at guacd). To get a real codec into the browser's
+**decoder** you need **true WebRTC**, with the encoder running *inside the desktop pod* next to
+the framebuffer and the browser as a real WebRTC peer. Round 3 adds that as a parallel viewer;
+Round 2 stays the default, general-purpose path.
+
+We **adopt [Selkies-GStreamer](https://github.com/selkies-project/selkies-gstreamer)** (Apache-2.0)
+as the in-pod engine rather than build one. First image is **software x264** (no GPU); GPU/nvenc
+(H.265/AV1) is a later opt-in variant. Note Selkies' prebuilt GStreamer bundle is **amd64-only**
+(no arm64 asset at v1.6.2), so the image is pinned to `linux/amd64` and runs under emulation on
+arm64 — the originally-planned "multi-arch like the RDP images" doesn't hold for this component.
+
+This is also where Whistler's "run any container as a desktop" idea ends for the WebRTC path:
+real VDI needs **purpose-built images** (a display server + Selkies baked in).
+
+```
+browser (Whistler page + vendored Selkies client JS)
+  │  signaling WS  ─▶  portal /ws-signal/<id>  ──relay──▶  in-pod Selkies signaling (:signalPort)
+  │  ICE config    ◀─  portal /ice/<id>   (TURN url + time-limited HMAC creds)
+  └═══ media (DTLS/SRTP) ═══▶  coturn ═══▶  in-pod Selkies (GStreamer x264enc)
+```
+
+### Viewer selection
+
+A `viewer: guacd | webrtc` field on the desktop `Template` (default `guacd`) picks the backend;
+`viewer: guacd` keeps Round 2 byte-for-byte. For `viewer: webrtc` the template carries a
+`signalPort` (default 8082) instead of `protocol`/`connectionParams`. To reuse all of Round 1/2's
+plumbing, `ensure_session` makes the **signaling port the effective `displayPort`** for the
+webrtc viewer — the per-session Service exposes it and `status.displayPort` advertises it exactly
+as before; only the portal branches on `viewer` (`status.viewer` is denormalized for that). The
+operator writes `status.viewer`; the portal's `connect()` resolves the viewer from the **template**
+(always present, unlike status which lags reconcile) to pick the page.
+
+### coturn is mandatory (the real new infra)
+
+WebRTC media can't reach a pod's cluster-internal ICE candidates from a browser outside the
+cluster, so **both peers relay through one shared coturn** (`charts/whistler/templates/coturn-*`).
+It mirrors the shared-guacd pattern but with two differences that matter:
+
+- **It must be browser-reachable.** `coturn.externalHost` (node IP / LoadBalancer) is *required*
+  when enabled; the browser and the in-pod Selkies both use it, and coturn advertises it as its
+  relay (`--external-ip`) address.
+- **hostNetwork by default.** A wide UDP relay port range can't be mapped sanely through a
+  Service/NodePort, so coturn runs with `hostNetwork: true` and the relay ports live on the node
+  (the Selkies-recommended pragmatic path). The `k8s WebRTC hairpin` — the in-pod Selkies reaching
+  coturn's *external* address from inside the cluster — is the env-specific part that makes a
+  one-command dev e2e impossible; it's why coturn is **disabled by default** and not force-enabled
+  in skaffold.
+
+Auth uses coturn's **use-auth-secret** (TURN REST) scheme: one shared `static-auth-secret`
+(Helm-generated into `<release>-coturn`, stable across upgrades) is given to coturn, injected into
+the desktop pod (`SELKIES_TURN_SHARED_SECRET` via `config._selkies_turn_env`), and used by the
+portal to **mint a time-limited HMAC credential per browser** at `/ice` — no per-session secrets,
+no DB. NetworkPolicy carve-outs: the **portal** joins guacd as an allowed ingress source to desktop
+pods (`_build_ingress_rules`), and desktop pods gain egress to coturn (`_build_coturn_egress_rules`).
+
+### Portal
+
+`whistler/portal/webrtc.py` is the parallel of `guacd.py`: pure `mint_turn_credentials` /
+`ice_servers` (unit-tested against the coturn HMAC contract) plus an opaque WS↔WS `signal_relay`
+(Selkies signaling is self-delimited JSON, so — unlike the guacd relay — there is no
+instruction-boundary rule). Routes: `/ice/<id>` (ICE config) and `/ws-signal/<id>` (signaling
+relay, reusing `ws()`'s resolve/guard prelude). `connect()` serves the Selkies video page for
+webrtc, the Guacamole canvas page for guacd.
+
+### Version lock (the gotcha that will bite, by analogy)
+
+The in-pod Selkies **server** and the Selkies **client JS** the portal serves
+(`whistler/portal/static/selkies-core.js`) **must be the same Selkies version** — the exact
+analogue of Round 2's guacamole-common-js ↔ guacd match, and almost certainly the same failure
+mode (loads, renders nothing). Both pin `SELKIES_VERSION`; the client bundle is sourced from the
+same release that ships in the desktop image (`/opt/gst-web`). See
+[`desktops/xfce-webrtc/README.md`](../desktops/xfce-webrtc/).
+
+### What's implemented vs. pending
+
+- **Implemented + unit-tested:** the `viewer`/`signalPort` CRD + status plumbing, the pod TURN-env
+  injection, the ingress/egress carve-outs, coturn chart objects + shared-secret Secret, the
+  portal `webrtc.py` (creds/ICE/relay) + `/ice` + `/ws-signal` + the viewer branch, and the
+  `desktops/xfce-webrtc` image + `webrtc-desktop` template.
+- **Pending (manual / next):** vendoring the version-locked `selkies-core.js` + the thin
+  `startSelkies({videoElement, signalUrl, iceServers, …})` adapter the connect page calls (the
+  page reports "client bundle not installed yet" until then); and the full **media e2e** (headed
+  browser + reachable coturn), which can't run in k3d/CI. A Playwright-driven check is the intended
+  follow-up. Idle-teardown (Round 2's still-missing loop) matters even more here — a WebRTC encoder
+  per session is heavier than an idle RDP pod.
+
+### Verification
+
+- **Unit** (`tests/unit/`, no cluster): `test_turn_creds.py` (HMAC cred contract, ICE list,
+  signaling relay against a fake in-pod WS), `test_desktop_pod_spec.py` (Selkies TURN-env injected
+  only for the webrtc viewer + only when TURN is configured), `test_ingress_rules.py` (portal joins
+  the carve-out). All in `make test-local`.
+- **Manual e2e:** `helm upgrade ... --set coturn.enabled=true --set coturn.externalHost=<node-ip>`,
+  launch `webrtc-desktop`, open `/connect/<id>`: confirm `/ice` returns creds, signaling connects
+  through `/ws-signal`, and (once the client JS is vendored) x264 video renders via coturn. Record
+  gotchas here as they surface — this path will accrue its own ICE/codec gotchas the way Round 2
+  accrued rendering ones.
+- **Regression:** existing guacd templates are unaffected (`viewer` defaults to `guacd`); run
+  [`tests/integration/test_display.py`](../tests/integration/test_display.py).

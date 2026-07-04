@@ -1,0 +1,27 @@
+{{- if .Values.coturn.enabled }}
+{{- /*
+  ClusterIP so `<release>-coturn` resolves in-cluster (handy for diagnostics).
+  Browser + in-pod Selkies actually reach coturn at coturn.externalHost — with
+  hostNetwork the relay ports live on the node, not behind this Service.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-coturn
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: whistler-coturn
+spec:
+  type: ClusterIP
+  selector:
+    app: whistler-coturn
+  ports:
+    - name: turn-udp
+      port: {{ .Values.coturn.port }}
+      targetPort: {{ .Values.coturn.port }}
+      protocol: UDP
+    - name: turn-tcp
+      port: {{ .Values.coturn.port }}
+      targetPort: {{ .Values.coturn.port }}
+      protocol: TCP
+{{- end }}

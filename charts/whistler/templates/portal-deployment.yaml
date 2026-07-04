@@ -54,6 +54,21 @@ spec:
               value: {{ .Values.whistler.security.forceKataForPrivileged | quote }}
             - name: WHISTLER_KATA_RUNTIME_CLASS
               value: {{ .Values.whistler.security.kataRuntimeClass | quote }}
+            {{- if .Values.coturn.enabled }}
+            # webrtc viewer: the portal mints time-limited TURN creds for the
+            # browser (/ice) and advertises coturn's browser-reachable address.
+            - name: TURN_EXTERNAL_HOST
+              value: {{ .Values.coturn.externalHost | quote }}
+            - name: TURN_PORT
+              value: {{ .Values.coturn.port | quote }}
+            - name: TURN_PROTOCOL
+              value: {{ .Values.coturn.protocol | quote }}
+            - name: TURN_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-coturn
+                  key: static-auth-secret
+            {{- end }}
           ports:
             - containerPort: 8080
               name: http

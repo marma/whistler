@@ -48,6 +48,41 @@ guacd:
       cpu: "250m"
       memory: 512Mi
 
+# Shared TURN relay (coturn) — REQUIRED by the webrtc viewer (Selkies desktops).
+# WebRTC media can't reach a pod's cluster-internal ICE candidates, so the browser
+# and the in-pod Selkies server both relay through this one coturn. Disabled by
+# default; only the webrtc viewer needs it (the guacd/RDP path doesn't).
+coturn:
+  enabled: false
+  image: "coturn/coturn:4.6"
+  replicaCount: 1
+  realm: "whistler"
+  # Browser-reachable address of coturn (node IP / LoadBalancer / public host).
+  # REQUIRED when enabled — both the browser and the in-pod Selkies use it, and
+  # coturn advertises it as the relay (external-ip) address. Empty = host
+  # candidates only (works just for host-networked dev).
+  externalHost: ""
+  port: 3478
+  protocol: "udp"          # udp | tcp — transport the browser/Selkies use to coturn
+  # Shared static-auth-secret for the use-auth-secret (time-limited HMAC) scheme.
+  # Empty => the chart generates one and persists it in <release>-coturn (kept
+  # stable across upgrades).
+  staticAuthSecret: ""
+  # hostNetwork puts coturn's relay port range directly on the node — the
+  # pragmatic way to keep a wide UDP range externally reachable (Service/NodePort
+  # can't map it sanely). Set externalHost to the node's IP when this is true.
+  hostNetwork: true
+  relayPortRange:
+    min: 49160
+    max: 49200
+  resources:
+    limits:
+      cpu: "1000m"
+      memory: 512Mi
+    requests:
+      cpu: "100m"
+      memory: 128Mi
+
 # Web portal: launch + connect to desktop sessions from a browser.
 portal:
   enabled: true
@@ -163,6 +198,7 @@ whistler:
     desktop:
       - ghcr.io/marma/whistler-desktop-xfce-rdp:latest
       - ghcr.io/marma/whistler-desktop-gnome-grd:latest
+      - ghcr.io/marma/whistler-desktop-xfce-webrtc:latest
     vm: []
 
   # Security policy enforced by the operator.
@@ -235,6 +271,24 @@ templates:
       force-lossless: "true"
     resources:
       cpu: "1000m"
+      memory: 4Gi
+  webrtc-desktop:
+    description: "XFCE desktop over WebRTC (Selkies, software x264)"
+    mode: desktop
+    runtime: container
+    # Built from desktops/xfce-webrtc (amd64-only — Selkies' GStreamer build has no
+    # arm64 asset; no GPU). Requires coturn.enabled and coturn.externalHost set —
+    # WebRTC media can't reach a pod's ICE candidates directly. See design/vdi.md
+    # "Round 3".
+    image: "ghcr.io/marma/whistler-desktop-xfce-webrtc:latest"
+    viewer: webrtc
+    # In-pod Selkies signaling/web port the portal relays to (becomes the effective
+    # displayPort the per-session Service exposes). protocol/connectionParams are
+    # unused for the webrtc viewer.
+    signalPort: 8082
+    persistence: ephemeral
+    resources:
+      cpu: "2000m"
       memory: 4Gi
   gnome-grd:
     description: "GNOME desktop over RDP (gnome-remote-desktop)"

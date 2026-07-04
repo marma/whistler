@@ -1,0 +1,78 @@
+{{- if .Values.coturn.enabled }}
+{{- /*
+  Shared TURN relay for the webrtc viewer. WebRTC media can't flow directly to a
+  pod's cluster-internal ICE candidates, so both peers (browser + in-pod Selkies)
+  relay through this one coturn. hostNetwork is the pragmatic default: the relay
+  port range must be reachable from outside, and mapping a wide UDP range through
+  a Service/NodePort is impractical — on the host those ports are simply open.
+  Set coturn.externalHost to the node's browser-reachable IP/hostname.
+
+  turnserver is launched via `sh -c` so the static-auth-secret is taken from the
+  env (never rendered into the manifest/args) and coturn's limited $(VAR)
+  expansion is sidestepped.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-coturn
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: whistler-coturn
+spec:
+  replicas: {{ .Values.coturn.replicaCount }}
+  selector:
+    matchLabels:
+      app: whistler-coturn
+  template:
+    metadata:
+      labels:
+        app: whistler-coturn
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/coturn-secret.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      hostNetwork: {{ .Values.coturn.hostNetwork }}
+      {{- if .Values.coturn.hostNetwork }}
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      containers:
+        - name: coturn
+          image: {{ .Values.coturn.image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - >-
+              exec turnserver
+              -n --no-cli --no-tls --no-dtls
+              --realm={{ .Values.coturn.realm }}
+              --use-auth-secret --static-auth-secret="$STATIC_AUTH_SECRET"
+              --listening-port={{ .Values.coturn.port }}
+              --min-port={{ .Values.coturn.relayPortRange.min }}
+              --max-port={{ .Values.coturn.relayPortRange.max }}
+              {{- if .Values.coturn.externalHost }}
+              --external-ip="$EXTERNAL_IP"
+              {{- end }}
+              --log-file=stdout --simple-log
+          env:
+            - name: STATIC_AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-coturn
+                  key: static-auth-secret
+            {{- if .Values.coturn.externalHost }}
+            - name: EXTERNAL_IP
+              value: {{ .Values.coturn.externalHost | quote }}
+            {{- end }}
+          ports:
+            - containerPort: {{ .Values.coturn.port }}
+              protocol: UDP
+              name: turn-udp
+            - containerPort: {{ .Values.coturn.port }}
+              protocol: TCP
+              name: turn-tcp
+          {{- with .Values.coturn.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

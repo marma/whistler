@@ -77,10 +77,27 @@ spec:
                 displayPort:
                   type: integer
                   description: Desktop-only. Port the display server listens on (ignored for ssh).
+                viewer:
+                  type: string
+                  enum: ["guacd", "webrtc"]
+                  default: guacd
+                  description: >-
+                    Desktop-only. Display backend the portal uses. "guacd" relays
+                    the Guacamole protocol to the shared guacd, which dials the pod
+                    over RDP/VNC (see protocol/connectionParams). "webrtc" relays
+                    only signaling to an in-pod WebRTC server (Selkies) on signalPort
+                    while media flows browser<->coturn<->pod; protocol/connectionParams/
+                    rdpSecurity are ignored.
+                signalPort:
+                  type: integer
+                  default: 8082
+                  description: >-
+                    Desktop-only, webrtc viewer. Port the in-pod WebRTC signaling
+                    server listens on. Ignored when viewer is "guacd".
                 protocol:
                   type: string
                   enum: ["vnc", "rdp"]
-                  description: Desktop-only. Guacamole protocol used by the portal.
+                  description: Desktop-only, guacd viewer. Guacamole protocol used by the portal.
                 connectionParams:
                   type: object
                   additionalProperties:
@@ -157,6 +174,15 @@ spec:
                   type: string
                 displayPort:
                   type: integer
+                  description: >-
+                    Port the broker dials on the per-session Service. For the
+                    guacd viewer this is the RDP/VNC display port; for the webrtc
+                    viewer it is the in-pod Selkies signaling port.
+                viewer:
+                  type: string
+                  description: >-
+                    Denormalized from the template (guacd/webrtc) so the portal
+                    knows which page to render and which relay to open.
                 sshHost:
                   type: string
                 sshPort:

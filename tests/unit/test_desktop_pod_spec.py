@@ -140,3 +140,40 @@ def test_data_named_requested_volume_is_skipped():
     data_vols = [v for v in pod["spec"]["volumes"] if v["name"] == "data"]
     assert len(data_vols) == 1  # only the home PVC, the requested "data" was skipped
     assert data_vols[0]["persistentVolumeClaim"]["claimName"] == "whistler-data-alice"
+
+
+# ---- webrtc viewer: in-pod Selkies TURN env ------------------------------ #
+
+def _env(container):
+    return {e["name"]: e["value"] for e in container.get("env", [])}
+
+
+def test_webrtc_viewer_injects_selkies_turn_env(monkeypatch):
+    monkeypatch.setenv("TURN_HOST", "turn.example")
+    monkeypatch.setenv("TURN_PORT", "3478")
+    monkeypatch.setenv("TURN_PROTOCOL", "udp")
+    monkeypatch.setenv("TURN_SHARED_SECRET", "shh")
+    container = _build(
+        template_spec={"image": "selkies:latest", "viewer": "webrtc"},
+        display_port=8082,
+    )["spec"]["containers"][0]
+    env = _env(container)
+    assert env["SELKIES_TURN_HOST"] == "turn.example"
+    assert env["SELKIES_TURN_PORT"] == "3478"
+    assert env["SELKIES_TURN_PROTOCOL"] == "udp"
+    assert env["SELKIES_TURN_SHARED_SECRET"] == "shh"
+
+
+def test_webrtc_viewer_without_turn_host_injects_no_env(monkeypatch):
+    monkeypatch.delenv("TURN_HOST", raising=False)
+    container = _build(
+        template_spec={"image": "selkies:latest", "viewer": "webrtc"},
+        display_port=8082,
+    )["spec"]["containers"][0]
+    assert "env" not in container
+
+
+def test_guacd_viewer_injects_no_turn_env(monkeypatch):
+    monkeypatch.setenv("TURN_HOST", "turn.example")
+    container = _build(template_spec={"image": "vnc:latest"})["spec"]["containers"][0]
+    assert "env" not in container

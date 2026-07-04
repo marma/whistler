@@ -10,6 +10,12 @@ spec:
   runtime: {{ $template.runtime | default "container" }}
   description: {{ $template.description | default "" | quote }}
   image: {{ $template.image }}
+{{- if $template.viewer }}
+  viewer: {{ $template.viewer }}
+{{- end }}
+{{- if $template.signalPort }}
+  signalPort: {{ $template.signalPort }}
+{{- end }}
 {{- if $template.protocol }}
   protocol: {{ $template.protocol }}
 {{- end }}

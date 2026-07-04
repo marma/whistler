@@ -3,9 +3,11 @@
 Routes (all under a dev-only auth gate — see ``auth_middleware``):
   GET  /                 list templates + sessions, launch form
   POST /launch           create a DesktopSession, redirect to /connect/<id>
-  GET  /connect/<id>     page that waits for Ready then opens the WS
+  GET  /connect/<id>     page that waits for Ready then opens the WS (viewer-aware)
   GET  /status/<id>      JSON readiness poll
-  GET  /ws/<id>          WebSocket <-> guacd relay
+  GET  /ws/<id>          WebSocket <-> guacd relay      (guacd viewer)
+  GET  /ice/<id>         JSON ICE servers + TURN creds  (webrtc viewer)
+  GET  /ws-signal/<id>   WebSocket signaling relay      (webrtc viewer)
   GET  /healthz          readiness probe
 
 State lives in CRs; the portal holds none. Blocking KubeConfigManager calls run
@@ -20,7 +22,7 @@ import secrets
 
 from aiohttp import web
 
-from whistler.portal import guacd, terminal
+from whistler.portal import guacd, terminal, webrtc
 from whistler.portal.guacd import handshake, resolve_session, _build_guacd_params
 from whistler.portal.protocol import take_complete_instructions
 
@@ -82,11 +84,16 @@ async def guac_js(request):
 # Vendored web-terminal assets (xterm.js + fit addon), served locally like the
 # guacamole bundle above rather than from a CDN. Whitelisted by name so the
 # dynamic /static/{filename} route can't be used to read arbitrary files.
+# Vendored Selkies WebRTC client (added with the desktop image in Phase 2; the
+# /static route 404s until then). Version-locked to the in-pod Selkies server.
+SELKIES_JS_FILENAME = "selkies-core.js"
+
 _STATIC_FILES = {
     "xterm.min.js": "application/javascript",
     "xterm.min.css": "text/css",
     "xterm-addon-fit.min.js": "application/javascript",
     "style.css": "text/css",
+    SELKIES_JS_FILENAME: "application/javascript",
 }
 _static_cache: dict[str, bytes] = {}
 
@@ -396,6 +403,81 @@ def _render_term(user, session_id):
             .replace("__USER__", html.escape(user)))
 
 
+# WebRTC (Selkies) viewer page. Mirrors the connect/terminal wait-for-ready
+# pattern, then hands (video element, iceServers from /ice, signaling WS to
+# /ws-signal) to the vendored Selkies client. The client JS is version-locked to
+# the in-pod Selkies server, so — exactly like guacamole-common-js ↔ guacd — it
+# is vendored alongside the desktop image work (Phase 2); until then this page
+# loads and reports that the client bundle is missing rather than erroring. The
+# `startSelkies(...)` call is the only Phase-2 seam.
+_CONNECT_WEBRTC_HTML = """<!doctype html><meta charset=utf-8><title>__ID__</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  #video{position:absolute;inset:0;width:100%;height:100%;background:#000;object-fit:contain}
+  #overlay{position:absolute;inset:0;z-index:20;background:rgba(0,0,0,.85);
+           display:flex;align-items:center;justify-content:center;transition:opacity .4s}
+  #overlay.hidden{opacity:0;pointer-events:none}
+  #overlay-msg{color:#e0e0e0;font:bold 1.4rem/1.5 system-ui,sans-serif;text-align:center;max-width:80%}
+</style>
+<video id=video autoplay playsinline></video>
+<div id=overlay><div id=overlay-msg>Connecting…</div></div>
+<script src="/static/__SELKIES_JS__"></script>
+<script>
+const id = "__ID__", user = "__USER__";
+const overlayEl = document.getElementById('overlay');
+const overlayMsg = document.getElementById('overlay-msg');
+const videoEl = document.getElementById('video');
+const setStatus = m => { overlayMsg.textContent = m; overlayEl.classList.remove('hidden'); };
+const hideStatus = () => overlayEl.classList.add('hidden');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function waitReady() {
+  setStatus('Waiting for session…');
+  for (;;) {
+    try {
+      const r = await fetch(`/status/${id}?user=${encodeURIComponent(user)}`);
+      if (r.ok) {
+        const j = await r.json();
+        setStatus('Session: ' + (j.phase || 'unknown'));
+        if (j.phase === 'Ready') return;
+      }
+    } catch (e) {}
+    await sleep(2000);
+  }
+}
+
+async function start() {
+  await waitReady();
+  setStatus('Negotiating media…');
+  const iceServers = await fetch(`/ice/${id}?user=${encodeURIComponent(user)}`)
+    .then(r => r.json()).then(j => j.iceServers).catch(() => []);
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  const signalUrl = proto + location.host + '/ws-signal/' + id +
+                    '?user=' + encodeURIComponent(user);
+
+  // Phase-2 seam: the vendored Selkies client (version-locked to the in-pod
+  // server) takes over here. Until it is vendored, report cleanly.
+  if (typeof startSelkies !== 'function') {
+    setStatus('WebRTC client bundle not installed yet (Phase 2). ' +
+              'Signaling endpoint: ' + signalUrl);
+    return;
+  }
+  startSelkies({ videoElement: videoEl, signalUrl, iceServers,
+                 onConnected: hideStatus,
+                 onStatus: setStatus });
+}
+
+start().catch(e => setStatus('Fatal error: ' + e));
+</script>"""
+
+
+def _render_connect_webrtc(user, session_id):
+    return (_CONNECT_WEBRTC_HTML
+            .replace("__ID__", html.escape(session_id))
+            .replace("__USER__", html.escape(user))
+            .replace("__SELKIES_JS__", html.escape(SELKIES_JS_FILENAME)))
+
+
 def _resolve_target(instances, desktop_sessions, name):
     """Locate a Session by its short name across ssh instances and desktop
     sessions, returning a uniform dict for the terminal: pod/namespace to exec
@@ -445,14 +527,33 @@ async def launch(request):
     raise web.HTTPFound(f"/connect/{name}?user={user}")
 
 
+async def _session_viewer(request, user, name):
+    """Resolve a session's display viewer (guacd|webrtc) from its template — the
+    template always carries it (default guacd), unlike status which lags reconcile.
+    Mirrors the template lookup ws() does."""
+    sessions = await _run(request, request.app["cm"].get_user_desktop_sessions, user)
+    sess = resolve_session(sessions, name)
+    if not sess:
+        return "guacd"
+    templates = await _run(request, request.app["cm"].get_user_desktop_templates, user)
+    template = next((t for t in templates
+                     if t.get("fullName") == sess.get("template")
+                     or t.get("name") == sess.get("template")), {})
+    return template.get("viewer") or "guacd"
+
+
 async def connect(request):
     """Serve the desktop viewer page and nudge the session's pod awake (same
     reconcile trigger the SSH server / web terminal fire on connect) so it
-    becomes Ready while the page polls /status."""
+    becomes Ready while the page polls /status. The page differs by viewer: the
+    guacd viewer renders the Guacamole canvas; the webrtc viewer renders the
+    Selkies video element."""
     cm, user = request.app["cm"], request["user"]
     name = request.match_info["id"]
     await _run(request, cm.trigger_instance_start, user, name)
-    return web.Response(text=_render_connect(user, name), content_type="text/html")
+    viewer = await _session_viewer(request, user, name)
+    page = _render_connect_webrtc(user, name) if viewer == "webrtc" else _render_connect(user, name)
+    return web.Response(text=page, content_type="text/html")
 
 
 async def status(request):
@@ -520,6 +621,47 @@ async def ws(request):
             await wsr.close(message=str(e).encode())
     finally:
         writer.close()
+    return wsr
+
+
+async def ice(request):
+    """Browser ICE config for the webrtc viewer: a STUN + a TURN entry on the
+    shared coturn, the TURN entry carrying freshly-minted time-limited creds. The
+    in-pod Selkies got the same coturn coordinates from the operator, so both
+    peers relay through one server. Returns an empty list when no TURN is
+    configured (host-candidate fallback — dev/host-network only)."""
+    return web.json_response({
+        "iceServers": webrtc.ice_servers_from_env(label=request.match_info["id"]),
+    })
+
+
+async def ws_signal(request):
+    """Relay WebRTC signaling between the browser and the in-pod Selkies server.
+    Only signaling crosses this socket; media flows browser<->coturn<->pod
+    directly. Mirrors ws()'s resolve/guard prelude."""
+    cm, user = request.app["cm"], request["user"]
+    session_id = request.match_info["id"]
+
+    sessions = await _run(request, cm.get_user_desktop_sessions, user)
+    sess = resolve_session(sessions, session_id)
+    if not sess:
+        return web.Response(status=404, text="unknown session")
+    if sess.get("phase") != "Ready":
+        return web.Response(status=409, text=f"session not ready (phase={sess.get('phase')})")
+
+    # For the webrtc viewer the per-session Service exposes the signaling port as
+    # the effective displayPort (see config.ensure_session), so the in-pod Selkies
+    # signaling socket is at address:displayPort.
+    upstream = webrtc.signal_url(sess["address"], sess["displayPort"])
+    wsr = web.WebSocketResponse()
+    await wsr.prepare(request)
+    logger.info(f"Opening signaling relay for {user}/{session_id} -> {upstream}")
+    try:
+        await webrtc.signal_relay(wsr, upstream)
+    except Exception as e:
+        logger.error(f"Signaling relay for {user}/{session_id} failed: {e}")
+        if not wsr.closed:
+            await wsr.close(message=str(e).encode())
     return wsr
 
 
@@ -642,6 +784,8 @@ def build_app(config_manager):
         web.get("/connect/{id}", connect),
         web.get("/status/{id}", status),
         web.get("/ws/{id}", ws),
+        web.get("/ice/{id}", ice),
+        web.get("/ws-signal/{id}", ws_signal),
         web.get("/term/{id}", term),
         web.get("/term-status/{id}", term_status),
         web.get("/ws-term/{id}", ws_term),

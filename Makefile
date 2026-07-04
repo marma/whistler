@@ -6,12 +6,24 @@
 #   make cluster-down      # delete it
 #   make integration       # full C1 round trip (creates+tears down a cluster)
 #   make integration-keep  # same, but keep the cluster for fast re-runs
+#   make desktop-webrtc-local  # run the WebRTC desktop image standalone (no cluster)
 
 CLUSTER      ?= whistler-it
 TEST_IMAGE   ?= whistler-test
 PYTHON       ?= $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python)
+WEBRTC_IMAGE ?= whistler-desktop-xfce-webrtc:dev
+# Lightweight encoding profile for the standalone local target. On Apple Silicon
+# the image runs amd64 x264 software encoding under QEMU emulation, and Selkies'
+# defaults (1280x720 / 60fps / 8Mbps) are too heavy — the first keyframe is slow
+# enough that the client's stream watchdog gives up. These override to a profile
+# the emulated encoder can keep up with. Bump them (or override on the command
+# line) on a native amd64/Linux host, e.g. `make desktop-webrtc-local WEBRTC_FRAMERATE=60`.
+WEBRTC_RESOLUTION    ?= 800x600
+WEBRTC_FRAMERATE     ?= 10
+WEBRTC_VIDEO_BITRATE ?= 1500
 
-.PHONY: test test-local cluster-up cluster-down integration integration-keep clean help
+.PHONY: test test-local cluster-up cluster-down integration integration-keep \
+        desktop-webrtc-local clean help
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?#' $(MAKEFILE_LIST) | sed 's/:.*#/\t/' | sort
@@ -40,6 +52,20 @@ integration-keep: # Same, but keep the cluster afterwards for fast iteration
 
 integration-existing: # C1 round trip against the current kubectl context (kind/docker-desktop)
 	PROVIDER=existing PYTHON=$(PYTHON) scripts/integration.sh
+
+desktop-webrtc-local: # Build + run the WebRTC desktop image standalone (no cluster); open http://localhost:8082/
+	docker build -t $(WEBRTC_IMAGE) desktops/xfce-webrtc
+	@echo "Open http://localhost:8082/ (Selkies' own UI). On macOS/Windows the internal"
+	@echo "TURN is enabled so media flows; on Linux you can drop it and add --network host."
+	docker run --rm -it \
+	  -p 8082:8082 \
+	  -p 3478:3478/udp -p 3478:3478/tcp \
+	  -p 49160-49200:49160-49200/udp \
+	  -e SELKIES_USE_INTERNAL_TURN=1 \
+	  -e SELKIES_RESOLUTION=$(WEBRTC_RESOLUTION) \
+	  -e SELKIES_FRAMERATE=$(WEBRTC_FRAMERATE) \
+	  -e SELKIES_VIDEO_BITRATE=$(WEBRTC_VIDEO_BITRATE) \
+	  $(WEBRTC_IMAGE)
 
 clean: # Remove the test image and any leftover cluster
 	-docker rmi $(TEST_IMAGE) 2>/dev/null
