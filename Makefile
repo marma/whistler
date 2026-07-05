@@ -8,12 +8,14 @@
 #   make integration-keep  # same, but keep the cluster for fast re-runs
 #   make desktop-webrtc-local  # run the WebRTC desktop image standalone (no cluster)
 #   make desktop-gnome-flashback-webrtc-local  # same, for the GNOME Flashback image
+#   make desktop-selkies2-local  # same, for the Selkies 2.x (pixelflux) spike image
 
 CLUSTER      ?= whistler-it
 TEST_IMAGE   ?= whistler-test
 PYTHON       ?= $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python)
 WEBRTC_IMAGE ?= whistler-desktop-xfce-webrtc:dev
 GNOME_FLASHBACK_WEBRTC_IMAGE ?= whistler-desktop-gnome-flashback-webrtc:dev
+SELKIES2_IMAGE ?= whistler-desktop-xfce-selkies2:dev
 # Lightweight encoding profile for the standalone local target. On Apple Silicon
 # the image runs amd64 x264 software encoding under QEMU emulation, and Selkies'
 # defaults (1280x720 / 60fps / 8Mbps) are too heavy — the first keyframe is slow
@@ -25,7 +27,8 @@ WEBRTC_FRAMERATE     ?= 10
 WEBRTC_VIDEO_BITRATE ?= 1500
 
 .PHONY: test test-local cluster-up cluster-down integration integration-keep \
-        desktop-webrtc-local desktop-gnome-flashback-webrtc-local clean help
+        desktop-webrtc-local desktop-gnome-flashback-webrtc-local \
+        desktop-selkies2-local clean help
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?#' $(MAKEFILE_LIST) | sed 's/:.*#/\t/' | sort
@@ -84,6 +87,24 @@ desktop-gnome-flashback-webrtc-local: # Build + run the GNOME Flashback WebRTC d
 	  -e SELKIES_FRAMERATE=$(WEBRTC_FRAMERATE) \
 	  -e SELKIES_VIDEO_BITRATE=$(WEBRTC_VIDEO_BITRATE) \
 	  $(GNOME_FLASHBACK_WEBRTC_IMAGE)
+
+# The 2.x web client requires a browser secure context (WebCodecs). Plain HTTP
+# is fine when browsing from the same machine (http://localhost is secure);
+# to reach it from ANOTHER machine, run `make desktop-selkies2-local
+# SELKIES2_HTTPS=true` and open https://<host>:8082/ (self-signed — click
+# through the warning).
+SELKIES2_HTTPS ?= false
+
+desktop-selkies2-local: # Build + run the Selkies 2.x (pixelflux/WebSockets) spike image standalone (no cluster); open http://localhost:8082/
+	docker build -t $(SELKIES2_IMAGE) desktops/xfce-selkies2
+	@echo "Open http://localhost:8082/ (Selkies 2.x dashboard). WebSockets transport —"
+	@echo "no TURN needed on any host OS; a plain port publish is enough."
+	@echo "Browsing from another machine? Re-run with SELKIES2_HTTPS=true and use https://."
+	docker run --rm -it \
+	  -p 8082:8082 \
+	  -e SELKIES_RESOLUTION=$(WEBRTC_RESOLUTION) \
+	  -e SELKIES_ENABLE_HTTPS=$(SELKIES2_HTTPS) \
+	  $(SELKIES2_IMAGE)
 
 clean: # Remove the test image and any leftover cluster
 	-docker rmi $(TEST_IMAGE) 2>/dev/null

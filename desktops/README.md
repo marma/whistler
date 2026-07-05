@@ -15,7 +15,10 @@ Over time this grows into a catalog for different use-cases (minimal vs full DE,
 CPU vs GPU, different toolchains). Add a new image either by copying an existing
 subdirectory, or — for an RDP desktop — by building `FROM` [`base-rdp`](base-rdp/)
 (see below). Then add the matching `DesktopTemplate` in
-`charts/whistler/values.yaml` (`desktopTemplates`).
+`charts/whistler/values.yaml` (`desktopTemplates`). **Read
+[design/creating_desktops.md](../design/creating_desktops.md) first** — stack
+choice, assembly checklist, silent-failure catalog, and the verification
+ladder for new images.
 
 | Image | Protocol | Port | Creds | Notes |
 |-------|----------|------|-------|-------|
@@ -24,6 +27,7 @@ subdirectory, or — for an RDP desktop — by building `FROM` [`base-rdp`](base
 | [`xfce-webrtc`](xfce-webrtc/) | **webrtc** | 8082 | none | XFCE over **WebRTC** (Selkies, software x264, **amd64-only**). The `viewer: webrtc` path — H.264 reaches the browser's decoder, not re-rasterized. Needs `coturn.enabled`. Media e2e verified manually. |
 | [`gnome-grd`](gnome-grd/) | rdp | 3389 | `abc` / `abc` | GNOME over **gnome-remote-desktop** (Wayland-native, headless gnome-shell). Does *not* use xrdp/base-rdp. Ubuntu 26.04. RDP handshake verified; full guacd pixel path not yet. |
 | [`gnome-flashback-webrtc`](gnome-flashback-webrtc/) | **webrtc** | 8082 | none | GNOME Flashback (Panel + Metacity, real GNOME tech on X11) over **WebRTC** (Selkies, software x264). Ubuntu 26.04, systemd-PID1 + `--privileged` like gnome-grd (GNOME Session needs `systemd --user`), session runs as root (GNOME's mandatory glycin/bwrap image-loading sandbox needs it). Needs `coturn.enabled`. |
+| [`xfce-selkies2`](xfce-selkies2/) | **websockets** | 8082 | none | XFCE over **Selkies 2.x** (pixelflux) — successor-stack spike. H.264 over plain WebSockets: **no coturn/TURN at all**. Multi-arch (pixelflux ships amd64+arm64 wheels). Ubuntu 26.04. Runs with `--cap-drop=ALL` (verified). Standalone only — no portal `viewer` type yet. |
 
 ### Building an RDP desktop on `base-rdp`
 
