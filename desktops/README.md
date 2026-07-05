@@ -23,6 +23,7 @@ subdirectory, or — for an RDP desktop — by building `FROM` [`base-rdp`](base
 | [`xfce-rdp`](xfce-rdp/) | rdp | 3389 | `abc` / `abc` | XFCE over xrdp (Ubuntu 22.04). Multi-arch (amd64 + arm64). |
 | [`xfce-webrtc`](xfce-webrtc/) | **webrtc** | 8082 | none | XFCE over **WebRTC** (Selkies, software x264, **amd64-only**). The `viewer: webrtc` path — H.264 reaches the browser's decoder, not re-rasterized. Needs `coturn.enabled`. Media e2e verified manually. |
 | [`gnome-grd`](gnome-grd/) | rdp | 3389 | `abc` / `abc` | GNOME over **gnome-remote-desktop** (Wayland-native, headless gnome-shell). Does *not* use xrdp/base-rdp. Ubuntu 26.04. RDP handshake verified; full guacd pixel path not yet. |
+| [`gnome-flashback-webrtc`](gnome-flashback-webrtc/) | **webrtc** | 8082 | none | GNOME Flashback (Panel + Metacity, real GNOME tech on X11) over **WebRTC** (Selkies, software x264). Ubuntu 26.04, systemd-PID1 + `--privileged` like gnome-grd (GNOME Session needs `systemd --user`), session runs as root (GNOME's mandatory glycin/bwrap image-loading sandbox needs it). Needs `coturn.enabled`. |
 
 ### Building an RDP desktop on `base-rdp`
 

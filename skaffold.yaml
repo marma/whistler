@@ -20,6 +20,10 @@ build:
       context: desktops/xfce-webrtc
       docker:
         dockerfile: Dockerfile
+    - image: whistler-desktop-gnome-flashback-webrtc
+      context: desktops/gnome-flashback-webrtc
+      docker:
+        dockerfile: Dockerfile
 deploy:
   helm:
     releases:
@@ -59,12 +63,14 @@ deploy:
           templates.rdp-desktop.image: "{{.IMAGE_REPO_whistler_desktop_xfce_rdp}}:{{.IMAGE_TAG_whistler_desktop_xfce_rdp}}"
           templates.gnome-grd.image: "{{.IMAGE_REPO_whistler_desktop_gnome_grd}}:{{.IMAGE_TAG_whistler_desktop_gnome_grd}}"
           templates.webrtc-desktop.image: "{{.IMAGE_REPO_whistler_desktop_xfce_webrtc}}:{{.IMAGE_TAG_whistler_desktop_xfce_webrtc}}"
+          templates.gnome-flashback-webrtc-desktop.image: "{{.IMAGE_REPO_whistler_desktop_gnome_flashback_webrtc}}:{{.IMAGE_TAG_whistler_desktop_gnome_flashback_webrtc}}"
           # Use the locally-built desktop images as the enforced desktop allow-list,
           # so the operator accepts them and the management UI picker shows the
           # actual build outputs (replaces the production defaults in values.yaml).
           whistler.images.desktop[0]: "{{.IMAGE_REPO_whistler_desktop_xfce_rdp}}:{{.IMAGE_TAG_whistler_desktop_xfce_rdp}}"
           whistler.images.desktop[1]: "{{.IMAGE_REPO_whistler_desktop_gnome_grd}}:{{.IMAGE_TAG_whistler_desktop_gnome_grd}}"
           whistler.images.desktop[2]: "{{.IMAGE_REPO_whistler_desktop_xfce_webrtc}}:{{.IMAGE_TAG_whistler_desktop_xfce_webrtc}}"
+          whistler.images.desktop[3]: "{{.IMAGE_REPO_whistler_desktop_gnome_flashback_webrtc}}:{{.IMAGE_TAG_whistler_desktop_gnome_flashback_webrtc}}"
           # For a real webrtc (Selkies) e2e, also enable coturn and point it at a
           # browser-reachable address (the k8s WebRTC hairpin makes this env-specific):
           #   --set coturn.enabled=true --set coturn.externalHost=<node-ip>

@@ -199,6 +199,7 @@ whistler:
       - ghcr.io/marma/whistler-desktop-xfce-rdp:latest
       - ghcr.io/marma/whistler-desktop-gnome-grd:latest
       - ghcr.io/marma/whistler-desktop-xfce-webrtc:latest
+      - ghcr.io/marma/whistler-desktop-gnome-flashback-webrtc:latest
     vm: []
 
   # Security policy enforced by the operator.
@@ -324,6 +325,27 @@ templates:
       # GNOME Shell is heavier than XFCE.
       cpu: "2000m"
       memory: 8Gi
+  gnome-flashback-webrtc-desktop:
+    description: "GNOME Flashback desktop over WebRTC (Selkies, software x264, Ubuntu 26.04)"
+    mode: desktop
+    runtime: container
+    # Built from desktops/gnome-flashback-webrtc. EXPERIMENTAL — see that
+    # image's README for why it needs both systemd-PID1 (like gnome-grd) AND
+    # WebRTC (like xfce-webrtc). Requires coturn.enabled and
+    # coturn.externalHost set, same as webrtc-desktop.
+    image: "ghcr.io/marma/whistler-desktop-gnome-flashback-webrtc:latest"
+    viewer: webrtc
+    signalPort: 8082
+    persistence: ephemeral
+    # Needs systemd as PID 1 (gnome-session hard-requires systemd --user) and
+    # runs its session as root (GNOME's mandatory glycin/bwrap sandboxed image
+    # loading needs a kernel-level privilege non-root doesn't have on hosts
+    # that restrict unprivileged user namespaces) — see the image's README.
+    # Coerced to runtime=kata in production, same as gnome-grd.
+    privileged: true
+    resources:
+      cpu: "2000m"
+      memory: 4Gi
   # win-vm:
   #   description: "Windows desktop (KubeVirt VM)"
   #   mode: desktop
