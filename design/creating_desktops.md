@@ -122,6 +122,13 @@ what's missing.** Symptoms observed → actual cause:
 | client shows "requires a secure connection (HTTPS)" | browsing a non-localhost origin over plain HTTP (WebCodecs needs a secure context) |
 | whole app crashes at import (`No module named 'distutils'`) | missing `setuptools` in the venv (Python ≥ 3.12) |
 | audio broken only after container restart (fresh pod fine) | stale PulseAudio pid/socket state in the writable layer |
+| GNOME session dies to "Oh no, something has gone wrong" | a *required* gnome-session component crash-looped: gnome-shell can't reach `login1` (`/run/systemd/seats` present → it picks systemd login mgr with no systemd behind it — `rm -rf /run/systemd`), or a required gsd plugin fails headless (`gsd-power`/`gsd-usb-protection`), or wrong `--session` name (`gnome-xorg` doesn't exist on 24.04) |
+| gnome-shell SIGSEGVs immediately at startup | `GNOME_SHELL_SESSION_MODE=ubuntu` with no Yaru theme installed — the mode loads a missing `.../theme/Yaru/gnome-shell-theme.gresource`; use the default `gnome` mode (Adwaita) or install the theme |
+| Firefox uninstallable / won't launch in a container | 24.04's `firefox` apt package is a snap transitional shim; install the real `.deb` from Mozilla's APT repo with an apt pin |
+| GNOME Shell: client shows black static windows / one window's content bleeds into another, but a server-side X screenshot is clean | pixelflux's default damage-based capture never re-sends regions mutter (a GL compositor) composited once and stopped damaging; set `--h264-streaming-mode=true` (`SELKIES_H264_STREAMING_MODE`) so it continuously streams full frames. Not needed for XFCE. **The protocol probe won't catch this** — it only checks H.264 arrives, not frame coherence; verify GNOME with a headed browser. |
+| A GTK4 app (Files/nautilus, Text Editor, Settings) shows a stale copy of the desktop instead of its own UI — even in a *server-side* screenshot | GTK4 renders content via GSK's OpenGL renderer, which is garbage under llvmpipe; set `GSK_RENDERER=cairo` in the session env for the software renderer. GTK3 apps (gnome-terminal) and gnome-shell itself (Clutter/Cogl) are unaffected, so the symptom is "some apps render, others are garbage". |
+| App/shell icons render as blurry scaled-up blobs while text stays crisp | the gdk-pixbuf SVG loader is missing — `--no-install-recommends` dropped `librsvg2-common`, so Adwaita's scalable-SVG icons can't be rasterized. Install `librsvg2-common` and regenerate the loader cache (`gdk-pixbuf-query-loaders --update-cache`; the dpkg trigger is unreliable in a build layer). |
+| GNOME Shell app-switcher/overview backdrop confined to a top-left rectangle at large (HiDPI) resolutions, while windows/panel/desktop are full-size | mutter's overview backdrop on X11 is created at the shell's startup resolution and only *shrinks* with the monitor, never grows; a client driving the framebuffer above that size (HiDPI + a >1920×1080 browser window) leaves the backdrop stuck small. Not scale-related (forcing `scaling-factor=1` doesn't help), not fixable by pre-growing or restarting the shell. Only a **fixed resolution** (no dynamic resize) avoids it — accept the cosmetic quirk or trade away window-matching. Cosmetic: launching apps still works. |
 
 When you hit a new one: fix it, then add the symptom→cause line here and the
 *why* comment at the fix site.
@@ -180,23 +187,90 @@ What the existing GNOME images already established:
   Kata coercion (§2), and the session currently runs as root (glycin/bwrap).
   Both facts are documented in the gnome-flashback-webrtc Dockerfile header.
 
-For "full GNOME on Selkies 2.x" there are three candidate shapes, in
-increasing order of unknowns:
+**The goal is the real GNOME Shell experience** — Activities, dynamic
+workspaces, extensions; as close to a stock desktop as possible. That goal
+rules the ranking below: options that substitute the Shell (Flashback) are
+fallbacks, not targets.
 
-1. **GNOME Flashback on X11 + Selkies 2.x** — a straight port of
-   gnome-flashback-webrtc onto the xfce-selkies2 recipe (swap the 1.x
-   GStreamer stack for the venv + pixelflux + tools from §4). Lowest risk;
-   real GNOME look-and-feel, not the real Shell.
-2. **GNOME Shell headless + gnome-remote-desktop** — already prototyped as
-   gnome-grd (guacd/RDP viewer, not selkies). Real Shell, re-rasterized
-   pixels.
-3. **GNOME Shell under Selkies' Wayland mode** — unproven territory: in
+Candidate shapes for "full GNOME on Selkies 2.x":
+
+1. **GNOME Shell 46 on Xorg (Ubuntu 24.04) + Selkies 2.x** — the only shape
+   with the actual `gnome-shell` (not Flashback's Panel+Metacity stand-in)
+   *and* the once-encoded H.264-to-browser pipeline (not guacd's
+   re-rasterized canvas tiles); every other option gives up one or the
+   other. GNOME 46 is the last generation with
+   both escape hatches 26.04's GNOME 50 removed: a Shell X11 backend (so
+   Xvfb + pixelflux X11 capture just works) and — likely — a session that
+   can start without `systemd --user` (distros ran GNOME 46 on elogind), so
+   possibly no systemd-PID1/privileged/Kata at all. Costs: GNOME 46 not 50
+   (LTS-supported until 2029), and 24.04's libva is 2.20 while pixelflux
+   needs ≥ 2.21 — vendor a newer libva (small, dependency-light; a short
+   extra build stage) into the image. **Verify early**: (a) session startup
+   without systemd — this is the load-bearing assumption for staying
+   unprivileged; (b) Shell-on-llvmpipe performance under Xvfb (Shell
+   animations are heavier than XFCE/Metacity).
+2. **GNOME Flashback on X11 (26.04) + Selkies 2.x** — a straight port of
+   gnome-flashback-webrtc onto the xfce-selkies2 recipe. Lowest technical
+   risk and current GNOME components, but Panel + Metacity is *not* the
+   Shell experience — fallback, not target.
+3. **GNOME Shell headless + gnome-remote-desktop** — already prototyped as
+   gnome-grd (guacd/RDP viewer, not selkies). Real, current Shell;
+   re-rasterized pixels and the systemd-PID1/privileged architecture.
+4. **GNOME Shell under Selkies' Wayland mode** — unproven territory: in
    `PIXELFLUX_WAYLAND=true` mode **pixelflux is itself the compositor**
    (clients connect to *its* Wayland socket). GNOME Shell/mutter is also a
    compositor, so it can't simply run as a client; whether a nested-mutter
-   arrangement works under pixelflux is an open question to spike separately.
-   Selkies' own Wayland desktops use wlroots compositors (labwc), not mutter.
+   arrangement works under pixelflux is an open question to spike
+   separately. Selkies' own Wayland desktops use wlroots compositors
+   (labwc), not mutter. This is the only shape that could ever deliver a
+   *current* Shell over the selkies path — the long-term watch item as
+   option 1's GNOME 46 ages.
 
-Recommended order: build 1 now (it exercises the 2.x + systemd-PID1
-combination, which no image has yet), keep 2 as the real-Shell fallback, and
-time-box a spike of 3 before betting on it.
+Recommended order: spike 1 first (it is the only shape that delivers the
+actual goal today), with 3 as the real-Shell fallback if its verify items
+fail, 2 only if both fail, and a time-boxed look at 4 before GNOME 46's
+runway runs out.
+
+### Option 1, built and verified — [`gnome-selkies2`](../desktops/gnome-selkies2/)
+
+Spike 1 is done and streams the real GNOME Shell on llvmpipe/Xvfb, unprivileged.
+How the two load-bearing verify items resolved, and the traps that weren't on
+the radar:
+
+- **(b) Shell-on-llvmpipe: fine.** Xvfb (`+extension GLX`) + Mesa
+  `libgl1-mesa-dri`/`libglx-mesa0` gives llvmpipe GL 4.5; gnome-shell 46
+  composits as an X11 WM with no GPU. `LIBGL_ALWAYS_SOFTWARE=1` in the session
+  env. No performance wall at 1280×720.
+- **(a) Session without `systemd --user`: yes, but not via `gnome-session`.**
+  gnome-session 46 *does* fall back to non-systemd startup, but Ubuntu's
+  `gnome.session` lists gsd plugins as *required* that can't run headless
+  (`gsd-power` needs logind+upower, `gsd-usb-protection` SIGSEGVs, a `pulseaudio`
+  autostart collides with ours) — and one crash-looping required component sends
+  the whole session to the "Oh no" failed screen. The working shape is to
+  **bypass gnome-session**: launch `gnome-shell --x11` + a curated set of gsd
+  plugins directly (see the image's `gnome-session-launch.sh`). This keeps it
+  unprivileged; the price is logind-only features (lock/suspend/seat switching),
+  irrelevant for a single-user stream.
+- **libva:** the 24.04-ships-2.20 problem (§6) is solved by building libva 2.22
+  from source in a stage and dropping it in `/usr/local/lib` (ahead of `/usr/lib`
+  in the ld order) — cheaper than it sounds, ~30 s, no runtime downside.
+- **Capture needs `--h264-streaming-mode=true`.** The one finding that only the
+  human/headed-browser check surfaced (§5, §6 step 5): pixelflux's damage-based
+  default leaves static GNOME windows black on the client because mutter's GL
+  compositor stops emitting damage for them. Streaming mode (continuous
+  full-frame encode) fixes it. This makes the "static desktop sends ~nothing"
+  property (§6 step 2) **false for GNOME** — expect constant traffic — and it's a
+  reminder that the scriptable `probe stream` PASS is necessary but not
+  sufficient for a GL-compositor DE; a headed browser decoding the real stream
+  is the only check that catches frame-coherence bugs.
+- **GTK4 apps need `GSK_RENDERER=cairo`** (§5). GTK4's GL renderer is garbage
+  under llvmpipe — Files/Text-Editor/Settings show a stale desktop copy instead
+  of their UI. The Shell (Clutter/Cogl) and GTK3 apps are fine, so the tell is
+  "some windows render, others don't". Also a headed-browser-only find, since a
+  server-side X grab shows the same garbage (it's a render bug, not capture).
+- **Result:** no `--privileged`, no Kata — the whole point over the 26.04 GNOME
+  images. It does need root PID 1 + a handful of caps
+  (`CHOWN,DAC_OVERRIDE,FOWNER,SETUID,SETGID`) because it creates the desktop user
+  at runtime (configurable UID/GID/sudo), so it's not `--cap-drop=ALL` like
+  xfce-selkies2. That's a consequence of the configurable-identity feature, not
+  the DE.

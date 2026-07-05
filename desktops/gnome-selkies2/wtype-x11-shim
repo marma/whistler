@@ -1,0 +1,13 @@
+#!/bin/sh
+# X11 stand-in for `wtype` (a Wayland-only virtual-keyboard tool).
+#
+# Selkies 2.x types every printable non-alphabetic character (digits,
+# punctuation, unicode) by shelling out to `wtype` — even when capturing X11.
+# That works in Selkies' own images because their "X11" apps run under
+# XWayland on the pixelflux compositor; on a bare Xvfb image there is no
+# Wayland socket and real wtype can never work, so those characters silently
+# vanish. This shim gives the exact call selkies makes (`wtype -- <text>`)
+# X11 semantics via xdotool, which handles arbitrary unicode by temporarily
+# remapping spare keycodes.
+[ "$1" = "--" ] && shift
+exec xdotool type --clearmodifiers --delay 5 -- "$1"
