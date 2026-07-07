@@ -2,12 +2,13 @@
 
 Xvfb + PulseAudio + **Selkies 2.x** (pixelflux/WebSockets) and **no desktop
 environment**. This image is not a catalog entry: it is the streamer sidecar
-the operator injects into desktop pods whose template sets `streamer: sidecar`,
-next to a *display-unaware* workload image (e.g. [`../xfce-plain`](../xfce-plain/)).
+the operator injects into **every desktop pod**, next to a *display-unaware*
+workload image (e.g. [`../xfce-plain`](../xfce-plain/),
+[`../gnome-plain`](../gnome-plain/)).
 
-This is stage 1 of the guest-unaware-display direction: the workload image
-stops knowing anything about streaming. Its entire display contract is two
-env vars and two shared sockets:
+This is stage 1 of the guest-unaware-display direction: workload images know
+nothing about streaming. Their entire display contract is two env vars and two
+shared sockets:
 
 | Shared | Path | Provided by |
 |--------|------|-------------|
@@ -19,12 +20,14 @@ with `restartPolicy: Always`) with a TCP startupProbe on `SELKIES_PORT`:
 Selkies only opens the port after X is up, so the workload container always
 starts against a live display. Swapping the streaming protocol later (WebRTC,
 host-side capture, anything) means swapping this image — no workload image
-changes. See `KubeConfigManager._build_pod_spec` (streamer=sidecar branch).
+changes. See `KubeConfigManager._build_pod_spec` (desktop branch).
 
-The Dockerfile deliberately tracks [`../xfce-selkies2/Dockerfile`](../xfce-selkies2/Dockerfile)
-(same base, same pinned `SELKIES_COMMIT`, same package rationale — the
-silent-failure catalog in its comments applies here too). Bump the two
-together.
+This image is the single home of the streaming stack: Selkies is pinned by
+`SELKIES_COMMIT`, and the Python server and web client are both built from
+that commit (client/server version lock by construction). The silent-failure
+catalog for its packages lives in the Dockerfile comments. It descends from
+the embedded `xfce-selkies2`/`gnome-selkies2` images, removed when the sidecar
+became the only display path; they remain in git history.
 
 ## Env
 
@@ -36,8 +39,10 @@ together.
   `streamerEnv` — the operator passes any `streamerEnv` entries straight into
   this container, which is how templates tune workload-dependent knobs the
   sidecar can't infer.
-- `SELKIES_ENCODER` / `SELKIES_MODE` / `SELKIES_ENABLE_HTTPS` — as in
-  the *-selkies2 images.
+- `SELKIES_ENCODER` (default `x264enc`) / `SELKIES_MODE` (default
+  `websockets`) / `SELKIES_ENABLE_HTTPS` (default `false`; the 2.x web client
+  needs a browser secure context, so any non-`http://localhost` dev access
+  needs HTTPS).
 
 Xvfb runs with `+extension GLX` so GL workloads (GNOME's llvmpipe compositing)
 get a software GL context; X clients additionally use MIT-SHM, which needs a

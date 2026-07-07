@@ -3,14 +3,13 @@
 XFCE and nothing display-protocol-specific: no X server, no PulseAudio daemon,
 no Selkies. Runs the desktop session against a display somebody else owns —
 in-cluster that is the [`../streamer-selkies2`](../streamer-selkies2/) sidecar
-(template sets `streamer: sidecar`), which shares `/tmp/.X11-unix` and
+(injected into every desktop pod), which shares `/tmp/.X11-unix` and
 `/tmp/pulse` and injects `DISPLAY` / `PULSE_SERVER`.
 
-This is the sidecar-mode counterpart of [`../xfce-selkies2`](../xfce-selkies2/)
-and the proof-of-model for stage 1 of the guest-unaware-display direction:
-compare the two Dockerfiles to see what the sidecar removes from a workload
-image. New sidecar-mode catalog images are just "DE-or-app + tools + a session
-entrypoint" — copy this directory and swap the DE.
+This is the proof-of-model for the guest-unaware-display direction: catalog
+images are just "DE-or-app + tools + a session entrypoint" — copy this
+directory and swap the DE. (Its embedded ancestor `xfce-selkies2`, which
+bundled X + Selkies in-image, is in git history.)
 
 The entrypoint waits briefly for the display (a no-op in-cluster, where the
 sidecar's startupProbe already gates this container) and then execs

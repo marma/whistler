@@ -25,8 +25,7 @@ if ! xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1; then
   exit 1
 fi
 
-# System D-Bus for the XFCE session (logind-less; same arrangement as
-# ../xfce-selkies2).
+# System D-Bus for the XFCE session (logind-less).
 mkdir -p /var/run/dbus && rm -f /var/run/dbus/pid
 dbus-daemon --system --fork
 

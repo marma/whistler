@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Display plane of a sidecar-mode desktop pod: X server + audio daemon +
-# Selkies 2.x streamer. No desktop environment — the workload container brings
-# that and finds the display through the shared sockets. Mirrors
-# ../xfce-selkies2/entrypoint.sh minus the DE launch; the deviations are the
-# shared-socket preparation steps marked below.
+# Display plane of a desktop pod: X server + audio daemon + Selkies 2.x
+# streamer. No desktop environment — the workload container brings that and
+# finds the display through the shared sockets. No systemd / no display
+# manager: the pieces run directly so the container lifecycle tracks the
+# selkies server in the foreground.
 set -e
 
 SELKIES_PORT="${SELKIES_PORT:-8082}"
@@ -64,18 +64,23 @@ for i in $(seq 1 30); do xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1 && break
   done & )
 
 # Selkies 2.x: pixelflux capture of $DISPLAY, x264 software encode, web client
-# + WebSocket streaming on one port. Same flag caveats as ../xfce-selkies2:
-# 2.x flags are dash-separated, misspellings are silently ignored, booleans
-# take =true/=false. Basic auth off — the per-session NetworkPolicy is the
-# security boundary. This port is also the startupProbe target: it only opens
-# once X is up, which is what lets the workload container assume DISPLAY works.
+# + WebSocket streaming on one port. Flag spelling matters: 2.x CLI flags are
+# dash-separated (--web-root, not --web_root) and the parser uses
+# parse_known_args, so a misspelled flag is IGNORED SILENTLY and the default
+# applies; booleans take =true/=false. (Everything also exists as
+# SELKIES_<NAME> env vars.) Basic auth is ON by default in 2.x — off here
+# explicitly; the per-session NetworkPolicy is the security boundary. This
+# port is also the startupProbe target: it only opens once X is up, which is
+# what lets the workload container assume DISPLAY works.
 # --h264-streaming-mode: OFF by default (damage-based capture — static content
 # sends ~nothing, right for XFCE-style X11 DEs) but REQUIRED =true for GL
 # compositors like GNOME Shell: mutter composits once and emits no further
-# damage for static windows, so damage mode leaves them BLACK on the client.
-# The streamer can't know what the workload runs, so the template says so via
-# streamerEnv (SELKIES_H264_STREAMING_MODE: "true"). Full story in
-# ../gnome-selkies2/entrypoint.sh.
+# damage for static windows, so damage mode never (re)sends those regions and
+# the client canvas shows them BLACK until something forces a full repaint.
+# Streaming mode continuously encodes the full frame like an ordinary video
+# stream (cost: constant bandwidth/CPU even idle — the right trade for a GL
+# compositor). The streamer can't know what the workload runs, so the template
+# says so via streamerEnv (SELKIES_H264_STREAMING_MODE: "true").
 exec selkies \
   --addr=0.0.0.0 \
   --port="${SELKIES_PORT}" \

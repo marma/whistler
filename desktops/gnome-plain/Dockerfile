@@ -1,26 +1,37 @@
-# Plain **GNOME Shell** workload image — the sidecar-mode counterpart of
-# ../gnome-selkies2, exactly as ../xfce-plain is to ../xfce-selkies2. No X
-# server, no PulseAudio daemon, no Selkies, no vendored libva: the streamer
-# sidecar (../streamer-selkies2) owns the whole display plane and this image
-# runs the real GNOME Shell session against the injected DISPLAY /
-# PULSE_SERVER (shared /tmp/.X11-unix and /tmp/pulse emptyDirs).
+# Plain **GNOME Shell** workload image — the real Shell (Activities, dynamic
+# workspaces, extensions) with no display plane inside. No X server, no
+# PulseAudio daemon, no Selkies, no vendored libva: the streamer sidecar
+# (../streamer-selkies2) owns all of that and this image runs the GNOME
+# session against the injected DISPLAY / PULSE_SERVER (shared /tmp/.X11-unix
+# and /tmp/pulse emptyDirs).
 #
 # NOT Wayland, by architecture: under Wayland, GNOME Shell/mutter *is* the
 # display server — there is nothing left for a display-owning sidecar to own
 # (and pixelflux's Wayland mode only works when pixelflux itself is the
-# compositor, which rules out Shell). So sidecar-GNOME means the Shell's X11
-# backend, which is why this stays on **Ubuntu 24.04 / GNOME 46** — the last
-# generation with (1) an X11-backend Shell and (2) a gnome-session that runs
-# without systemd --user; the full rationale is ../gnome-selkies2/Dockerfile's
-# header. A Wayland-native GNOME needs the capture point moved out of X
-# entirely (stage 2/3 of the guest-unaware-display plan).
+# compositor, which rules out Shell). A Wayland-native GNOME needs the capture
+# point moved out of X entirely (stage 2/3 of the guest-unaware-display plan).
 #
-# What the sidecar split removes vs ../gnome-selkies2: the selkies web+server
-# build stages, Xvfb/PulseAudio and all the X11 injection tooling
-# (xclip/xdotool/xcvt/wtype), ssl-cert, the python toolchain — and the whole
-# vendored-libva-2.22 stage (that existed only because pixelflux needs
-# libva >= 2.21 and 24.04 ships 2.20; pixelflux now lives in the 26.04-based
-# streamer, so the constraint left with it).
+# Why Ubuntu 24.04 / GNOME 46 specifically (NOT 26.04 like the other images):
+# GNOME 46 is the last generation with the two escape hatches GNOME 50 (26.04)
+# removed —
+#   1. GNOME Shell still has an **X11 backend** (`gnome-shell --x11`), so it
+#      can composit a foreign X server's display. On 26.04's GNOME 50 mutter
+#      only has `--wayland`, and per the above that can never pair with a
+#      display-owning sidecar.
+#   2. GNOME 46's gnome-session starts **without `systemd --user`**: when
+#      systemd is not PID 1 (`sd_booted()` false) it uses its built-in
+#      component launcher instead of session .target units. GNOME 50 made
+#      systemd --user a hard requirement ("Failed to obtain session bus"
+#      otherwise), which would force systemd-PID1 + `--privileged` + Kata.
+#      Staying on 46 keeps this image unprivileged with a plain entrypoint.
+# 24.04 also dodges 26.04's mandatory glycin/bwrap image-loading sandbox
+# (which needs unprivileged userns) — on 24.04 gdk-pixbuf still loads images
+# in-process, so the session runs as an unprivileged user.
+#
+# (The embedded ancestor gnome-selkies2 — same session architecture with
+# Selkies/Xvfb/Pulse and a vendored libva 2.22 baked in — is in git history;
+# the libva vendoring died with it: pixelflux needs libva >= 2.21 and lives in
+# the 26.04-based streamer now.)
 #
 # IMPORTANT pairing note: templates using this image must set
 #   streamerEnv: { SELKIES_H264_STREAMING_MODE: "true" }
@@ -43,22 +54,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget gpg ca-cer
  && printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' \
       > /etc/apt/preferences.d/mozilla
 
-# Package set = ../gnome-selkies2 minus everything the streamer now owns. The
-# per-package rationale (why gnome-settings-daemon and librsvg2-common must be
-# explicit under --no-install-recommends, why the SVG loader cache is rebuilt,
-# etc.) is documented there and applies unchanged.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+      # gnome-session provides the session manager; gnome-shell is mutter +
+      # the Shell UI (X11 backend still present on 46). gnome-settings-daemon
+      # is a soft dep pinned explicitly so --no-install-recommends can't drop
+      # it (a Shell with no settings-daemon has no cursor theme / xsettings
+      # and looks broken).
       gnome-session \
       gnome-shell \
       gnome-settings-daemon \
+      # Minimal application set: Terminal, Files, Text Editor, Settings —
+      # usable but deliberately small; firefox from the Mozilla repo above.
       gnome-terminal \
       nautilus \
       gnome-text-editor \
       gnome-control-center \
       firefox \
+      # Adwaita icon/cursor theme + sane default fonts so the Shell isn't a
+      # sea of missing-icon boxes.
       adwaita-icon-theme \
       fonts-ubuntu \
       fonts-dejavu-core \
+      # librsvg2-common provides the gdk-pixbuf *SVG loader*. Adwaita's icons
+      # are scalable SVGs; without it every icon renders as a tiny bitmap
+      # scaled to a blurry blob. Normally pulled via Recommends, which
+      # --no-install-recommends drops, so it MUST be explicit — and the loader
+      # cache is regenerated below because the dpkg trigger is unreliable in a
+      # docker build layer (loader present on disk but not in loaders.cache =
+      # still blurry).
       librsvg2-common \
       # Software OpenGL: mutter hard-requires GL; llvmpipe renders client-side
       # here and presents via the *streamer's* Xvfb GLX (started with
@@ -82,15 +105,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV DISPLAY=:0 \
     # Runtime identity (applied by the entrypoint so a mounted home volume
-    # lines up by ownership — same contract as ../gnome-selkies2).
+    # lines up by ownership).
     DESKTOP_USER=abc \
     PUID=1000 \
     PGID=1000 \
     DESKTOP_SUDO=false
 
 # The session launcher (gnome-shell + curated settings daemons, not plain
-# gnome-session — see the script header for why). Shared verbatim with
-# ../gnome-selkies2; keep the two in sync.
+# gnome-session — see the script header for why).
 COPY gnome-session-launch.sh /usr/local/bin/gnome-session-launch.sh
 
 COPY entrypoint.sh /entrypoint.sh

@@ -55,15 +55,16 @@ def test_kata_runtime_sets_runtime_class():
     assert "runtimeClassName" not in pod["spec"]
 
 
-def test_display_port_wired_as_named_container_port():
+def test_display_port_wired_as_named_port_on_sidecar():
     pod = _build(display_port=5900)
-    container = pod["spec"]["containers"][0]
-    assert container["ports"] == [{"containerPort": 5900, "name": "display"}]
+    sidecar = pod["spec"]["initContainers"][0]
+    assert sidecar["ports"] == [{"containerPort": 5900, "name": "display"}]
+    assert "ports" not in pod["spec"]["containers"][0]
 
 
 def test_no_command_override():
-    """Desktop images self-start their display server; unlike the SSH pod we
-    must NOT override the entrypoint with `sleep 3600`."""
+    """The workload image's entrypoint starts the DE/app session; unlike the
+    SSH pod we must NOT override the entrypoint with `sleep 3600`."""
     container = _build()["spec"]["containers"][0]
     assert "command" not in container
 
@@ -144,14 +145,13 @@ def test_data_named_requested_volume_is_skipped():
 
 
 # --------------------------------------------------------------------- #
-# streamer=sidecar: the workload container is display-unaware; a native  #
-# sidecar (initContainer, restartPolicy=Always) owns Xvfb+Pulse+Selkies  #
-# and shares the X/Pulse sockets over emptyDirs.                          #
+# The streamer sidecar (every desktop pod): the workload container is    #
+# display-unaware; a native sidecar (initContainer, restartPolicy=Always) #
+# owns Xvfb+Pulse+Selkies and shares the X/Pulse sockets over emptyDirs.  #
 # --------------------------------------------------------------------- #
 
 def _build_sidecar(**overrides):
-    template_spec = overrides.pop("template_spec",
-                                  {"image": "xfce-plain:latest", "streamer": "sidecar"})
+    template_spec = overrides.pop("template_spec", {"image": "xfce-plain:latest"})
     return _build(template_spec=template_spec, display_port=8082, **overrides)
 
 
@@ -169,7 +169,6 @@ def test_sidecar_is_native_init_sidecar_with_default_image():
 
 def test_sidecar_template_streamer_image_overrides_default():
     pod = _build_sidecar(template_spec={"image": "xfce-plain:latest",
-                                        "streamer": "sidecar",
                                         "streamerImage": "custom/streamer:v9"})
     assert pod["spec"]["initContainers"][0]["image"] == "custom/streamer:v9"
 
@@ -202,7 +201,7 @@ def test_sidecar_streamer_env_appended_after_port():
     """streamerEnv carries workload-dependent knobs (e.g. GNOME Shell needs
     SELKIES_H264_STREAMING_MODE=true or static windows render black)."""
     pod = _build_sidecar(template_spec={
-        "image": "gnome-plain:latest", "streamer": "sidecar",
+        "image": "gnome-plain:latest",
         "streamerEnv": {"SELKIES_H264_STREAMING_MODE": "true",
                         "SELKIES_RESOLUTION": "1920x1080"},
     })
@@ -228,32 +227,27 @@ def test_sidecar_workload_keeps_home_pvc_mount():
     assert {"name": "data", "mountPath": "/userdata"} in main["volumeMounts"]
 
 
-def test_embedded_default_gets_no_sidecar():
-    pod = _build(template_spec={"image": "vnc:latest"}, display_port=8082)
-    assert "initContainers" not in pod["spec"]
-    assert pod["spec"]["containers"][0]["ports"] == \
-        [{"containerPort": 8082, "name": "display"}]
-
-
-def test_ssh_mode_ignores_streamer_field():
+def test_ssh_mode_gets_no_sidecar():
     pod = _build(mode="ssh", display_port=None,
-                 template_spec={"image": "ubuntu:latest", "streamer": "sidecar"})
+                 template_spec={"image": "ubuntu:latest"})
     assert "initContainers" not in pod["spec"]
     assert pod["spec"]["containers"][0]["command"] == ["sleep", "3600"]
 
 
-def test_sidecar_without_display_port_falls_back_to_plain_pod():
-    pod = _build(template_spec={"image": "xfce-plain:latest", "streamer": "sidecar"},
-                 display_port=None)
+def test_desktop_without_display_port_falls_back_to_plain_pod():
+    """Defensive dead end: the resolver always supplies displayPort for
+    desktop templates, but a missing one must not produce a broken sidecar."""
+    pod = _build(template_spec={"image": "xfce-plain:latest"}, display_port=None)
     assert "initContainers" not in pod["spec"]
 
 
 # The websockets viewer (Selkies 2.x) needs no TURN/coturn, so desktop pods get
-# no injected TURN env regardless of environment.
+# no injected TURN env regardless of environment — the workload env stays the
+# two-var display contract.
 def test_websockets_viewer_injects_no_turn_env(monkeypatch):
     monkeypatch.setenv("TURN_HOST", "turn.example")
     container = _build(
-        template_spec={"image": "selkies:latest", "viewer": "websockets"},
+        template_spec={"image": "xfce-plain:latest", "viewer": "websockets"},
         display_port=8082,
     )["spec"]["containers"][0]
-    assert "env" not in container
+    assert sorted(e["name"] for e in container["env"]) == ["DISPLAY", "PULSE_SERVER"]

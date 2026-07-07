@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Start the real GNOME Shell (X11 backend) on a display somebody else owns —
-# the streamer sidecar in-cluster, any X server elsewhere. Identity and session
-# bring-up are ../gnome-selkies2/entrypoint.sh verbatim; the display/audio
-# plane (Xvfb, PulseAudio, Selkies) is gone — that's the streamer's job now.
+# the streamer sidecar in-cluster, any X server elsewhere. No systemd, no
+# display manager: identity → dbus → session, with the display/audio plane
+# (Xvfb, PulseAudio, Selkies) being the streamer's job.
 #
-# The load-bearing bet is unchanged from gnome-selkies2: GNOME 46 gnome-session
-# starts WITHOUT `systemd --user` because systemd is not PID 1 (sd_booted()
-# false → built-in component launcher). If a base bump regresses this, the
-# symptom is "Failed to obtain session bus".
+# The load-bearing bet: GNOME 46 gnome-session starts WITHOUT `systemd --user`
+# because systemd is not PID 1 (sd_booted() false → built-in component
+# launcher). If a base bump regresses this, the symptom is "Failed to obtain
+# session bus" — and the fix costs systemd-PID1 + --privileged (see the
+# Dockerfile header).
 set -e
 
 # --- Runtime-configurable identity -------------------------------------------
@@ -57,11 +58,15 @@ mkdir -p "${XDG_RUNTIME_DIR}"
 chown "${PUID}:${PGID}" "${XDG_RUNTIME_DIR}"
 chmod 700 "${XDG_RUNTIME_DIR}"
 
-# Force gnome-shell onto its built-in dummy login manager: the systemd package
-# (pulled transitively) bakes an empty /run/systemd/seats into the layer, which
-# makes gnome-shell believe logind exists — then every login1 D-Bus call fails
-# and the session dies on the "Oh no" screen. Full story in
-# ../gnome-selkies2/entrypoint.sh.
+# Force gnome-shell onto its built-in *dummy* login manager: the systemd
+# package (pulled transitively) bakes an empty /run/systemd/seats into the
+# layer, and gnome-shell's loginManager.js keys off exactly
+# `GLib.access('/run/systemd/seats')` to decide logind is present — then every
+# login1 D-Bus call fails ("org.freedesktop.login1 ... exited with status 1")
+# and gnome-session gives up to the "Oh no, something has gone wrong" screen.
+# Removing the dir makes haveSystemd() false → LoginManagerDummy → clean boot.
+# We forgo logind-only features (lock/suspend/seat switching), meaningless for
+# a single-user streamed desktop.
 rm -rf /run/systemd
 
 # --- Wait for the shared display ----------------------------------------------
@@ -86,12 +91,23 @@ mkdir -p /var/run/dbus && rm -f /var/run/dbus/pid
 dbus-daemon --system --fork
 
 # --- GNOME Shell session, foreground, as the unprivileged desktop user ---------
-# Same env block as ../gnome-selkies2 (llvmpipe forcing, X11 pinning,
-# GSK_RENDERER=cairo for GTK4 apps under llvmpipe — see there for each line's
-# failure mode). Differences: PULSE_SERVER comes from the operator/compose
-# instead of a local daemon, and the session is exec'd in the FOREGROUND — the
-# container tracks the session (there is no selkies process to track here) and
-# a Shell crash restarts the container against the still-running display.
+# The env block, line by line:
+#   LIBGL_ALWAYS_SOFTWARE/GALLIUM_DRIVER/__GLX_VENDOR_LIBRARY_NAME — force Mesa
+#     llvmpipe: no GPU here, so mutter's GL context comes from the streamer's
+#     Xvfb software GLX (verified: gnome-shell 46 composits fine this way).
+#   XDG_SESSION_TYPE=x11 / GDK_BACKEND=x11 — keep Shell and GTK on X11;
+#     without them mutter may try Wayland and fail.
+#   XDG_CURRENT_DESKTOP=GNOME — app-visibility / portal hints expect it.
+#   GSK_RENDERER=cairo — REQUIRED for GTK4 apps (Files, Text Editor,
+#     Settings). GTK4's default GSK OpenGL renderer produces GARBAGE under
+#     llvmpipe: the window shows a stale copy of the desktop framebuffer
+#     instead of its own content (still resizable, stacks correctly — only the
+#     pixels are wrong). Cairo fixes it; gnome-shell itself (Clutter/Cogl, not
+#     GSK) and GTK3 apps are unaffected.
+#   NO_AT_BRIDGE / GTK_A11Y=none — no accessibility bus here; silence at-spi.
+# dbus-run-session gives the session its own bus (no systemd --user); the
+# session is exec'd in the FOREGROUND so the container tracks it and a Shell
+# crash restarts the container against the still-running display.
 # NOTE: one shell string passed to su -c — no `#` comments inside it.
 exec su - "${USER_NAME}" -c "\
   env DISPLAY=${DISPLAY} \

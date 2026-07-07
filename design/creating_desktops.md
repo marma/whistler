@@ -1,87 +1,92 @@
 # Creating desktop images
 
-Practical guidelines for adding a new image under [`desktops/`](../desktops/),
-distilled from building the catalog ([`xfce-selkies2`](../desktops/xfce-selkies2/),
-[`gnome-selkies2`](../desktops/gnome-selkies2/)) and the guacd/RDP and
-Selkies-1.x/WebRTC spikes that preceded it (removed — see the banner in
-[`design/vdi.md`](vdi.md)). Read together with
+Practical guidelines for adding a new **workload image** under
+[`desktops/`](../desktops/) and for maintaining the **streamer sidecar**
+([`desktops/streamer-selkies2`](../desktops/streamer-selkies2/)), distilled
+from building the catalog and the guacd/RDP, Selkies-1.x/WebRTC, and embedded
+Selkies-2.x rounds that preceded it (all removed — see the banner in
+[`design/vdi.md`](vdi.md); recoverable from git history). Read together with
 [`desktops/README.md`](../desktops/README.md) (the catalog + conventions).
 
-> **Sidecar mode (stage 1 of guest-unaware displays).** Since the streamer
-> sidecar landed, there are two ways to build a catalog image. With
-> `streamer: sidecar` in the template, the workload image needs **none of the
-> streaming stack below** — no Selkies, no Xvfb, no PulseAudio daemon; just a
-> DE/app plus a session entrypoint against the injected `DISPLAY`
-> ([`desktops/xfce-plain`](../desktops/xfce-plain/) is the model; the sidecar
-> itself is [`desktops/streamer-selkies2`](../desktops/streamer-selkies2/)).
-> Prefer sidecar mode for new images. Everything below still applies to
-> `streamer: embedded` images (self-contained X + Selkies) — and to the
-> sidecar image itself, which is where the streaming stack now lives.
+The display model is fixed: every desktop pod = one display-unaware workload
+container + the streamer sidecar. A **workload image** needs none of the
+streaming stack — no Selkies, no Xvfb, no PulseAudio daemon; just a DE/app
+plus a session entrypoint against the injected `DISPLAY`/`PULSE_SERVER`
+([`desktops/xfce-plain`](../desktops/xfce-plain/) is the minimal model,
+[`desktops/gnome-plain`](../desktops/gnome-plain/) the full-DE one). The
+streaming sections below (§1, §4, most of §5) concern the **streamer image**;
+the session/DE sections (§2, the GNOME notes) concern workload images.
 
-## 1. The streaming stack: Selkies 2.x / pixelflux
+## 1. The streaming stack: Selkies 2.x / pixelflux (streamer image)
 
-There is one stack, and every new image uses it: **Selkies 2.x (pixelflux)** with
-the portal's **`websockets`** viewer. H.264 reaches the browser's decoder over a
-single TCP port (plain WebSockets), no coturn/TURN, multi-arch (amd64+arm64),
-unprivileged. The alternatives that were evaluated and dropped — guacd/RDP
-(re-rasterized frames, extra daemon) and Selkies 1.x + WebRTC/coturn (amd64-only,
-needs a TURN relay) — are recorded in [`vdi.md`](vdi.md) and recoverable from git
-history; the one thing guacd/VNC offered that Selkies can't is *agentless*
-VM-console capture (KubeVirt QEMU framebuffer), if that is ever needed.
+There is one stack, and it lives in one image: **Selkies 2.x (pixelflux)** in
+`streamer-selkies2`, spoken to by the portal's **`websockets`** viewer. H.264
+reaches the browser's decoder over a single TCP port (plain WebSockets), no
+coturn/TURN, multi-arch (amd64+arm64), unprivileged. The alternatives that
+were evaluated and dropped — guacd/RDP (re-rasterized frames, extra daemon)
+and Selkies 1.x + WebRTC/coturn (amd64-only, needs a TURN relay) — are
+recorded in [`vdi.md`](vdi.md); the one thing guacd/VNC offered that Selkies
+can't is *agentless* VM-console capture (KubeVirt QEMU framebuffer), if that
+is ever needed.
 
 The Selkies 2.x stack is unreleased upstream: pin `SELKIES_COMMIT` and build the
 Python server **and** the web client from that same commit (see the
-xfce-selkies2 Dockerfile) — client/server version lock by construction. Treat
+streamer-selkies2 Dockerfile) — client/server version lock by construction. Treat
 `pixelflux`/`pcmflux` (PyPI, linuxserver-maintained) as pinned upstream *code*
 dependencies; we do not consume anyone's prebuilt desktop images.
 
-## 2. Choose the process architecture
+## 2. Choose the process architecture (workload image)
 
 Two patterns exist; the DE dictates which one you get, not preference:
 
-- **Plain entrypoint** (xfce-*): the entrypoint starts each piece in order
-  (dbus → pulseaudio → Xvfb → DE session → selkies in the foreground) and the
-  container lifecycle tracks the streaming server. Unprivileged; verified down
-  to `--cap-drop=ALL`. Always prefer this when the DE allows it.
-- **systemd as PID 1** (gnome-*): required the moment the session needs
-  `systemd --user` — GNOME Session hard-requires it with no opt-out. This
-  forces `privileged: true` on the template, which production coerces to the
-  Kata runtime (`forceKataForPrivileged`). Accept this only when the DE leaves
-  no choice, and say so in the Dockerfile header.
+- **Plain entrypoint** (xfce-plain, gnome-plain): the entrypoint waits for the
+  shared display (a no-op in-cluster — the sidecar's startupProbe gates it),
+  starts the session plumbing (system dbus, identity), and execs the DE
+  session in the foreground so the container lifecycle tracks it.
+  Unprivileged. Always prefer this when the DE allows it.
+- **systemd as PID 1**: required the moment the session needs
+  `systemd --user` — modern GNOME Session hard-requires it with no opt-out.
+  This forces `privileged: true` on the template, which production coerces to
+  the Kata runtime (`forceKataForPrivileged`). Accept this only when the DE
+  leaves no choice, and say so in the Dockerfile header.
 
 Rule of thumb from the catalog so far: **privilege requirements come from the
-DE, never from the streaming layer.** If your image needs a capability, the
-justification must name the DE component that demands it (e.g. GNOME's
-glycin/bwrap image-loading sandbox needing real root under
-`apparmor_restrict_unprivileged_userns=1`, a systemd-PID1 base — which is why
-`gnome-selkies2` deliberately pins GNOME 46 / Ubuntu 24.04 to avoid it).
+DE, never from the display layer** (which isn't even in the workload image
+anymore). If your image needs a capability, the justification must name the
+DE component that demands it (e.g. GNOME 50's glycin/bwrap image-loading
+sandbox needing real root under `apparmor_restrict_unprivileged_userns=1`, a
+systemd-PID1 base — which is why `gnome-plain` deliberately pins GNOME 46 /
+Ubuntu 24.04 to avoid it).
 
 ## 3. Image anatomy and conventions
 
 - One directory per catalog entry: `Dockerfile`, `entrypoint.sh` (or systemd
-  units), `README.md`. The README documents build, standalone local test, and
-  a `| |` table of viewer/port/creds/arch/privileged facts.
-- **Self-contained and standalone-testable**: the image must be verifiable
-  with plain `docker run -p` and a browser, no cluster or portal. This is
-  the bottom of the test pyramid; every image gets a `make desktop-*-local`
-  target.
-- Display server self-starts as the entrypoint; the pod spec overrides no
-  command. Ports: 8082 for selkies (any generation), 3389 RDP, 590x VNC.
-- Fixed well-known credentials (`abc`/`abc`) or none; the per-session
-  NetworkPolicy is the security boundary, never the desktop login.
-- **Multi-arch (amd64+arm64) unless a dependency forbids it** — with Selkies
-  2.x nothing does anymore; don't add `--platform` pins without a reason
-  documented in the header.
-- Base on **Ubuntu 26.04** for new images (matches gnome-*, and Selkies 2.x
-  needs its libva ≥ 2.21 — see §6).
+  units), `README.md`.
+- **Cluster-free testable**: the workload image must be verifiable by pairing
+  it with the streamer in plain docker — the parameterized
+  [`desktops/compose-sidecar.yaml`](../desktops/compose-sidecar.yaml) +
+  `make desktop-*-sidecar-local` targets do this. This is the bottom of the
+  test pyramid.
+- The session self-starts as the entrypoint (foreground); the pod spec
+  overrides no command. Include the wait-for-X + fail-loudly guard for
+  non-k8s runs (copy it from xfce-plain).
+- Fixed well-known user (`abc`, or gnome-plain's runtime `PUID`/`PGID`
+  identity) and no desktop login; the per-session NetworkPolicy is the
+  security boundary.
+- **Multi-arch (amd64+arm64) unless a dependency forbids it**; don't add
+  `--platform` pins without a reason documented in the header.
+- Base on **Ubuntu 26.04** for new workload images unless the DE forces
+  otherwise (gnome-plain's GNOME-46 pin is the documented exception; the
+  libva ≥ 2.21 constraint applies only to the streamer image).
 - Comment discipline: every non-obvious package and entrypoint line carries
   the *why*, including the failure mode it prevents. The Dockerfiles are the
   institutional memory of this catalog — the gotchas below were all
   expensive to find and cheap to write down.
 
-## 4. Runtime assembly checklist (Selkies 2.x / X11)
+## 4. Runtime assembly checklist (streamer image, Selkies 2.x / X11)
 
-The pieces an entrypoint must provide, and the traps in each:
+The pieces the streamer's entrypoint provides, and the traps in each (kept
+here as the maintenance guide for `streamer-selkies2`):
 
 - **X server**: Xvfb started at the RandR ceiling (`7680x4320`), *not* at the
   default resolution — Xvfb bakes its maximum size in at startup and can never
@@ -97,16 +102,19 @@ The pieces an entrypoint must provide, and the traps in each:
   audio while a fresh pod works.
 - **Input tools**: `xdotool` (space/Enter/arrows/F-keys) and a `wtype` shim
   (digits/punctuation/unicode) — see
-  [`desktops/xfce-selkies2/wtype-x11-shim`](../desktops/xfce-selkies2/wtype-x11-shim).
+  [`desktops/streamer-selkies2/wtype-x11-shim`](../desktops/streamer-selkies2/wtype-x11-shim).
   Only a–z is injected via XTEST directly; the other two paths swallow their
   errors, so missing binaries present as "only letters type".
 - **Clipboard**: `xclip` (2.x; 1.x used `xsel`). A missing xclip kills the
   per-client WS loop on connect — presents as "video never starts".
 - **Python runtime**: selkies in its own venv; add `setuptools` explicitly
   (GPUtil imports `distutils`, gone since Python 3.12).
-- **Session**: run the DE as the unprivileged `abc` user on the shared
-  DISPLAY (`Xvfb -ac`); selkies runs as container-root. GNOME images deviate
-  (root session) only for the documented glycin reason.
+- **Session**: lives in the *workload* container — the streamer only serves
+  the display (`Xvfb -ac`; any process that reaches the shared socket may
+  connect, the pod is the trust boundary) and runs selkies as container-root.
+  Cross-container GL (GNOME/mutter) additionally needs Xvfb's
+  `+extension GLX` and the pod's shared IPC namespace for MIT-SHM (compose
+  needs explicit `ipc:` pairing).
 - **Flags**: selkies 2.x CLI flags are dash-separated (`--web-root`) and the
   parser uses `parse_known_args` — **misspelled flags are ignored silently**
   and env vars (`SELKIES_*`) are overridden by explicit flags. Basic auth is
@@ -137,7 +145,7 @@ what's missing.** Symptoms observed → actual cause:
 | GNOME session dies to "Oh no, something has gone wrong" | a *required* gnome-session component crash-looped: gnome-shell can't reach `login1` (`/run/systemd/seats` present → it picks systemd login mgr with no systemd behind it — `rm -rf /run/systemd`), or a required gsd plugin fails headless (`gsd-power`/`gsd-usb-protection`), or wrong `--session` name (`gnome-xorg` doesn't exist on 24.04) |
 | gnome-shell SIGSEGVs immediately at startup | `GNOME_SHELL_SESSION_MODE=ubuntu` with no Yaru theme installed — the mode loads a missing `.../theme/Yaru/gnome-shell-theme.gresource`; use the default `gnome` mode (Adwaita) or install the theme |
 | Firefox uninstallable / won't launch in a container | 24.04's `firefox` apt package is a snap transitional shim; install the real `.deb` from Mozilla's APT repo with an apt pin |
-| GNOME Shell: client shows black static windows / one window's content bleeds into another, but a server-side X screenshot is clean | pixelflux's default damage-based capture never re-sends regions mutter (a GL compositor) composited once and stopped damaging; set `--h264-streaming-mode=true` (`SELKIES_H264_STREAMING_MODE`) so it continuously streams full frames. Not needed for XFCE. **The protocol probe won't catch this** — it only checks H.264 arrives, not frame coherence; verify GNOME with a headed browser. |
+| GNOME Shell: client shows black static windows / one window's content bleeds into another, but a server-side X screenshot is clean | pixelflux's default damage-based capture never re-sends regions mutter (a GL compositor) composited once and stopped damaging; set `SELKIES_H264_STREAMING_MODE: "true"` in the template's `streamerEnv` so it continuously streams full frames. Not needed for XFCE. **The protocol probe won't catch this** — it only checks H.264 arrives, not frame coherence; verify GNOME with a headed browser. |
 | A GTK4 app (Files/nautilus, Text Editor, Settings) shows a stale copy of the desktop instead of its own UI — even in a *server-side* screenshot | GTK4 renders content via GSK's OpenGL renderer, which is garbage under llvmpipe; set `GSK_RENDERER=cairo` in the session env for the software renderer. GTK3 apps (gnome-terminal) and gnome-shell itself (Clutter/Cogl) are unaffected, so the symptom is "some apps render, others are garbage". |
 | App/shell icons render as blurry scaled-up blobs while text stays crisp | the gdk-pixbuf SVG loader is missing — `--no-install-recommends` dropped `librsvg2-common`, so Adwaita's scalable-SVG icons can't be rasterized. Install `librsvg2-common` and regenerate the loader cache (`gdk-pixbuf-query-loaders --update-cache`; the dpkg trigger is unreliable in a build layer). |
 | GNOME Shell app-switcher/overview backdrop confined to a top-left rectangle at large (HiDPI) resolutions, while windows/panel/desktop are full-size | mutter's overview backdrop on X11 is created at the shell's startup resolution and only *shrinks* with the monitor, never grows; a client driving the framebuffer above that size (HiDPI + a >1920×1080 browser window) leaves the backdrop stuck small. Not scale-related (forcing `scaling-factor=1` doesn't help), not fixable by pre-growing or restarting the shell. Only a **fixed resolution** (no dynamic resize) avoids it — accept the cosmetic quirk or trade away window-matching. Cosmetic: launching apps still works. |
@@ -149,25 +157,33 @@ When you hit a new one: fix it, then add the symptom→cause line here and the
 
 Work up this ladder before calling an image done; each step catches what the
 previous can't. [`scripts/selkies2_probe.py`](../scripts/selkies2_probe.py)
-automates the protocol steps for Selkies 2.x images:
+automates the protocol steps (run it inside the *streamer* container — that's
+where the selkies venv lives):
 
-1. **Boots + serves**: `docker run -p 8082:8082`, `curl` the index (HTTP 200),
-   scan logs for tracebacks.
-2. **Streams**: `selkies2_probe.py stream` inside the container — must print
-   `PASS` (VIDEO_STARTED + large type-4 H.264 stripes + AUDIO_STARTED). A
-   static desktop sending ~nothing is *correct* (damage-based capture); the
-   probe wiggles the mouse to force frames.
-3. **Types**: focus a terminal running `cat > /tmp/typed.txt` in the pod, run
-   `selkies2_probe.py keys`, and confirm the file contains exactly `a 5!\n` —
-   one key per injection path.
-4. **Least privilege**: repeat step 2 with `--cap-drop=ALL
-   --security-opt=no-new-privileges`. If it now fails, either remove the
+1. **Boots + pairs**: bring the pair up with the compose file
+   (`make desktop-<name>-sidecar-local` or `SIDECAR_WORKLOAD=<name> docker
+   compose -f desktops/compose-sidecar.yaml up --build`), `curl` the index
+   (HTTP 200), scan both containers' logs for tracebacks, and confirm the
+   workload's windows exist in the streamer's X
+   (`docker compose ... exec streamer xdotool search --name '' getwindowname %@`).
+2. **Streams**: `selkies2_probe.py stream` in the streamer container — must
+   print `PASS` (VIDEO_STARTED + large type-4 H.264 stripes + AUDIO_STARTED).
+   A static desktop sending ~nothing is *correct* in damage mode; with
+   `SELKIES_H264_STREAMING_MODE=true` (GNOME) expect constant traffic instead.
+3. **Types**: focus a terminal running `cat > /tmp/typed.txt` in the desktop,
+   run `selkies2_probe.py keys`, and confirm the file contains exactly
+   `a 5!\n` — one key per injection path.
+4. **Least privilege**: run the *workload* container with `--cap-drop=ALL
+   --security-opt=no-new-privileges` where its identity model allows (fixed-
+   user images like xfce-plain should survive; gnome-plain's runtime
+   PUID/PGID setup documents its needed caps). If it fails, either remove the
    dependency or document precisely which DE component needs what.
-5. **Human check**: `make desktop-<name>-local`, real browser, look at
-   latency/fidelity, type into a terminal, resize the window, play audio.
-6. **Cluster**: only after all of the above — template in `values.yaml`,
-   `skaffold dev`, connect through the portal (once the websockets viewer
-   exists; until then 2.x images are standalone-only).
+5. **Human check**: the make target + a real browser — latency/fidelity,
+   typing into a terminal, window resize, audio, and (GL compositors) frame
+   coherence of *static* windows, which no script catches.
+6. **Cluster**: only after all of the above — template in `values.yaml`
+   (with any required `streamerEnv`), `skaffold dev`, connect through the
+   portal.
 
 Media quality (step 5) is the only step that genuinely needs eyes; everything
 else is scriptable and should stay scripted so the next stack bump can re-run
@@ -175,31 +191,36 @@ it.
 
 ## 7. Wiring a finished image into the product
 
-Checklist of files to touch (grep for `xfce-selkies2` to see a complete
-example of the first three):
+Checklist of files to touch (grep for `xfce-plain` to see a complete example):
 
 - `desktops/<name>/` — the image itself.
-- `Makefile` — `desktop-<name>-local` target + image var + `.PHONY`.
+- `Makefile` — a `desktop-<name>-sidecar-local` target (a thin wrapper
+  setting `SIDECAR_WORKLOAD`/`SIDECAR_WORKLOAD_IMAGE` for the shared compose
+  file) + `.PHONY`.
 - `desktops/README.md` — catalog table row.
-- `charts/whistler/values.yaml` — `desktopTemplates` entry (image, viewer,
-  ports, `privileged`/`fuse` flags with their why-comments, resources).
-- `skaffold.yaml` — build artifact + template image override for local dev.
-- Portal/CRD — only if the image introduces a new `viewer:` type (the
-  Selkies 2.x websockets viewer is the pending case: a reverse-proxy of
-  HTTP+WS to the pod's 8082, no coturn, no vendored client JS).
+- `charts/whistler/values.yaml` — `templates` entry (image, `displayPort`,
+  any required `streamerEnv` with its why-comment, resources) and the
+  `whistler.images.desktop` allow-list.
+- `skaffold.yaml` — build artifact + template image override + allow-list
+  override for local dev.
+- Portal/CRD — only if the image needs a new `viewer:` type or a new
+  streamer-level knob (add it as env in the streamer image and pass it via
+  `streamerEnv`, not as a new CRD field, unless the operator must act on it).
 
 ## 8. Notes for the full-GNOME image
 
 What the GNOME spikes established (the losing options were removed with the
-guacd/webrtc cleanup — see the banner in [vdi.md](vdi.md) — leaving
-[`gnome-selkies2`](../desktops/gnome-selkies2/) as the built answer):
+guacd/webrtc cleanup — see the banner in [vdi.md](vdi.md) — leaving GNOME
+Shell 46 on X11 as the built answer: today
+[`gnome-plain`](../desktops/gnome-plain/) + the streamer sidecar; its embedded
+ancestor `gnome-selkies2` is in git history):
 
 - GNOME Shell **46 is the last gen with an X11 backend**; newer Shell runs only
   headless-Wayland. Selkies 2.x captures the X11 framebuffer, so GNOME 46 on
   Ubuntu 24.04 is what lets us stream the *real* Shell unprivileged.
 - On newer bases GNOME Session hard-requires `systemd --user` → systemd-PID1 +
   privileged + Kata coercion (§2), and the session runs as root (glycin/bwrap).
-  Pinning to GNOME 46 / 24.04 avoids all of that — hence `gnome-selkies2` needs
+  Pinning to GNOME 46 / 24.04 avoids all of that — hence `gnome-plain` needs
   **no `--privileged`**.
 
 **The goal is the real GNOME Shell experience** — Activities, dynamic
@@ -246,11 +267,12 @@ actual goal today), with 3 as the real-Shell fallback if its verify items
 fail, 2 only if both fail, and a time-boxed look at 4 before GNOME 46's
 runway runs out.
 
-### Option 1, built and verified — [`gnome-selkies2`](../desktops/gnome-selkies2/)
+### Option 1, built and verified — today [`gnome-plain`](../desktops/gnome-plain/) (+ streamer sidecar)
 
-Spike 1 is done and streams the real GNOME Shell on llvmpipe/Xvfb, unprivileged.
-How the two load-bearing verify items resolved, and the traps that weren't on
-the radar:
+Spike 1 was built as the embedded `gnome-selkies2` (git history) and then
+split into `gnome-plain` + the streamer; it streams the real GNOME Shell on
+llvmpipe/Xvfb, unprivileged. How the two load-bearing verify items resolved,
+and the traps that weren't on the radar:
 
 - **(b) Shell-on-llvmpipe: fine.** Xvfb (`+extension GLX`) + Mesa
   `libgl1-mesa-dri`/`libglx-mesa0` gives llvmpipe GL 4.5; gnome-shell 46
@@ -266,9 +288,10 @@ the radar:
   plugins directly (see the image's `gnome-session-launch.sh`). This keeps it
   unprivileged; the price is logind-only features (lock/suspend/seat switching),
   irrelevant for a single-user stream.
-- **libva:** the 24.04-ships-2.20 problem (§6) is solved by building libva 2.22
-  from source in a stage and dropping it in `/usr/local/lib` (ahead of `/usr/lib`
-  in the ld order) — cheaper than it sounds, ~30 s, no runtime downside.
+- **libva:** the embedded image had to vendor libva 2.22 from source because
+  pixelflux needs ≥ 2.21 and 24.04 ships 2.20. **Obsolete since the sidecar
+  split**: pixelflux lives in the 26.04-based streamer, so the GNOME workload
+  image carries no libva hack at all.
 - **Capture needs `--h264-streaming-mode=true`.** The one finding that only the
   human/headed-browser check surfaced (§5, §6 step 5): pixelflux's damage-based
   default leaves static GNOME windows black on the client because mutter's GL

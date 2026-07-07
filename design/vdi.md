@@ -1,18 +1,23 @@
 # VDI: desktop-pod and KubeVirt-VM backends
 
 > **⚠️ Superseded below Round 1 — kept as design history.** The project has
-> consolidated on a single display path: the **Selkies 2.x (pixelflux)
-> "websockets" viewer**, where the in-pod server streams H.264 over plain
-> WebSockets and the portal reverse-proxies it to the browser — **no guacd, no
-> coturn/TURN**. The guacd/RDP path (Round 2) and the Selkies-1.x WebRTC + coturn
-> path (Round 3) described below, and their images (`base-rdp`, `xfce-rdp`,
-> `gnome-grd`, `xfce-webrtc`, `gnome-flashback-webrtc`), **have been removed**.
-> They remain recoverable from git history if an agentless VM-console path
-> (KubeVirt QEMU framebuffer, pre-boot/panic debugging) is ever wanted — that is
-> the one capability guacd+VNC offered that in-guest Selkies cannot. Round 1
-> (provisioning: desktop pods + KubeVirt VMs) and the NetworkPolicy security
-> model still apply. See [creating_desktops.md](creating_desktops.md) for the
-> current image-building guidance.
+> consolidated on a single display path: the **streamer sidecar** — every
+> desktop pod pairs a *display-unaware workload image* with the
+> `streamer-selkies2` native sidecar (Xvfb + PulseAudio + **Selkies 2.x
+> (pixelflux)**), whose server streams H.264 over plain WebSockets to the
+> portal's **"websockets" viewer** — **no guacd, no coturn/TURN**, and no
+> streaming stack in workload images (stage 1 of the guest-unaware-display
+> direction; later stages move the capture point host-side for VMs). The
+> guacd/RDP path (Round 2), the Selkies-1.x WebRTC + coturn path (Round 3),
+> and the embedded Selkies-2.x images that bundled the display plane in-image
+> (`xfce-selkies2`, `gnome-selkies2`) — plus `base-rdp`, `xfce-rdp`,
+> `gnome-grd`, `xfce-webrtc`, `gnome-flashback-webrtc` — **have been
+> removed**. All remain recoverable from git history; guacd+VNC is the one
+> path that offered *agentless* VM-console capture (KubeVirt QEMU framebuffer,
+> pre-boot/panic debugging), if that is ever wanted. Round 1 (provisioning:
+> desktop pods + KubeVirt VMs) and the NetworkPolicy security model still
+> apply. See [creating_desktops.md](creating_desktops.md) for the current
+> image-building guidance.
 
 Status (historical): **rounds 1–3 implemented** (round 3 partially — see below). Round 1 = provisioning
 (desktop pods + KubeVirt VMs). Round 2 = the **guacd** display path (RDP desktop + shared

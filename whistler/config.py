@@ -213,8 +213,8 @@ class KubeConfigManager(ConfigManager):
             "WHISTLER_FORCE_KATA_FOR_PRIVILEGED", "false"
         ).strip().lower() in ("1", "true", "yes")
         self.kata_runtime_class = os.environ.get("WHISTLER_KATA_RUNTIME_CLASS", "kata")
-        # Default image for the streamer sidecar (templates with
-        # streamer=sidecar); a template's streamerImage overrides it.
+        # Default image for the streamer sidecar every desktop pod gets;
+        # a template's streamerImage overrides it.
         self.streamer_image = os.environ.get(
             "WHISTLER_STREAMER_IMAGE",
             "ghcr.io/marma/whistler-streamer-selkies2:latest",
@@ -829,12 +829,13 @@ class KubeConfigManager(ConfigManager):
         Handles both access modes (ssh / desktop) and the container/kata runtimes
         (runtime=vm is built by ``_build_vm_spec`` instead):
           - ssh overrides the entrypoint with ``sleep`` (the image must stay
-            alive for the exec bridge); desktop does not (the display server
-            self-starts) and exposes the display port.
-          - desktop templates with streamer=sidecar additionally get a native
-            streamer sidecar (Xvfb + PulseAudio + Selkies) sharing the X/Pulse
-            sockets with the workload container; the workload image then needs
-            no display server at all (see desktops/streamer-selkies2).
+            alive for the exec bridge); desktop does not (the workload image's
+            entrypoint starts the DE/app session).
+          - desktop pods get a native streamer sidecar (Xvfb + PulseAudio +
+            Selkies, see desktops/streamer-selkies2) sharing the X/Pulse
+            sockets with the workload container over emptyDirs; the workload
+            image needs no display server at all and its entire display
+            contract is the injected DISPLAY/PULSE_SERVER env.
           - both ``instance`` and ``session`` labels are emitted so the SSH
             server's pod-watch and the desktop Service selector both resolve.
           - runtime=kata pins the configured Kata RuntimeClass.
@@ -863,14 +864,15 @@ class KubeConfigManager(ConfigManager):
         if mode == "ssh":
             # SSH images are bridged via `kubectl exec`; keep the pod alive.
             container["command"] = ["sleep", "3600"]
-        elif template_spec.get('streamer', 'embedded') == 'sidecar' and display_port is not None:
-            # Streamer sidecar: the workload image knows nothing about
-            # displays — a native sidecar (initContainer with
-            # restartPolicy=Always) owns Xvfb + PulseAudio + Selkies and shares
-            # the X/Pulse sockets over emptyDirs. The startupProbe on the
-            # Selkies port gates the workload container: its entrypoint (a DE
-            # session or app) can assume DISPLAY is live without a wait loop.
-            # The display port therefore lives on the sidecar, not "main".
+        elif display_port is not None:
+            # Every desktop pod gets the streamer sidecar: the workload image
+            # knows nothing about displays — a native sidecar (initContainer
+            # with restartPolicy=Always) owns Xvfb + PulseAudio + Selkies and
+            # shares the X/Pulse sockets over emptyDirs. The startupProbe on
+            # the Selkies port gates the workload container: its entrypoint (a
+            # DE session or app) can assume DISPLAY is live without a wait
+            # loop. The display port therefore lives on the sidecar, not
+            # "main".
             # Pod containers share the IPC namespace by default, which is what
             # lets the workload's X clients use MIT-SHM against the sidecar's
             # Xvfb (compose needs explicit ipc: wiring for the same effect).
@@ -906,13 +908,10 @@ class KubeConfigManager(ConfigManager):
                 {"name": "x11", "mountPath": "/tmp/.X11-unix"},
                 {"name": "pulse", "mountPath": "/tmp/pulse"},
             ]
-        else:
-            # Embedded streamer: the desktop image self-starts its display
-            # server + Selkies; expose its port. The websockets viewer (Selkies
-            # 2.x / pixelflux) serves H.264 over a plain HTTP/WebSocket port
-            # the portal reverse-proxies — no coturn/TURN.
-            if display_port is not None:
-                container["ports"] = [{"containerPort": display_port, "name": "display"}]
+        # (mode == desktop with display_port None builds a plain pod — it can't
+        # be reached by the portal, but the resolver always supplies the
+        # template's displayPort default so this is a defensive dead end, not a
+        # supported shape.)
 
         app_label = "whistler-instance" if mode == "ssh" else "whistler-desktop"
         pod_body = {
@@ -1165,9 +1164,9 @@ class KubeConfigManager(ConfigManager):
         runtime = template_spec.get('runtime', 'container')
         viewer = template_spec.get('viewer', 'websockets') if mode == 'desktop' else None
         # The websockets viewer (Selkies 2.x) serves H.264 over HTTP/WebSockets;
-        # displayPort is the port the in-pod Selkies server listens on and the
-        # portal reverse-proxies. The per-session Service exposes it and status
-        # advertises it.
+        # displayPort is the port the streamer sidecar's Selkies server listens
+        # on and the portal reverse-proxies. The per-session Service exposes it
+        # and status advertises it.
         display_port = template_spec.get('displayPort', 8082)
         persistence = template_spec.get('persistence', 'ephemeral')
         # SSH ephemeral sessions carry preemptible on the Session spec; desktop
@@ -1618,7 +1617,7 @@ class KubeConfigManager(ConfigManager):
         spec = {"user": "system"}
         for key in ("mode", "runtime", "displayName", "image", "description",
                     "resources", "nodeSelector", "personalMountPath", "volumes",
-                    "displayPort", "viewer", "streamer", "streamerImage", "streamerEnv",
+                    "displayPort", "viewer", "streamerImage", "streamerEnv",
                     "privileged", "fuse", "instancetype", "persistence"):
             if template_data.get(key) is not None:
                 spec[key] = template_data[key]

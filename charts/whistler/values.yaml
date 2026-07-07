@@ -31,9 +31,11 @@ server:
       memory: 1Gi
   logLevel: DEBUG
 
-# Desktop display path: the portal reverse-proxies the browser straight to the
-# in-pod Selkies 2.x (pixelflux) server over HTTP/WebSockets — H.264 reaches the
-# browser's decoder with no external relay. There is no shared guacd and no
+# Desktop display path: every desktop pod gets a streamer sidecar
+# (whistler.streamer.image) owning Xvfb + PulseAudio + Selkies 2.x (pixelflux);
+# the workload image is display-unaware. The portal reverse-proxies the browser
+# straight to the sidecar's Selkies server over HTTP/WebSockets — H.264 reaches
+# the browser's decoder with no external relay. There is no shared guacd and no
 # coturn/TURN: the Selkies 2.x "websockets" viewer needs neither.
 
 # Web portal: launch + connect to desktop sessions from a browser.
@@ -149,18 +151,15 @@ whistler:
       - debian:12-slim
       - alpine:3.19
     desktop:
-      - ghcr.io/marma/whistler-desktop-xfce-selkies2:latest
-      - ghcr.io/marma/whistler-desktop-gnome-selkies2:latest
       - ghcr.io/marma/whistler-desktop-xfce-plain:latest
       - ghcr.io/marma/whistler-desktop-gnome-plain:latest
     vm: []
 
-  # Streamer sidecar default image (templates with streamer: sidecar): owns
-  # Xvfb + PulseAudio + Selkies next to a display-unaware workload container
-  # (built from desktops/streamer-selkies2). A template's streamerImage
-  # overrides this per template. Sidecar mode needs Kubernetes >= 1.29
-  # (native sidecars: initContainer restartPolicy=Always, beta+default since
-  # 1.29); embedded templates have no such floor.
+  # Streamer sidecar default image (every desktop pod gets one): owns Xvfb +
+  # PulseAudio + Selkies next to the display-unaware workload container (built
+  # from desktops/streamer-selkies2). A template's streamerImage overrides this
+  # per template. Desktop pods need Kubernetes >= 1.29 (native sidecars:
+  # initContainer restartPolicy=Always, beta+default since 1.29).
   streamer:
     image: ghcr.io/marma/whistler-streamer-selkies2:latest
 
@@ -190,10 +189,12 @@ whistler:
 #            templates expose a display server consumed by the web portal.
 #   runtime: container | kata | vm — plain pod, Kata-isolated pod, or KubeVirt VM.
 #
-# For desktop templates: displayPort is where the image's Selkies 2.x
-# (pixelflux) server listens over HTTP/WebSockets; the per-session Service
-# exposes it and the portal reverse-proxies it to the browser. All desktop
-# templates use viewer: websockets — there is no guacd/RDP or webrtc/coturn path.
+# For desktop templates: the image is a display-unaware workload (a DE or app
+# with a session entrypoint — no Selkies/X server inside); the operator injects
+# the streamer sidecar, whose Selkies 2.x (pixelflux) server listens on
+# displayPort over HTTP/WebSockets. The per-session Service exposes it and the
+# portal reverse-proxies it to the browser. All desktop templates use
+# viewer: websockets — there is no guacd/RDP or webrtc/coturn path.
 templates:
   small:
     description: "Small SSH instance"
@@ -204,59 +205,26 @@ templates:
       cpu: 500m
       memory: 2Gi
   xfce-desktop:
-    description: "XFCE desktop over Selkies 2.x (pixelflux/WebSockets)"
+    description: "XFCE desktop (streamer sidecar, Selkies 2.x/WebSockets)"
     mode: desktop
     runtime: container
-    # Built from desktops/xfce-selkies2 (multi-arch; pixelflux ships amd64+arm64
-    # wheels). For local dev, skaffold overrides this with the freshly-built image.
-    image: "ghcr.io/marma/whistler-desktop-xfce-selkies2:latest"
+    # Display-unaware XFCE workload (desktops/xfce-plain); the operator injects
+    # the streamer sidecar. For local dev, skaffold overrides both images.
+    image: "ghcr.io/marma/whistler-desktop-xfce-plain:latest"
     viewer: websockets
-    # The in-pod Selkies HTTP/WebSocket port the portal reverse-proxies.
     displayPort: 8082
     persistence: ephemeral
     resources:
       cpu: "2000m"
       memory: 4Gi
   gnome-desktop:
-    description: "Real GNOME Shell over Selkies 2.x (pixelflux/WebSockets)"
+    description: "Real GNOME Shell (streamer sidecar, Selkies 2.x/WebSockets)"
     mode: desktop
     runtime: container
-    # Built from desktops/gnome-selkies2 (Ubuntu 24.04 / GNOME 46, unprivileged —
-    # no systemd-PID1). For local dev, skaffold overrides this with the
-    # freshly-built image.
-    image: "ghcr.io/marma/whistler-desktop-gnome-selkies2:latest"
-    viewer: websockets
-    displayPort: 8082
-    persistence: ephemeral
-    resources:
-      # GNOME Shell is heavier than XFCE.
-      cpu: "2000m"
-      memory: 8Gi
-  xfce-sidecar:
-    description: "XFCE desktop, streamer sidecar (display-unaware workload image)"
-    mode: desktop
-    runtime: container
-    # Plain XFCE image with no Selkies inside (desktops/xfce-plain); the pod
-    # gets a streamer sidecar (whistler.streamer.image) that owns the display
-    # and streaming. For local dev, skaffold overrides both images.
-    image: "ghcr.io/marma/whistler-desktop-xfce-plain:latest"
-    viewer: websockets
-    streamer: sidecar
-    displayPort: 8082
-    persistence: ephemeral
-    resources:
-      cpu: "2000m"
-      memory: 4Gi
-  gnome-sidecar:
-    description: "GNOME Shell desktop, streamer sidecar (display-unaware workload image)"
-    mode: desktop
-    runtime: container
-    # Real GNOME Shell (X11 backend, GNOME 46) with no Selkies inside
-    # (desktops/gnome-plain); the streamer sidecar owns display + streaming.
-    # For local dev, skaffold overrides both images.
+    # Display-unaware GNOME Shell workload (desktops/gnome-plain; X11 backend,
+    # GNOME 46, unprivileged). For local dev, skaffold overrides both images.
     image: "ghcr.io/marma/whistler-desktop-gnome-plain:latest"
     viewer: websockets
-    streamer: sidecar
     streamerEnv:
       # REQUIRED for GNOME: mutter is a GL compositor and emits no damage for
       # static content — without streaming mode, static windows render black

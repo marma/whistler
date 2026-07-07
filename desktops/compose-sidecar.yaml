@@ -1,6 +1,6 @@
-# Local, cluster-free run of a sidecar-mode desktop pair — the docker
-# equivalent of what the operator builds for a `streamer: sidecar` template
-# (see KubeConfigManager._build_pod_spec):
+# Local, cluster-free run of a desktop pair — the docker equivalent of what
+# the operator builds for every desktop pod (see
+# KubeConfigManager._build_pod_spec):
 #
 #   streamer  = the pod's native init sidecar (Xvfb + PulseAudio + Selkies 2.x)
 #   desktop   = the display-unaware workload container

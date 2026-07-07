@@ -16,9 +16,6 @@ spec:
 {{- if $template.displayPort }}
   displayPort: {{ $template.displayPort }}
 {{- end }}
-{{- if $template.streamer }}
-  streamer: {{ $template.streamer }}
-{{- end }}
 {{- if $template.streamerImage }}
   streamerImage: {{ $template.streamerImage | quote }}
 {{- end }}

@@ -1,8 +1,8 @@
-# Plain XFCE **workload** image — the sidecar-mode counterpart of
-# ../xfce-selkies2. No X server, no PulseAudio daemon, no Selkies: the pod's
-# streamer sidecar (../streamer-selkies2) owns all of that and this image just
-# runs the desktop session against the display it finds via the injected
-# DISPLAY / PULSE_SERVER env (shared /tmp/.X11-unix and /tmp/pulse emptyDirs).
+# Plain XFCE **workload** image. No X server, no PulseAudio daemon, no
+# Selkies: the pod's streamer sidecar (../streamer-selkies2) owns all of that
+# and this image just runs the desktop session against the display it finds
+# via the injected DISPLAY / PULSE_SERVER env (shared /tmp/.X11-unix and
+# /tmp/pulse emptyDirs).
 #
 # That is the entire contract, and it is the point of the sidecar model: a
 # workload image is an ordinary "DE or app + its tools" image with a session
@@ -31,7 +31,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # Well-known desktop user (no login prompt — the streamer captures whatever
-# this session draws). Same convention as the *-selkies2 images.
+# this session draws). gnome-plain upgrades this to runtime-configurable
+# PUID/PGID identity; here a fixed user keeps the image minimal.
 ARG DESKTOP_USER=abc
 RUN useradd -m -s /bin/bash "${DESKTOP_USER}"
 
