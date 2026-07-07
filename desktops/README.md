@@ -1,14 +1,30 @@
 # Desktop images
 
 Container images that provide a graphical desktop reachable by the Whistler
-portal. Each subdirectory is one catalog entry; a `DesktopTemplate` references the
-built image and the portal serves it through the **websockets** viewer:
+portal. Each subdirectory is one catalog entry (except the streamer sidecar,
+see below); a `DesktopTemplate` references the built image and the portal
+serves it through the **websockets** viewer:
 
 - `viewer: websockets` (the only viewer) — browser ⇄ portal ⇄ in-pod **Selkies
-  2.x** (pixelflux) server. The image streams **H.264 over plain WebSockets**
+  2.x** (pixelflux) server. The pod streams **H.264 over plain WebSockets**
   straight to the browser's decoder; the portal reverse-proxies the HTTP/WS
   stream to the pod. **No guacd, no coturn/TURN.** The template gives the
   `displayPort` the in-pod Selkies server listens on (default `8082`).
+
+Where the Selkies server *runs* is the template's `streamer` field:
+
+- `streamer: embedded` (default) — the image itself starts X + Selkies
+  (`xfce-selkies2`, `gnome-selkies2`).
+- `streamer: sidecar` — the operator injects a **streamer sidecar**
+  ([`streamer-selkies2`](streamer-selkies2/), a native init sidecar) that owns
+  Xvfb + PulseAudio + Selkies and shares the X/Pulse sockets over emptyDirs;
+  the workload image is **display-unaware** (no Selkies inside — just a session
+  entrypoint against the injected `DISPLAY`, e.g. [`xfce-plain`](xfce-plain/)).
+  This is stage 1 of the guest-unaware-display direction: the streaming
+  protocol becomes a property of the sidecar image, swappable per template
+  without touching workload images. The pair also runs without any cluster as
+  two plain docker containers — see
+  [`streamer-selkies2/README.md`](streamer-selkies2/README.md).
 
 Over time this grows into a catalog for different use-cases (minimal vs full DE,
 CPU vs GPU, different toolchains). Add a new image by copying an existing
@@ -18,10 +34,13 @@ subdirectory. Then add the matching `DesktopTemplate` in
 choice, assembly checklist, silent-failure catalog, and the verification
 ladder for new images.
 
-| Image | Viewer | Port | Notes |
-|-------|--------|------|-------|
-| [`xfce-selkies2`](xfce-selkies2/) | **websockets** | 8082 | XFCE over **Selkies 2.x** (pixelflux). H.264 over plain WebSockets — no coturn/TURN. Multi-arch (pixelflux ships amd64+arm64 wheels). Ubuntu 26.04. Runs with `--cap-drop=ALL` (verified). |
-| [`gnome-selkies2`](gnome-selkies2/) | **websockets** | 8082 | **Real GNOME Shell** over **Selkies 2.x** (pixelflux). **Ubuntu 24.04 / GNOME 46** — the last gen with an X11-backend Shell *and* an unprivileged (no systemd-PID1) session, so **no `--privileged`**. Runtime-configurable user/UID/GID/sudo + home volume (`DESKTOP_USER`/`PUID`/`PGID`/`DESKTOP_SUDO`). Vendors libva 2.22 (24.04 ships 2.20). Firefox from Mozilla `.deb`. |
+| Image | Streamer | Port | Notes |
+|-------|----------|------|-------|
+| [`xfce-selkies2`](xfce-selkies2/) | embedded | 8082 | XFCE over **Selkies 2.x** (pixelflux). H.264 over plain WebSockets — no coturn/TURN. Multi-arch (pixelflux ships amd64+arm64 wheels). Ubuntu 26.04. Runs with `--cap-drop=ALL` (verified). |
+| [`gnome-selkies2`](gnome-selkies2/) | embedded | 8082 | **Real GNOME Shell** over **Selkies 2.x** (pixelflux). **Ubuntu 24.04 / GNOME 46** — the last gen with an X11-backend Shell *and* an unprivileged (no systemd-PID1) session, so **no `--privileged`**. Runtime-configurable user/UID/GID/sudo + home volume (`DESKTOP_USER`/`PUID`/`PGID`/`DESKTOP_SUDO`). Vendors libva 2.22 (24.04 ships 2.20). Firefox from Mozilla `.deb`. |
+| [`xfce-plain`](xfce-plain/) | **sidecar** | 8082 (on the sidecar) | XFCE with **no Selkies inside** — display-unaware workload image paired with the `streamer-selkies2` sidecar via `streamer: sidecar`. Ubuntu 26.04. |
+| [`gnome-plain`](gnome-plain/) | **sidecar** | 8082 (on the sidecar) | **Real GNOME Shell** (X11 backend — Wayland is architecturally incompatible with a display-owning sidecar), display-unaware. Ubuntu 24.04 / GNOME 46, unprivileged, PUID/PGID identity like `gnome-selkies2` — minus Selkies/Xvfb/Pulse *and* minus the vendored libva. Template **must set** `streamerEnv: {SELKIES_H264_STREAMING_MODE: "true"}`. |
+| [`streamer-selkies2`](streamer-selkies2/) | *(is the sidecar)* | 8082 | Not a catalog entry. Xvfb + PulseAudio + **Selkies 2.x**, injected by the operator (`whistler.streamer.image`, per-template `streamerImage` override). Tracks `xfce-selkies2`'s Dockerfile/pin. |
 
 > **History:** earlier spikes explored other display paths — XFCE/GNOME over
 > **guacd/RDP** (`base-rdp`, `xfce-rdp`, `gnome-grd`) and over **Selkies 1.x

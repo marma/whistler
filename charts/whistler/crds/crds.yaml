@@ -90,6 +90,35 @@ spec:
                     reverse-proxies the browser to the in-pod Selkies 2.x
                     (pixelflux) server on displayPort — H.264 over plain WebSockets
                     reaches the browser's decoder, no coturn/TURN involved.
+                streamer:
+                  type: string
+                  enum: ["embedded", "sidecar"]
+                  default: embedded
+                  description: >-
+                    Desktop-only. Where the display server + Selkies streamer run.
+                    "embedded" (default): the workload image itself starts X and
+                    Selkies (the pre-sidecar model; images under desktops/
+                    *-selkies2). "sidecar": the pod gets a streamer sidecar
+                    (native init sidecar) that owns Xvfb + PulseAudio + Selkies
+                    and shares the X/Pulse sockets with the workload container
+                    via emptyDirs; the workload image only needs to start a DE
+                    or app against the injected DISPLAY — no Selkies inside.
+                streamerImage:
+                  type: string
+                  description: >-
+                    Desktop-only, streamer=sidecar. Override the streamer sidecar
+                    image; defaults to the operator-configured
+                    WHISTLER_STREAMER_IMAGE (whistler.streamer.image).
+                streamerEnv:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  description: >-
+                    Desktop-only, streamer=sidecar. Extra env vars for the
+                    streamer sidecar, for workload-dependent streaming knobs the
+                    sidecar cannot infer — e.g. SELKIES_H264_STREAMING_MODE:
+                    "true" (required for GL compositors like GNOME Shell) or
+                    SELKIES_RESOLUTION.
                 instancetype:
                   type: string
                   description: VM-only. KubeVirt instancetype name (e.g. "u1.medium").

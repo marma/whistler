@@ -213,6 +213,12 @@ class KubeConfigManager(ConfigManager):
             "WHISTLER_FORCE_KATA_FOR_PRIVILEGED", "false"
         ).strip().lower() in ("1", "true", "yes")
         self.kata_runtime_class = os.environ.get("WHISTLER_KATA_RUNTIME_CLASS", "kata")
+        # Default image for the streamer sidecar (templates with
+        # streamer=sidecar); a template's streamerImage overrides it.
+        self.streamer_image = os.environ.get(
+            "WHISTLER_STREAMER_IMAGE",
+            "ghcr.io/marma/whistler-streamer-selkies2:latest",
+        )
 
     def _get_user_namespace(self, username: str) -> str:
         return f"whistler-user-{username}"
@@ -825,6 +831,10 @@ class KubeConfigManager(ConfigManager):
           - ssh overrides the entrypoint with ``sleep`` (the image must stay
             alive for the exec bridge); desktop does not (the display server
             self-starts) and exposes the display port.
+          - desktop templates with streamer=sidecar additionally get a native
+            streamer sidecar (Xvfb + PulseAudio + Selkies) sharing the X/Pulse
+            sockets with the workload container; the workload image then needs
+            no display server at all (see desktops/streamer-selkies2).
           - both ``instance`` and ``session`` labels are emitted so the SSH
             server's pod-watch and the desktop Service selector both resolve.
           - runtime=kata pins the configured Kata RuntimeClass.
@@ -849,13 +859,58 @@ class KubeConfigManager(ConfigManager):
             "resources": resource_reqs,
             "volumeMounts": volume_mounts,
         }
+        streamer_sidecar = None
         if mode == "ssh":
             # SSH images are bridged via `kubectl exec`; keep the pod alive.
             container["command"] = ["sleep", "3600"]
+        elif template_spec.get('streamer', 'embedded') == 'sidecar' and display_port is not None:
+            # Streamer sidecar: the workload image knows nothing about
+            # displays — a native sidecar (initContainer with
+            # restartPolicy=Always) owns Xvfb + PulseAudio + Selkies and shares
+            # the X/Pulse sockets over emptyDirs. The startupProbe on the
+            # Selkies port gates the workload container: its entrypoint (a DE
+            # session or app) can assume DISPLAY is live without a wait loop.
+            # The display port therefore lives on the sidecar, not "main".
+            # Pod containers share the IPC namespace by default, which is what
+            # lets the workload's X clients use MIT-SHM against the sidecar's
+            # Xvfb (compose needs explicit ipc: wiring for the same effect).
+            # streamerEnv carries workload-dependent streaming knobs the sidecar
+            # cannot infer (e.g. SELKIES_H264_STREAMING_MODE for GL compositors).
+            sidecar_env = [{"name": "SELKIES_PORT", "value": str(display_port)}]
+            for k, v in (template_spec.get('streamerEnv') or {}).items():
+                sidecar_env.append({"name": str(k), "value": str(v)})
+            streamer_sidecar = {
+                "name": "streamer",
+                "image": template_spec.get('streamerImage') or self.streamer_image,
+                "restartPolicy": "Always",
+                "env": sidecar_env,
+                "ports": [{"containerPort": display_port, "name": "display"}],
+                "volumeMounts": [
+                    {"name": "x11", "mountPath": "/tmp/.X11-unix"},
+                    {"name": "pulse", "mountPath": "/tmp/pulse"},
+                ],
+                "startupProbe": {
+                    "tcpSocket": {"port": display_port},
+                    "periodSeconds": 2,
+                    "failureThreshold": 60,
+                },
+                # Requests only (scheduling hint); encode bursts get whatever
+                # CPU the node has free.
+                "resources": {"requests": {"cpu": "250m", "memory": "256Mi"}},
+            }
+            container["env"] = [
+                {"name": "DISPLAY", "value": ":0"},
+                {"name": "PULSE_SERVER", "value": "unix:/tmp/pulse/native"},
+            ]
+            container["volumeMounts"] = volume_mounts + [
+                {"name": "x11", "mountPath": "/tmp/.X11-unix"},
+                {"name": "pulse", "mountPath": "/tmp/pulse"},
+            ]
         else:
-            # Desktop images self-start their display server; expose its port.
-            # The websockets viewer (Selkies 2.x / pixelflux) serves H.264 over a
-            # plain HTTP/WebSocket port the portal reverse-proxies — no coturn/TURN.
+            # Embedded streamer: the desktop image self-starts its display
+            # server + Selkies; expose its port. The websockets viewer (Selkies
+            # 2.x / pixelflux) serves H.264 over a plain HTTP/WebSocket port
+            # the portal reverse-proxies — no coturn/TURN.
             if display_port is not None:
                 container["ports"] = [{"containerPort": display_port, "name": "display"}]
 
@@ -884,6 +939,13 @@ class KubeConfigManager(ConfigManager):
                 "automountServiceAccountToken": False,
             },
         }
+
+        if streamer_sidecar is not None:
+            pod_body["spec"]["initContainers"] = [streamer_sidecar]
+            pod_body["spec"]["volumes"] = pod_volumes + [
+                {"name": "x11", "emptyDir": {}},
+                {"name": "pulse", "emptyDir": {}},
+            ]
 
         if user_details and "securityContext" in user_details:
             pod_body["spec"]["securityContext"] = user_details["securityContext"]
@@ -1556,7 +1618,7 @@ class KubeConfigManager(ConfigManager):
         spec = {"user": "system"}
         for key in ("mode", "runtime", "displayName", "image", "description",
                     "resources", "nodeSelector", "personalMountPath", "volumes",
-                    "displayPort", "viewer",
+                    "displayPort", "viewer", "streamer", "streamerImage", "streamerEnv",
                     "privileged", "fuse", "instancetype", "persistence"):
             if template_data.get(key) is not None:
                 spec[key] = template_data[key]

@@ -16,6 +16,18 @@ build:
       context: desktops/gnome-selkies2
       docker:
         dockerfile: Dockerfile
+    - image: whistler-desktop-xfce-plain
+      context: desktops/xfce-plain
+      docker:
+        dockerfile: Dockerfile
+    - image: whistler-desktop-gnome-plain
+      context: desktops/gnome-plain
+      docker:
+        dockerfile: Dockerfile
+    - image: whistler-streamer-selkies2
+      context: desktops/streamer-selkies2
+      docker:
+        dockerfile: Dockerfile
 deploy:
   helm:
     releases:
@@ -54,11 +66,18 @@ deploy:
           # Use the locally-built desktop images for the sample templates.
           templates.xfce-desktop.image: "{{.IMAGE_REPO_whistler_desktop_xfce_selkies2}}:{{.IMAGE_TAG_whistler_desktop_xfce_selkies2}}"
           templates.gnome-desktop.image: "{{.IMAGE_REPO_whistler_desktop_gnome_selkies2}}:{{.IMAGE_TAG_whistler_desktop_gnome_selkies2}}"
+          templates.xfce-sidecar.image: "{{.IMAGE_REPO_whistler_desktop_xfce_plain}}:{{.IMAGE_TAG_whistler_desktop_xfce_plain}}"
+          templates.gnome-sidecar.image: "{{.IMAGE_REPO_whistler_desktop_gnome_plain}}:{{.IMAGE_TAG_whistler_desktop_gnome_plain}}"
+          # The streamer sidecar image the operator injects for streamer=sidecar
+          # templates.
+          whistler.streamer.image: "{{.IMAGE_REPO_whistler_streamer_selkies2}}:{{.IMAGE_TAG_whistler_streamer_selkies2}}"
           # Use the locally-built desktop images as the enforced desktop allow-list,
           # so the operator accepts them and the management UI picker shows the
           # actual build outputs (replaces the production defaults in values.yaml).
           whistler.images.desktop[0]: "{{.IMAGE_REPO_whistler_desktop_xfce_selkies2}}:{{.IMAGE_TAG_whistler_desktop_xfce_selkies2}}"
           whistler.images.desktop[1]: "{{.IMAGE_REPO_whistler_desktop_gnome_selkies2}}:{{.IMAGE_TAG_whistler_desktop_gnome_selkies2}}"
+          whistler.images.desktop[2]: "{{.IMAGE_REPO_whistler_desktop_xfce_plain}}:{{.IMAGE_TAG_whistler_desktop_xfce_plain}}"
+          whistler.images.desktop[3]: "{{.IMAGE_REPO_whistler_desktop_gnome_plain}}:{{.IMAGE_TAG_whistler_desktop_gnome_plain}}"
 # Forward the front doors to localhost on `skaffold dev` (NodePorts aren't
 # auto-published on kind the way they are on docker-desktop). The portal now goes
 # through the chart's bundled Traefik proxy (whistler-portal-proxy :80): both

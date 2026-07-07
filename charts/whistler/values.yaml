@@ -151,7 +151,18 @@ whistler:
     desktop:
       - ghcr.io/marma/whistler-desktop-xfce-selkies2:latest
       - ghcr.io/marma/whistler-desktop-gnome-selkies2:latest
+      - ghcr.io/marma/whistler-desktop-xfce-plain:latest
+      - ghcr.io/marma/whistler-desktop-gnome-plain:latest
     vm: []
+
+  # Streamer sidecar default image (templates with streamer: sidecar): owns
+  # Xvfb + PulseAudio + Selkies next to a display-unaware workload container
+  # (built from desktops/streamer-selkies2). A template's streamerImage
+  # overrides this per template. Sidecar mode needs Kubernetes >= 1.29
+  # (native sidecars: initContainer restartPolicy=Always, beta+default since
+  # 1.29); embedded templates have no such floor.
+  streamer:
+    image: ghcr.io/marma/whistler-streamer-selkies2:latest
 
   # Security policy enforced by the operator.
   security:
@@ -219,6 +230,42 @@ templates:
     persistence: ephemeral
     resources:
       # GNOME Shell is heavier than XFCE.
+      cpu: "2000m"
+      memory: 8Gi
+  xfce-sidecar:
+    description: "XFCE desktop, streamer sidecar (display-unaware workload image)"
+    mode: desktop
+    runtime: container
+    # Plain XFCE image with no Selkies inside (desktops/xfce-plain); the pod
+    # gets a streamer sidecar (whistler.streamer.image) that owns the display
+    # and streaming. For local dev, skaffold overrides both images.
+    image: "ghcr.io/marma/whistler-desktop-xfce-plain:latest"
+    viewer: websockets
+    streamer: sidecar
+    displayPort: 8082
+    persistence: ephemeral
+    resources:
+      cpu: "2000m"
+      memory: 4Gi
+  gnome-sidecar:
+    description: "GNOME Shell desktop, streamer sidecar (display-unaware workload image)"
+    mode: desktop
+    runtime: container
+    # Real GNOME Shell (X11 backend, GNOME 46) with no Selkies inside
+    # (desktops/gnome-plain); the streamer sidecar owns display + streaming.
+    # For local dev, skaffold overrides both images.
+    image: "ghcr.io/marma/whistler-desktop-gnome-plain:latest"
+    viewer: websockets
+    streamer: sidecar
+    streamerEnv:
+      # REQUIRED for GNOME: mutter is a GL compositor and emits no damage for
+      # static content — without streaming mode, static windows render black
+      # (see desktops/gnome-plain/README.md).
+      SELKIES_H264_STREAMING_MODE: "true"
+    displayPort: 8082
+    persistence: ephemeral
+    resources:
+      # GNOME Shell is heavier than XFCE (llvmpipe compositing).
       cpu: "2000m"
       memory: 8Gi
   # win-vm:

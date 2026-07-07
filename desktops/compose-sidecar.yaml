@@ -1,0 +1,73 @@
+# Local, cluster-free run of a sidecar-mode desktop pair — the docker
+# equivalent of what the operator builds for a `streamer: sidecar` template
+# (see KubeConfigManager._build_pod_spec):
+#
+#   streamer  = the pod's native init sidecar (Xvfb + PulseAudio + Selkies 2.x)
+#   desktop   = the display-unaware workload container
+#
+# The two shared named volumes stand in for the pod's emptyDirs; the
+# healthcheck-gated depends_on stands in for the sidecar's startupProbe (the
+# workload only starts once Selkies is listening, which means X is up); and
+# the explicit `ipc:` pairing stands in for the pod's shared IPC namespace
+# (X clients use MIT-SHM against the streamer's Xvfb — GNOME's llvmpipe
+# compositing in particular). The workload entrypoints additionally have their
+# own 30s wait-and-fail-loudly guard for when this file isn't used.
+#
+# The workload is selected by env (compose interpolation), so one file serves
+# every *-plain image:
+#   SIDECAR_WORKLOAD        build context under desktops/   (default xfce-plain)
+#   SIDECAR_WORKLOAD_IMAGE  image tag for it                (default whistler-desktop-xfce-plain:dev)
+#   SELKIES2_H264_STREAMING streamer streaming-mode flag    (default false; MUST
+#                           be true for GL compositors like GNOME Shell — the
+#                           compose analogue of the template's streamerEnv)
+#
+# Driven by `make desktop-sidecar-local` (XFCE) and
+# `make desktop-gnome-sidecar-local` (GNOME), torn down by
+# `make desktop-sidecar-local-down`; see desktops/streamer-selkies2/README.md
+# for the manual `docker run` spelling.
+name: whistler-sidecar
+
+services:
+  streamer:
+    build: ./streamer-selkies2
+    image: whistler-streamer-selkies2:dev
+    ports:
+      - "8082:8082"
+    environment:
+      # Same knobs (and Apple-Silicon rationale) as the desktop-*-local make
+      # targets: SELKIES2_RESOLUTION / SELKIES2_HTTPS on the make command line.
+      SELKIES_RESOLUTION: ${SELKIES2_RESOLUTION:-800x600}
+      SELKIES_ENABLE_HTTPS: ${SELKIES2_HTTPS:-false}
+      SELKIES_H264_STREAMING_MODE: ${SELKIES2_H264_STREAMING:-false}
+    volumes:
+      - x11:/tmp/.X11-unix
+      - pulse:/tmp/pulse
+    ipc: shareable
+    healthcheck:
+      # TCP-connect to the Selkies port via bash's /dev/tcp (no curl in the
+      # image) — the same "port open == display live" signal the k8s
+      # startupProbe uses.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8082"]
+      interval: 2s
+      retries: 60
+
+  desktop:
+    build: ./${SIDECAR_WORKLOAD:-xfce-plain}
+    image: ${SIDECAR_WORKLOAD_IMAGE:-whistler-desktop-xfce-plain:dev}
+    environment:
+      DISPLAY: ":0"
+      PULSE_SERVER: "unix:/tmp/pulse/native"
+    volumes:
+      - x11:/tmp/.X11-unix
+      - pulse:/tmp/pulse
+    ipc: service:streamer
+    depends_on:
+      streamer:
+        condition: service_healthy
+    # A DE crash restarts the session against the still-running display, like
+    # the pod's restartPolicy would.
+    restart: unless-stopped
+
+volumes:
+  x11:
+  pulse:

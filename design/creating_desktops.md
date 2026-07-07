@@ -7,6 +7,17 @@ Selkies-1.x/WebRTC spikes that preceded it (removed — see the banner in
 [`design/vdi.md`](vdi.md)). Read together with
 [`desktops/README.md`](../desktops/README.md) (the catalog + conventions).
 
+> **Sidecar mode (stage 1 of guest-unaware displays).** Since the streamer
+> sidecar landed, there are two ways to build a catalog image. With
+> `streamer: sidecar` in the template, the workload image needs **none of the
+> streaming stack below** — no Selkies, no Xvfb, no PulseAudio daemon; just a
+> DE/app plus a session entrypoint against the injected `DISPLAY`
+> ([`desktops/xfce-plain`](../desktops/xfce-plain/) is the model; the sidecar
+> itself is [`desktops/streamer-selkies2`](../desktops/streamer-selkies2/)).
+> Prefer sidecar mode for new images. Everything below still applies to
+> `streamer: embedded` images (self-contained X + Selkies) — and to the
+> sidecar image itself, which is where the streaming stack now lives.
+
 ## 1. The streaming stack: Selkies 2.x / pixelflux
 
 There is one stack, and every new image uses it: **Selkies 2.x (pixelflux)** with

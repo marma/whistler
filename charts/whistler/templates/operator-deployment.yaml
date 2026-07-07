@@ -41,6 +41,8 @@ spec:
               value: {{ .Values.whistler.security.forceKataForPrivileged | quote }}
             - name: WHISTLER_KATA_RUNTIME_CLASS
               value: {{ .Values.whistler.security.kataRuntimeClass | quote }}
+            - name: WHISTLER_STREAMER_IMAGE
+              value: {{ .Values.whistler.streamer.image | quote }}
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
           # ensure_pod() runs here now, so the operator needs the same user and
