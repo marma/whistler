@@ -1,22 +1,22 @@
 # Creating desktop images
 
 Practical guidelines for adding a new image under [`desktops/`](../desktops/),
-distilled from building the existing catalog (xfce-rdp, xfce-webrtc,
-gnome-flashback-webrtc, gnome-grd, xfce-selkies2). Read together with
-[`desktops/README.md`](../desktops/README.md) (the catalog + conventions) and
-[`design/vdi.md`](vdi.md) (viewer architecture). Written with the next image —
-a full GNOME desktop — in mind.
+distilled from building the catalog ([`xfce-selkies2`](../desktops/xfce-selkies2/),
+[`gnome-selkies2`](../desktops/gnome-selkies2/)) and the guacd/RDP and
+Selkies-1.x/WebRTC spikes that preceded it (removed — see the banner in
+[`design/vdi.md`](vdi.md)). Read together with
+[`desktops/README.md`](../desktops/README.md) (the catalog + conventions).
 
-## 1. Choose the streaming stack first
+## 1. The streaming stack: Selkies 2.x / pixelflux
 
-This decision shapes everything else in the image:
-
-| Stack | Viewer | When |
-|---|---|---|
-| **Selkies 2.x / pixelflux** ([`xfce-selkies2`](../desktops/xfce-selkies2/)) | websockets (portal viewer TBD) | **Default for all new images.** H.264 in the browser, one TCP port, no coturn, multi-arch, unprivileged. |
-| gnome-remote-desktop | `guacd` (RDP) | Wayland-native GNOME Shell specifically ([`gnome-grd`](../desktops/gnome-grd/)) — keeps the existing guacd contract at the cost of re-rasterized frames. |
-| xrdp via [`base-rdp`](../desktops/base-rdp/) | `guacd` (RDP) | Legacy/simple X11 DEs where guacd-quality output is fine. |
-| Selkies 1.x GStreamer | `webrtc` | **Don't build new images on this.** Kept for xfce-webrtc / gnome-flashback-webrtc until they're ported to 2.x. |
+There is one stack, and every new image uses it: **Selkies 2.x (pixelflux)** with
+the portal's **`websockets`** viewer. H.264 reaches the browser's decoder over a
+single TCP port (plain WebSockets), no coturn/TURN, multi-arch (amd64+arm64),
+unprivileged. The alternatives that were evaluated and dropped — guacd/RDP
+(re-rasterized frames, extra daemon) and Selkies 1.x + WebRTC/coturn (amd64-only,
+needs a TURN relay) — are recorded in [`vdi.md`](vdi.md) and recoverable from git
+history; the one thing guacd/VNC offered that Selkies can't is *agentless*
+VM-console capture (KubeVirt QEMU framebuffer), if that is ever needed.
 
 The Selkies 2.x stack is unreleased upstream: pin `SELKIES_COMMIT` and build the
 Python server **and** the web client from that same commit (see the
@@ -42,7 +42,8 @@ Rule of thumb from the catalog so far: **privilege requirements come from the
 DE, never from the streaming layer.** If your image needs a capability, the
 justification must name the DE component that demands it (e.g. GNOME's
 glycin/bwrap image-loading sandbox needing real root under
-`apparmor_restrict_unprivileged_userns=1` — see gnome-flashback-webrtc).
+`apparmor_restrict_unprivileged_userns=1`, a systemd-PID1 base — which is why
+`gnome-selkies2` deliberately pins GNOME 46 / Ubuntu 24.04 to avoid it).
 
 ## 3. Image anatomy and conventions
 
@@ -50,7 +51,7 @@ glycin/bwrap image-loading sandbox needing real root under
   units), `README.md`. The README documents build, standalone local test, and
   a `| |` table of viewer/port/creds/arch/privileged facts.
 - **Self-contained and standalone-testable**: the image must be verifiable
-  with plain `docker run -p` and a browser, no cluster/portal/coturn. This is
+  with plain `docker run -p` and a browser, no cluster or portal. This is
   the bottom of the test pyramid; every image gets a `make desktop-*-local`
   target.
 - Display server self-starts as the entrypoint; the pod spec overrides no
@@ -178,14 +179,17 @@ example of the first three):
 
 ## 8. Notes for the full-GNOME image
 
-What the existing GNOME images already established:
+What the GNOME spikes established (the losing options were removed with the
+guacd/webrtc cleanup — see the banner in [vdi.md](vdi.md) — leaving
+[`gnome-selkies2`](../desktops/gnome-selkies2/) as the built answer):
 
-- GNOME Shell has **no X11 backend anymore** — X11-based capture can never
-  show the real Shell. GNOME Flashback (Panel + Metacity) is the X11-native
-  stand-in; GNOME Shell itself runs only headless-Wayland (gnome-grd).
-- GNOME Session hard-requires `systemd --user` → systemd-PID1 + privileged +
-  Kata coercion (§2), and the session currently runs as root (glycin/bwrap).
-  Both facts are documented in the gnome-flashback-webrtc Dockerfile header.
+- GNOME Shell **46 is the last gen with an X11 backend**; newer Shell runs only
+  headless-Wayland. Selkies 2.x captures the X11 framebuffer, so GNOME 46 on
+  Ubuntu 24.04 is what lets us stream the *real* Shell unprivileged.
+- On newer bases GNOME Session hard-requires `systemd --user` → systemd-PID1 +
+  privileged + Kata coercion (§2), and the session runs as root (glycin/bwrap).
+  Pinning to GNOME 46 / 24.04 avoids all of that — hence `gnome-selkies2` needs
+  **no `--privileged`**.
 
 **The goal is the real GNOME Shell experience** — Activities, dynamic
 workspaces, extensions; as close to a stock desktop as possible. That goal

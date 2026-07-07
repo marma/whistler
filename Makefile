@@ -6,30 +6,23 @@
 #   make cluster-down      # delete it
 #   make integration       # full C1 round trip (creates+tears down a cluster)
 #   make integration-keep  # same, but keep the cluster for fast re-runs
-#   make desktop-webrtc-local  # run the WebRTC desktop image standalone (no cluster)
-#   make desktop-gnome-flashback-webrtc-local  # same, for the GNOME Flashback image
-#   make desktop-selkies2-local  # same, for the Selkies 2.x (pixelflux) spike image
+#   make desktop-selkies2-local  # run the XFCE Selkies 2.x (pixelflux) image standalone (no cluster)
 #   make desktop-gnome-selkies2-local  # same, for the full GNOME Shell (Selkies 2.x) image
 
 CLUSTER      ?= whistler-it
 TEST_IMAGE   ?= whistler-test
 PYTHON       ?= $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python)
-WEBRTC_IMAGE ?= whistler-desktop-xfce-webrtc:dev
-GNOME_FLASHBACK_WEBRTC_IMAGE ?= whistler-desktop-gnome-flashback-webrtc:dev
 SELKIES2_IMAGE ?= whistler-desktop-xfce-selkies2:dev
 GNOME_SELKIES2_IMAGE ?= whistler-desktop-gnome-selkies2:dev
-# Lightweight encoding profile for the standalone local target. On Apple Silicon
+# Lightweight encoding profile for the standalone local targets. On Apple Silicon
 # the image runs amd64 x264 software encoding under QEMU emulation, and Selkies'
-# defaults (1280x720 / 60fps / 8Mbps) are too heavy — the first keyframe is slow
-# enough that the client's stream watchdog gives up. These override to a profile
-# the emulated encoder can keep up with. Bump them (or override on the command
-# line) on a native amd64/Linux host, e.g. `make desktop-webrtc-local WEBRTC_FRAMERATE=60`.
-WEBRTC_RESOLUTION    ?= 800x600
-WEBRTC_FRAMERATE     ?= 10
-WEBRTC_VIDEO_BITRATE ?= 1500
+# default resolution is too heavy — the first keyframe is slow enough that the
+# client's stream watchdog gives up. This overrides to a profile the emulated
+# encoder can keep up with. Bump it (or override on the command line) on a native
+# amd64/Linux host, e.g. `make desktop-selkies2-local SELKIES2_RESOLUTION=1920x1080`.
+SELKIES2_RESOLUTION ?= 800x600
 
 .PHONY: test test-local cluster-up cluster-down integration integration-keep \
-        desktop-webrtc-local desktop-gnome-flashback-webrtc-local \
         desktop-selkies2-local desktop-gnome-selkies2-local clean help
 
 help:
@@ -60,36 +53,6 @@ integration-keep: # Same, but keep the cluster afterwards for fast iteration
 integration-existing: # C1 round trip against the current kubectl context (kind/docker-desktop)
 	PROVIDER=existing PYTHON=$(PYTHON) scripts/integration.sh
 
-desktop-webrtc-local: # Build + run the WebRTC desktop image standalone (no cluster); open http://localhost:8082/
-	docker build -t $(WEBRTC_IMAGE) desktops/xfce-webrtc
-	@echo "Open http://localhost:8082/ (Selkies' own UI). On macOS/Windows the internal"
-	@echo "TURN is enabled so media flows; on Linux you can drop it and add --network host."
-	docker run --rm -it \
-	  -p 8082:8082 \
-	  -p 3478:3478/udp -p 3478:3478/tcp \
-	  -p 49160-49200:49160-49200/udp \
-	  -e SELKIES_USE_INTERNAL_TURN=1 \
-	  -e SELKIES_RESOLUTION=$(WEBRTC_RESOLUTION) \
-	  -e SELKIES_FRAMERATE=$(WEBRTC_FRAMERATE) \
-	  -e SELKIES_VIDEO_BITRATE=$(WEBRTC_VIDEO_BITRATE) \
-	  $(WEBRTC_IMAGE)
-
-desktop-gnome-flashback-webrtc-local: # Build + run the GNOME Flashback WebRTC desktop image standalone (no cluster); open http://localhost:8082/
-	docker build -t $(GNOME_FLASHBACK_WEBRTC_IMAGE) desktops/gnome-flashback-webrtc
-	@echo "Open http://localhost:8082/ (Selkies' own UI). Needs --privileged (systemd as"
-	@echo "PID 1 — see desktops/gnome-flashback-webrtc/README.md). On macOS/Windows the"
-	@echo "internal TURN is enabled so media flows; on Linux you can drop it and add"
-	@echo "--network host."
-	docker run --rm -it --privileged \
-	  -p 8082:8082 \
-	  -p 3478:3478/udp -p 3478:3478/tcp \
-	  -p 49160-49200:49160-49200/udp \
-	  -e SELKIES_USE_INTERNAL_TURN=1 \
-	  -e SELKIES_RESOLUTION=$(WEBRTC_RESOLUTION) \
-	  -e SELKIES_FRAMERATE=$(WEBRTC_FRAMERATE) \
-	  -e SELKIES_VIDEO_BITRATE=$(WEBRTC_VIDEO_BITRATE) \
-	  $(GNOME_FLASHBACK_WEBRTC_IMAGE)
-
 # The 2.x web client requires a browser secure context (WebCodecs). Plain HTTP
 # is fine when browsing from the same machine (http://localhost is secure);
 # to reach it from ANOTHER machine, run `make desktop-selkies2-local
@@ -104,7 +67,7 @@ desktop-selkies2-local: # Build + run the Selkies 2.x (pixelflux/WebSockets) spi
 	@echo "Browsing from another machine? Re-run with SELKIES2_HTTPS=true and use https://."
 	docker run --rm -it \
 	  -p 8082:8082 \
-	  -e SELKIES_RESOLUTION=$(WEBRTC_RESOLUTION) \
+	  -e SELKIES_RESOLUTION=$(SELKIES2_RESOLUTION) \
 	  -e SELKIES_ENABLE_HTTPS=$(SELKIES2_HTTPS) \
 	  $(SELKIES2_IMAGE)
 
@@ -119,7 +82,7 @@ desktop-gnome-selkies2-local: # Build + run the full GNOME Shell (Selkies 2.x) d
 	@echo "machine? Re-run with SELKIES2_HTTPS=true and use https://."
 	docker run --rm -it \
 	  -p 8082:8082 \
-	  -e SELKIES_RESOLUTION=$(WEBRTC_RESOLUTION) \
+	  -e SELKIES_RESOLUTION=$(SELKIES2_RESOLUTION) \
 	  -e SELKIES_ENABLE_HTTPS=$(SELKIES2_HTTPS) \
 	  $(GNOME_SELKIES2_IMAGE)
 

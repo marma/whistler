@@ -3,18 +3,24 @@
 Routes (all under a dev-only auth gate — see ``auth_middleware``):
   GET  /                 list templates + sessions, launch form
   POST /launch           create a DesktopSession, redirect to /connect/<id>
-  GET  /connect/<id>     page that waits for Ready then opens the WS (viewer-aware)
+  GET  /connect/<id>     desktop viewer page (websockets viewer — see below)
   GET  /status/<id>      JSON readiness poll
-  GET  /ws/<id>          WebSocket <-> guacd relay      (guacd viewer)
-  GET  /ice/<id>         JSON ICE servers + TURN creds  (webrtc viewer)
-  GET  /ws-signal/<id>   WebSocket signaling relay      (webrtc viewer)
+  GET  /term/<id>        web-terminal page
+  GET  /term-status/<id> JSON terminal-readiness poll
+  GET  /ws-term/<id>     WebSocket <-> in-pod shell (kubectl exec) relay
   GET  /healthz          readiness probe
+
+The only display backend is the **websockets viewer**: the browser connects to
+the in-pod Selkies 2.x (pixelflux) server, which serves H.264 over plain
+WebSockets straight to the browser's decoder — no guacd, no coturn/TURN. The
+reverse-proxy that carries that HTTP/WS stream to the pod is not wired yet, so
+``/connect`` currently serves a placeholder (see ``_render_connect``); the web
+terminal is fully functional.
 
 State lives in CRs; the portal holds none. Blocking KubeConfigManager calls run
 in an executor so the event loop stays responsive.
 """
 import asyncio
-import codecs
 import html
 import logging
 import os
@@ -22,9 +28,7 @@ import secrets
 
 from aiohttp import web
 
-from whistler.portal import guacd, terminal, webrtc
-from whistler.portal.guacd import handshake, resolve_session, _build_guacd_params
-from whistler.portal.protocol import take_complete_instructions
+from whistler.portal import terminal
 
 logger = logging.getLogger("whistler.portal")
 
@@ -56,44 +60,23 @@ async def _run(request, func, *args):
     return await loop.run_in_executor(None, func, *args)
 
 
+def _resolve_session(sessions, short_name):
+    """Find a desktop session by its short (per-user) name in a list from
+    ``get_user_desktop_sessions``."""
+    return next((s for s in sessions if s.get("name") == short_name), None)
+
+
 # --------------------------------------------------------------------------- #
-# Pages (inline; guacamole-common-js served locally from the portal)            #
+# Static assets (xterm.js for the web terminal), served locally not from a CDN.#
+# Whitelisted by name so /static/{filename} can't read arbitrary files.        #
 # --------------------------------------------------------------------------- #
 
-# guacamole-common-js is vendored (whistler/portal/static/) and served by the
-# portal rather than pulled from a CDN. We pin 1.6.0: the npm-published builds
-# stop at 1.5.0, whose renderer mishandles guacd's save-under copy ops (the
-# selection-rectangle / drag artifacts). 1.6.0 must be advertised to guacd too —
-# see guacd._CLIENT_PROTOCOL_VERSION. Overridable to a URL for experiments.
 _STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-_GUAC_JS_FILENAME = "guacamole-common.min.js"
-GUAC_JS_URL = os.environ.get("PORTAL_GUAC_JS_URL", "/static/" + _GUAC_JS_FILENAME)
-
-_guac_js_cache = None
-
-
-async def guac_js(request):
-    global _guac_js_cache
-    if _guac_js_cache is None:
-        with open(os.path.join(_STATIC_DIR, _GUAC_JS_FILENAME), "rb") as f:
-            _guac_js_cache = f.read()
-    return web.Response(body=_guac_js_cache, content_type="application/javascript",
-                        charset="utf-8")
-
-
-# Vendored web-terminal assets (xterm.js + fit addon), served locally like the
-# guacamole bundle above rather than from a CDN. Whitelisted by name so the
-# dynamic /static/{filename} route can't be used to read arbitrary files.
-# Vendored Selkies WebRTC client (added with the desktop image in Phase 2; the
-# /static route 404s until then). Version-locked to the in-pod Selkies server.
-SELKIES_JS_FILENAME = "selkies-core.js"
-
 _STATIC_FILES = {
     "xterm.min.js": "application/javascript",
     "xterm.min.css": "text/css",
     "xterm-addon-fit.min.js": "application/javascript",
     "style.css": "text/css",
-    SELKIES_JS_FILENAME: "application/javascript",
 }
 _static_cache: dict[str, bytes] = {}
 
@@ -109,13 +92,17 @@ async def static_file(request):
     return web.Response(body=_static_cache[name], content_type=content_type, charset="utf-8")
 
 
+# --------------------------------------------------------------------------- #
+# Pages                                                                        #
+# --------------------------------------------------------------------------- #
+
 def _render_index(user, templates, sessions):
     tpl_rows = "".join(
         f"<li><form method=post action='/launch'>"
         f"<input type=hidden name=template value='{html.escape(t['fullName'])}'>"
         f"<input type=hidden name=user value='{html.escape(user)}'>"
         f"{html.escape(t['name'])} ({html.escape(t.get('runtime','container'))}/"
-        f"{html.escape(t.get('protocol','rdp'))}) "
+        f"{html.escape(t.get('viewer','websockets'))}) "
         f"<input name=name placeholder='session name'>"
         f"<button>Launch</button></form></li>"
         for t in templates
@@ -136,67 +123,24 @@ def _render_index(user, templates, sessions):
     )
 
 
-# Placeholders are replaced (not .format) so JS braces stay intact.
+# Desktop viewer page (websockets viewer). The in-pod Selkies 2.x server serves
+# its own web client + H.264-over-WebSocket stream; the portal will reverse-proxy
+# that HTTP/WS to the pod. That proxy seam is not wired yet, so for now this page
+# waits for the session to be Ready and reports the pending work rather than
+# erroring. Placeholders are replaced (not .format) so JS braces survive.
 _CONNECT_HTML = """<!doctype html><meta charset=utf-8><title>__ID__</title>
 <style>
-  html,body{margin:0;height:100%;background:#202020;overflow:hidden}
-  /* Guacamole gives its layer canvases z-index:-1, which paints them BEHIND the
-     page background — so the desktop renders but stays hidden under body's
-     background. Make #display its own stacking context (position + z-index, plus
-     isolation for good measure) so that -1 resolves inside #display, on top of
-     the body background, instead of behind the whole page. */
-  #display{position:absolute;inset:0;z-index:0;isolation:isolate}
-  /* No interpolation. On a hidpi screen the browser upscales the canvas from CSS
-     px to device px; the default bilinear filter makes that blurry (reads as
-     "compression"). pixelated/crisp-edges force nearest-neighbour -> jaggies
-     instead of blur. With 1:1 rendering (below) there's no resampling at all at
-     100%; this matters for the 2x mode and fractional DPRs. */
-  #display canvas{image-rendering:pixelated;image-rendering:crisp-edges}
-  #log{position:absolute;top:0;left:0;z-index:10;color:#0f0;font:12px/1.4 monospace;
-       background:rgba(0,0,0,.7);padding:6px;max-width:95%;white-space:pre-wrap;pointer-events:none}
-  #q{position:absolute;bottom:6px;right:6px;z-index:21;font:12px monospace;cursor:pointer;
-     background:rgba(0,0,0,.6);color:#0f0;border:1px solid #0f0;border-radius:3px;padding:2px 6px}
-  #overlay{position:absolute;inset:0;z-index:20;background:rgba(0,0,0,.65);
-           display:flex;align-items:center;justify-content:center;
-           transition:opacity .4s}
-  #overlay.hidden{opacity:0;pointer-events:none}
-  #overlay-msg{color:#e0e0e0;font:bold 2rem/1.5 system-ui,sans-serif;text-align:center;
-               text-shadow:0 2px 8px rgba(0,0,0,.9);max-width:80%}
+  html,body{margin:0;height:100%;background:#202020;overflow:hidden;
+            color:#e0e0e0;font:15px/1.5 system-ui,sans-serif}
+  #msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+       text-align:center;padding:2rem;box-sizing:border-box}
 </style>
-<div id=display></div>
-<div id=overlay><div id=overlay-msg>Connecting…</div></div>
-<pre id=log></pre>
-<button id=q title="Toggle remote render resolution (1:1 physical vs half)">100%</button>
-<!-- guacamole-common-js ships a CommonJS bundle: it sets a global `var Guacamole`
-     but ends with an unguarded `module.exports`. Define a dummy `module` so that
-     last line is a harmless no-op instead of a ReferenceError. -->
-<script>var module = {};</script>
-<!-- guacamole-common-js prefers createImageBitmap when present, but Chrome's
-     createImageBitmap intermittently throws "source image could not be decoded"
-     on valid Blob input under load, and the rejected promise permanently stalls
-     guacamole's draw queue (updates freeze after the first such error). Disabling
-     it *before* the library loads forces the robust <img>-based decode path:
-     slower per image, but failures hit img.onerror instead of freezing the
-     session. Must run before the library script below. -->
-<script>try { window.createImageBitmap = undefined; } catch (e) {}</script>
-<script src="__GUAC_JS__"></script>
+<div id=msg>Connecting…</div>
 <script>
 const id = "__ID__", user = "__USER__";
-// The on-screen log is opt-in via ?debug; otherwise everything still goes to the
-// JS console, so the desktop fills the page cleanly during normal use.
-const DEBUG = new URLSearchParams(location.search).has('debug');
-const logEl = document.getElementById('log');
-if (!DEBUG) logEl.style.display = 'none';
-const NL = String.fromCharCode(10);
-function log(m) { if (DEBUG) logEl.textContent += m + NL; try { console.log("[whistler]", m); } catch (e) {} }
-const STATES = ["IDLE","CONNECTING","WAITING","CONNECTED","DISCONNECTING","DISCONNECTED"];
-if (!window.Guacamole) log("FATAL: Guacamole library not loaded");
+const msgEl = document.getElementById('msg');
+const setStatus = m => { msgEl.textContent = m; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-const overlayEl = document.getElementById('overlay');
-const overlayMsg = document.getElementById('overlay-msg');
-function setStatus(msg) { overlayMsg.textContent = msg; overlayEl.classList.remove('hidden'); }
-function hideStatus() { overlayEl.classList.add('hidden'); }
 
 async function waitReady() {
   setStatus('Waiting for session…');
@@ -204,131 +148,28 @@ async function waitReady() {
     try {
       const r = await fetch(`/status/${id}?user=${encodeURIComponent(user)}`);
       if (r.ok) {
-        const j = await r.json(); log("status: " + j.phase);
-        setStatus(j.phase === 'Ready' ? 'Opening display…' : 'Session: ' + j.phase);
+        const j = await r.json();
+        setStatus('Session: ' + (j.phase || 'unknown'));
         if (j.phase === 'Ready') return;
-      } else { log("status http " + r.status); }
-    } catch (e) { log("status error: " + e); }
+      }
+    } catch (e) {}
     await sleep(2000);
   }
 }
-// Size the remote in PHYSICAL device pixels, not CSS pixels: on a hidpi/scaled
-// display (e.g. 4K @ 150%) window.innerWidth is in CSS px, but the screen has
-// innerWidth*devicePixelRatio real pixels — rendering at CSS px then leaves the
-// browser to upscale, which is soft. We render at innerWidth*dpr and scale the
-// canvas back down by 1/dpr to fill the viewport, so one remote pixel == one
-// device pixel (crisp, no resampling).
-function remoteSize() {
-  const dpr = window.devicePixelRatio || 1;
-  return {
-    w: Math.max(640, Math.min(8192, Math.round(window.innerWidth  * dpr))),
-    h: Math.max(480, Math.min(8192, Math.round(window.innerHeight * dpr))),
-    scale: 1 / dpr,
-  };
-}
-function connect() {
-  log("connecting…");
-  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  // No query string here: WebSocketTunnel appends `?`+connect-data itself, so a
-  // pre-existing query would produce a doubled `?` and corrupt the params.
-  const url = proto + location.host + '/ws/' + id;
-  const tunnel = new Guacamole.WebSocketTunnel(url);
-  const client = new Guacamole.Client(tunnel);
-  const display = client.getDisplay();
-  document.getElementById('display').appendChild(display.getElement());
 
-  let connected = false;
-  client.onstatechange = s => {
-    connected = (s === 3); log("state: " + (STATES[s] || s));
-    if (s === 3) hideStatus();
-    else if (s === 5) setStatus('Disconnected');
-  };
-  client.onerror = e => { log("client error: " + (e && e.message || e)); setStatus('Error: ' + (e && e.message || String(e))); };
-  tunnel.onerror = e => { log("tunnel error: " + (e && e.message || e)); setStatus('Connection error'); };
-
-  // Initial size travels in the connect data -> WS query -> guacd handshake, so
-  // the RDP session starts at the right resolution (no fixed 1024x768 then resize).
-  const r0 = remoteSize();
-  let remoteW = r0.w, remoteH = r0.h;   // actual remote size, updated by onresize
-  let halfMode = (window.devicePixelRatio || 1) > 1;
-
-  // Compute the target remote resolution and the canvas scale needed for it to
-  // fill the viewport. halfMode requests half the device pixels (less to encode,
-  // visibly blurry but same viewport coverage).
-  function targetSize() {
-    const dpr = window.devicePixelRatio || 1;
-    const div = halfMode ? 2 : 1;
-    return {
-      w: Math.max(640, Math.min(8192, Math.round(window.innerWidth  * dpr / div))),
-      h: Math.max(480, Math.min(8192, Math.round(window.innerHeight * dpr / div))),
-      scale: div / dpr,
-    };
-  }
-
-  function applySize() {
-    const t = targetSize();
-    try {
-      // Optimistic: apply the scale for the requested target dimensions immediately.
-      // Correct for xrdp (honors sendSize). For grd (ignores sendSize), the
-      // fallback below re-fits using the actual fixed remote dimensions.
-      display.scale(t.scale);
-      if (connected) client.sendSize(t.w, t.h);
-      log('target ' + t.w + 'x' + t.h + ' @' + t.scale.toFixed(3));
-      clearTimeout(applySize._fix);
-      applySize._fix = setTimeout(() => {
-        try { display.scale(Math.min(window.innerWidth / remoteW, window.innerHeight / remoteH)); } catch (e) {}
-      }, 400);
-    } catch (e) { log('size error: ' + e); }
-  }
-
-  // When the remote actually resizes (xrdp), cancel the fallback and lock in the
-  // exact fit based on the real dimensions.
-  display.onresize = (width, height) => {
-    clearTimeout(applySize._fix);
-    remoteW = width; remoteH = height;
-    try { display.scale(Math.min(window.innerWidth / width, window.innerHeight / height)); } catch (e) {}
-  };
-
-  const t0 = targetSize();
-  display.scale(t0.scale);
-  client.connect('user=' + encodeURIComponent(user) + '&w=' + t0.w + '&h=' + t0.h);
-
-  let rt;
-  window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(applySize, 300); });
-
-  // 50%/100%: both fill the viewport, but 50% sends half the remote pixels
-  // (lower quality, less bandwidth). Does NOT change the canvas size.
-  const qBtn = document.getElementById('q');
-  qBtn.textContent = halfMode ? '50%' : '100%';
-  qBtn.onclick = () => {
-    halfMode = !halfMode;
-    qBtn.textContent = halfMode ? '50%' : '100%';
-    applySize();
-  };
-
-  try {
-    const el = display.getElement();
-    const mouse = new Guacamole.Mouse(el);
-    // sendMouseState(state, true): the `true` makes guac divide the coords by the
-    // display scale itself (and move the cursor to match). Do NOT pre-scale or
-    // mutate the state — guac reuses one state object across events and fires
-    // mousedown WITHOUT recomputing position, so mutating it double-scales the
-    // click anchor (correct on drag-move, 2x off on the initial press).
-    mouse.onmousedown = mouse.onmouseup = mouse.onmousemove = st => client.sendMouseState(st, true);
-    const kb = new Guacamole.Keyboard(document);
-    kb.onkeydown = k => client.sendKeyEvent(1, k);
-    kb.onkeyup = k => client.sendKeyEvent(0, k);
-  } catch (e) { log("input setup error: " + e); }
-}
-waitReady().then(connect).catch(e => { log("fatal: " + e); setStatus('Fatal error: ' + e); });
+waitReady().then(() => {
+  // Seam for the Selkies 2.x websockets viewer: once the portal reverse-proxies
+  // the in-pod Selkies HTTP/WS to a path here, redirect the browser to it.
+  setStatus('Session ready. The Selkies 2.x (websockets) viewer is not wired ' +
+            'into the portal yet — connect to the pod directly for now.');
+}).catch(e => setStatus('Fatal error: ' + e));
 </script>"""
 
 
 def _render_connect(user, session_id):
     return (_CONNECT_HTML
             .replace("__ID__", html.escape(session_id))
-            .replace("__USER__", html.escape(user))
-            .replace("__GUAC_JS__", html.escape(GUAC_JS_URL)))
+            .replace("__USER__", html.escape(user)))
 
 
 # Web terminal page: xterm.js + fit addon over a plain WebSocket to /ws-term.
@@ -403,81 +244,6 @@ def _render_term(user, session_id):
             .replace("__USER__", html.escape(user)))
 
 
-# WebRTC (Selkies) viewer page. Mirrors the connect/terminal wait-for-ready
-# pattern, then hands (video element, iceServers from /ice, signaling WS to
-# /ws-signal) to the vendored Selkies client. The client JS is version-locked to
-# the in-pod Selkies server, so — exactly like guacamole-common-js ↔ guacd — it
-# is vendored alongside the desktop image work (Phase 2); until then this page
-# loads and reports that the client bundle is missing rather than erroring. The
-# `startSelkies(...)` call is the only Phase-2 seam.
-_CONNECT_WEBRTC_HTML = """<!doctype html><meta charset=utf-8><title>__ID__</title>
-<style>
-  html,body{margin:0;height:100%;background:#000;overflow:hidden}
-  #video{position:absolute;inset:0;width:100%;height:100%;background:#000;object-fit:contain}
-  #overlay{position:absolute;inset:0;z-index:20;background:rgba(0,0,0,.85);
-           display:flex;align-items:center;justify-content:center;transition:opacity .4s}
-  #overlay.hidden{opacity:0;pointer-events:none}
-  #overlay-msg{color:#e0e0e0;font:bold 1.4rem/1.5 system-ui,sans-serif;text-align:center;max-width:80%}
-</style>
-<video id=video autoplay playsinline></video>
-<div id=overlay><div id=overlay-msg>Connecting…</div></div>
-<script src="/static/__SELKIES_JS__"></script>
-<script>
-const id = "__ID__", user = "__USER__";
-const overlayEl = document.getElementById('overlay');
-const overlayMsg = document.getElementById('overlay-msg');
-const videoEl = document.getElementById('video');
-const setStatus = m => { overlayMsg.textContent = m; overlayEl.classList.remove('hidden'); };
-const hideStatus = () => overlayEl.classList.add('hidden');
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-async function waitReady() {
-  setStatus('Waiting for session…');
-  for (;;) {
-    try {
-      const r = await fetch(`/status/${id}?user=${encodeURIComponent(user)}`);
-      if (r.ok) {
-        const j = await r.json();
-        setStatus('Session: ' + (j.phase || 'unknown'));
-        if (j.phase === 'Ready') return;
-      }
-    } catch (e) {}
-    await sleep(2000);
-  }
-}
-
-async function start() {
-  await waitReady();
-  setStatus('Negotiating media…');
-  const iceServers = await fetch(`/ice/${id}?user=${encodeURIComponent(user)}`)
-    .then(r => r.json()).then(j => j.iceServers).catch(() => []);
-  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  const signalUrl = proto + location.host + '/ws-signal/' + id +
-                    '?user=' + encodeURIComponent(user);
-
-  // Phase-2 seam: the vendored Selkies client (version-locked to the in-pod
-  // server) takes over here. Until it is vendored, report cleanly.
-  if (typeof startSelkies !== 'function') {
-    setStatus('WebRTC client bundle not installed yet (Phase 2). ' +
-              'Signaling endpoint: ' + signalUrl);
-    return;
-  }
-  startSelkies({ videoElement: videoEl, signalUrl, iceServers,
-                 onConnected: hideStatus,
-                 onStatus: setStatus });
-}
-
-start().catch(e => setStatus('Fatal error: ' + e));
-</script>"""
-
-
-def _render_connect_webrtc(user, session_id):
-    return (_CONNECT_WEBRTC_HTML
-            .replace("__ID__", html.escape(session_id))
-            .replace("__USER__", html.escape(user))
-            .replace("__SELKIES_JS__", html.escape(SELKIES_JS_FILENAME)))
-
-
 def _resolve_target(instances, desktop_sessions, name):
     """Locate a Session by its short name across ssh instances and desktop
     sessions, returning a uniform dict for the terminal: pod/namespace to exec
@@ -527,39 +293,20 @@ async def launch(request):
     raise web.HTTPFound(f"/connect/{name}?user={user}")
 
 
-async def _session_viewer(request, user, name):
-    """Resolve a session's display viewer (guacd|webrtc) from its template — the
-    template always carries it (default guacd), unlike status which lags reconcile.
-    Mirrors the template lookup ws() does."""
-    sessions = await _run(request, request.app["cm"].get_user_desktop_sessions, user)
-    sess = resolve_session(sessions, name)
-    if not sess:
-        return "guacd"
-    templates = await _run(request, request.app["cm"].get_user_desktop_templates, user)
-    template = next((t for t in templates
-                     if t.get("fullName") == sess.get("template")
-                     or t.get("name") == sess.get("template")), {})
-    return template.get("viewer") or "guacd"
-
-
 async def connect(request):
     """Serve the desktop viewer page and nudge the session's pod awake (same
     reconcile trigger the SSH server / web terminal fire on connect) so it
-    becomes Ready while the page polls /status. The page differs by viewer: the
-    guacd viewer renders the Guacamole canvas; the webrtc viewer renders the
-    Selkies video element."""
+    becomes Ready while the page polls /status."""
     cm, user = request.app["cm"], request["user"]
     name = request.match_info["id"]
     await _run(request, cm.trigger_instance_start, user, name)
-    viewer = await _session_viewer(request, user, name)
-    page = _render_connect_webrtc(user, name) if viewer == "webrtc" else _render_connect(user, name)
-    return web.Response(text=page, content_type="text/html")
+    return web.Response(text=_render_connect(user, name), content_type="text/html")
 
 
 async def status(request):
     cm, user = request.app["cm"], request["user"]
     sessions = await _run(request, cm.get_user_desktop_sessions, user)
-    sess = resolve_session(sessions, request.match_info["id"])
+    sess = _resolve_session(sessions, request.match_info["id"])
     if not sess:
         return web.json_response({"error": "not found"}, status=404)
     return web.json_response({
@@ -567,102 +314,6 @@ async def status(request):
         "address": sess.get("address"),
         "displayPort": sess.get("displayPort"),
     })
-
-
-async def ws(request):
-    cm, user = request.app["cm"], request["user"]
-    session_id = request.match_info["id"]
-
-    sessions = await _run(request, cm.get_user_desktop_sessions, user)
-    sess = resolve_session(sessions, session_id)
-    if not sess:
-        return web.Response(status=404, text="unknown session")
-    if sess.get("phase") != "Ready":
-        return web.Response(status=409, text=f"session not ready (phase={sess.get('phase')})")
-
-    templates = await _run(request, cm.get_user_desktop_templates, user)
-    template = next((t for t in templates
-                     if t.get("fullName") == sess.get("template")
-                     or t.get("name") == sess.get("template")), {})
-    protocol = template.get("protocol") or "rdp"
-    params = _build_guacd_params(template, sess["address"], sess["displayPort"])
-
-    # Initial display size from the browser viewport (?w/?h on the connect data),
-    # clamped; falls back to a sane default. Resizes after connect go via the
-    # client's `size` instruction, not here.
-    def _dim(key, default):
-        try:
-            return max(320, min(8192, int(request.query.get(key, ""))))
-        except (TypeError, ValueError):
-            return default
-    width, height = _dim("w", 1024), _dim("h", 768)
-
-    # guacamole-common-js connects with the "guacamole" subprotocol.
-    wsr = web.WebSocketResponse(protocols=("guacamole",))
-    await wsr.prepare(request)
-    logger.info(f"Opening relay for {user}/{session_id} -> guacd ({protocol} {sess['address']})")
-
-    try:
-        reader, writer = await asyncio.open_connection(guacd.GUACD_HOST, guacd.GUACD_PORT)
-    except OSError as e:
-        await wsr.close(message=f"guacd unreachable: {e}".encode())
-        return wsr
-
-    try:
-        _conn_id, leftover = await handshake(reader, writer, protocol=protocol, params=params,
-                                             width=width, height=height)
-        # `leftover` may end mid-multibyte-char, so it must be fed through the
-        # relay's incremental decoder (not decoded standalone) or the partial
-        # tail corrupts/raises.
-        await _relay(wsr, reader, writer, initial=leftover)
-    except Exception as e:
-        logger.error(f"Relay for {user}/{session_id} failed: {e}")
-        if not wsr.closed:
-            await wsr.close(message=str(e).encode())
-    finally:
-        writer.close()
-    return wsr
-
-
-async def ice(request):
-    """Browser ICE config for the webrtc viewer: a STUN + a TURN entry on the
-    shared coturn, the TURN entry carrying freshly-minted time-limited creds. The
-    in-pod Selkies got the same coturn coordinates from the operator, so both
-    peers relay through one server. Returns an empty list when no TURN is
-    configured (host-candidate fallback — dev/host-network only)."""
-    return web.json_response({
-        "iceServers": webrtc.ice_servers_from_env(label=request.match_info["id"]),
-    })
-
-
-async def ws_signal(request):
-    """Relay WebRTC signaling between the browser and the in-pod Selkies server.
-    Only signaling crosses this socket; media flows browser<->coturn<->pod
-    directly. Mirrors ws()'s resolve/guard prelude."""
-    cm, user = request.app["cm"], request["user"]
-    session_id = request.match_info["id"]
-
-    sessions = await _run(request, cm.get_user_desktop_sessions, user)
-    sess = resolve_session(sessions, session_id)
-    if not sess:
-        return web.Response(status=404, text="unknown session")
-    if sess.get("phase") != "Ready":
-        return web.Response(status=409, text=f"session not ready (phase={sess.get('phase')})")
-
-    # For the webrtc viewer the per-session Service exposes the signaling port as
-    # the effective displayPort (see config.ensure_session), so the in-pod Selkies
-    # signaling socket is at address:displayPort.
-    upstream = webrtc.signal_url(sess["address"], sess["displayPort"])
-    wsr = web.WebSocketResponse()
-    await wsr.prepare(request)
-    logger.info(f"Opening signaling relay for {user}/{session_id} -> {upstream}")
-    try:
-        await webrtc.signal_relay(wsr, upstream)
-    except Exception as e:
-        logger.error(f"Signaling relay for {user}/{session_id} failed: {e}")
-        if not wsr.closed:
-            await wsr.close(message=str(e).encode())
-    return wsr
 
 
 async def term(request):
@@ -721,60 +372,6 @@ async def healthz(request):
     return web.Response(text="ok")
 
 
-async def _relay(wsr, reader, writer, initial=b""):
-    """Bidirectional byte pump between the browser WS and the guacd socket.
-    Parses nothing — guacd<->browser is opaque after the handshake. ``initial``
-    is the bytes that arrived glued to ``ready`` during the handshake; it is fed
-    through the same incremental decoder so a multibyte char split at that
-    boundary is never lost or mis-decoded."""
-    async def guacd_to_ws():
-        # guacamole-common-js parses each WS message independently and does NOT
-        # buffer a partial instruction across messages (it raises "Incomplete
-        # instruction" / corrupts its parse, hanging the page). So we must never
-        # split an instruction across messages: decode bytes, forward only whole
-        # instructions, and hold the partial tail for the next read.
-        utf8 = codecs.getincrementaldecoder("utf-8")()
-        buf = ""
-
-        async def forward(data: bytes):
-            nonlocal buf
-            buf += utf8.decode(data)
-            complete, buf = take_complete_instructions(buf)
-            if complete:
-                await wsr.send_str(complete)
-
-        try:
-            if initial:
-                await forward(initial)
-            while True:
-                data = await reader.read(65536)
-                if not data:
-                    break
-                await forward(data)
-        finally:
-            if not wsr.closed:
-                await wsr.close()
-
-    async def ws_to_guacd():
-        try:
-            async for msg in wsr:
-                if msg.type == web.WSMsgType.TEXT:
-                    writer.write(msg.data.encode("utf-8"))
-                    await writer.drain()
-                elif msg.type == web.WSMsgType.BINARY:
-                    writer.write(msg.data)
-                    await writer.drain()
-                else:
-                    break
-        finally:
-            try:
-                writer.close()
-            except Exception:
-                pass
-
-    await asyncio.gather(guacd_to_ws(), ws_to_guacd(), return_exceptions=True)
-
-
 def build_app(config_manager):
     app = web.Application(middlewares=[auth_middleware])
     app["cm"] = config_manager
@@ -783,14 +380,10 @@ def build_app(config_manager):
         web.post("/launch", launch),
         web.get("/connect/{id}", connect),
         web.get("/status/{id}", status),
-        web.get("/ws/{id}", ws),
-        web.get("/ice/{id}", ice),
-        web.get("/ws-signal/{id}", ws_signal),
         web.get("/term/{id}", term),
         web.get("/term-status/{id}", term_status),
         web.get("/ws-term/{id}", ws_term),
         web.get("/healthz", healthz),
-        web.get("/static/" + _GUAC_JS_FILENAME, guac_js),
         web.get("/static/{filename}", static_file),
     ])
     return app

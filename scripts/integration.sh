@@ -54,21 +54,18 @@ WORK="$(mktemp -d)"
 SERVER_PID=""
 OPERATOR_PID=""
 PORTAL_PID=""
-GUACD_PF_PID=""
 
 cleanup() {
   set +e
   [[ -n "$SERVER_PID" ]]    && kill "$SERVER_PID"    2>/dev/null
   [[ -n "$OPERATOR_PID" ]]  && kill "$OPERATOR_PID"  2>/dev/null
   [[ -n "$PORTAL_PID" ]]    && kill "$PORTAL_PID"    2>/dev/null
-  [[ -n "$GUACD_PF_PID" ]]  && kill "$GUACD_PF_PID"  2>/dev/null
   if [[ "$PROVIDER" == "k3d" && -z "${KEEP_CLUSTER:-}" ]]; then
     k3d cluster delete "$CLUSTER" >/dev/null 2>&1
   elif [[ "$PROVIDER" == "existing" ]]; then
     # Only remove what we created; leave the cluster itself alone.
     echo "==> Cleaning up test namespaces and template"
     kubectl delete template "$TEST_TEMPLATE" -n "$SYS_NS" --ignore-not-found >/dev/null 2>&1
-    kubectl delete deployment,service whistler-guacd -n "$SYS_NS" --ignore-not-found >/dev/null 2>&1
     kubectl delete namespace "$USER_NS" "$SYS_NS" --ignore-not-found --wait=false >/dev/null 2>&1
   fi
   rm -rf "$WORK"
@@ -166,46 +163,10 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
-# --- Display path: shared guacd + portal (for tests/integration/test_display.py) ---
-echo "==> Deploying guacd into $SYS_NS"
-kubectl apply -n "$SYS_NS" -f - <<'EOF'
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: whistler-guacd
-  labels: { app: whistler-guacd }
-spec:
-  replicas: 1
-  selector: { matchLabels: { app: whistler-guacd } }
-  template:
-    metadata: { labels: { app: whistler-guacd } }
-    spec:
-      automountServiceAccountToken: false
-      containers:
-        - name: guacd
-          image: guacamole/guacd:1.6.0
-          ports: [{ containerPort: 4822 }]
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: whistler-guacd
-  labels: { app: whistler-guacd }
-spec:
-  selector: { app: whistler-guacd }
-  ports: [{ name: guacd, port: 4822, targetPort: 4822 }]
-EOF
-kubectl rollout status deployment/whistler-guacd -n "$SYS_NS" --timeout=120s || {
-  echo "guacd did not become ready"; kubectl describe deploy/whistler-guacd -n "$SYS_NS"; exit 1; }
-
-echo "==> Port-forwarding guacd to 127.0.0.1:4822"
-kubectl port-forward -n "$SYS_NS" svc/whistler-guacd 4822:4822 >"$WORK/guacd-pf.log" 2>&1 &
-GUACD_PF_PID=$!
-for _ in $(seq 1 30); do nc -z 127.0.0.1 4822 2>/dev/null && break; sleep 1; done
-
+# --- Display path: portal (viewer app + web terminal) ---
 echo "==> Starting portal on :8080"
 env "${COMMON_ENV[@]}" WHISTLER_LOG_LEVEL=INFO \
-  WHISTLER_AUTH_ALLOW_ANY=true GUACD_HOST=127.0.0.1 GUACD_PORT=4822 PORTAL_PORT=8080 \
+  WHISTLER_AUTH_ALLOW_ANY=true PORTAL_PORT=8080 \
   "$PYTHON" -m whistler.portal >"$WORK/portal.log" 2>&1 &
 PORTAL_PID=$!
 for _ in $(seq 1 30); do

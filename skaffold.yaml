@@ -8,20 +8,12 @@ build:
       context: .
       docker:
         dockerfile: Dockerfile
-    - image: whistler-desktop-xfce-rdp
-      context: desktops/xfce-rdp
+    - image: whistler-desktop-xfce-selkies2
+      context: desktops/xfce-selkies2
       docker:
         dockerfile: Dockerfile
-    - image: whistler-desktop-gnome-grd
-      context: desktops/gnome-grd
-      docker:
-        dockerfile: Dockerfile
-    - image: whistler-desktop-xfce-webrtc
-      context: desktops/xfce-webrtc
-      docker:
-        dockerfile: Dockerfile
-    - image: whistler-desktop-gnome-flashback-webrtc
-      context: desktops/gnome-flashback-webrtc
+    - image: whistler-desktop-gnome-selkies2
+      context: desktops/gnome-selkies2
       docker:
         dockerfile: Dockerfile
 deploy:
@@ -60,21 +52,13 @@ deploy:
           image.repository: "{{.IMAGE_REPO_whistler}}"
           image.tag: "{{.IMAGE_TAG_whistler}}"
           # Use the locally-built desktop images for the sample templates.
-          templates.rdp-desktop.image: "{{.IMAGE_REPO_whistler_desktop_xfce_rdp}}:{{.IMAGE_TAG_whistler_desktop_xfce_rdp}}"
-          templates.gnome-grd.image: "{{.IMAGE_REPO_whistler_desktop_gnome_grd}}:{{.IMAGE_TAG_whistler_desktop_gnome_grd}}"
-          templates.webrtc-desktop.image: "{{.IMAGE_REPO_whistler_desktop_xfce_webrtc}}:{{.IMAGE_TAG_whistler_desktop_xfce_webrtc}}"
-          templates.gnome-flashback-webrtc-desktop.image: "{{.IMAGE_REPO_whistler_desktop_gnome_flashback_webrtc}}:{{.IMAGE_TAG_whistler_desktop_gnome_flashback_webrtc}}"
+          templates.xfce-desktop.image: "{{.IMAGE_REPO_whistler_desktop_xfce_selkies2}}:{{.IMAGE_TAG_whistler_desktop_xfce_selkies2}}"
+          templates.gnome-desktop.image: "{{.IMAGE_REPO_whistler_desktop_gnome_selkies2}}:{{.IMAGE_TAG_whistler_desktop_gnome_selkies2}}"
           # Use the locally-built desktop images as the enforced desktop allow-list,
           # so the operator accepts them and the management UI picker shows the
           # actual build outputs (replaces the production defaults in values.yaml).
-          whistler.images.desktop[0]: "{{.IMAGE_REPO_whistler_desktop_xfce_rdp}}:{{.IMAGE_TAG_whistler_desktop_xfce_rdp}}"
-          whistler.images.desktop[1]: "{{.IMAGE_REPO_whistler_desktop_gnome_grd}}:{{.IMAGE_TAG_whistler_desktop_gnome_grd}}"
-          whistler.images.desktop[2]: "{{.IMAGE_REPO_whistler_desktop_xfce_webrtc}}:{{.IMAGE_TAG_whistler_desktop_xfce_webrtc}}"
-          whistler.images.desktop[3]: "{{.IMAGE_REPO_whistler_desktop_gnome_flashback_webrtc}}:{{.IMAGE_TAG_whistler_desktop_gnome_flashback_webrtc}}"
-          # For a real webrtc (Selkies) e2e, also enable coturn and point it at a
-          # browser-reachable address (the k8s WebRTC hairpin makes this env-specific):
-          #   --set coturn.enabled=true --set coturn.externalHost=<node-ip>
-          # Left off here because externalHost can't be guessed; see design/vdi.md Round 3.
+          whistler.images.desktop[0]: "{{.IMAGE_REPO_whistler_desktop_xfce_selkies2}}:{{.IMAGE_TAG_whistler_desktop_xfce_selkies2}}"
+          whistler.images.desktop[1]: "{{.IMAGE_REPO_whistler_desktop_gnome_selkies2}}:{{.IMAGE_TAG_whistler_desktop_gnome_selkies2}}"
 # Forward the front doors to localhost on `skaffold dev` (NodePorts aren't
 # auto-published on kind the way they are on docker-desktop). The portal now goes
 # through the chart's bundled Traefik proxy (whistler-portal-proxy :80): both

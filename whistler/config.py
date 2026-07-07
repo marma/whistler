@@ -256,7 +256,7 @@ class KubeConfigManager(ConfigManager):
                 "podSelector": {},
                 "policyTypes": ["Ingress", "Egress"],
                 "ingress": self._build_ingress_rules(),
-                "egress": self._build_egress_rules() + self._build_coturn_egress_rules()
+                "egress": self._build_egress_rules()
             }
         }
         logger.debug(f"Applying NetworkPolicy {policy_name} in {ns_name}:\n{yaml.dump(policy_body, default_flow_style=False)}")
@@ -658,48 +658,21 @@ class KubeConfigManager(ConfigManager):
             logger.error(f"Failed to load networkpolicy.yaml: {e}")
 
     def _build_ingress_rules(self) -> list:
-        """Ingress for a user namespace: deny everything except the two trusted
-        display brokers reaching desktop pods. Without this carve-out the round-1
-        deny-all-ingress policy would block them and the desktop would never
-        render.
+        """Ingress for a user namespace: deny everything except the trusted portal
+        reaching desktop pods. Without this carve-out the round-1 deny-all-ingress
+        policy would block it and the desktop would never render.
 
-          - shared guacd  — dials the per-session Service over RDP/VNC (guacd viewer).
-          - the portal     — dials the in-pod Selkies signaling port (webrtc viewer).
-
-        Both are pinned by namespace + pod label; no port is pinned because the
-        display/signaling port varies per template and these brokers only ever
-        dial that one port anyway. Both sources are allowed regardless of a
-        template's viewer (the policy is per-namespace, not per-session); each
-        broker only connects to the pods it actually serves."""
-        broker_ns = os.environ.get("GUACD_NAMESPACE", self.namespace)
+        The portal (websockets viewer) reverse-proxies the browser to the in-pod
+        Selkies HTTP/WebSocket server on the pod's display port. It is pinned by
+        namespace + pod label; no port is pinned because the display port varies
+        per template and the portal only ever dials that one port anyway."""
+        broker_ns = os.environ.get("PORTAL_NAMESPACE", self.namespace)
         ns_selector = {"matchLabels": {"kubernetes.io/metadata.name": broker_ns}}
         return [{
             "from": [
                 {"namespaceSelector": ns_selector,
-                 "podSelector": {"matchLabels": {"app": "whistler-guacd"}}},
-                {"namespaceSelector": ns_selector,
                  "podSelector": {"matchLabels": {"app": "whistler-portal"}}},
             ]
-        }]
-
-    def _build_coturn_egress_rules(self) -> list:
-        """Egress allowance for desktop pods to reach the shared coturn (the
-        webrtc viewer relays media through it; the browser can't reach a pod's
-        ICE candidates directly). Pinned to coturn's pod by namespace + label —
-        the mirror of the portal/guacd ingress carve-out. Kept out of
-        ``_build_egress_rules`` (pure CIDR math) and appended at policy assembly.
-        Harmless when coturn is disabled — it just permits traffic to a pod that
-        isn't there."""
-        coturn_ns = os.environ.get("COTURN_NAMESPACE",
-                                   os.environ.get("GUACD_NAMESPACE",
-                                                  getattr(self, "namespace", "whistler")))
-        return [{
-            "to": [{
-                "namespaceSelector": {
-                    "matchLabels": {"kubernetes.io/metadata.name": coturn_ns}
-                },
-                "podSelector": {"matchLabels": {"app": "whistler-coturn"}},
-            }]
         }]
 
     def _build_egress_rules(self) -> list:
@@ -840,29 +813,6 @@ class KubeConfigManager(ConfigManager):
             "blockOwnerDeletion": True,
         }
 
-    def _selkies_turn_env(self) -> list:
-        """Env vars handed to an in-pod Selkies (webrtc viewer) so it relays media
-        through the shared coturn. The operator deployment receives coturn's
-        coordinates as TURN_* env (rendered from whistler.coturn values); we map
-        them to the SELKIES_TURN_* names the Selkies server reads natively. The
-        browser is given the same TURN host + a freshly-minted time-limited
-        credential by the portal (/ice), so both peers relay through one coturn.
-
-        Returns [] when no TURN host is configured — leaving the pod to fall back
-        to host-candidate ICE, which only works with host networking (dev)."""
-        host = os.environ.get("TURN_HOST", "")
-        if not host:
-            return []
-        env = [
-            {"name": "SELKIES_TURN_HOST", "value": host},
-            {"name": "SELKIES_TURN_PORT", "value": os.environ.get("TURN_PORT", "3478")},
-            {"name": "SELKIES_TURN_PROTOCOL", "value": os.environ.get("TURN_PROTOCOL", "udp")},
-        ]
-        secret = os.environ.get("TURN_SHARED_SECRET", "")
-        if secret:
-            env.append({"name": "SELKIES_TURN_SHARED_SECRET", "value": secret})
-        return env
-
     def _build_pod_spec(self, *, full_name, hostname, username, uid, mode, runtime,
                         template_spec, pvc_name, available_volumes, user_details,
                         preemptible, display_port=None):
@@ -904,15 +854,10 @@ class KubeConfigManager(ConfigManager):
             container["command"] = ["sleep", "3600"]
         else:
             # Desktop images self-start their display server; expose its port.
+            # The websockets viewer (Selkies 2.x / pixelflux) serves H.264 over a
+            # plain HTTP/WebSocket port the portal reverse-proxies — no coturn/TURN.
             if display_port is not None:
                 container["ports"] = [{"containerPort": display_port, "name": "display"}]
-            # webrtc viewer: the in-pod Selkies server needs the shared coturn
-            # to relay media (the browser can't reach a pod's ICE candidates).
-            # Hand it coturn's coordinates so it issues TURN-relay candidates.
-            if template_spec.get('viewer') == 'webrtc':
-                turn_env = self._selkies_turn_env()
-                if turn_env:
-                    container["env"] = container.get("env", []) + turn_env
 
         app_label = "whistler-instance" if mode == "ssh" else "whistler-desktop"
         pod_body = {
@@ -962,7 +907,7 @@ class KubeConfigManager(ConfigManager):
     # ------------------------------------------------------------------ #
     # Session backends: plain pod, Kata pod, or a KubeVirt VM — shared by  #
     # ssh and desktop access modes. Provisioning + lifecycle; the desktop  #
-    # display tunnel (Guacamole) lives in the portal. These reuse the      #
+    # display relay (websockets viewer) lives in the portal. These reuse    #
     # common spine (_ensure_user_namespace, _ensure_pvc, _build_egress).   #
     # ------------------------------------------------------------------ #
 
@@ -1058,7 +1003,7 @@ class KubeConfigManager(ConfigManager):
     def _build_session_service(self, *, session_name, username, uid, display_port):
         """Build the per-session ClusterIP Service manifest (pure). It selects
         the desktop pod / VMI launcher pod by the ``session`` label and exposes
-        the display port — the future Guacamole tunnel reaches a desktop here."""
+        the display port — the portal's websockets viewer reaches a desktop here."""
         return {
             "apiVersion": "v1",
             "kind": "Service",
@@ -1156,15 +1101,12 @@ class KubeConfigManager(ConfigManager):
         template_spec = template.get('spec', {})
         mode = template_spec.get('mode', 'ssh')
         runtime = template_spec.get('runtime', 'container')
-        viewer = template_spec.get('viewer', 'guacd') if mode == 'desktop' else None
-        display_port = template_spec.get('displayPort', 3389)
-        # For the webrtc viewer the portal relays signaling to the in-pod Selkies
-        # server, so the signaling port is the effective "display port" the
-        # per-session Service exposes and status advertises — guacd's RDP/VNC
-        # displayPort is unused. This keeps the Service/status plumbing identical
-        # for both viewers; only the portal branches on `viewer`.
-        if viewer == 'webrtc':
-            display_port = template_spec.get('signalPort', 8082)
+        viewer = template_spec.get('viewer', 'websockets') if mode == 'desktop' else None
+        # The websockets viewer (Selkies 2.x) serves H.264 over HTTP/WebSockets;
+        # displayPort is the port the in-pod Selkies server listens on and the
+        # portal reverse-proxies. The per-session Service exposes it and status
+        # advertises it.
+        display_port = template_spec.get('displayPort', 8082)
         persistence = template_spec.get('persistence', 'ephemeral')
         # SSH ephemeral sessions carry preemptible on the Session spec; desktop
         # templates express it via persistence. Honor either.
@@ -1199,7 +1141,7 @@ class KubeConfigManager(ConfigManager):
         if not ok:
             return result
 
-        # Desktop sessions are reached through a per-session Service (guacd dials
+        # Desktop sessions are reached through a per-session Service (the portal dials
         # it); SSH sessions are bridged via `kubectl exec` and need no Service.
         if mode == 'desktop':
             if not self._ensure_session_service(
@@ -1609,13 +1551,12 @@ class KubeConfigManager(ConfigManager):
             return False
         # Build the spec only from the fields the caller actually provided, so an
         # update merges over the existing spec rather than clobbering fields the
-        # admin form doesn't carry (e.g. a desktop template's connectionParams /
-        # rdpSecurity / nodeSelector / volumes).
+        # admin form doesn't carry (e.g. a desktop template's displayPort /
+        # nodeSelector / volumes).
         spec = {"user": "system"}
         for key in ("mode", "runtime", "displayName", "image", "description",
                     "resources", "nodeSelector", "personalMountPath", "volumes",
-                    "displayPort", "viewer", "signalPort", "protocol",
-                    "connectionParams", "rdpSecurity",
+                    "displayPort", "viewer",
                     "privileged", "fuse", "instancetype", "persistence"):
             if template_data.get(key) is not None:
                 spec[key] = template_data[key]

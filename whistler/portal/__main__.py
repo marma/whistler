@@ -5,8 +5,8 @@ Runs two apps side-by-side in the same event loop:
   * **Management app** (FastAPI, port MANAGEMENT_PORT, default 8081)
     Admin + user web UI backed by Jinja2 templates.
 
-  * **Guacamole relay app** (aiohttp, port PORTAL_PORT, default 8080)
-    Browser ↔ guacd WebSocket bridge for desktop sessions.
+  * **Viewer app** (aiohttp, port PORTAL_PORT, default 8080)
+    Desktop viewer (Selkies 2.x websockets) + web terminal for sessions.
 
 Both share the same KubeConfigManager instance.
 Set WHISTLER_AUTH_ALLOW_ANY=true and WHISTLER_AUTH_ALLOW_ADMIN=true for local dev.
@@ -37,28 +37,26 @@ def main():
     kubeconfig = os.environ.get("KUBECONFIG")
     config_manager = KubeConfigManager(kubeconfig=kubeconfig)
 
-    guac_port = int(os.environ.get("PORTAL_PORT", "8080"))
+    viewer_port = int(os.environ.get("PORTAL_PORT", "8080"))
     mgmt_port = int(os.environ.get("MANAGEMENT_PORT", "8081"))
 
     logger.info(
         f"Starting Whistler portal — "
         f"management :{mgmt_port}, "
-        f"guacamole relay :{guac_port} "
-        f"(guacd {os.environ.get('GUACD_HOST', 'whistler-guacd')}:"
-        f"{os.environ.get('GUACD_PORT', '4822')})"
+        f"viewer :{viewer_port}"
     )
 
-    asyncio.run(_run_both(config_manager, guac_port, mgmt_port, log_level, logger))
+    asyncio.run(_run_both(config_manager, viewer_port, mgmt_port, log_level, logger))
 
 
-async def _run_both(config_manager, guac_port: int, mgmt_port: int, log_level: str, logger):
-    # --- aiohttp Guacamole relay ---
+async def _run_both(config_manager, viewer_port: int, mgmt_port: int, log_level: str, logger):
+    # --- aiohttp viewer app (desktop viewer + web terminal) ---
     aio_app = build_app(config_manager)
     runner  = web.AppRunner(aio_app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", guac_port)
+    site = web.TCPSite(runner, "0.0.0.0", viewer_port)
     await site.start()
-    logger.info(f"Guacamole relay listening on :{guac_port}")
+    logger.info(f"Viewer app listening on :{viewer_port}")
 
     # --- FastAPI management app ---
     fastapi_app = build_management_app(config_manager)

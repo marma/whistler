@@ -2,85 +2,56 @@
 
 Container images that provide a graphical desktop reachable by the Whistler
 portal. Each subdirectory is one catalog entry; a `DesktopTemplate` references the
-built image and selects a **viewer**:
+built image and the portal serves it through the **websockets** viewer:
 
-- `viewer: guacd` (default) — browser → portal → guacd → image over RDP/VNC.
-  guacd re-rasterizes frames to a canvas. Template gives `protocol`,
-  `displayPort`, `connectionParams`.
-- `viewer: webrtc` — browser ⇄ coturn ⇄ image (Selkies); the portal relays only
-  signaling and H.264 reaches the browser's decoder. Template gives `signalPort`;
-  requires `coturn.enabled`. See `design/vdi.md` → Round 3.
+- `viewer: websockets` (the only viewer) — browser ⇄ portal ⇄ in-pod **Selkies
+  2.x** (pixelflux) server. The image streams **H.264 over plain WebSockets**
+  straight to the browser's decoder; the portal reverse-proxies the HTTP/WS
+  stream to the pod. **No guacd, no coturn/TURN.** The template gives the
+  `displayPort` the in-pod Selkies server listens on (default `8082`).
 
 Over time this grows into a catalog for different use-cases (minimal vs full DE,
-CPU vs GPU, different toolchains). Add a new image either by copying an existing
-subdirectory, or — for an RDP desktop — by building `FROM` [`base-rdp`](base-rdp/)
-(see below). Then add the matching `DesktopTemplate` in
-`charts/whistler/values.yaml` (`desktopTemplates`). **Read
+CPU vs GPU, different toolchains). Add a new image by copying an existing
+subdirectory. Then add the matching `DesktopTemplate` in
+`charts/whistler/values.yaml` (`templates`). **Read
 [design/creating_desktops.md](../design/creating_desktops.md) first** — stack
 choice, assembly checklist, silent-failure catalog, and the verification
 ladder for new images.
 
-| Image | Protocol | Port | Creds | Notes |
-|-------|----------|------|-------|-------|
-| [`base-rdp`](base-rdp/) | rdp | 3389 | `abc` / `abc` | **Base layer**, not a catalog entry. xrdp/xorgxrdp plumbing on Ubuntu 26.04, no DE. Build X11 desktop images `FROM` it. Multi-arch (amd64 + arm64). |
-| [`xfce-rdp`](xfce-rdp/) | rdp | 3389 | `abc` / `abc` | XFCE over xrdp (Ubuntu 22.04). Multi-arch (amd64 + arm64). |
-| [`xfce-webrtc`](xfce-webrtc/) | **webrtc** | 8082 | none | XFCE over **WebRTC** (Selkies, software x264, **amd64-only**). The `viewer: webrtc` path — H.264 reaches the browser's decoder, not re-rasterized. Needs `coturn.enabled`. Media e2e verified manually. |
-| [`gnome-grd`](gnome-grd/) | rdp | 3389 | `abc` / `abc` | GNOME over **gnome-remote-desktop** (Wayland-native, headless gnome-shell). Does *not* use xrdp/base-rdp. Ubuntu 26.04. RDP handshake verified; full guacd pixel path not yet. |
-| [`gnome-flashback-webrtc`](gnome-flashback-webrtc/) | **webrtc** | 8082 | none | GNOME Flashback (Panel + Metacity, real GNOME tech on X11) over **WebRTC** (Selkies, software x264). Ubuntu 26.04, systemd-PID1 + `--privileged` like gnome-grd (GNOME Session needs `systemd --user`), session runs as root (GNOME's mandatory glycin/bwrap image-loading sandbox needs it). Needs `coturn.enabled`. |
-| [`xfce-selkies2`](xfce-selkies2/) | **websockets** | 8082 | none | XFCE over **Selkies 2.x** (pixelflux) — successor-stack spike. H.264 over plain WebSockets: **no coturn/TURN at all**. Multi-arch (pixelflux ships amd64+arm64 wheels). Ubuntu 26.04. Runs with `--cap-drop=ALL` (verified). Standalone only — no portal `viewer` type yet. |
-| [`gnome-selkies2`](gnome-selkies2/) | **websockets** | 8082 | `abc`/none, configurable | **Real GNOME Shell** over **Selkies 2.x** (pixelflux). **Ubuntu 24.04 / GNOME 46** — the last gen with an X11-backend Shell *and* an unprivileged (no systemd-PID1) session, so **no `--privileged`** unlike the 26.04 GNOME images. Runtime-configurable user/UID/GID/sudo + home volume (`DESKTOP_USER`/`PUID`/`PGID`/`DESKTOP_SUDO`). Vendors libva 2.22 (24.04 ships 2.20). Firefox from Mozilla `.deb`. Standalone only. |
+| Image | Viewer | Port | Notes |
+|-------|--------|------|-------|
+| [`xfce-selkies2`](xfce-selkies2/) | **websockets** | 8082 | XFCE over **Selkies 2.x** (pixelflux). H.264 over plain WebSockets — no coturn/TURN. Multi-arch (pixelflux ships amd64+arm64 wheels). Ubuntu 26.04. Runs with `--cap-drop=ALL` (verified). |
+| [`gnome-selkies2`](gnome-selkies2/) | **websockets** | 8082 | **Real GNOME Shell** over **Selkies 2.x** (pixelflux). **Ubuntu 24.04 / GNOME 46** — the last gen with an X11-backend Shell *and* an unprivileged (no systemd-PID1) session, so **no `--privileged`**. Runtime-configurable user/UID/GID/sudo + home volume (`DESKTOP_USER`/`PUID`/`PGID`/`DESKTOP_SUDO`). Vendors libva 2.22 (24.04 ships 2.20). Firefox from Mozilla `.deb`. |
 
-### Building an RDP desktop on `base-rdp`
-
-`base-rdp` carries everything common to an RDP desktop — the xrdp listener,
-xorgxrdp Xorg backend, the lossless-bitmap `xrdp.ini`, the well-known `abc`/`abc`
-login, and a `startwm.sh` that sets up the session D-Bus + `XDG_RUNTIME_DIR` —
-but ships **no desktop environment**. A DE image just installs its DE and tells
-xrdp how to start it via `WHISTLER_SESSION_CMD`:
-
-```dockerfile
-FROM whistler-desktop-base-rdp:dev
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      xfce4 xfce4-terminal \
- && rm -rf /var/lib/apt/lists/*
-ENV WHISTLER_SESSION_CMD=startxfce4
-```
-
-Running `base-rdp` directly is a misconfiguration — with no `WHISTLER_SESSION_CMD`
-its `startwm.sh` exits loudly rather than dropping you into a black screen.
-
-`base-rdp` is the right base for **X11-native** DEs (XFCE, MATE, …). It is *not*
-suitable for GNOME: GNOME defaults to Wayland and is dropping its GNOME-on-Xorg
-session, while xorgxrdp is an X11 backend. So [`gnome-grd`](gnome-grd/) takes the
-Wayland-native route instead — a headless `gnome-shell` whose session is served
-over RDP by `gnome-remote-desktop`, with no xrdp in the picture. It still exposes
-RDP on 3389, so guacd and the `DesktopTemplate` contract are unchanged.
+> **History:** earlier spikes explored other display paths — XFCE/GNOME over
+> **guacd/RDP** (`base-rdp`, `xfce-rdp`, `gnome-grd`) and over **Selkies 1.x
+> WebRTC** with a coturn relay (`xfce-webrtc`, `gnome-flashback-webrtc`). All were
+> removed when the project consolidated on Selkies 2.x (see the banner in
+> [design/vdi.md](../design/vdi.md)); they remain recoverable from git history if
+> an agentless VM-console path (KubeVirt QEMU framebuffer) is ever needed.
 
 ## Conventions
 
 - **Display server self-starts** as the image entrypoint (the desktop pod spec
-  overrides no command). RDP images listen on 3389; VNC images on 5900/5901.
-- **Fixed, well-known credentials** baked into the image, mirrored in the
-  template's `connectionParams`. These are not a security boundary — the
-  per-session NetworkPolicy is (only guacd can reach the pod). See
-  [../design/vdi.md](../design/vdi.md).
+  overrides no command). The in-pod Selkies server listens on `displayPort`
+  (8082 by convention).
 - **Multi-arch**: prefer base images/packages with arm64 builds so desktops run
   natively on Apple-Silicon/arm64 clusters. Build multi-arch for a registry with
   `docker buildx build --platform linux/amd64,linux/arm64 -t <ref> --push .`.
+- **Security boundary** is the per-session NetworkPolicy (only the portal can
+  reach the pod), not credentials baked into the image. See
+  [../design/vdi.md](../design/vdi.md).
 
 ## Build & use
 
 Locally, `skaffold dev` builds these as additional artifacts and points the
-sample `DesktopTemplate` at the freshly-built image (see `skaffold.yaml`). To
+sample `DesktopTemplate`s at the freshly-built images (see `skaffold.yaml`). To
 build one by hand:
 
 ```bash
-docker build -t whistler-desktop-xfce-rdp:dev desktops/xfce-rdp
+docker build -t whistler-desktop-xfce-selkies2:dev desktops/xfce-selkies2
 
-# The base layer (tag it to match the FROM in any image building on it):
-docker build -t whistler-desktop-base-rdp:dev desktops/base-rdp
-
-# Multi-arch base, pushed to a registry:
+# Multi-arch, pushed to a registry:
 docker buildx build --platform linux/amd64,linux/arm64 \
-  -t <registry>/whistler-desktop-base-rdp:<tag> --push desktops/base-rdp
+  -t <registry>/whistler-desktop-gnome-selkies2:<tag> --push desktops/gnome-selkies2
 ```

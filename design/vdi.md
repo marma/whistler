@@ -1,6 +1,20 @@
 # VDI: desktop-pod and KubeVirt-VM backends
 
-Status: **rounds 1–3 implemented** (round 3 partially — see below). Round 1 = provisioning
+> **⚠️ Superseded below Round 1 — kept as design history.** The project has
+> consolidated on a single display path: the **Selkies 2.x (pixelflux)
+> "websockets" viewer**, where the in-pod server streams H.264 over plain
+> WebSockets and the portal reverse-proxies it to the browser — **no guacd, no
+> coturn/TURN**. The guacd/RDP path (Round 2) and the Selkies-1.x WebRTC + coturn
+> path (Round 3) described below, and their images (`base-rdp`, `xfce-rdp`,
+> `gnome-grd`, `xfce-webrtc`, `gnome-flashback-webrtc`), **have been removed**.
+> They remain recoverable from git history if an agentless VM-console path
+> (KubeVirt QEMU framebuffer, pre-boot/panic debugging) is ever wanted — that is
+> the one capability guacd+VNC offered that in-guest Selkies cannot. Round 1
+> (provisioning: desktop pods + KubeVirt VMs) and the NetworkPolicy security
+> model still apply. See [creating_desktops.md](creating_desktops.md) for the
+> current image-building guidance.
+
+Status (historical): **rounds 1–3 implemented** (round 3 partially — see below). Round 1 = provisioning
 (desktop pods + KubeVirt VMs). Round 2 = the **guacd** display path (RDP desktop + shared
 guacd + a Python WebSocket portal) — see [Round 2: the display path](#round-2-the-display-path).
 Round 3 = a parallel **WebRTC** display path (Selkies + coturn) for hardware-class H.264 to

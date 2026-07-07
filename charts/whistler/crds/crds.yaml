@@ -76,41 +76,20 @@ spec:
                     the container privileged.
                 displayPort:
                   type: integer
-                  description: Desktop-only. Port the display server listens on (ignored for ssh).
-                viewer:
-                  type: string
-                  enum: ["guacd", "webrtc"]
-                  default: guacd
-                  description: >-
-                    Desktop-only. Display backend the portal uses. "guacd" relays
-                    the Guacamole protocol to the shared guacd, which dials the pod
-                    over RDP/VNC (see protocol/connectionParams). "webrtc" relays
-                    only signaling to an in-pod WebRTC server (Selkies) on signalPort
-                    while media flows browser<->coturn<->pod; protocol/connectionParams/
-                    rdpSecurity are ignored.
-                signalPort:
-                  type: integer
                   default: 8082
                   description: >-
-                    Desktop-only, webrtc viewer. Port the in-pod WebRTC signaling
-                    server listens on. Ignored when viewer is "guacd".
-                protocol:
+                    Desktop-only. Port the in-pod Selkies (websockets viewer) HTTP/
+                    WebSocket server listens on; the portal reverse-proxies it
+                    (ignored for ssh). Defaults to 8082.
+                viewer:
                   type: string
-                  enum: ["vnc", "rdp"]
-                  description: Desktop-only, guacd viewer. Guacamole protocol used by the portal.
-                connectionParams:
-                  type: object
-                  additionalProperties:
-                    type: string
-                  description: Desktop-only. Extra guacamole connection parameters.
-                rdpSecurity:
-                  type: string
-                  enum: ["any", "nla", "tls", "rdp", "vmconnect"]
+                  enum: ["websockets"]
+                  default: websockets
                   description: >-
-                    Desktop-only. RDP security/authentication mode passed to guacd
-                    as the ``security`` connection parameter. "nla" is required by
-                    gnome-remote-desktop. Overrides a ``security`` key in
-                    connectionParams if both are set.
+                    Desktop-only. Display backend the portal uses. "websockets"
+                    reverse-proxies the browser to the in-pod Selkies 2.x
+                    (pixelflux) server on displayPort — H.264 over plain WebSockets
+                    reaches the browser's decoder, no coturn/TURN involved.
                 instancetype:
                   type: string
                   description: VM-only. KubeVirt instancetype name (e.g. "u1.medium").
@@ -175,14 +154,13 @@ spec:
                 displayPort:
                   type: integer
                   description: >-
-                    Port the broker dials on the per-session Service. For the
-                    guacd viewer this is the RDP/VNC display port; for the webrtc
-                    viewer it is the in-pod Selkies signaling port.
+                    Port the portal reverse-proxies on the per-session Service —
+                    the in-pod Selkies (websockets viewer) HTTP/WebSocket port.
                 viewer:
                   type: string
                   description: >-
-                    Denormalized from the template (guacd/webrtc) so the portal
-                    knows which page to render and which relay to open.
+                    Denormalized from the template (websockets) so the portal
+                    knows which relay to open.
                 sshHost:
                   type: string
                 sshPort:

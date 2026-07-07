@@ -31,57 +31,10 @@ server:
       memory: 1Gi
   logLevel: DEBUG
 
-# Shared, stateless guacd (Guacamole protocol daemon). The portal opens a
-# connection to it per session; guacd dials the desktop's display port.
-guacd:
-  enabled: true
-  # 1.6.0+ is multi-arch (amd64 + arm64); 1.5.x was amd64-only.
-  image: "guacamole/guacd:1.6.0"
-  replicaCount: 1
-  # guacd does the RDP-decode -> Guacamole-encode (incl. image compression), so
-  # it's the CPU-heavy half of the pipeline.
-  resources:
-    limits:
-      cpu: "1000m"
-      memory: 4Gi
-    requests:
-      cpu: "250m"
-      memory: 512Mi
-
-# Shared TURN relay (coturn) — REQUIRED by the webrtc viewer (Selkies desktops).
-# WebRTC media can't reach a pod's cluster-internal ICE candidates, so the browser
-# and the in-pod Selkies server both relay through this one coturn. Disabled by
-# default; only the webrtc viewer needs it (the guacd/RDP path doesn't).
-coturn:
-  enabled: false
-  image: "coturn/coturn:4.6"
-  replicaCount: 1
-  realm: "whistler"
-  # Browser-reachable address of coturn (node IP / LoadBalancer / public host).
-  # REQUIRED when enabled — both the browser and the in-pod Selkies use it, and
-  # coturn advertises it as the relay (external-ip) address. Empty = host
-  # candidates only (works just for host-networked dev).
-  externalHost: ""
-  port: 3478
-  protocol: "udp"          # udp | tcp — transport the browser/Selkies use to coturn
-  # Shared static-auth-secret for the use-auth-secret (time-limited HMAC) scheme.
-  # Empty => the chart generates one and persists it in <release>-coturn (kept
-  # stable across upgrades).
-  staticAuthSecret: ""
-  # hostNetwork puts coturn's relay port range directly on the node — the
-  # pragmatic way to keep a wide UDP range externally reachable (Service/NodePort
-  # can't map it sanely). Set externalHost to the node's IP when this is true.
-  hostNetwork: true
-  relayPortRange:
-    min: 49160
-    max: 49200
-  resources:
-    limits:
-      cpu: "1000m"
-      memory: 512Mi
-    requests:
-      cpu: "100m"
-      memory: 128Mi
+# Desktop display path: the portal reverse-proxies the browser straight to the
+# in-pod Selkies 2.x (pixelflux) server over HTTP/WebSockets — H.264 reaches the
+# browser's decoder with no external relay. There is no shared guacd and no
+# coturn/TURN: the Selkies 2.x "websockets" viewer needs neither.
 
 # Web portal: launch + connect to desktop sessions from a browser.
 portal:
@@ -196,10 +149,8 @@ whistler:
       - debian:12-slim
       - alpine:3.19
     desktop:
-      - ghcr.io/marma/whistler-desktop-xfce-rdp:latest
-      - ghcr.io/marma/whistler-desktop-gnome-grd:latest
-      - ghcr.io/marma/whistler-desktop-xfce-webrtc:latest
-      - ghcr.io/marma/whistler-desktop-gnome-flashback-webrtc:latest
+      - ghcr.io/marma/whistler-desktop-xfce-selkies2:latest
+      - ghcr.io/marma/whistler-desktop-gnome-selkies2:latest
     vm: []
 
   # Security policy enforced by the operator.
@@ -228,11 +179,10 @@ whistler:
 #            templates expose a display server consumed by the web portal.
 #   runtime: container | kata | vm — plain pod, Kata-isolated pod, or KubeVirt VM.
 #
-# For desktop templates: displayPort is where the image's display server
-# (RDP/VNC) listens; the per-session Service exposes it and guacd dials it.
-# protocol + connectionParams are passed to guacd (RDP needs a login, so the
-# image's well-known creds live here — transport safety comes from the
-# locked-down NetworkPolicy, not the password).
+# For desktop templates: displayPort is where the image's Selkies 2.x
+# (pixelflux) server listens over HTTP/WebSockets; the per-session Service
+# exposes it and the portal reverse-proxies it to the browser. All desktop
+# templates use viewer: websockets — there is no guacd/RDP or webrtc/coturn path.
 templates:
   small:
     description: "Small SSH instance"
@@ -242,117 +192,41 @@ templates:
     resources:
       cpu: 500m
       memory: 2Gi
-  rdp-desktop:
-    description: "XFCE desktop over RDP"
+  xfce-desktop:
+    description: "XFCE desktop over Selkies 2.x (pixelflux/WebSockets)"
     mode: desktop
     runtime: container
-    # Built from desktops/xfce-rdp (multi-arch). For local dev, skaffold
-    # overrides this with the freshly-built image.
-    image: "ghcr.io/marma/whistler-desktop-xfce-rdp:latest"
-    protocol: rdp
-    displayPort: 3389
-    persistence: ephemeral
-    rdpSecurity: "any"
-    connectionParams:
-      username: "abc"
-      password: "abc"
-      ignore-cert: "true"
-      resize-method: "display-update"
-      # Full color over the RDP link (guacd often defaults to 16-bit, which
-      # bands). This is the RDP-link depth; separate from guacd's re-encoding to
-      # the browser (force-lossless below).
-      color-depth: "24"
-      # Force lossless (PNG) frames to the browser. guacd defaults to a lossy
-      # heuristic that sends JPEG for regions it deems "photographic" -- the
-      # JPEG ringing/mosquito-noise around sharp edges (text, window borders).
-      # Advertising only image/png in the handshake does NOT prevent this: PNG
-      # and JPEG are baseline formats guacd assumes every client supports, so it
-      # still emits JPEG. force-lossless is the actual lever (verified: drops
-      # guacd's image/jpeg frames to zero). Trade-off is bandwidth.
-      force-lossless: "true"
-    resources:
-      cpu: "1000m"
-      memory: 4Gi
-  webrtc-desktop:
-    description: "XFCE desktop over WebRTC (Selkies, software x264)"
-    mode: desktop
-    runtime: container
-    # Built from desktops/xfce-webrtc (amd64-only — Selkies' GStreamer build has no
-    # arm64 asset; no GPU). Requires coturn.enabled and coturn.externalHost set —
-    # WebRTC media can't reach a pod's ICE candidates directly. See design/vdi.md
-    # "Round 3".
-    image: "ghcr.io/marma/whistler-desktop-xfce-webrtc:latest"
-    viewer: webrtc
-    # In-pod Selkies signaling/web port the portal relays to (becomes the effective
-    # displayPort the per-session Service exposes). protocol/connectionParams are
-    # unused for the webrtc viewer.
-    signalPort: 8082
+    # Built from desktops/xfce-selkies2 (multi-arch; pixelflux ships amd64+arm64
+    # wheels). For local dev, skaffold overrides this with the freshly-built image.
+    image: "ghcr.io/marma/whistler-desktop-xfce-selkies2:latest"
+    viewer: websockets
+    # The in-pod Selkies HTTP/WebSocket port the portal reverse-proxies.
+    displayPort: 8082
     persistence: ephemeral
     resources:
       cpu: "2000m"
       memory: 4Gi
-  gnome-grd:
-    description: "GNOME desktop over RDP (gnome-remote-desktop)"
+  gnome-desktop:
+    description: "Real GNOME Shell over Selkies 2.x (pixelflux/WebSockets)"
     mode: desktop
     runtime: container
-    # Built from desktops/gnome-grd (Wayland-native; gnome-remote-desktop, not
-    # xrdp). For local dev, skaffold overrides this with the freshly-built image.
-    # EXPERIMENTAL — see desktops/gnome-grd.
-    image: "ghcr.io/marma/whistler-desktop-gnome-grd:latest"
-    protocol: rdp
-    displayPort: 3389
+    # Built from desktops/gnome-selkies2 (Ubuntu 24.04 / GNOME 46, unprivileged —
+    # no systemd-PID1). For local dev, skaffold overrides this with the
+    # freshly-built image.
+    image: "ghcr.io/marma/whistler-desktop-gnome-selkies2:latest"
+    viewer: websockets
+    displayPort: 8082
     persistence: ephemeral
-    # gnome-grd runs systemd as PID 1, which requires a privileged container.
-    # In production (whistler.security.forceKataForPrivileged=true) this is
-    # automatically coerced to runtime=kata so --privileged runs inside a
-    # lightweight VM, isolated from the host kernel.
-    privileged: true
-    # grd's RDP clipboard mounts a FUSE filesystem; without /dev/fuse the daemon
-    # aborts the moment a client connects.
-    fuse: true
-    # gnome-remote-desktop mandates NLA; "any" fails because grd refuses the
-    # fallback security modes guacd tries first when negotiating.
-    rdpSecurity: "nla"
-    connectionParams:
-      username: "abc"
-      password: "abc"
-      ignore-cert: "true"
-      resize-method: "display-update"
-      color-depth: "24"
-      # See rdp-desktop above for why force-lossless is the real lever.
-      force-lossless: "true"
     resources:
       # GNOME Shell is heavier than XFCE.
       cpu: "2000m"
       memory: 8Gi
-  gnome-flashback-webrtc-desktop:
-    description: "GNOME Flashback desktop over WebRTC (Selkies, software x264, Ubuntu 26.04)"
-    mode: desktop
-    runtime: container
-    # Built from desktops/gnome-flashback-webrtc. EXPERIMENTAL — see that
-    # image's README for why it needs both systemd-PID1 (like gnome-grd) AND
-    # WebRTC (like xfce-webrtc). Requires coturn.enabled and
-    # coturn.externalHost set, same as webrtc-desktop.
-    image: "ghcr.io/marma/whistler-desktop-gnome-flashback-webrtc:latest"
-    viewer: webrtc
-    signalPort: 8082
-    persistence: ephemeral
-    # Needs systemd as PID 1 (gnome-session hard-requires systemd --user) and
-    # runs its session as root (GNOME's mandatory glycin/bwrap sandboxed image
-    # loading needs a kernel-level privilege non-root doesn't have on hosts
-    # that restrict unprivileged user namespaces) — see the image's README.
-    # Coerced to runtime=kata in production, same as gnome-grd.
-    privileged: true
-    resources:
-      cpu: "2000m"
-      memory: 4Gi
   # win-vm:
   #   description: "Windows desktop (KubeVirt VM)"
   #   mode: desktop
   #   runtime: vm
   #   image: "registry.example/desktops/win:latest"
-  #   protocol: rdp
-  #   displayPort: 3389
+  #   displayPort: 8082
   #   persistence: persistent
   #   instancetype: "u1.medium"
 

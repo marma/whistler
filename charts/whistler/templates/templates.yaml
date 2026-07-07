@@ -13,21 +13,8 @@ spec:
 {{- if $template.viewer }}
   viewer: {{ $template.viewer }}
 {{- end }}
-{{- if $template.signalPort }}
-  signalPort: {{ $template.signalPort }}
-{{- end }}
-{{- if $template.protocol }}
-  protocol: {{ $template.protocol }}
-{{- end }}
 {{- if $template.displayPort }}
   displayPort: {{ $template.displayPort }}
-{{- end }}
-{{- if $template.connectionParams }}
-  connectionParams:
-{{ toYaml $template.connectionParams | indent 4 }}
-{{- end }}
-{{- if $template.rdpSecurity }}
-  rdpSecurity: {{ $template.rdpSecurity }}
 {{- end }}
 {{- if $template.fuse }}
   fuse: {{ $template.fuse }}

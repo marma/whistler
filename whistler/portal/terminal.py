@@ -1,6 +1,7 @@
 """Web terminal: browser (xterm.js) <-> WebSocket <-> ``kubectl exec`` PTY.
 
-The desktop viewer relays the browser to guacd; a terminal needs none of that.
+The desktop viewer reverse-proxies the browser to the in-pod Selkies server; a
+terminal needs none of that.
 We open a local PTY, spawn ``kubectl exec -it <pod> -n <ns> -- <shell>`` with its
 stdio on the slave end, and pump bytes between the PTY master and the WebSocket.
 Resize is carried out-of-band: the browser sends a small JSON control frame and

@@ -41,21 +41,6 @@ spec:
               value: {{ .Values.whistler.security.forceKataForPrivileged | quote }}
             - name: WHISTLER_KATA_RUNTIME_CLASS
               value: {{ .Values.whistler.security.kataRuntimeClass | quote }}
-            {{- if .Values.coturn.enabled }}
-            # webrtc viewer: _selkies_turn_env injects these into desktop pods so
-            # in-pod Selkies relays media through the shared coturn.
-            - name: TURN_HOST
-              value: {{ .Values.coturn.externalHost | quote }}
-            - name: TURN_PORT
-              value: {{ .Values.coturn.port | quote }}
-            - name: TURN_PROTOCOL
-              value: {{ .Values.coturn.protocol | quote }}
-            - name: TURN_SHARED_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Release.Name }}-coturn
-                  key: static-auth-secret
-            {{- end }}
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
           # ensure_pod() runs here now, so the operator needs the same user and

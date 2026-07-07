@@ -134,10 +134,10 @@ def _render_status_html(name: str, status: str, user: str, controls: bool,
 
 # Both kinds of session are now one `Session` CR (ssh / desktop mode); the user
 # dashboard lists them in a single table. Desktop sessions connect in the browser
-# through the guacd relay (whistler.portal.app), which runs on its own port — so
-# the "Connect" link needs that relay's base URL. WHISTLER_DESKTOP_PORTAL_URL
+# through the viewer app (whistler.portal.app), which runs on its own port — so
+# the "Connect" link needs that app's base URL. WHISTLER_DESKTOP_PORTAL_URL
 # overrides it (e.g. "https://desktops.example.com"); empty means same-origin
-# (works when the relay is reachable on the same host, e.g. behind one ingress).
+# (works when the viewer is reachable on the same host, e.g. behind one ingress).
 _DESKTOP_PORTAL_URL = os.environ.get("WHISTLER_DESKTOP_PORTAL_URL", "").rstrip("/")
 
 
