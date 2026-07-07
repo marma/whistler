@@ -52,9 +52,8 @@ pairing in [`../compose-sidecar.yaml`](../compose-sidecar.yaml).
 ## Running without a cluster (docker only)
 
 The sidecar pairing degrades gracefully to two plain containers sharing two
-named volumes — no Kubernetes involved. Useful on a laptop (including
-Apple Silicon; both images are multi-arch-capable bases). The one-command way,
-from the repo root:
+named volumes — no Kubernetes involved. The one-command way, from the repo
+root:
 
 ```bash
 make desktop-sidecar-local        # build + run both (XFCE), http://localhost:8082/

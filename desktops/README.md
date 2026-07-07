@@ -43,9 +43,8 @@ template's `streamerEnv` (e.g. GNOME's mandatory
   fail-loudly guard for use outside Kubernetes (in-cluster the sidecar's
   startupProbe already gates them).
 - **Multi-arch**: prefer base images/packages with arm64 builds so desktops
-  run natively on Apple-Silicon/arm64 clusters. Build multi-arch for a
-  registry with `docker buildx build --platform linux/amd64,linux/arm64 -t
-  <ref> --push .`.
+  run natively on arm64 clusters. Build multi-arch for a registry with
+  `docker buildx build --platform linux/amd64,linux/arm64 -t <ref> --push .`.
 - **Security boundary** is the per-session NetworkPolicy (only the portal can
   reach the pod), not credentials baked into the image. See
   [../design/vdi.md](../design/vdi.md).

@@ -13,14 +13,10 @@
 CLUSTER      ?= whistler-it
 TEST_IMAGE   ?= whistler-test
 PYTHON       ?= $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python)
-# Lightweight encoding profile for the local desktop targets. On Apple Silicon
-# the streamer runs amd64 x264 software encoding under QEMU emulation, and
-# Selkies' default resolution is too heavy — the first keyframe is slow enough
-# that the client's stream watchdog gives up. This overrides to a profile the
-# emulated encoder can keep up with. Bump it (or override on the command line)
-# on a native amd64/Linux host, e.g.
-# `make desktop-sidecar-local SELKIES2_RESOLUTION=1920x1080`.
-SELKIES2_RESOLUTION ?= 800x600
+# Initial desktop resolution for the local desktop targets (Selkies resizes
+# dynamically to the browser window on connect anyway). Override on the
+# command line, e.g. `make desktop-sidecar-local SELKIES2_RESOLUTION=1920x1080`.
+SELKIES2_RESOLUTION ?= 1280x720
 
 .PHONY: test test-local cluster-up cluster-down integration integration-keep \
         desktop-sidecar-local desktop-gnome-sidecar-local \

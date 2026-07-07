@@ -34,9 +34,9 @@ services:
     ports:
       - "8082:8082"
     environment:
-      # Same knobs (and Apple-Silicon rationale) as the desktop-*-local make
-      # targets: SELKIES2_RESOLUTION / SELKIES2_HTTPS on the make command line.
-      SELKIES_RESOLUTION: ${SELKIES2_RESOLUTION:-800x600}
+      # Same knobs as the desktop-*-local make targets: SELKIES2_RESOLUTION /
+      # SELKIES2_HTTPS on the make command line.
+      SELKIES_RESOLUTION: ${SELKIES2_RESOLUTION:-1280x720}
       SELKIES_ENABLE_HTTPS: ${SELKIES2_HTTPS:-false}
       SELKIES_H264_STREAMING_MODE: ${SELKIES2_H264_STREAMING:-false}
     volumes:
