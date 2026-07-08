@@ -10,13 +10,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install kubectl for the image's target architecture. TARGETARCH is set
-# automatically by BuildKit (amd64/arm64); without it a fixed amd64 binary
-# fails with "Exec format error" on arm64 nodes (e.g. Apple-silicon
-# docker-desktop), breaking every `kubectl exec` bridge.
+# automatically by BuildKit (amd64/arm64) and is what makes CI's buildx
+# multi-arch builds pick the right binary — but a legacy (non-BuildKit)
+# `docker build`, which is what skaffold's docker builder can end up doing
+# locally, leaves it EMPTY. That turned the URL into .../bin/linux//kubectl,
+# and since plain `curl -LO` saves HTTP error bodies, the "kubectl" installed
+# was a 241-byte XML error page — surfacing much later as
+# "[Errno 8] Exec format error: 'kubectl'" on every exec bridge (web terminal,
+# SSH session, SFTP). Hence: fall back to dpkg's native arch when TARGETARCH
+# is unset (correct for any same-arch build), and curl with -f so a bad
+# download fails the *build*, not the first user session.
 ARG TARGETARCH
-RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${TARGETARCH}/kubectl" && \
+RUN arch="${TARGETARCH:-$(dpkg --print-architecture)}" && \
+    curl -fLO "https://dl.k8s.io/release/$(curl -fL -s https://dl.k8s.io/release/stable.txt)/bin/linux/${arch}/kubectl" && \
     install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl && \
-    rm kubectl
+    rm kubectl && \
+    kubectl version --client >/dev/null
 
 # Copy application code
 COPY whistler/ whistler/

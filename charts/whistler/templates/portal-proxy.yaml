@@ -2,7 +2,7 @@
 {{- /*
 Bundled Traefik reverse proxy fronting the portal pod's two web apps on one
 origin (see portal-deployment.yaml / whistler/portal/__main__.py):
-  * viewer  (:8080) — desktop viewer + web terminal: /connect, /launch, /status, /term, /ws-term, /static
+  * viewer  (:8080) — desktop viewer + web terminal: /connect, /desktop, /launch, /status, /term, /ws-term, /static
   * mgmt    (:8081) — admin + user UI: /, /instances, /admin, /static
 Route sets are disjoint except /static (both serve the SAME dir, so either
 backend works — it falls to mgmt) and /healthz (probes hit the pod directly).

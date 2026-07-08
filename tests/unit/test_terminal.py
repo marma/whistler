@@ -7,15 +7,27 @@ from whistler.portal.app import _resolve_target
 
 # --- build_exec_command ---------------------------------------------------- #
 
-def test_exec_command_is_interactive_tty():
+def test_exec_command_is_interactive_tty_pinned_to_main():
+    # -c main: no "Defaulted container" banner, and never the streamer sidecar.
     cmd = terminal.build_exec_command("pod-x", "ns-y")
-    assert cmd[:7] == ["kubectl", "exec", "-it", "pod-x", "-n", "ns-y", "--"]
+    assert cmd[:9] == ["kubectl", "exec", "-it", "pod-x", "-n", "ns-y",
+                       "-c", "main", "--"]
 
 
 def test_exec_command_falls_back_to_sh():
     # The remote shell expression must degrade to /bin/sh when bash is absent.
     cmd = terminal.build_exec_command("pod-x", "ns-y", shell="/bin/zsh")
-    assert cmd[-1] == "exec /bin/zsh || exec /bin/sh"
+    assert cmd[-1].endswith("exec /bin/zsh || exec /bin/sh")
+
+
+def test_exec_command_drops_root_to_desktop_user():
+    # Root + DESKTOP_USER set (the desktop workload convention) -> su into the
+    # created user's login shell, with DISPLAY/PULSE_SERVER re-exported so GUI
+    # apps launched from the terminal reach the streamed desktop.
+    script = terminal.build_exec_command("pod-x", "ns-y")[-1]
+    assert '[ "$(id -u)" = "0" ]' in script
+    assert 'exec su - "$DESKTOP_USER"' in script
+    assert "DISPLAY='$DISPLAY'" in script and "PULSE_SERVER='$PULSE_SERVER'" in script
 
 
 # --- parse_resize ---------------------------------------------------------- #

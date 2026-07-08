@@ -30,6 +30,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
+# Ubuntu 26.04's gdk-pixbuf decodes images through glycin, which sandboxes
+# every decode in a bwrap (user-namespace) worker. Inside a Kubernetes pod that
+# nested sandbox cannot be set up, and the failure mode is nasty: glycin only
+# falls back to unsandboxed loading when bwrap fails with an error string it
+# recognizes, and the error you actually get under containerd/k3d ("bwrap:
+# loopback: Failed RTM_NEWADDR: Operation not permitted") is not on that list —
+# so glycin keeps using bwrap, every loader worker dies instantly, every
+# icon/PNG decode returns NULL, GTK warns "Could not load a pixbuf from icon
+# theme", and libwnck's g_assert on its fallback icon aborts xfce4-panel,
+# taking the whole session down (CrashLoopBackOff). The same image is fine
+# under plain `docker run`, which is what makes this so misleading.
+# Fix: divert bwrap to a stub that fails with an error glycin's detection DOES
+# recognize -> glycin runs loaders unsandboxed. The pod (and its
+# NetworkPolicy) is the security boundary here; a nested userns sandbox inside
+# an unprivileged container is not something we can support anyway.
+RUN dpkg-divert --rename --add /usr/bin/bwrap \
+ && printf '#!/bin/sh\necho "bwrap: Creating new namespace failed: disabled in this container image (see Dockerfile)" >&2\nexit 1\n' > /usr/bin/bwrap \
+ && chmod +x /usr/bin/bwrap
+
 # Well-known desktop user (no login prompt — the streamer captures whatever
 # this session draws). gnome-plain upgrades this to runtime-configurable
 # PUID/PGID identity; here a fixed user keeps the image minimal.

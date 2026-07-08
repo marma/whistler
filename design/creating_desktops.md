@@ -124,7 +124,8 @@ here as the maintenance guide for `streamer-selkies2`):
   dev needs `SELKIES_ENABLE_HTTPS=true` (images bake Debian's `ssl-cert`
   snakeoil pair, which selkies' cert-path defaults point at). In-cluster the
   portal's own HTTPS origin covers it — but this makes portal-HTTPS a hard
-  requirement of the future websockets viewer.
+  requirement of the websockets viewer (now wired: the portal reverse-proxies
+  the in-pod Selkies server under `/desktop/<id>/`).
 
 ## 5. Silent-failure catalog
 
@@ -149,6 +150,7 @@ what's missing.** Symptoms observed → actual cause:
 | A GTK4 app (Files/nautilus, Text Editor, Settings) shows a stale copy of the desktop instead of its own UI — even in a *server-side* screenshot | GTK4 renders content via GSK's OpenGL renderer, which is garbage under llvmpipe; set `GSK_RENDERER=cairo` in the session env for the software renderer. GTK3 apps (gnome-terminal) and gnome-shell itself (Clutter/Cogl) are unaffected, so the symptom is "some apps render, others are garbage". |
 | App/shell icons render as blurry scaled-up blobs while text stays crisp | the gdk-pixbuf SVG loader is missing — `--no-install-recommends` dropped `librsvg2-common`, so Adwaita's scalable-SVG icons can't be rasterized. Install `librsvg2-common` and regenerate the loader cache (`gdk-pixbuf-query-loaders --update-cache`; the dpkg trigger is unreliable in a build layer). |
 | GNOME Shell app-switcher/overview backdrop confined to a top-left rectangle at large (HiDPI) resolutions, while windows/panel/desktop are full-size | mutter's overview backdrop on X11 is created at the shell's startup resolution and only *shrinks* with the monitor, never grows; a client driving the framebuffer above that size (HiDPI + a >1920×1080 browser window) leaves the backdrop stuck small. Not scale-related (forcing `scaling-factor=1` doesn't help), not fixable by pre-growing or restarting the shell. Only a **fixed resolution** (no dynamic resize) avoids it — accept the cosmetic quirk or trade away window-matching. Cosmetic: launching apps still works. |
+| Session crash-loops **only in Kubernetes** (fine under `docker run`/compose, same image): GTK warns "Could not load a pixbuf from icon theme … pixbuf loaders or the mime database could not be found", then `Wnck:ERROR:…default_icon_at_size: assertion failed: (base)` aborts xfce4-panel | Ubuntu 26.04's gdk-pixbuf decodes via **glycin**, which runs each decode in a nested bwrap/user-namespace sandbox. Under containerd/k3d the sandbox fails (`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`) with an error string glycin's blocked-sandbox detection does **not** recognize, so it never falls back to unsandboxed loading — every decode returns NULL. Fix in the image: `dpkg-divert` bwrap to a stub that fails with `"Creating new namespace failed"` (a string glycin does recognize) → loaders run unsandboxed; the pod is the sandbox (see `xfce-plain/Dockerfile`). Applies to any 26.04-based workload image with GTK. |
 
 When you hit a new one: fix it, then add the symptom→cause line here and the
 *why* comment at the fix site.

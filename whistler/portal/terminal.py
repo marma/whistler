@@ -35,12 +35,39 @@ _MAX_DIM = 1000  # clamp absurd values before they reach the kernel ioctl
 def build_exec_command(pod_name: str, namespace: str, shell: str = "/bin/bash") -> list[str]:
     """The ``kubectl exec`` argv for an interactive PTY shell into a pod.
 
+    ``-c main`` pins the workload container: every Session pod names it "main"
+    (see ``_build_pod_spec``), and without the flag kubectl both prints a
+    "Defaulted container ..." banner into the terminal and would pick the
+    streamer sidecar if the container order ever changed.
+
+    Desktop workload containers start as root (their entrypoint needs it for
+    the system bus) and ``su`` down to the image's ``DESKTOP_USER`` for the
+    actual session — so a bare exec lands a root shell. Mirror the entrypoint:
+    if we're root and ``DESKTOP_USER`` names a real account, drop into their
+    login shell, re-exporting DISPLAY/PULSE_SERVER (``su -`` scrubs them) so
+    GUI apps launched from the terminal appear on the streamed desktop.
+    Otherwise (ssh pods, images without the convention) keep the plain shell.
+
     ``-it`` allocates a remote TTY (so line editing, job control, and SIGWINCH
     work); ``--`` ends kubectl's own flag parsing. Falls back to ``sh`` if the
     requested shell is missing, mirroring how interactive shells degrade."""
+    inner = (f"env DISPLAY='$DISPLAY' PULSE_SERVER='$PULSE_SERVER' {shell} -l "
+             f"|| env DISPLAY='$DISPLAY' PULSE_SERVER='$PULSE_SERVER' sh -l")
+    script = (
+        'if [ "$(id -u)" = "0" ] && [ -n "$DESKTOP_USER" ] '
+        '&& id "$DESKTOP_USER" >/dev/null 2>&1; then '
+        # su -c leaves the shell a non-session-leader on the exec'd TTY ("no
+        # job control", Ctrl-C/Ctrl-Z dead). util-linux su --pty gives the
+        # child its own pty session (and forwards resize), fixing that; probe
+        # for it since exec'ing an unsupported flag would kill the session.
+        "if su --help 2>&1 | grep -q -- --pty; then "
+        f'exec su -P - "$DESKTOP_USER" -c "{inner}"; fi; '
+        f'exec su - "$DESKTOP_USER" -c "{inner}"; '
+        f"fi; exec {shell} || exec /bin/sh"
+    )
     return [
-        "kubectl", "exec", "-it", pod_name, "-n", namespace, "--",
-        "sh", "-c", f"exec {shell} || exec /bin/sh",
+        "kubectl", "exec", "-it", pod_name, "-n", namespace, "-c", "main", "--",
+        "sh", "-c", script,
     ]
 
 

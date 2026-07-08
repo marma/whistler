@@ -54,7 +54,10 @@ template's `streamerEnv` (e.g. GNOME's mandatory
 ## Build & use
 
 `skaffold dev` builds all images and points the sample templates + the
-operator's streamer image at the fresh builds. Without a cluster:
+operator's streamer image at the fresh builds; launch a desktop from the
+portal at `http://localhost:30080/?user=<name>` and the viewer opens at
+`/desktop/<session>/` (the portal reverse-proxies the sidecar's Selkies
+server — HTTP and the H.264 WebSocket both). Without a cluster:
 
 ```bash
 make desktop-sidecar-local        # streamer + XFCE pair, http://localhost:8082/

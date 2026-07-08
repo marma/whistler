@@ -5,9 +5,10 @@ for the Deployment/Service and the routing rationale). Static config + dynamic
 routers/services in one ConfigMap.
 */}}
 {{- $host := .Values.portal.ingress.host }}
-{{- /* The viewer app serves the desktop connect page (/connect, websockets
-       viewer) and the web terminal (/term + /term-status + /ws-term). */}}
-{{- $viewerPaths := "PathPrefix(`/connect`) || PathPrefix(`/launch`) || PathPrefix(`/status`) || PathPrefix(`/term`) || PathPrefix(`/ws-term`)" }}
+{{- /* The viewer app serves the desktop connect page (/connect), the
+       reverse-proxied Selkies viewer (/desktop) and the web terminal
+       (/term + /term-status + /ws-term). */}}
+{{- $viewerPaths := "PathPrefix(`/connect`) || PathPrefix(`/desktop`) || PathPrefix(`/launch`) || PathPrefix(`/status`) || PathPrefix(`/term`) || PathPrefix(`/ws-term`)" }}
 {{- $viewerRule := $viewerPaths }}
 {{- $mgmtRule := "PathPrefix(`/`)" }}
 {{- if $host }}

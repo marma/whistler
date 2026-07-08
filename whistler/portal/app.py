@@ -3,19 +3,22 @@
 Routes (all under a dev-only auth gate — see ``auth_middleware``):
   GET  /                 list templates + sessions, launch form
   POST /launch           create a DesktopSession, redirect to /connect/<id>
-  GET  /connect/<id>     desktop viewer page (websockets viewer — see below)
+  GET  /connect/<id>     desktop viewer page: waits for Ready, then redirects
+                         to /desktop/<id>/
+  ANY  /desktop/<id>/*   reverse proxy (HTTP + WebSocket) to the in-pod
+                         Selkies 2.x server — see whistler.portal.proxy
   GET  /status/<id>      JSON readiness poll
   GET  /term/<id>        web-terminal page
   GET  /term-status/<id> JSON terminal-readiness poll
   GET  /ws-term/<id>     WebSocket <-> in-pod shell (kubectl exec) relay
   GET  /healthz          readiness probe
 
-The only display backend is the **websockets viewer**: the browser connects to
-the in-pod Selkies 2.x (pixelflux) server, which serves H.264 over plain
-WebSockets straight to the browser's decoder — no guacd, no coturn/TURN. The
-reverse-proxy that carries that HTTP/WS stream to the pod is not wired yet, so
-``/connect`` currently serves a placeholder (see ``_render_connect``); the web
-terminal is fully functional.
+The only display backend is the **websockets viewer**: the streamer sidecar's
+Selkies 2.x (pixelflux) server serves its own web client and streams H.264 over
+plain WebSockets — no guacd, no coturn/TURN. The portal reverse-proxies both
+(the client is fully page-relative, so no rewriting) under ``/desktop/<id>/``,
+which also means the browser only ever talks to the portal origin: one TLS
+endpoint satisfies the client's secure-context requirement for every session.
 
 State lives in CRs; the portal holds none. Blocking KubeConfigManager calls run
 in an executor so the event loop stays responsive.
@@ -25,10 +28,12 @@ import html
 import logging
 import os
 import secrets
+import time
 
+import aiohttp
 from aiohttp import web
 
-from whistler.portal import terminal
+from whistler.portal import proxy, terminal
 
 logger = logging.getLogger("whistler.portal")
 
@@ -36,6 +41,9 @@ logger = logging.getLogger("whistler.portal")
 # --------------------------------------------------------------------------- #
 # Auth — minimal, dev-only this round. Real web SSO/OIDC is a follow-up.       #
 # --------------------------------------------------------------------------- #
+
+_USER_COOKIE = "whistler_user"
+
 
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
@@ -48,10 +56,16 @@ async def auth_middleware(request: web.Request, handler):
                  "For dev, set WHISTLER_AUTH_ALLOW_ANY=true and pass ?user=<name>.",
         )
     # Dev: identity from header or query; first segment is the real user (mirrors
-    # the SSH server's username convention).
-    raw = request.headers.get("X-Whistler-User") or request.query.get("user") or "tester"
+    # the SSH server's username convention). The cookie fallback exists for the
+    # /desktop/<id>/* proxy: the Selkies client's own asset/WS requests carry no
+    # ?user=, so the identity that loaded the page is echoed back via cookie.
+    explicit = request.headers.get("X-Whistler-User") or request.query.get("user")
+    raw = explicit or request.cookies.get(_USER_COOKIE) or "tester"
     request["user"] = raw.split("-")[0]
-    return await handler(request)
+    response = await handler(request)
+    if explicit and isinstance(response, web.StreamResponse) and not response.prepared:
+        response.set_cookie(_USER_COOKIE, raw, path="/", samesite="Lax")
+    return response
 
 
 async def _run(request, func, *args):
@@ -123,11 +137,11 @@ def _render_index(user, templates, sessions):
     )
 
 
-# Desktop viewer page (websockets viewer). The in-pod Selkies 2.x server serves
-# its own web client + H.264-over-WebSocket stream; the portal will reverse-proxy
-# that HTTP/WS to the pod. That proxy seam is not wired yet, so for now this page
-# waits for the session to be Ready and reports the pending work rather than
-# erroring. Placeholders are replaced (not .format) so JS braces survive.
+# Desktop viewer page (websockets viewer): waits for the session to be Ready,
+# then hands the browser to the reverse-proxied Selkies client at
+# /desktop/<id>/. The auth cookie set by this page's own request is what
+# authorizes the proxied asset/WebSocket requests that follow (they carry no
+# ?user=). Placeholders are replaced (not .format) so JS braces survive.
 _CONNECT_HTML = """<!doctype html><meta charset=utf-8><title>__ID__</title>
 <style>
   html,body{margin:0;height:100%;background:#202020;overflow:hidden;
@@ -158,10 +172,10 @@ async function waitReady() {
 }
 
 waitReady().then(() => {
-  // Seam for the Selkies 2.x websockets viewer: once the portal reverse-proxies
-  // the in-pod Selkies HTTP/WS to a path here, redirect the browser to it.
-  setStatus('Session ready. The Selkies 2.x (websockets) viewer is not wired ' +
-            'into the portal yet — connect to the pod directly for now.');
+  setStatus('Session ready — opening desktop…');
+  // The trailing slash matters: the Selkies client resolves every asset, API
+  // and WebSocket URL relative to the page *directory*.
+  location.replace(`/desktop/${encodeURIComponent(id)}/`);
 }).catch(e => setStatus('Fatal error: ' + e));
 </script>"""
 
@@ -289,7 +303,19 @@ async def launch(request):
         return web.Response(status=400, text="missing template")
     ok = await _run(request, cm.add_desktop_session, user, template, name)
     if not ok:
-        return web.Response(status=500, text="failed to create session")
+        # The CR create is not idempotent (409 on an existing name), but
+        # re-launching your own session should just reconnect to it — only a
+        # name collision with a *different* template is a real conflict.
+        sessions = await _run(request, cm.get_user_desktop_sessions, user)
+        existing = _resolve_session(sessions, name)
+        if existing is None:
+            return web.Response(status=500, text="failed to create session")
+        if existing.get("template") != template:
+            return web.Response(
+                status=409,
+                text=f"session '{name}' already exists with template "
+                     f"'{existing.get('template')}' — pick another name or "
+                     f"delete it first")
     raise web.HTTPFound(f"/connect/{name}?user={user}")
 
 
@@ -314,6 +340,68 @@ async def status(request):
         "address": sess.get("address"),
         "displayPort": sess.get("displayPort"),
     })
+
+
+# --------------------------------------------------------------------------- #
+# Desktop reverse proxy (/desktop/<id>/*) — resolution + dispatch. The relay    #
+# mechanics live in whistler.portal.proxy; this half owns *which* backend a     #
+# request may reach: the session must exist in the requesting user's namespace  #
+# and be Ready. Resolved targets are cached briefly because one dashboard load  #
+# is a dozen asset requests and each resolution is two cluster list calls.      #
+# --------------------------------------------------------------------------- #
+
+_TARGET_TTL_SECONDS = 10.0
+
+
+async def _resolve_desktop_base(request):
+    """Return ``(base_url, error_response)`` for the session in the URL. Only
+    Ready sessions resolve (and only those get cached); anything else is an
+    error response for the proxy handler to return as-is."""
+    cm, user = request.app["cm"], request["user"]
+    name = request.match_info["id"]
+    cache = request.app["desktop_targets"]
+    key = (user, name)
+    hit = cache.get(key)
+    if hit and hit[0] > time.monotonic():
+        return hit[1], None
+
+    sessions = await _run(request, cm.get_user_desktop_sessions, user)
+    sess = _resolve_session(sessions, name)
+    if not sess:
+        return None, web.Response(status=404, text="unknown session")
+    if sess.get("phase") != "Ready":
+        return None, web.Response(
+            status=409, text=f"session not ready (phase={sess.get('phase')})")
+    display_port = sess.get("displayPort")
+    if not display_port:
+        return None, web.Response(status=409, text="session has no display port")
+    # status.address lags the operator's probe timer; the per-session Service
+    # name is deterministic (<user>-<name>), so fall back to constructing it.
+    address = sess.get("address") or \
+        f"{user}-{name}.{sess['namespace']}.svc.cluster.local"
+    base = f"http://{address}:{display_port}"
+    cache[key] = (time.monotonic() + _TARGET_TTL_SECONDS, base)
+    return base, None
+
+
+async def desktop_redirect(request):
+    """/desktop/<id> -> /desktop/<id>/ — the Selkies client only works from a
+    directory URL (all its asset/WS paths are page-relative)."""
+    suffix = f"?{request.query_string}" if request.query_string else ""
+    raise web.HTTPFound(f"/desktop/{request.match_info['id']}/{suffix}")
+
+
+async def desktop_proxy(request):
+    base, err = await _resolve_desktop_base(request)
+    if err is not None:
+        return err
+    target = f"{base}/{request.match_info.get('tail', '')}"
+    if request.query_string:
+        target += f"?{request.query_string}"
+    client = request.app["proxy_client"]
+    if proxy.is_websocket_upgrade(request):
+        return await proxy.relay_ws(request, target, client)
+    return await proxy.relay_http(request, target, client)
 
 
 async def term(request):
@@ -372,13 +460,29 @@ async def healthz(request):
     return web.Response(text="ok")
 
 
+async def _proxy_client_ctx(app):
+    """Shared upstream HTTP client for the desktop proxy. auto_decompress=False
+    keeps the relay byte-transparent (Content-Encoding passes through); no total
+    timeout because the H.264 WebSocket lives for the whole session."""
+    app["proxy_client"] = aiohttp.ClientSession(
+        auto_decompress=False,
+        timeout=aiohttp.ClientTimeout(total=None, sock_connect=10),
+    )
+    app["desktop_targets"] = {}
+    yield
+    await app["proxy_client"].close()
+
+
 def build_app(config_manager):
     app = web.Application(middlewares=[auth_middleware])
     app["cm"] = config_manager
+    app.cleanup_ctx.append(_proxy_client_ctx)
     app.add_routes([
         web.get("/", index),
         web.post("/launch", launch),
         web.get("/connect/{id}", connect),
+        web.get("/desktop/{id}", desktop_redirect),
+        web.route("*", "/desktop/{id}/{tail:.*}", desktop_proxy),
         web.get("/status/{id}", status),
         web.get("/term/{id}", term),
         web.get("/term-status/{id}", term_status),
