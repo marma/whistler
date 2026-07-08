@@ -1,0 +1,9 @@
+noVNC v1.7.0 (https://github.com/novnc/noVNC/releases/tag/v1.7.0)
+
+Vendored subset: core/ + vendor/ (ES modules, no build step) + LICENSE.txt.
+Served by the portal at /static/novnc/; the /vnc/<id> viewer page imports
+core/rfb.js and points it at the /ws-vnc/<id> relay (KubeVirt VNC
+subresource, raw RFB over binary websocket frames).
+
+To upgrade: download the release tarball, replace core/ and vendor/, update
+this file.

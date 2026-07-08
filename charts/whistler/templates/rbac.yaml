@@ -37,6 +37,12 @@ rules:
   - apiGroups: [kubevirt.io]
     resources: [virtualmachines, virtualmachineinstances]
     verbs: [create, delete, get, list, watch, patch, update]
+  # CDI root-disk DataVolumes (imageURL boot source): the phase timer reads
+  # them to surface the Importing phase. Created via the VM's
+  # dataVolumeTemplates, so no create/delete needed here.
+  - apiGroups: [cdi.kubevirt.io]
+    resources: [datavolumes]
+    verbs: [get, list, watch]
 
   # Application: other resources it produces and manages.
   - apiGroups: [""]
@@ -184,6 +190,18 @@ rules:
   - apiGroups: [""]
     resources: [persistentvolumeclaims]
     verbs: [get, list]
+
+  # KubeVirt VM sessions: read VMs/VMIs for status, patch VMs so
+  # stop_instance / reconnect can flip runStrategy (Halted/Always), and open
+  # the serial-console / VNC subresource websockets for the web terminal and
+  # the noVNC viewer (same grant virtctl console/vnc needs). Harmless when
+  # KubeVirt is not installed.
+  - apiGroups: [kubevirt.io]
+    resources: [virtualmachines, virtualmachineinstances]
+    verbs: [get, list, watch, patch]
+  - apiGroups: [subresources.kubevirt.io]
+    resources: [virtualmachineinstances/console, virtualmachineinstances/vnc]
+    verbs: [get]
 
   # Read services and configmaps cluster-wide; secrets are read-only here
   # (write access to the users Secret is granted by the namespaced Role below).

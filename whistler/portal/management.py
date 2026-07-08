@@ -37,6 +37,7 @@ _STATUS_GROUPS = {
     "initializing": "Starting",
     "provisioning": "Starting",
     "booting":      "Starting",
+    "importing":    "Starting",
     "stopping":     "Stopping …",
     "terminating":  "Stopping …",
     "stopped":      "Stopped",
@@ -155,7 +156,7 @@ def _merge_sessions(instances: list, desktop_sessions: list, user: str) -> list[
     """Flatten ssh instances + desktop sessions into one list of rows with a
     common shape (name/template/status/mode), so the dashboard can render them in
     a single table. Desktop rows carry the browser viewer URL. Every row gets a
-    web-terminal URL except VM-runtime desktops (no pod to exec into)."""
+    web-terminal URL (VM sessions get the KubeVirt serial console)."""
     rows: list[dict] = []
     for i in instances:
         rows.append({
@@ -168,7 +169,7 @@ def _merge_sessions(instances: list, desktop_sessions: list, user: str) -> list[
             "name": s["name"], "template": s.get("template"),
             "status": s.get("phase"), "mode": "desktop",
             "connect_url": _desktop_viewer_url(user, s["name"]),
-            "term_url": None if s.get("runtime") == "vm" else _terminal_url(user, s["name"]),
+            "term_url": _terminal_url(user, s["name"]),
         })
     rows.sort(key=lambda r: r["name"])
     return rows
@@ -278,7 +279,7 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
         if sess:
             status = sess["phase"]
             connect_url = _desktop_viewer_url(user, name)
-            term_url = None if sess.get("runtime") == "vm" else _terminal_url(user, name)
+            term_url = _terminal_url(user, name)
         else:
             status, connect_url, term_url = "Unknown", None, None
     return HTMLResponse(
@@ -448,11 +449,12 @@ async def admin_user_create(
     request: Request, cm: CM, admin: Admin,
     name:         Annotated[str, Form()],
     public_keys:  Annotated[Optional[str], Form()] = None,
+    uid:          Annotated[Optional[str], Form()] = None,
     run_as_user:  Annotated[Optional[str], Form()] = None,
     run_as_group: Annotated[Optional[str], Form()] = None,
     fs_group:     Annotated[Optional[str], Form()] = None,
 ):
-    user_data = _build_user_data(name, public_keys, run_as_user, run_as_group, fs_group)
+    user_data = _build_user_data(name, public_keys, run_as_user, run_as_group, fs_group, uid)
     ok = await request.app.state.run(cm.save_user, user_data)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to create user.")
@@ -477,11 +479,12 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
 async def admin_user_update(
     request: Request, cm: CM, admin: Admin, username: str,
     public_keys:  Annotated[Optional[str], Form()] = None,
+    uid:          Annotated[Optional[str], Form()] = None,
     run_as_user:  Annotated[Optional[str], Form()] = None,
     run_as_group: Annotated[Optional[str], Form()] = None,
     fs_group:     Annotated[Optional[str], Form()] = None,
 ):
-    user_data = _build_user_data(username, public_keys, run_as_user, run_as_group, fs_group)
+    user_data = _build_user_data(username, public_keys, run_as_user, run_as_group, fs_group, uid)
     ok = await request.app.state.run(cm.save_user, user_data)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to update user.")
@@ -607,9 +610,12 @@ def _template_form_data(*, name, display_name, image, description, cpu, memory,
     return data
 
 
-def _build_user_data(name, public_keys, run_as_user, run_as_group, fs_group) -> dict:
+def _build_user_data(name, public_keys, run_as_user, run_as_group, fs_group,
+                     uid=None) -> dict:
     keys = [k.strip() for k in (public_keys or "").splitlines() if k.strip()]
     data: dict = {"name": name.strip(), "publicKeys": keys}
+    if uid and str(uid).strip():
+        data["uid"] = int(uid)
     sec_ctx = _nonempty({
         "runAsUser":  run_as_user  or "",
         "runAsGroup": run_as_group or "",

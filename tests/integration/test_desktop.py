@@ -5,9 +5,8 @@ Exercises the provisioning path with no SSH/Guacamole in the loop:
   reconcile_session_fn ensures the pod + per-session Service -> the phase
   timer drives status.phase to Ready.
 
-The VM backend is NOT exercised here: KubeVirt is not installed in k3d/CI, so
-it is covered only by the pure manifest assertions in tests/unit/test_vm_spec.py
-and is treated as unverified end-to-end.
+The VM backend is NOT exercised here — see tests/integration/test_vm.py, which
+skips unless the cluster has the KubeVirt CRDs (k3d/CI does not).
 
 Talks to the cluster directly (the harness exports KUBECONFIG). Marked
 `integration` so it is excluded from the default unit run.

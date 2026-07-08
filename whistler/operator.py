@@ -11,6 +11,9 @@ from whistler.config import (
     KUBEVIRT_VERSION,
     KUBEVIRT_VM_PLURAL,
     KUBEVIRT_VMI_PLURAL,
+    CDI_GROUP,
+    CDI_VERSION,
+    CDI_DV_PLURAL,
 )
 
 logger = logging.getLogger("whistler.operator")
@@ -100,9 +103,10 @@ def _probe_pod(namespace, name, logger):
 def _probe_vmi(namespace, name, logger):
     """Return (session_phase, vmiName, address) by reading the KubeVirt VMI.
 
-    Guarded: a 404 covers both 'VMI not up yet' and 'KubeVirt CRDs absent';
-    both are treated as still-Booting so the operator never crashes without
-    KubeVirt installed."""
+    Every read is 404-guarded so the timer never crashes on a cluster without
+    the KubeVirt (or CDI) CRDs. A missing VMI is disambiguated by falling back
+    to the VirtualMachine (halted -> Stopped) and the CDI root-disk DataVolume
+    (still importing -> Importing) rather than reporting Booting forever."""
     api = client.CustomObjectsApi()
     try:
         vmi = api.get_namespaced_custom_object(
@@ -111,10 +115,46 @@ def _probe_vmi(namespace, name, logger):
     except client.rest.ApiException as e:
         if e.status != 404:
             logger.warning(f"Error reading VMI {name}: {e}")
-        return ("Booting", name, None)
+            return ("Booting", name, None)
+        return _probe_vm_without_vmi(api, namespace, name, logger)
+    if (vmi.get("metadata") or {}).get("deletionTimestamp"):
+        # Draining after a stop (runStrategy Halted) or a session delete —
+        # without this the VMI still reports phase Running while the guest
+        # shuts down and the dashboard would keep saying Running.
+        return ("Terminating", name, None)
     phase = (vmi.get("status") or {}).get("phase")
     if phase == "Running":
         return ("Ready", name, _session_address(name, namespace))
+    if phase == "Failed":
+        return ("Failed", name, None)
+    if phase == "Succeeded":
+        # Guest shut itself down under runStrategy Halted.
+        return ("Stopped", name, None)
+    return ("Booting", name, None)
+
+
+def _probe_vm_without_vmi(api, namespace, name, logger):
+    """Disambiguate a missing VMI: Stopped (VM absent or halted), Importing
+    (CDI still pulling the root disk), else Booting (VMI not up yet)."""
+    try:
+        vm = api.get_namespaced_custom_object(
+            KUBEVIRT_GROUP, KUBEVIRT_VERSION, namespace, KUBEVIRT_VM_PLURAL, name
+        )
+    except client.rest.ApiException as e:
+        if e.status != 404:
+            logger.warning(f"Error reading VM {name}: {e}")
+            return ("Booting", name, None)
+        return ("Stopped", None, None)
+    if (vm.get("spec") or {}).get("runStrategy") == "Halted":
+        return ("Stopped", name, None)
+    try:
+        dv = api.get_namespaced_custom_object(
+            CDI_GROUP, CDI_VERSION, namespace, CDI_DV_PLURAL, f"{name}-root"
+        )
+        if (dv.get("status") or {}).get("phase") != "Succeeded":
+            return ("Importing", name, None)
+    except client.rest.ApiException:
+        pass  # no DataVolume (containerDisk boot) or CDI absent
     return ("Booting", name, None)
 
 
@@ -163,7 +203,9 @@ def reconcile_session_fn(spec, name, namespace, meta, patch, logger, **kwargs):
         patch.status['viewer'] = result['viewer']
 
     if result['ok']:
-        patch.status['phase'] = 'Provisioning'
+        # ensure_session may report a more accurate initial phase (a VM
+        # created Halted starts life Stopped, not Provisioning).
+        patch.status['phase'] = result.get('phase') or 'Provisioning'
     else:
         # Transient (e.g. the old pod is still terminating, or the template
         # isn't present yet). Retry with backoff.

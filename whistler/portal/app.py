@@ -4,21 +4,31 @@ Routes (all under a dev-only auth gate — see ``auth_middleware``):
   GET  /                 list templates + sessions, launch form
   POST /launch           create a DesktopSession, redirect to /connect/<id>
   GET  /connect/<id>     desktop viewer page: waits for Ready, then redirects
-                         to /desktop/<id>/
+                         to /desktop/<id>/ or /vnc/<id> by viewer
   ANY  /desktop/<id>/*   reverse proxy (HTTP + WebSocket) to the in-pod
                          Selkies 2.x server — see whistler.portal.proxy
+  GET  /vnc/<id>         noVNC viewer page (VM sessions)
+  GET  /ws-vnc/<id>      WebSocket <-> KubeVirt VNC subresource relay
   GET  /status/<id>      JSON readiness poll
   GET  /term/<id>        web-terminal page
   GET  /term-status/<id> JSON terminal-readiness poll
-  GET  /ws-term/<id>     WebSocket <-> in-pod shell (kubectl exec) relay
+  GET  /ws-term/<id>     WebSocket <-> in-pod shell (kubectl exec) or VMI
+                         serial console relay
   GET  /healthz          readiness probe
 
-The only display backend is the **websockets viewer**: the streamer sidecar's
-Selkies 2.x (pixelflux) server serves its own web client and streams H.264 over
-plain WebSockets — no guacd, no coturn/TURN. The portal reverse-proxies both
-(the client is fully page-relative, so no rewriting) under ``/desktop/<id>/``,
-which also means the browser only ever talks to the portal origin: one TLS
-endpoint satisfies the client's secure-context requirement for every session.
+Two display backends, chosen per session by ``status.viewer``:
+
+* **websockets** — the Selkies 2.x (pixelflux) server (streamer sidecar for
+  pods, or a guest-run Selkies in a VM) serves its own web client and streams
+  H.264 over plain WebSockets — no guacd, no coturn/TURN. The portal
+  reverse-proxies both (the client is fully page-relative, so no rewriting)
+  under ``/desktop/<id>/``.
+* **vnc** — VM sessions only: the portal serves its vendored noVNC client and
+  bridges it to the VMI's VNC subresource on the API server (raw RFB; guest
+  needs no agent, works from BIOS onward) — see whistler.portal.kubevirt.
+
+Either way the browser only ever talks to the portal origin: one TLS endpoint
+satisfies the client's secure-context requirement for every session.
 
 State lives in CRs; the portal holds none. Blocking KubeConfigManager calls run
 in an executor so the event loop stays responsive.
@@ -33,7 +43,7 @@ import time
 import aiohttp
 from aiohttp import web
 
-from whistler.portal import proxy, terminal
+from whistler.portal import kubevirt, proxy, terminal
 
 logger = logging.getLogger("whistler.portal")
 
@@ -164,18 +174,22 @@ async function waitReady() {
       if (r.ok) {
         const j = await r.json();
         setStatus('Session: ' + (j.phase || 'unknown'));
-        if (j.phase === 'Ready') return;
+        if (j.phase === 'Ready') return j.viewer;
       }
     } catch (e) {}
     await sleep(2000);
   }
 }
 
-waitReady().then(() => {
+waitReady().then(viewer => {
   setStatus('Session ready — opening desktop…');
-  // The trailing slash matters: the Selkies client resolves every asset, API
-  // and WebSocket URL relative to the page *directory*.
-  location.replace(`/desktop/${encodeURIComponent(id)}/`);
+  if (viewer === 'vnc') {
+    location.replace(`/vnc/${encodeURIComponent(id)}`);
+  } else {
+    // The trailing slash matters: the Selkies client resolves every asset, API
+    // and WebSocket URL relative to the page *directory*.
+    location.replace(`/desktop/${encodeURIComponent(id)}/`);
+  }
 }).catch(e => setStatus('Fatal error: ' + e));
 </script>"""
 
@@ -258,27 +272,99 @@ def _render_term(user, session_id):
             .replace("__USER__", html.escape(user)))
 
 
+# noVNC viewer page (vnc viewer, VM sessions): the vendored RFB module dials
+# /ws-vnc/<id>, which the portal bridges to the VMI's VNC subresource. Same
+# wait-for-ready pattern as the connect page; RFB reconnects after a drop by
+# re-running the poll (a halted VM comes back on the next connect trigger).
+# Placeholders replaced (not .format) so JS braces survive.
+_VNC_HTML = """<!doctype html><meta charset=utf-8><title>__ID__ — desktop</title>
+<style>
+  html,body{margin:0;height:100%;background:#202020;overflow:hidden}
+  #screen{position:absolute;inset:0}
+  #msg{position:absolute;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;
+       color:#e0e0e0;font:15px/1.5 system-ui,sans-serif;background:rgba(32,32,32,.9)}
+  #msg.hidden{display:none}
+</style>
+<div id=screen></div>
+<div id=msg>Connecting…</div>
+<script type=module>
+import RFB from '/static/novnc/core/rfb.js';
+
+const id = "__ID__", user = "__USER__";
+const msgEl = document.getElementById('msg');
+const setStatus = m => { msgEl.textContent = m; msgEl.classList.remove('hidden'); };
+const hideStatus = () => msgEl.classList.add('hidden');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function waitReady() {
+  for (;;) {
+    try {
+      const r = await fetch(`/status/${id}?user=${encodeURIComponent(user)}`);
+      if (r.ok) {
+        const j = await r.json();
+        setStatus('Session: ' + (j.phase || 'unknown'));
+        if (j.phase === 'Ready') return;
+      }
+    } catch (e) {}
+    await sleep(2000);
+  }
+}
+
+async function run() {
+  for (;;) {
+    await waitReady();
+    setStatus('Opening desktop…');
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const rfb = new RFB(document.getElementById('screen'),
+                        proto + location.host + '/ws-vnc/' + encodeURIComponent(id) +
+                        '?user=' + encodeURIComponent(user));
+    rfb.scaleViewport = true;
+    const closed = new Promise(resolve => {
+      rfb.addEventListener('connect', hideStatus);
+      rfb.addEventListener('disconnect', e => resolve(e));
+    });
+    await closed;
+    setStatus('Disconnected — retrying…');
+    await sleep(2000);
+  }
+}
+run();
+</script>"""
+
+
+def _render_vnc(user, session_id):
+    return (_VNC_HTML
+            .replace("__ID__", html.escape(session_id))
+            .replace("__USER__", html.escape(user)))
+
+
 def _resolve_target(instances, desktop_sessions, name):
     """Locate a Session by its short name across ssh instances and desktop
-    sessions, returning a uniform dict for the terminal: pod/namespace to exec
-    into, readiness, and whether a terminal is even possible (VM-runtime desktop
-    sessions have no pod to exec into)."""
+    sessions, returning a uniform dict for the terminal: what to attach to
+    (pod for container/kata — kubectl exec; VMI for vm — the KubeVirt serial
+    console subresource), plus namespace and readiness."""
     for i in instances:
         if i["name"] == name:
             return {
                 "podName": i.get("podName"), "namespace": i.get("namespace"),
                 "phase": i.get("status"), "runtime": "container",
+                "vmiName": None,
                 "ready": i.get("status") == "Running" and bool(i.get("podName")),
                 "supported": True,
             }
     for s in desktop_sessions:
         if s["name"] == name:
             runtime = s.get("runtime")
+            if runtime == "vm":
+                ready = s.get("phase") == "Ready" and bool(s.get("vmiName"))
+            else:
+                ready = s.get("phase") == "Ready" and bool(s.get("podName"))
             return {
                 "podName": s.get("podName"), "namespace": s.get("namespace"),
                 "phase": s.get("phase"), "runtime": runtime,
-                "ready": s.get("phase") == "Ready" and bool(s.get("podName")),
-                "supported": runtime != "vm",
+                "vmiName": s.get("vmiName"),
+                "ready": ready,
+                "supported": True,
             }
     return None
 
@@ -339,6 +425,7 @@ async def status(request):
         "phase": sess.get("phase"),
         "address": sess.get("address"),
         "displayPort": sess.get("displayPort"),
+        "viewer": sess.get("viewer"),
     })
 
 
@@ -441,8 +528,52 @@ async def ws_term(request):
         return web.Response(status=404, text="unknown session")
     if not target["supported"]:
         return web.Response(status=400, text="terminal not available for this session")
-    if not target["ready"] or not target["podName"]:
+    if not target["ready"]:
         return web.Response(status=409, text=f"session not ready (phase={target['phase']})")
+
+    if target["runtime"] == "vm":
+        # No pod to exec into. Default: SSH into the guest with the portal's
+        # per-user access key (real login semantics — fresh session, MOTD,
+        # exit works). WHISTLER_VM_TERMINAL=console falls back to the shared
+        # serial console (works even for guests without sshd, but it is the
+        # boot console: shared TTY, no resize, autologin respawn on exit).
+        if os.environ.get("WHISTLER_VM_TERMINAL", "ssh") == "console":
+            try:
+                upstream = await kubevirt.open_subresource_ws(
+                    request.app["kube_ws_client"], target["namespace"],
+                    target["vmiName"], "console")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.warning(f"VM console for {user}/{name} failed to dial: {e}")
+                return web.Response(status=502, text="VM console unreachable")
+            wsr = web.WebSocketResponse()
+            await wsr.prepare(request)
+            logger.info(f"Opening serial console for {user}/{name} -> {target['vmiName']}")
+            try:
+                await kubevirt.relay_console(wsr, upstream)
+            except Exception as e:
+                logger.error(f"VM console for {user}/{name} failed: {e}")
+                if not wsr.closed:
+                    await wsr.close(message=str(e).encode())
+            return wsr
+
+        address, private_key = await asyncio.gather(
+            _run(request, cm.get_vmi_address, user, name),
+            _run(request, cm.get_vm_access_private_key, user),
+        )
+        if not address:
+            return web.Response(status=409, text="VM has no address yet")
+        if not private_key:
+            return web.Response(status=502, text="no VM access key for this user")
+        wsr = web.WebSocketResponse()
+        await wsr.prepare(request)
+        logger.info(f"Opening SSH terminal for {user}/{name} -> {address}")
+        try:
+            await kubevirt.relay_ssh(wsr, address, user, private_key)
+        except Exception as e:
+            logger.error(f"VM SSH terminal for {user}/{name} failed: {e}")
+            if not wsr.closed:
+                await wsr.close(message=str(e).encode())
+        return wsr
 
     wsr = web.WebSocketResponse()
     await wsr.prepare(request)
@@ -454,6 +585,61 @@ async def ws_term(request):
         if not wsr.closed:
             await wsr.close(message=str(e).encode())
     return wsr
+
+
+async def vnc_page(request):
+    """Serve the noVNC viewer page (VM sessions) and nudge the VM awake, like
+    /connect does for the Selkies path."""
+    cm, user = request.app["cm"], request["user"]
+    name = request.match_info["id"]
+    await _run(request, cm.trigger_instance_start, user, name)
+    return web.Response(text=_render_vnc(user, name), content_type="text/html")
+
+
+async def ws_vnc(request):
+    """Bridge the browser's RFB websocket to the VMI's VNC subresource. Same
+    ownership boundary as ws_term: the session must resolve in the requesting
+    user's namespace and be Ready."""
+    cm, user = request.app["cm"], request["user"]
+    name = request.match_info["id"]
+
+    sessions = await _run(request, cm.get_user_desktop_sessions, user)
+    sess = _resolve_session(sessions, name)
+    if not sess:
+        return web.Response(status=404, text="unknown session")
+    if sess.get("runtime") != "vm":
+        return web.Response(status=400, text="VNC is only available for VM sessions")
+    if sess.get("phase") != "Ready" or not sess.get("vmiName"):
+        return web.Response(status=409, text=f"session not ready (phase={sess.get('phase')})")
+
+    try:
+        upstream = await kubevirt.open_subresource_ws(
+            request.app["kube_ws_client"], sess["namespace"], sess["vmiName"], "vnc")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.warning(f"VNC for {user}/{name} failed to dial: {e}")
+        return web.Response(status=502, text="VM VNC unreachable")
+
+    downstream = web.WebSocketResponse(max_msg_size=0)
+    await downstream.prepare(request)
+    logger.info(f"Opening VNC for {user}/{name} -> {sess['vmiName']}")
+    try:
+        # Raw RFB bytes both ways; proxy._pump is already byte-transparent.
+        done, pending = await asyncio.wait(
+            [asyncio.ensure_future(proxy._pump(downstream, upstream)),
+             asyncio.ensure_future(proxy._pump(upstream, downstream))],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        for task in done:
+            exc = task.exception()
+            if exc is not None:
+                logger.warning(f"VNC relay for {user}/{name} error: {exc}")
+    finally:
+        await upstream.close()
+        if not downstream.closed:
+            await downstream.close()
+    return downstream
 
 
 async def healthz(request):
@@ -477,17 +663,24 @@ def build_app(config_manager):
     app = web.Application(middlewares=[auth_middleware])
     app["cm"] = config_manager
     app.cleanup_ctx.append(_proxy_client_ctx)
+    app.cleanup_ctx.append(kubevirt.kube_ws_client_ctx)
     app.add_routes([
         web.get("/", index),
         web.post("/launch", launch),
         web.get("/connect/{id}", connect),
         web.get("/desktop/{id}", desktop_redirect),
         web.route("*", "/desktop/{id}/{tail:.*}", desktop_proxy),
+        web.get("/vnc/{id}", vnc_page),
+        web.get("/ws-vnc/{id}", ws_vnc),
         web.get("/status/{id}", status),
         web.get("/term/{id}", term),
         web.get("/term-status/{id}", term_status),
         web.get("/ws-term/{id}", ws_term),
         web.get("/healthz", healthz),
+        # The vendored noVNC tree (ES modules with relative imports) is served
+        # whole; aiohttp's static handler is traversal-safe. The flat whitelist
+        # handler below still covers the xterm.js/style single files.
+        web.static("/static/novnc", os.path.join(_STATIC_DIR, "novnc")),
         web.get("/static/{filename}", static_file),
     ])
     return app

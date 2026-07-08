@@ -47,6 +47,20 @@ def test_ssh_vm_still_restricted_to_vm_list():
         cm._apply_policy({"image": "anything"}, "ssh", "vm")
 
 
+def test_vm_image_url_checked_against_vm_list():
+    url = "https://example.com/noble.img"
+    cm = _manager(images={"ssh": [], "desktop": [], "vm": [url]})
+    assert cm._apply_policy({"imageURL": url}, "desktop", "vm") == "vm"
+    with pytest.raises(PolicyError):
+        cm._apply_policy({"imageURL": "https://example.com/other.img"}, "desktop", "vm")
+
+
+def test_vm_rejects_both_image_and_image_url():
+    cm = _manager(images={"ssh": [], "desktop": [], "vm": ["v:1", "u"]})
+    with pytest.raises(PolicyError):
+        cm._apply_policy({"image": "v:1", "imageURL": "u"}, "desktop", "vm")
+
+
 # --- privileged -> kata coercion --------------------------------------- #
 
 def test_privileged_container_coerced_to_kata_when_enabled():

@@ -29,6 +29,9 @@ deploy:
         createNamespace: true
         valuesFiles:
           - charts/whistler/values.yaml
+          # Dev VM templates (containerDisk + CDI qcow2 import); needs KubeVirt
+          # installed on the cluster or the sessions just fail policy/probe.
+          - charts/whistler/values-dev-vm.yaml
         setValues:
           whistler.auth.allowAny: false
           # k3d/docker-desktop have no "kata" RuntimeClass, so coercing
@@ -54,7 +57,9 @@ deploy:
           whistler.users[0].publicKeys[0]: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMNj07CelG2QAh7IogB+vlS4tRjuxOTr3mt0z3fX8jlX marma"
         setValueTemplates:
           image.repository: "{{.IMAGE_REPO_whistler}}"
-          image.tag: "{{.IMAGE_TAG_whistler}}"
+          # tag@digest: the git-dirty tag alone doesn't change between edits,
+          # so without the digest a rebuild would not roll the deployments.
+          image.tag: "{{.IMAGE_TAG_whistler}}@{{.IMAGE_DIGEST_whistler}}"
           # Use the locally-built workload images for the sample templates.
           templates.xfce-desktop.image: "{{.IMAGE_REPO_whistler_desktop_xfce_plain}}:{{.IMAGE_TAG_whistler_desktop_xfce_plain}}"
           templates.gnome-desktop.image: "{{.IMAGE_REPO_whistler_desktop_gnome_plain}}:{{.IMAGE_TAG_whistler_desktop_gnome_plain}}"

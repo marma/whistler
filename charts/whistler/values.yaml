@@ -96,6 +96,10 @@ whistler:
     # - name: someuser
     #   publicKeys:
     #     - "ssh-rsa ..."
+    #   # POSIX uid injected into VM sessions via cloud-init (the in-guest user
+    #   # is created with this uid; falls back to securityContext.runAsUser,
+    #   # then 1000).
+    #   uid: 1001
     #   securityContext:
     #     fsGroup: 1001
     #     runAsUser: 1001
@@ -141,7 +145,10 @@ whistler:
   #   - ssh:     SUGGESTIONS only. An empty list means "allow any image"; ssh
   #              container/kata templates may use any image regardless.
   #   - desktop: ENFORCED. mode=desktop templates must use an image in this list.
-  #   - vm:      ENFORCED. runtime=vm templates must use an image/ISO in this list.
+  #   - vm:      ENFORCED. runtime=vm templates must use a boot source in this
+  #              list — either a containerDisk image ref (template `image`) or
+  #              an HTTP qcow2/raw URL (template `imageURL`, imported by CDI).
+  #              Either way the guest must ship cloud-init + a serial getty.
   images:
     ssh:
       - ubuntu:22.04
@@ -153,7 +160,8 @@ whistler:
     desktop:
       - ghcr.io/marma/whistler-desktop-xfce-plain:latest
       - ghcr.io/marma/whistler-desktop-gnome-plain:latest
-    vm: []
+    vm:
+      - quay.io/containerdisks/ubuntu:24.04
 
   # Streamer sidecar default image (every desktop pod gets one): owns Xvfb +
   # PulseAudio + Selkies next to the display-unaware workload container (built
@@ -236,14 +244,27 @@ templates:
       # GNOME Shell is heavier than XFCE (llvmpipe compositing).
       cpu: "2000m"
       memory: 8Gi
-  # win-vm:
-  #   description: "Windows desktop (KubeVirt VM)"
+  # KubeVirt VM template (needs KubeVirt installed — scripts/install_kubevirt.sh).
+  # The guest is a stock cloud image: cloud-init creates the real user
+  # (username/uid/SSH keys), mounts the per-user home PVC via virtiofs, and
+  # enables serial-console autologin (the web terminal). viewer: vnc serves the
+  # portal's noVNC client over the KubeVirt VNC subresource — no agent in the
+  # guest. Uncomment to enable:
+  # ubuntu-vm:
+  #   description: "Ubuntu 24.04 VM (KubeVirt, noVNC)"
   #   mode: desktop
   #   runtime: vm
-  #   image: "registry.example/desktops/win:latest"
-  #   displayPort: 8082
-  #   persistence: persistent
-  #   instancetype: "u1.medium"
+  #   image: "quay.io/containerdisks/ubuntu:24.04"
+  #   viewer: vnc
+  #   resources:
+  #     cpu: "2"
+  #     memory: 4Gi
+  #   # CDI variant: import an HTTP qcow2 into a persistent root disk instead
+  #   # of the ephemeral containerDisk (add the URL to whistler.images.vm):
+  #   # imageURL: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+  #   # rootDiskSize: 20Gi
+  #   # Or size via a KubeVirt instancetype instead of resources:
+  #   # instancetype: "u1.medium"
 
 userVolume:
   accessMode: ReadWriteMany

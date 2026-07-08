@@ -25,9 +25,7 @@ changes. See `KubeConfigManager._build_pod_spec` (desktop branch).
 This image is the single home of the streaming stack: Selkies is pinned by
 `SELKIES_COMMIT`, and the Python server and web client are both built from
 that commit (client/server version lock by construction). The silent-failure
-catalog for its packages lives in the Dockerfile comments. It descends from
-the embedded `xfce-selkies2`/`gnome-selkies2` images, removed when the sidecar
-became the only display path; they remain in git history.
+catalog for its packages lives in the Dockerfile comments.
 
 ## Env
 

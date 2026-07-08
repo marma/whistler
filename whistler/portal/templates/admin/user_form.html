@@ -23,6 +23,12 @@
       <div class="ui pointing label">One key per line (OpenSSH format).</div>
     </div>
 
+    <div class="field">
+      <label>UID</label>
+      <input name="uid" type="number" placeholder="1000">
+      <div class="ui pointing label">POSIX uid injected into VM sessions (falls back to runAsUser, then 1000).</div>
+    </div>
+
     <div class="ui segment">
       <h4 class="ui header">Security Context <span class="ui grey tiny label">optional</span></h4>
       <div class="three fields">

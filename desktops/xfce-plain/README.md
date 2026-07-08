@@ -8,8 +8,7 @@ in-cluster that is the [`../streamer-selkies2`](../streamer-selkies2/) sidecar
 
 This is the proof-of-model for the guest-unaware-display direction: catalog
 images are just "DE-or-app + tools + a session entrypoint" — copy this
-directory and swap the DE. (Its embedded ancestor `xfce-selkies2`, which
-bundled X + Selkies in-image, is in git history.)
+directory and swap the DE.
 
 The entrypoint waits briefly for the display (a no-op in-cluster, where the
 sidecar's startupProbe already gates this container) and then execs

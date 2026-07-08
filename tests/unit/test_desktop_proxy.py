@@ -1,13 +1,15 @@
 """The desktop reverse proxy (/desktop/<id>/* -> in-pod Selkies server):
 HTTP + WebSocket relaying, session resolution/authorization, the trailing-slash
-redirect, and the dev-auth cookie that carries identity onto the proxied
-requests. A local aiohttp app stands in for the sidecar's Selkies server; no
-cluster."""
+redirect, the dev-auth cookie that carries identity onto the proxied requests,
+and the VM viewer/terminal paths (noVNC page, /ws-vnc + /ws-term bridged to a
+fake KubeVirt subresource endpoint). A local aiohttp app stands in for the
+sidecar's Selkies server and the API-server subresources; no cluster."""
 import aiohttp
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from whistler.portal import kubevirt
 from whistler.portal.app import build_app
 
 
@@ -40,12 +42,24 @@ def _fake_selkies_app():
                 await ws.send_bytes(b"echo:" + msg.data)
         return ws
 
+    async def subresource(request):
+        # Stands in for the KubeVirt console/vnc subresources: raw bytes over
+        # binary frames (greeting first, then echo).
+        ws = web.WebSocketResponse(protocols=(kubevirt.SUBPROTOCOL,))
+        await ws.prepare(request)
+        await ws.send_bytes(b"HELLO:" + request.match_info["kind"].encode())
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.BINARY:
+                await ws.send_bytes(b"echo:" + msg.data)
+        return ws
+
     app = web.Application()
     app.add_routes([
         web.get("/", index),
         web.get("/status", status),
         web.post("/tokens", tokens),
         web.get("/websockets", websockets),
+        web.get("/subresource/{kind}", subresource),
     ])
     return app
 
@@ -61,6 +75,15 @@ class FakeCM:
     def get_user_desktop_sessions(self, username):
         return self.sessions.get(username, [])
 
+    def get_user_instances(self, username):
+        return []  # ssh instances are irrelevant to the viewer tests
+
+    def get_vmi_address(self, username, name):
+        return "10.42.0.99"
+
+    def get_vm_access_private_key(self, username):
+        return "FAKE-PRIVATE-KEY"
+
     def add_desktop_session(self, username, template_name, session_name):
         mine = self.sessions.setdefault(username, [])
         if any(s["name"] == session_name for s in mine):
@@ -74,7 +97,14 @@ class FakeCM:
 
 def _session(name, port, phase="Ready", address="127.0.0.1"):
     return {"name": name, "namespace": "ns", "phase": phase, "runtime": "container",
-            "podName": f"pod-{name}", "address": address, "displayPort": port}
+            "podName": f"pod-{name}", "vmiName": None, "address": address,
+            "displayPort": port, "viewer": "websockets"}
+
+
+def _vm_session(name, phase="Ready", vmi="vmi"):
+    return {"name": name, "namespace": "ns", "phase": phase, "runtime": "vm",
+            "podName": None, "vmiName": f"{vmi}-{name}" if vmi else None,
+            "address": None, "displayPort": None, "viewer": "vnc"}
 
 
 @pytest.fixture
@@ -92,6 +122,8 @@ async def portal(backend, monkeypatch):
     cm.sessions["alice"] = [
         _session("d1", backend.port),
         _session("booting", backend.port, phase="Booting"),
+        _vm_session("v1"),
+        _vm_session("vbooting", phase="Booting", vmi=None),
     ]
     client = TestClient(TestServer(build_app(cm)))
     await client.start_server()
@@ -226,3 +258,84 @@ async def test_without_any_identity_falls_back_to_tester(portal):
     # Fresh client state: no cookie, no query -> "tester", who owns nothing.
     resp = await portal.get("/desktop/d1/status")
     assert resp.status == 404
+
+
+# --------------------------------------------------------------------------- #
+# VM sessions: /status viewer, the noVNC page, and the /ws-vnc + /ws-term      #
+# bridges to the (faked) KubeVirt subresources.                                #
+# --------------------------------------------------------------------------- #
+
+def _fake_subresource_opener(backend):
+    async def fake_open(session, namespace, name, kind):
+        assert namespace == "ns"
+        return await session.ws_connect(
+            f"http://127.0.0.1:{backend.port}/subresource/{kind}")
+    return fake_open
+
+
+async def test_status_reports_viewer(portal):
+    for name, viewer in (("d1", "websockets"), ("v1", "vnc")):
+        resp = await portal.get(f"/status/{name}", params={"user": "alice"})
+        assert (await resp.json())["viewer"] == viewer
+
+
+async def test_vnc_page_serves_novnc_client(portal):
+    resp = await portal.get("/vnc/v1", params={"user": "alice"})
+    assert resp.status == 200
+    body = await resp.text()
+    assert "/static/novnc/core/rfb.js" in body
+    assert "/ws-vnc/" in body
+
+
+async def test_novnc_module_served_statically(portal):
+    resp = await portal.get("/static/novnc/core/rfb.js")
+    assert resp.status == 200
+
+
+async def test_ws_vnc_authorization(portal):
+    # Unknown session, non-vm session, not-Ready vm session.
+    assert (await portal.get("/ws-vnc/nope", params={"user": "alice"})).status == 404
+    assert (await portal.get("/ws-vnc/d1", params={"user": "alice"})).status == 400
+    assert (await portal.get("/ws-vnc/vbooting", params={"user": "alice"})).status == 409
+
+
+async def test_ws_vnc_relays_rfb_bytes(portal, backend, monkeypatch):
+    monkeypatch.setattr(kubevirt, "open_subresource_ws",
+                        _fake_subresource_opener(backend))
+    ws = await portal.ws_connect("/ws-vnc/v1?user=alice")
+    assert (await ws.receive_bytes()) == b"HELLO:vnc"
+    await ws.send_bytes(b"RFB 003.008\n")
+    assert (await ws.receive_bytes()) == b"echo:RFB 003.008\n"
+    await ws.close()
+
+
+async def test_ws_term_vm_uses_ssh_relay(portal, monkeypatch):
+    # The default VM terminal is an SSH session into the guest; assert the
+    # route resolves address/key from the CM and hands the socket to relay_ssh.
+    seen = {}
+
+    async def fake_relay_ssh(browser_ws, host, username, private_key, **kw):
+        seen.update(host=host, username=username, key=private_key)
+        await browser_ws.send_bytes(b"SSH-SHELL")
+        await browser_ws.close()
+
+    monkeypatch.setattr(kubevirt, "relay_ssh", fake_relay_ssh)
+    ws = await portal.ws_connect("/ws-term/v1?user=alice")
+    assert (await ws.receive_bytes()) == b"SSH-SHELL"
+    await ws.close()
+    assert seen == {"host": "10.42.0.99", "username": "alice",
+                    "key": "FAKE-PRIVATE-KEY"}
+
+
+async def test_ws_term_vm_console_mode(portal, backend, monkeypatch):
+    # WHISTLER_VM_TERMINAL=console falls back to the serial-console relay.
+    monkeypatch.setenv("WHISTLER_VM_TERMINAL", "console")
+    monkeypatch.setattr(kubevirt, "open_subresource_ws",
+                        _fake_subresource_opener(backend))
+    ws = await portal.ws_connect("/ws-term/v1?user=alice")
+    assert (await ws.receive_bytes()) == b"HELLO:console"
+    # Text keystrokes reach the console as bytes; resize frames are dropped.
+    await ws.send_str('{"resize": [120, 40]}')
+    await ws.send_str("ls\n")
+    assert (await ws.receive_bytes()) == b"echo:ls\n"
+    await ws.close()

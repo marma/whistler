@@ -28,6 +28,9 @@
         <tbody>
           <tr><td>Username</td><td>{{ user_obj.name }}</td></tr>
           <tr><td>SSH Keys</td><td>{{ user_obj.publicKeys | length }} key(s)</td></tr>
+          {% if user_obj.uid is defined and user_obj.uid is not none %}
+          <tr><td>UID</td><td>{{ user_obj.uid }}</td></tr>
+          {% endif %}
           {% if user_obj.securityContext %}
           <tr><td>runAsUser</td><td>{{ user_obj.securityContext.get("runAsUser", "—") }}</td></tr>
           <tr><td>runAsGroup</td><td>{{ user_obj.securityContext.get("runAsGroup", "—") }}</td></tr>
@@ -114,6 +117,11 @@
           <label>SSH Public Keys</label>
           <textarea name="public_keys" rows="4">{{ (user_obj.publicKeys or []) | join("\n") }}</textarea>
           <div class="ui pointing label">One key per line.</div>
+        </div>
+        <div class="field">
+          <label>UID</label>
+          <input name="uid" type="number" value="{{ user_obj.uid if user_obj.uid is defined and user_obj.uid is not none else '' }}">
+          <div class="ui pointing label">POSIX uid injected into VM sessions (falls back to runAsUser, then 1000).</div>
         </div>
         <div class="three fields">
           <div class="field">

@@ -9,7 +9,15 @@ spec:
   mode: {{ $template.mode | default "ssh" }}
   runtime: {{ $template.runtime | default "container" }}
   description: {{ $template.description | default "" | quote }}
+{{- if $template.image }}
   image: {{ $template.image }}
+{{- end }}
+{{- if $template.imageURL }}
+  imageURL: {{ $template.imageURL | quote }}
+{{- end }}
+{{- if $template.rootDiskSize }}
+  rootDiskSize: {{ $template.rootDiskSize | quote }}
+{{- end }}
 {{- if $template.viewer }}
   viewer: {{ $template.viewer }}
 {{- end }}

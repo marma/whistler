@@ -10,6 +10,8 @@ import ipaddress
 import os
 import yaml
 
+from whistler.cloudinit import build_user_data, resolve_uid
+
 logger = logging.getLogger(__name__)
 
 # Config file locations. Defaults match the in-cluster mount paths used by the
@@ -29,6 +31,13 @@ KUBEVIRT_GROUP = "kubevirt.io"
 KUBEVIRT_VERSION = "v1"
 KUBEVIRT_VM_PLURAL = "virtualmachines"
 KUBEVIRT_VMI_PLURAL = "virtualmachineinstances"
+
+# CDI (Containerized Data Importer) coordinates — used for the imageURL boot
+# source (HTTP qcow2/raw imported into a per-session root PVC). Like KubeVirt,
+# CDI may be absent; all reads are 404-guarded.
+CDI_GROUP = "cdi.kubevirt.io"
+CDI_VERSION = "v1beta1"
+CDI_DV_PLURAL = "datavolumes"
 
 # Custom-resource plurals for the unified Template/Session model (group
 # whistler.martinmalmsten.net/v1). One Template kind covers ssh + desktop; one
@@ -645,9 +654,18 @@ class KubeConfigManager(ConfigManager):
             category = "vm" if effective_runtime == "vm" else "desktop"
             allowed = self.images.get(category, []) or []
             image = template_spec.get("image")
-            if image not in allowed:
+            image_url = template_spec.get("imageURL")
+            if effective_runtime == "vm" and image and image_url:
                 raise PolicyError(
-                    f"image {image!r} is not in the allowed {category} image list "
+                    "template sets both image (containerDisk) and imageURL "
+                    "(CDI import); they are mutually exclusive"
+                )
+            # For vm templates the allow-list holds containerDisk refs AND
+            # imageURL strings; whichever boot source is set must be listed.
+            source = image_url or image
+            if source not in allowed:
+                raise PolicyError(
+                    f"image {source!r} is not in the allowed {category} image list "
                     f"(whistler.images.{category}); allowed: {allowed}"
                 )
         return effective_runtime
@@ -995,17 +1013,28 @@ class KubeConfigManager(ConfigManager):
 
     def _build_vm_spec(self, *, session_name, hostname, username, uid,
                        template_spec, pvc_name, display_port, instancetype,
-                       preemptible):
+                       preemptible, user_details=None, run_strategy="Halted",
+                       portal_public_key=None):
         """Build a KubeVirt VirtualMachine manifest from resolved inputs.
 
-        Pure (no API calls). KubeVirt is not available in any cluster we test
-        against, so this is unit-tested in isolation but treated as unverified
-        end-to-end. The VMI launcher pod inherits the template labels so the
-        per-session Service can select it.
+        Pure (no API calls). The VMI launcher pod inherits the template labels
+        so the per-session Service can select it.
+
+        Boot source: `image` is a containerDisk (OCI-wrapped qcow2, ephemeral
+        root), `imageURL` an HTTP qcow2/raw imported by CDI into a per-session
+        root PVC via dataVolumeTemplates. The user's home PVC is exposed as a
+        virtiofs share (tag "home") — attaching a filesystem-mode PVC as a
+        disk would expect a disk.img on it and would not share files with pod
+        sessions. cloud-init creates the real user (username/uid/keys) and
+        mounts the share; serial console + VNC graphics rely on KubeVirt's
+        autoattach defaults (both true), which the portal's terminal and noVNC
+        viewer depend on.
         """
-        image = template_spec.get('image', 'ubuntu:latest')
+        image = template_spec.get('image')
+        image_url = template_spec.get('imageURL')
         resources = template_spec.get('resources', {}) or {}
         node_selector = template_spec.get('nodeSelector', {})
+        user_details = user_details or {}
 
         labels = {
             "app": "whistler-desktop",
@@ -1016,16 +1045,45 @@ class KubeConfigManager(ConfigManager):
         devices = {
             "disks": [
                 {"name": "rootdisk", "disk": {"bus": "virtio"}},
-                {"name": "home", "disk": {"bus": "virtio"}},
+                {"name": "cloudinit", "disk": {"bus": "virtio"}},
+            ],
+            "filesystems": [
+                {"name": "home", "virtiofs": {}},
             ],
             "interfaces": [{"name": "default", "masquerade": {}}],
         }
         if 'gpu' in resources:
             devices["gpus"] = [{"name": "gpu0", "deviceName": "nvidia.com/gpu"}]
 
+        # The guest's authorized_keys: the user's own keys plus the portal's
+        # per-user access key, which backs the web terminal (an SSH session
+        # into the guest — real login semantics, MOTD, exit that sticks —
+        # unlike the shared serial console).
+        ssh_keys = list(user_details.get("publicKeys", []) or [])
+        if portal_public_key:
+            ssh_keys.append(portal_public_key)
+        user_data = build_user_data(
+            username=username,
+            uid=resolve_uid(user_details),
+            ssh_keys=ssh_keys,
+            hostname=hostname,
+        )
+
+        if image_url:
+            root_volume = {"name": "rootdisk",
+                           "dataVolume": {"name": f"{session_name}-root"}}
+        else:
+            root_volume = {"name": "rootdisk",
+                           "containerDisk": {"image": image or 'ubuntu:latest'}}
+
         domain = {"devices": devices}
         vm_spec = {
-            "running": True,
+            # runStrategy (not `running`) so stop/start is a spec patch:
+            # Halted = stopped-but-existing, Always = running/restarted.
+            # VMs default to Halted at creation — unlike pods they are
+            # expensive, so they boot on first connect (the connect/term/vnc
+            # pages bump whistler/last-connect), not on session creation.
+            "runStrategy": run_strategy,
             "template": {
                 "metadata": {"labels": labels},
                 "spec": {
@@ -1033,12 +1091,25 @@ class KubeConfigManager(ConfigManager):
                     "domain": domain,
                     "networks": [{"name": "default", "pod": {}}],
                     "volumes": [
-                        {"name": "rootdisk", "containerDisk": {"image": image}},
+                        root_volume,
                         {"name": "home", "persistentVolumeClaim": {"claimName": pvc_name}},
+                        {"name": "cloudinit", "cloudInitNoCloud": {"userData": user_data}},
                     ],
                 },
             },
         }
+        if image_url:
+            # `storage:` (not `pvc:`) lets CDI's StorageProfile pick the
+            # access/volume modes for the root-disk PVC.
+            vm_spec["dataVolumeTemplates"] = [{
+                "metadata": {"name": f"{session_name}-root"},
+                "spec": {
+                    "source": {"http": {"url": image_url}},
+                    "storage": {"resources": {"requests": {
+                        "storage": template_spec.get('rootDiskSize', '20Gi'),
+                    }}},
+                },
+            }]
 
         # instancetype supplies cpu/memory; KubeVirt rejects setting both it and
         # domain.cpu/domain.resources, so they are mutually exclusive here.
@@ -1140,7 +1211,7 @@ class KubeConfigManager(ConfigManager):
         user_ns = self._ensure_user_namespace(username)
         full_name = f"{username}-{session_name}"
         result = {"ok": False, "mode": None, "runtime": None, "displayPort": None,
-                  "viewer": None}
+                  "viewer": None, "phase": None}
 
         try:
             cr = self.api.get_namespaced_custom_object(
@@ -1162,7 +1233,6 @@ class KubeConfigManager(ConfigManager):
         template_spec = template.get('spec', {})
         mode = template_spec.get('mode', 'ssh')
         runtime = template_spec.get('runtime', 'container')
-        viewer = template_spec.get('viewer', 'websockets') if mode == 'desktop' else None
         # The websockets viewer (Selkies 2.x) serves H.264 over HTTP/WebSockets;
         # displayPort is the port the streamer sidecar's Selkies server listens
         # on and the portal reverse-proxies. The per-session Service exposes it
@@ -1178,6 +1248,11 @@ class KubeConfigManager(ConfigManager):
         result["mode"] = mode
         result["runtime"] = effective_runtime
         if mode == 'desktop':
+            # Viewer default depends on the effective runtime (which the CRD
+            # schema can't express): VMs get the agentless noVNC path over the
+            # KubeVirt VNC subresource, pods the Selkies websockets relay.
+            viewer = template_spec.get('viewer') or (
+                'vnc' if effective_runtime == 'vm' else 'websockets')
             result["displayPort"] = display_port
             result["viewer"] = viewer
 
@@ -1187,11 +1262,22 @@ class KubeConfigManager(ConfigManager):
             return result
 
         if effective_runtime == 'vm':
+            # A connect (portal connect/term/vnc, or SSH) bumps this
+            # annotation before/while reconcile runs; its presence means
+            # "the user wants in now", so boot immediately even if the
+            # create and the trigger coalesced into one event.
+            wants_start = 'whistler/last-connect' in (
+                cr['metadata'].get('annotations') or {})
             ok = self._create_vm(
                 user_ns, full_name, session_name, username, uid,
                 template_spec, pvc_name, display_port,
                 template_spec.get('instancetype'), preemptible,
+                start=wants_start,
             )
+            # Honest initial phase: without a connect the VM is Halted, and
+            # reporting Provisioning would show a phantom "Starting" badge
+            # until the 10s probe timer corrects it.
+            result["phase"] = "Provisioning" if wants_start else "Stopped"
         else:
             ok = self._create_pod(
                 user_ns, full_name, session_name, username, uid, mode,
@@ -1250,9 +1336,86 @@ class KubeConfigManager(ConfigManager):
             logger.error(f"Failed to create pod: {e}")
             return False
 
+    def _vm_access_secret_name(self, username: str) -> str:
+        return f"whistler-vm-access-{username}"
+
+    def _ensure_vm_access_key(self, username: str, user_ns: str) -> Optional[str]:
+        """Per-user SSH keypair for the portal's VM web terminal: the public
+        half is injected into every VM via cloud-init, the private half stays
+        in a Secret in the user namespace that only the portal (and operator)
+        can read. Returns the public key, or None if the Secret could not be
+        ensured (the VM still boots; only the web terminal is degraded)."""
+        secret_name = self._vm_access_secret_name(username)
+        core_api = client.CoreV1Api()
+        try:
+            sec = core_api.read_namespaced_secret(secret_name, user_ns)
+            import base64
+            return base64.b64decode(sec.data["id_ed25519.pub"]).decode().strip()
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to read VM access key for {username}: {e}")
+                return None
+
+        import asyncssh  # deferred: only the VM path needs key generation
+        key = asyncssh.generate_private_key(
+            "ssh-ed25519", comment=f"whistler-portal-{username}")
+        public = key.export_public_key().decode().strip()
+        body = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": secret_name,
+                "labels": {"app": "whistler", "user": username},
+            },
+            "stringData": {
+                "id_ed25519": key.export_private_key().decode(),
+                "id_ed25519.pub": public,
+            },
+        }
+        try:
+            core_api.create_namespaced_secret(user_ns, body)
+            logger.info(f"Created VM access keypair for {username}")
+            return public
+        except ApiException as e:
+            if e.status == 409:  # lost a race; use the winner's key
+                return self._ensure_vm_access_key(username, user_ns)
+            logger.error(f"Failed to create VM access key for {username}: {e}")
+            return None
+
+    def get_vm_access_private_key(self, username: str) -> Optional[str]:
+        """Private half of the per-user VM access keypair (portal-side)."""
+        user_ns = self._get_user_namespace(username)
+        core_api = client.CoreV1Api()
+        try:
+            sec = core_api.read_namespaced_secret(
+                self._vm_access_secret_name(username), user_ns)
+            import base64
+            return base64.b64decode(sec.data["id_ed25519"]).decode()
+        except ApiException as e:
+            logger.error(f"Failed to read VM access key for {username}: {e}")
+            return None
+
+    def get_vmi_address(self, username: str, session_name: str) -> Optional[str]:
+        """The running VMI's pod-network IP (masquerade forwards all ports,
+        including the guest's sshd). None while the VMI is absent/booting."""
+        user_ns = self._get_user_namespace(username)
+        full_name = f"{username}-{session_name}"
+        try:
+            vmi = self.api.get_namespaced_custom_object(
+                KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns,
+                KUBEVIRT_VMI_PLURAL, full_name)
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to read VMI {full_name}: {e}")
+            return None
+        for iface in (vmi.get("status") or {}).get("interfaces") or []:
+            if iface.get("ipAddress"):
+                return iface["ipAddress"]
+        return None
+
     def _create_vm(self, user_ns, full_name, session_name, username, uid,
                    template_spec, pvc_name, display_port, instancetype,
-                   preemptible) -> bool:
+                   preemptible, start=False) -> bool:
         vm_body = self._build_vm_spec(
             session_name=full_name,
             hostname=session_name,
@@ -1263,17 +1426,34 @@ class KubeConfigManager(ConfigManager):
             display_port=display_port,
             instancetype=instancetype,
             preemptible=preemptible,
+            user_details=self.get_user(username),
+            run_strategy="Always" if start else "Halted",
+            portal_public_key=self._ensure_vm_access_key(username, user_ns),
         )
         logger.debug(f"Creating KubeVirt VM:\n{yaml.safe_dump(vm_body)}")
         try:
             self.api.create_namespaced_custom_object(
                 KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns, KUBEVIRT_VM_PLURAL, vm_body
             )
-            logger.info(f"VirtualMachine {full_name} created")
+            logger.info(f"VirtualMachine {full_name} created "
+                        f"({'running' if start else 'halted until first connect'})")
             return True
         except ApiException as e:
             if e.status == 409:
-                return True  # Already exists
+                # Already exists — created Halted, or halted by stop_instance.
+                # Only a connect (start=True, i.e. the last-connect annotation
+                # is present) flips it to running; other reconciles (admin
+                # edits etc.) must leave a stopped VM stopped.
+                if start:
+                    try:
+                        self.api.patch_namespaced_custom_object(
+                            KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns,
+                            KUBEVIRT_VM_PLURAL, full_name,
+                            {"spec": {"runStrategy": "Always"}},
+                        )
+                    except ApiException as pe:
+                        logger.warning(f"Could not restart VirtualMachine {full_name}: {pe}")
+                return True
             # 404 here means the KubeVirt CRDs are not installed in this cluster.
             logger.error(f"Failed to create VirtualMachine {full_name} "
                          f"(is KubeVirt installed?): {e}")
@@ -1366,6 +1546,11 @@ class KubeConfigManager(ConfigManager):
                 phase = status.get("phase", "Unknown")
                 if status.get("runtime") != "vm":
                     phase = self._pod_session_phase(pod_map.get(full_name))
+                # A deleting CR beats any derived phase: the operator's timer
+                # skips deleting sessions, so status.phase would stay at its
+                # last value (e.g. Ready) for the whole teardown.
+                if item["metadata"].get("deletionTimestamp"):
+                    phase = "Terminating"
 
                 sessions.append({
                     "name": display_name,
@@ -1615,7 +1800,8 @@ class KubeConfigManager(ConfigManager):
         # admin form doesn't carry (e.g. a desktop template's displayPort /
         # nodeSelector / volumes).
         spec = {"user": "system"}
-        for key in ("mode", "runtime", "displayName", "image", "description",
+        for key in ("mode", "runtime", "displayName", "image", "imageURL",
+                    "rootDiskSize", "description",
                     "resources", "nodeSelector", "personalMountPath", "volumes",
                     "displayPort", "viewer", "streamerImage", "streamerEnv",
                     "privileged", "fuse", "instancetype", "persistence"):
@@ -1700,9 +1886,37 @@ class KubeConfigManager(ConfigManager):
             return False
 
     def stop_instance(self, username: str, instance_name: str) -> bool:
-        """Delete the running pod but leave the Session CR in place."""
+        """Stop the running workload but leave the Session CR in place.
+        Pods are deleted (state lives on the PVC); VMs are halted via
+        runStrategy so the VirtualMachine object (and a CDI root disk)
+        survive for restart on the next connect."""
         user_ns = self._get_user_namespace(username)
         full_name = f"{username}-{instance_name}"
+
+        runtime = None
+        try:
+            cr = self.api.get_namespaced_custom_object(
+                self.group, self.version, user_ns, SESSION_PLURAL, full_name
+            )
+            runtime = (cr.get("status") or {}).get("runtime")
+        except ApiException:
+            pass  # fall through to the pod path
+
+        if runtime == "vm":
+            try:
+                self.api.patch_namespaced_custom_object(
+                    KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns,
+                    KUBEVIRT_VM_PLURAL, full_name,
+                    {"spec": {"runStrategy": "Halted"}},
+                )
+                logger.info(f"Halted VirtualMachine {full_name} in {user_ns}")
+                return True
+            except ApiException as e:
+                if e.status == 404:
+                    return True  # Already gone
+                logger.error(f"Failed to halt VirtualMachine {full_name}: {e}")
+                return False
+
         core_api = client.CoreV1Api()
         try:
             core_api.delete_namespaced_pod(full_name, user_ns)

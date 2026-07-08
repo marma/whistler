@@ -1,0 +1,43 @@
+# Dev-only overlay (wired into skaffold.yaml valuesFiles): two KubeVirt VM
+# templates on top of the base values. Needs KubeVirt on the cluster
+# (scripts/install_kubevirt.sh — the metal/multipass create scripts run it);
+# on nodes without /dev/kvm set KUBEVIRT_USE_EMULATION=1.
+#
+# Helm merges maps but REPLACES lists, so whistler.images.vm here must carry
+# every allowed VM boot source, not just additions.
+whistler:
+  images:
+    vm:
+      - quay.io/containerdisks/ubuntu:24.04
+      - https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+
+templates:
+  # containerDisk boot: the qcow2 ships inside an OCI image. Fast pull-and-boot,
+  # ephemeral root (home persists via the virtiofs-shared user PVC).
+  ubuntu-vm:
+    description: "Ubuntu 24.04 VM (containerDisk, noVNC)"
+    mode: desktop
+    runtime: vm
+    image: "quay.io/containerdisks/ubuntu:24.04"
+    viewer: vnc
+    persistence: ephemeral
+    resources:
+      cpu: "2"
+      memory: 2Gi
+
+  # CDI boot: the same cloud image imported from its qcow2 URL into a
+  # per-session root-disk PVC (persistent root; first boot waits on the
+  # import — the session shows phase Importing). Requires CDI, which
+  # install_kubevirt.sh installs by default. Note: this is a *disk image*
+  # import, not an installer-ISO flow — the guest must ship cloud-init.
+  ubuntu-vm-cdi:
+    description: "Ubuntu 24.04 VM (CDI-imported root disk, noVNC)"
+    mode: desktop
+    runtime: vm
+    imageURL: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+    rootDiskSize: 10Gi
+    viewer: vnc
+    persistence: persistent
+    resources:
+      cpu: "2"
+      memory: 2Gi

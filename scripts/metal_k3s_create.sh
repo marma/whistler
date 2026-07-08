@@ -21,12 +21,23 @@
 # The kubeconfig is written to KUBECONFIG_OUT (default:
 # ~/.kube/<CLUSTER_NAME>.yaml) with cluster/context named CLUSTER_NAME.
 #
+# A dev image registry is deployed *inside* the cluster (registry:2 with
+# hostNetwork, so it answers on localhost:REGISTRY_PORT for both the host's
+# Docker daemon pushing and k3s's containerd pulling — same address, no TLS,
+# no kube-proxy localhost-NodePort quirks). Its manifest goes through k3s's
+# auto-deploy dir and its data lives on a local-path PV, so
+# metal_k3s_delete.sh removes every trace with the cluster. Use it from
+# skaffold with:
+#   skaffold config set --kube-context <CLUSTER_NAME> default-repo localhost:5000
+#
 # Env knobs:
 #   CLUSTER_NAME      context name in the kubeconfig   (default: k3s-metal)
 #   K3S_CHANNEL       k3s release channel              (default: stable)
 #   K3S_EXTRA_ARGS    extra args for the k3s server    (default: empty)
 #   KUBEVIRT_VERSION  KubeVirt release tag             (default: latest stable)
 #   KUBECONFIG_OUT    where to write the kubeconfig
+#   METAL_REGISTRY    set to 0 to skip the in-cluster dev registry
+#   REGISTRY_PORT     host port for the dev registry   (default: 5000)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,6 +46,8 @@ CLUSTER_NAME="${CLUSTER_NAME:-k3s-metal}"
 K3S_CHANNEL="${K3S_CHANNEL:-stable}"
 K3S_EXTRA_ARGS="${K3S_EXTRA_ARGS:-}"
 KUBECONFIG_OUT="${KUBECONFIG_OUT:-$HOME/.kube/${CLUSTER_NAME}.yaml}"
+METAL_REGISTRY="${METAL_REGISTRY:-1}"
+REGISTRY_PORT="${REGISTRY_PORT:-5000}"
 
 command -v curl >/dev/null || { echo "ERROR: curl not found"; exit 1; }
 
@@ -72,6 +85,85 @@ else
   echo "           needs GPU containers (k3s picks it up on install/restart)"
 fi
 
+# --- In-cluster dev registry (staged before install; k3s reads both at start) --
+if [[ "$METAL_REGISTRY" == "1" ]]; then
+  echo "==> Staging in-cluster dev registry (localhost:${REGISTRY_PORT})"
+
+  # containerd side: plain-HTTP endpoint for localhost:PORT image refs.
+  # (The Docker daemon pushing needs nothing — localhost is auto-insecure.)
+  sudo mkdir -p /etc/rancher/k3s
+  sudo tee /etc/rancher/k3s/registries.yaml >/dev/null <<EOF
+mirrors:
+  "localhost:${REGISTRY_PORT}":
+    endpoint:
+      - "http://localhost:${REGISTRY_PORT}"
+EOF
+
+  # k3s auto-applies everything in server/manifests/ (and re-applies on
+  # change), so the registry needs no kubectl ordering. hostNetwork puts it
+  # on localhost:PORT directly; Recreate avoids old/new pods fighting over
+  # the port and the RWO local-path PV on redeploys.
+  sudo mkdir -p /var/lib/rancher/k3s/server/manifests
+  sudo tee /var/lib/rancher/k3s/server/manifests/whistler-dev-registry.yaml >/dev/null <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dev-registry
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: registry-data
+  namespace: dev-registry
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: dev-registry
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: registry
+  template:
+    metadata:
+      labels:
+        app: registry
+    spec:
+      hostNetwork: true
+      containers:
+        - name: registry
+          image: registry:2
+          env:
+            - name: REGISTRY_HTTP_ADDR
+              value: "127.0.0.1:${REGISTRY_PORT}"
+            - name: REGISTRY_STORAGE_DELETE_ENABLED
+              value: "true"
+          ports:
+            - containerPort: ${REGISTRY_PORT}
+          readinessProbe:
+            httpGet:
+              path: /v2/
+              port: ${REGISTRY_PORT}
+              host: 127.0.0.1
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/registry
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: registry-data
+EOF
+fi
+
 echo "==> Installing k3s (channel: ${K3S_CHANNEL})"
 # shellcheck disable=SC2086  # K3S_EXTRA_ARGS is intentionally word-split
 curl -sfL https://get.k3s.io \
@@ -99,14 +191,33 @@ if [[ ! -e /dev/kvm ]]; then
 fi
 "$SCRIPT_DIR/install_kubevirt.sh"
 
+# --- Dev registry readiness ------------------------------------------------------
+if [[ "$METAL_REGISTRY" == "1" ]]; then
+  echo "==> Waiting for the dev registry"
+  kubectl -n dev-registry rollout status deployment/registry --timeout=5m
+  curl -sf "http://localhost:${REGISTRY_PORT}/v2/" >/dev/null \
+    || { echo "ERROR: dev registry not answering on localhost:${REGISTRY_PORT}"; exit 1; }
+
+  # Point skaffold's default-repo for this context at the in-cluster registry
+  # (per-context global config; skaffold.yaml stays cluster-agnostic).
+  if command -v skaffold >/dev/null 2>&1; then
+    skaffold config set --kube-context "$CLUSTER_NAME" default-repo "localhost:${REGISTRY_PORT}"
+    echo "    skaffold default-repo for context '$CLUSTER_NAME' -> localhost:${REGISTRY_PORT}"
+  else
+    echo "    (skaffold not found — when you use it, run:"
+    echo "     skaffold config set --kube-context $CLUSTER_NAME default-repo localhost:${REGISTRY_PORT})"
+  fi
+fi
+
 cat <<EOF
 
-Cluster '$CLUSTER_NAME' is up on this host, with KubeVirt.
+Cluster '$CLUSTER_NAME' is up on this host, with KubeVirt$( [[ "$METAL_REGISTRY" == "1" ]] && echo " and an in-cluster dev registry (localhost:${REGISTRY_PORT})" ).
 
   export KUBECONFIG=$KUBECONFIG_OUT
   kubectl get nodes
   kubectl -n kubevirt get pods
   virtctl console <vm>                    # once a VM is running
 
-  scripts/metal_k3s_delete.sh             # tear everything down
+  skaffold dev                            # builds/pushes via localhost:${REGISTRY_PORT}
+  scripts/metal_k3s_delete.sh             # tear everything down (registry + images too)
 EOF

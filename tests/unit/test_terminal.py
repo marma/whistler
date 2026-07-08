@@ -55,8 +55,9 @@ def _ssh(name, status, pod="p"):
     return {"name": name, "status": status, "podName": pod, "namespace": "ns"}
 
 
-def _desk(name, phase, runtime, pod="p"):
-    return {"name": name, "phase": phase, "runtime": runtime, "podName": pod, "namespace": "ns"}
+def _desk(name, phase, runtime, pod="p", vmi=None):
+    return {"name": name, "phase": phase, "runtime": runtime, "podName": pod,
+            "vmiName": vmi, "namespace": "ns"}
 
 
 def test_resolve_ssh_ready_when_running():
@@ -74,10 +75,16 @@ def test_resolve_desktop_container_ready():
     assert t["supported"] and t["ready"]
 
 
-def test_resolve_desktop_vm_unsupported():
-    # VM-runtime desktops have no pod to exec into — terminal is gated off.
-    t = _resolve_target([], [_desk("d", "Ready", "vm")], "d")
-    assert t["supported"] is False
+def test_resolve_desktop_vm_ready_via_vmi():
+    # VM-runtime desktops attach the KubeVirt serial console: supported, and
+    # readiness keys on the VMI (there is no pod to exec into).
+    t = _resolve_target([], [_desk("d", "Ready", "vm", pod=None, vmi="d-vmi")], "d")
+    assert t["supported"] and t["ready"] and t["vmiName"] == "d-vmi"
+
+
+def test_resolve_desktop_vm_not_ready_without_vmi():
+    t = _resolve_target([], [_desk("d", "Ready", "vm", pod=None, vmi=None)], "d")
+    assert t["supported"] and not t["ready"]
 
 
 def test_resolve_unknown_returns_none():

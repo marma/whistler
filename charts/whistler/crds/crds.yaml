@@ -37,6 +37,19 @@ spec:
                     is operator-configured, not set here.
                 image:
                   type: string
+                imageURL:
+                  type: string
+                  description: >-
+                    VM-only. HTTP(S) URL of a qcow2/raw disk image imported by CDI
+                    into a per-session root-disk PVC (via dataVolumeTemplates).
+                    Mutually exclusive with image. Subject to the whistler.images.vm
+                    allow-list; the image must ship cloud-init and a serial getty.
+                rootDiskSize:
+                  type: string
+                  default: "20Gi"
+                  description: >-
+                    VM-only. Size of the CDI-imported root disk PVC (only used with
+                    imageURL; containerDisk roots are ephemeral and unsized).
                 displayName:
                   type: string
                 description:
@@ -83,14 +96,15 @@ spec:
                     reverse-proxies it (ignored for ssh). Defaults to 8082.
                 viewer:
                   type: string
-                  enum: ["websockets"]
-                  default: websockets
+                  enum: ["websockets", "vnc"]
                   description: >-
                     Desktop-only. Display backend the portal uses. "websockets"
-                    reverse-proxies the browser to the streamer sidecar's Selkies
-                    2.x (pixelflux) server on displayPort — H.264 over plain
-                    WebSockets reaches the browser's decoder, no coturn/TURN
-                    involved.
+                    reverse-proxies the browser to a Selkies 2.x (pixelflux)
+                    server on displayPort — the streamer sidecar for pods, or a
+                    guest-run Selkies for VMs. "vnc" serves the portal's vendored
+                    noVNC client over the KubeVirt VNC subresource (VM-only;
+                    works for any guest, no agent needed). Default is computed by
+                    the operator: "vnc" for runtime=vm, "websockets" otherwise.
                 streamerImage:
                   type: string
                   description: >-
@@ -153,6 +167,11 @@ spec:
               properties:
                 phase:
                   type: string
+                  description: >-
+                    Session lifecycle phase. Pending/Provisioning/Booting/Ready/
+                    Failed/Terminating for all runtimes; VM sessions additionally
+                    use Importing (CDI is pulling the root disk image) and
+                    Stopped (the VirtualMachine exists but is halted).
                 mode:
                   type: string
                   description: Denormalized from the referenced template.
@@ -176,7 +195,7 @@ spec:
                 viewer:
                   type: string
                   description: >-
-                    Denormalized from the template (websockets) so the portal
+                    Denormalized from the template (websockets/vnc) so the portal
                     knows which relay to open.
                 sshHost:
                   type: string

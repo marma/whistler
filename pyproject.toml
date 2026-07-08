@@ -30,9 +30,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["whistler"]
-# Vendored guacamole-common-js is served by the portal; force-include it so it
-# lands in the wheel even though it is a non-.py (and possibly untracked) asset.
-artifacts = ["whistler/portal/static/*.js"]
+# Vendored portal assets (xterm.js flat files + the noVNC tree) are served by
+# the portal; force-include them so they land in the wheel even though they are
+# non-.py (and possibly untracked) assets.
+artifacts = [
+    "whistler/portal/static/*.js",
+    "whistler/portal/static/novnc/**",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

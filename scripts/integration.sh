@@ -129,12 +129,17 @@ EOF
 # fails (test_desktop.py uses the pause image; test_display.py uses an RDP image).
 DESKTOP_IMAGE="${WHISTLER_TEST_DESKTOP_IMAGE:-registry.k8s.io/pause:3.9}"
 RDP_IMAGE="${WHISTLER_TEST_RDP_IMAGE:-linuxserver/rdesktop:latest}"
+# VM boot source for tests/integration/test_vm.py — harmless on k3d, where the
+# test skips (no KubeVirt CRDs); needed on metal/multipass clusters.
+VM_IMAGE="${WHISTLER_TEST_VM_IMAGE:-quay.io/containerdisks/ubuntu:24.04}"
 cat > "$WORK/images.yaml" <<EOF
 ssh: []
 desktop:
   - ${DESKTOP_IMAGE}
   - ${RDP_IMAGE}
-vm: []
+vm:
+  - ${VM_IMAGE}${WHISTLER_TEST_VM_URL:+
+  - ${WHISTLER_TEST_VM_URL}}
 EOF
 
 COMMON_ENV=(
