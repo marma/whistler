@@ -1,0 +1,24 @@
+# Display plane of a Whistler VM desktop (Xvfb + PulseAudio + Selkies 2.x).
+# Baked enabled: it has no per-session inputs beyond the optional
+# /etc/whistler/streamer.env that cloud-init writes before multi-user.target,
+# so it simply starts on every boot. The DE session is the separate
+# whistler-desktop@<user>.service, enabled by cloud-init once the user exists.
+[Unit]
+Description=Whistler display streamer (Xvfb + PulseAudio + Selkies)
+# dbus for PulseAudio's module loading; network so --addr=0.0.0.0 binds late
+# enough to survive early-boot interface churn.
+After=network.target dbus.service
+Wants=dbus.service
+
+[Service]
+Type=simple
+# Per-session streamer knobs (SELKIES_PORT from the template's displayPort,
+# anything else from streamerEnv). Optional: the baked image boots fine on
+# the defaults without it.
+EnvironmentFile=-/etc/whistler/streamer.env
+ExecStart=/usr/local/bin/whistler-streamer
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

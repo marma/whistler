@@ -10,6 +10,10 @@ whistler:
     vm:
       - quay.io/containerdisks/ubuntu:24.04
       - https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+      # Baked desktop VM (XFCE + in-guest Selkies) — build & push with
+      # `make vm-desktop-image PUSH=1` (desktops/vm-xfce-selkies/build.sh);
+      # not a skaffold artifact because the qcow2 bake needs qemu/KVM.
+      - localhost:5000/whistler-vm-xfce-selkies:dev
 
 templates:
   # containerDisk boot: the qcow2 ships inside an OCI image. Fast pull-and-boot,
@@ -41,3 +45,21 @@ templates:
     resources:
       cpu: "2"
       memory: 2Gi
+
+  # ubuntu-vm + a real desktop: XFCE and the Selkies 2.x stack are baked into
+  # the containerDisk (desktops/vm-xfce-selkies — the sidecar can't reach into
+  # a VM, so the streamer lives in the guest as whistler-streamer.service).
+  # viewer: websockets makes the portal reverse-proxy the guest's Selkies on
+  # displayPort, exactly like a pod desktop: per-session Service -> launcher
+  # pod -> masquerade -> guest. The VNC subresource console stays available
+  # as a rescue path (shows the text console, not the desktop).
+  ubuntu-vm-selkies:
+    description: "Ubuntu 26.04 VM + XFCE (containerDisk, Selkies)"
+    mode: desktop
+    runtime: vm
+    image: "localhost:5000/whistler-vm-xfce-selkies:dev"
+    viewer: websockets
+    persistence: ephemeral
+    resources:
+      cpu: "2"
+      memory: 4Gi

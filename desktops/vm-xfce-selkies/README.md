@@ -1,0 +1,88 @@
+# vm-xfce-selkies — desktop VM containerDisk (XFCE + in-guest Selkies)
+
+A KubeVirt **containerDisk** (OCI-wrapped qcow2, Ubuntu 26.04 cloud image)
+with XFCE and the Selkies 2.x streaming stack **baked into the guest**. It
+backs `runtime: vm` desktop templates with `viewer: websockets`
+(`ubuntu-vm-selkies` in [values-dev-vm.yaml](../../charts/whistler/values-dev-vm.yaml)):
+the portal reverse-proxies the guest's Selkies server exactly like a pod
+desktop's sidecar — per-session Service → virt-launcher pod → masquerade →
+guest `:8082`.
+
+**Why baked, not cloud-init-installed, and not a sidecar:** the streamer
+sidecar model cannot reach into a VM (unix sockets don't cross the VM
+boundary), so VMs need an in-guest streamer. Installing it at boot is out:
+containerDisk roots are ephemeral (every session boot would pay the full
+install), the user-namespace egress policy blocks package mirrors by design,
+and Selkies 2.x is an unreleased pinned-commit source build. So the bytes are
+baked; cloud-init stays the per-session control plane (user/uid/keys, SMB
+home mount, streamer env, session-unit start — see
+[whistler/cloudinit.py](../../whistler/cloudinit.py)).
+
+## What's inside the guest
+
+- **`whistler-streamer.service`** (baked enabled, runs as root): Xvfb +
+  PulseAudio + Selkies — a port of
+  [`streamer-selkies2/entrypoint.sh`](../streamer-selkies2/entrypoint.sh),
+  which stays the reference copy; keep them in sync. Reads optional
+  per-session knobs from `/etc/whistler/streamer.env` (written by cloud-init
+  from the template's `streamerEnv` + `displayPort`). The KubeVirt
+  virtio-gpu/VNC console is *not* the desktop — it keeps showing the text
+  console and stays available as the agentless rescue path (`viewer: vnc`
+  semantics) even on this image.
+- **`whistler-desktop@<user>.service`** (template unit, `User=%i`): waits for
+  the streamer's X and the SMB home mount, then runs XFCE in the foreground —
+  the in-guest analog of [`xfce-plain/entrypoint.sh`](../xfce-plain/entrypoint.sh).
+  Only cloud-init knows the username, so the session's userData does
+  `systemctl enable --now whistler-desktop@<user>` (enable so CDI
+  persistent-root guests resume the desktop on later boots).
+- The Selkies venv + web client are **extracted from the
+  [`streamer-selkies2`](../streamer-selkies2/) docker build** at bake time:
+  one `SELKIES_COMMIT`, client/server lock preserved, binary-compatible
+  (both Ubuntu 26.04). The bake also installs `cifs-utils` (so the home mount
+  uses mount.cifs instead of the raw-kernel fallback) and purges snapd
+  (snapd.seeded otherwise delays every session boot ~30 s).
+- Unlike the pod images there is **no bwrap divert**: the VM has a full
+  kernel and Ubuntu ships an AppArmor profile permitting bwrap's user
+  namespace, so glycin's image-decode sandbox actually works here. If icons
+  die with GTK pixbuf warnings, revisit this (see the symptom table in
+  [design/creating_desktops.md](../../design/creating_desktops.md) §5).
+
+## Build
+
+```bash
+make vm-desktop-image          # → localhost:5000/whistler-vm-xfce-selkies:dev
+make vm-desktop-image PUSH=1   # …and push to the dev registry
+```
+
+Needs docker, `qemu-system-x86_64` and `/dev/kvm` — **no libguestfs**: the
+bake boots the Ubuntu cloud image once under qemu with a NoCloud seed served
+over HTTP (`-smbios … ds=nocloud-net;s=http://10.0.2.2:<port>/`, so no ISO
+tooling either), runs [`bake/user-data.in`](bake/user-data.in), and powers
+off; `build.sh` then flattens/compresses the disk and wraps it with
+[`Dockerfile.containerdisk`](Dockerfile.containerdisk). Bake console log:
+`build/console.log`. amd64-only (the bake runs the target arch under KVM).
+
+The bake ends with `cloud-init clean --machine-id`, so the published image
+treats every session's `cloudInitNoCloud` seed as a genuine first boot —
+that per-session seed (not the bake's) creates the user, mounts the home and
+starts the desktop.
+
+## Verify without a cluster
+
+```bash
+desktops/vm-xfce-selkies/test.sh   # boots the baked disk with a session-like
+                                   # seed; PASS = Selkies serving on :8082
+```
+
+It generates the seed with the real `whistler.cloudinit.build_user_data`
+(desktop mode), boots the disk with `hostfwd`, waits for the in-guest Selkies
+to serve HTTP, then (over SSH, with a throwaway key) fakes the SMB share
+landing with a tmpfs on the home mountpoint — no gateway exists outside the
+cluster — and asserts that the XFCE session comes up *and stays up* and that
+a fresh SSH connection still authenticates once the mount shadows
+`~/.ssh/authorized_keys` (regression check: the bake tar once restored
+group-writable modes onto `/etc`, and sshd's StrictModes then refused the
+root-disk `/etc/ssh/authorized_keys.d` path — the one the portal's web
+terminal depends on after the real mount lands). By default the VM is left
+running for the §6-step-5 human check at http://localhost:8082/ (Ctrl-C to
+tear down; `KEEP=0` for CI mode).

@@ -20,7 +20,7 @@ SELKIES2_RESOLUTION ?= 1280x720
 
 .PHONY: test test-local cluster-up cluster-down integration integration-keep \
         desktop-sidecar-local desktop-gnome-sidecar-local \
-        desktop-sidecar-local-down clean help
+        desktop-sidecar-local-down vm-desktop-image clean help
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?#' $(MAKEFILE_LIST) | sed 's/:.*#/\t/' | sort
@@ -86,6 +86,9 @@ desktop-gnome-sidecar-local: # Build + run the streamer sidecar + display-unawar
 
 desktop-sidecar-local-down: # Stop the sidecar pair (either variant) and remove its shared X/Pulse volumes
 	docker compose -f desktops/compose-sidecar.yaml down -v
+
+vm-desktop-image: # Bake the XFCE+Selkies KubeVirt containerDisk (needs qemu/KVM; PUSH=1 to push, IMAGE/TAG to override)
+	PUSH=$(or $(PUSH),0) desktops/vm-xfce-selkies/build.sh
 
 clean: # Remove the test image and any leftover cluster
 	-docker rmi $(TEST_IMAGE) 2>/dev/null

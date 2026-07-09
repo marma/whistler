@@ -193,3 +193,24 @@ def test_gpu_devices_present_only_when_requested():
 def test_node_selector_propagated():
     vm = _build(template_spec={"image": "x", "nodeSelector": {"gpu": "true"}})
     assert vm["spec"]["template"]["spec"]["nodeSelector"] == {"gpu": "true"}
+
+
+def test_websockets_viewer_arms_in_guest_desktop():
+    # viewer=websockets means a desktop-VM image with the Selkies stack baked
+    # in: cloud-init enables the per-user session unit and writes the
+    # streamer env (template streamerEnv + displayPort).
+    user_data = _cloud_init(
+        viewer="websockets",
+        template_spec={"image": "x",
+                       "streamerEnv": {"SELKIES_H264_STREAMING_MODE": "true"}})
+    assert "whistler-desktop@alice.service" in user_data
+    assert "SELKIES_PORT=5900" in user_data
+    assert "SELKIES_H264_STREAMING_MODE=true" in user_data
+
+
+def test_vnc_viewer_gets_plain_guest():
+    # The noVNC path is agentless — no desktop units in the guest document.
+    for viewer in (None, "vnc"):
+        user_data = _cloud_init(viewer=viewer)
+        assert "whistler-desktop@" not in user_data
+        assert "SELKIES_PORT" not in user_data

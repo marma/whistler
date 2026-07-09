@@ -26,6 +26,19 @@ template's `streamerEnv` (e.g. GNOME's mandatory
 | [`xfce-plain`](xfce-plain/) | 8082 (sidecar) | XFCE. Ubuntu 26.04. The minimal model for new workload images — copy it and swap the DE. |
 | [`gnome-plain`](gnome-plain/) | 8082 (sidecar) | **Real GNOME Shell** (X11 backend — Wayland is architecturally incompatible with a display-owning sidecar). Ubuntu 24.04 / GNOME 46, unprivileged, runtime `PUID`/`PGID` identity. Template **must set** `streamerEnv: {SELKIES_H264_STREAMING_MODE: "true"}`. |
 | [`streamer-selkies2`](streamer-selkies2/) | 8082 | *Not a catalog entry* — the sidecar itself, injected by the operator (`whistler.streamer.image`, per-template `streamerImage` override). Single home of the Selkies/pixelflux stack. |
+| [`vm-xfce-selkies`](vm-xfce-selkies/) | 8082 (in-guest) | **KubeVirt containerDisk, not an OCI workload**: XFCE + the same Selkies stack baked *into the guest* (the sidecar can't cross the VM boundary). For `runtime: vm` + `viewer: websockets` templates. Built by a qemu/KVM bake (`make vm-desktop-image`), not skaffold. |
+
+## VM desktops
+
+The sidecar model stops at the VM boundary (the shared X/Pulse sockets can't
+cross it), so `runtime: vm` desktops carry the streamer **inside the guest**:
+[`vm-xfce-selkies`](vm-xfce-selkies/) bakes the DE and the identical Selkies
+stack (extracted from the streamer image's build — one `SELKIES_COMMIT`) into
+a bootable disk; per-session cloud-init starts the user's session unit. The
+portal path is unchanged — `viewer: websockets` proxies the per-session
+Service, which reaches the guest through the launcher pod's masquerade. The
+agentless `viewer: vnc` (noVNC over the KubeVirt VNC subresource) remains the
+rescue path / default for unbaked VM images.
 
 ## Conventions
 

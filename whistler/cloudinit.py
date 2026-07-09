@@ -54,15 +54,31 @@ additional isolation.)
 import yaml
 
 SMB_CREDENTIALS_PATH = "/etc/whistler/smb-credentials"
+STREAMER_ENV_PATH = "/etc/whistler/streamer.env"
 
 
 def build_user_data(*, username: str, uid: int, ssh_keys: list,
                     hostname: str, smb_host: str, smb_password: str,
-                    autologin: bool = True) -> str:
+                    autologin: bool = True, desktop: bool = False,
+                    streamer_env: dict = None,
+                    display_port: int = None) -> str:
     """Return a ``#cloud-config`` userData document for cloudInitNoCloud.
 
     ``smb_host`` is the storage gateway Service DNS name;
     ``smb_password`` the user's password from Secret whistler-smb-<user>.
+
+    ``desktop=True`` targets a Whistler desktop-VM image (viewer:
+    websockets — e.g. desktops/vm-xfce-selkies): the image ships the
+    Selkies streamer baked in and always-on, but the DE session unit is the
+    per-user template ``whistler-desktop@<user>.service`` — only cloud-init
+    knows the username, so it enables the unit here. ``streamer_env`` (the
+    template's streamerEnv) and ``display_port`` land in
+    ``/etc/whistler/streamer.env``, the EnvironmentFile of the baked
+    whistler-streamer.service — the VM analog of the sidecar's env
+    injection. SELKIES_PORT is written last so displayPort (which the
+    per-session Service and the portal proxy are built from) always wins
+    over a stray streamerEnv override — they must agree or the viewer
+    can't reach the streamer.
     """
     home = f"/home/{username}"
     keys = list(ssh_keys or [])
@@ -206,6 +222,25 @@ exit 1
             "systemctl start --no-block whistler-home.service",
         ],
     }
+    if desktop:
+        env_lines = [f"{k}={v}" for k, v in (streamer_env or {}).items()]
+        if display_port:
+            env_lines.append(f"SELKIES_PORT={display_port}")
+        if env_lines:
+            write_files.append({
+                "path": STREAMER_ENV_PATH,
+                "content": "\n".join(env_lines) + "\n",
+            })
+            # write_files lands in cloud-init's init stage, normally before
+            # multi-user services start — but nothing guarantees that on a
+            # slow boot, so kick the (Restart=always) streamer to be sure it
+            # runs with this env.
+            doc["runcmd"].append(
+                "systemctl try-restart whistler-streamer.service")
+        # enable + start (not just start): persistent-root (CDI) guests must
+        # bring the desktop back on later boots, where runcmd doesn't re-run.
+        doc["runcmd"].append(
+            f"systemctl enable --now whistler-desktop@{username}.service")
     if autologin:
         write_files.append(
             {

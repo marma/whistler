@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Display plane of a Whistler *VM* desktop: X server + audio daemon + Selkies
+# 2.x streamer, run as a system service (whistler-streamer.service). This is
+# the in-guest port of desktops/streamer-selkies2/entrypoint.sh — the sidecar
+# model can't reach into a VM (unix sockets don't cross the VM boundary), so
+# the same stack runs inside the guest instead. Keep the two in sync: every
+# quirk here was expensive to find, and the streamer entrypoint is the
+# reference copy (see design/creating_desktops.md §4-5).
+#
+# Differences from the container entrypoint, all deliberate:
+#   - no `dbus-daemon --system` (the VM's systemd already runs dbus.service;
+#     the unit orders After=dbus.service),
+#   - /tmp/.X11-unix and /tmp/pulse are plain directories, not shared
+#     emptyDirs — the DE session (whistler-desktop@.service) lives in the
+#     same guest and finds them by path,
+#   - config comes from /etc/whistler/streamer.env (EnvironmentFile in the
+#     unit), written per-session by cloud-init from the template's
+#     streamerEnv/displayPort — the VM analog of the sidecar's env injection.
+set -e
+
+export PATH=/opt/venv/bin:$PATH
+export DISPLAY="${DISPLAY:-:0}"
+
+SELKIES_PORT="${SELKIES_PORT:-8082}"
+RES="${SELKIES_RESOLUTION:-1280x720}"
+
+# Headless PulseAudio with a null sink; pcmflux captures the sink's monitor.
+# The DE session reaches the same daemon via PULSE_SERVER, so its playback is
+# what gets streamed. auth-anonymous because the guest is the trust boundary.
+export PULSE_SERVER="unix:/tmp/pulse/native"
+# Clear runtime state left by a previous run (a persistent-root/CDI guest
+# reboots into the same disk): a stale pid file makes the daemon refuse to
+# start and silently kills audio; a stale X lock or socket makes Xvfb exit
+# immediately.
+rm -rf /root/.config/pulse /tmp/pulse-* /tmp/pulse/* /tmp/.X*-lock /tmp/.X11-unix/X*
+mkdir -p /tmp/pulse && chmod 777 /tmp/pulse
+# The sink MUST be named `output`: selkies 2.x tells pcmflux to capture from
+# the device literally named "output.monitor" and pa_simple_new() fails with
+# "No such entity" for anything else.
+pulseaudio --daemonize=false --realtime=false --disallow-exit --exit-idle-time=-1 \
+  --load="module-native-protocol-unix auth-anonymous=1 socket=/tmp/pulse/native" \
+  --load="module-null-sink sink_name=output sink_properties=device.description=output" \
+  --log-target=stderr &
+for i in $(seq 1 30); do [ -S /tmp/pulse/native ] && break; sleep 0.2; done
+pactl set-default-source output.monitor 2>/dev/null || \
+  echo "[whistler-streamer] warning: could not set default pulse source (audio may not work)"
+
+# Open up the X socket dir so the (differently-uid'd) desktop user's clients
+# can reach the socket Xvfb drops in it. Sticky like a real X11 dir.
+mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+
+# Headless X server (software framebuffer) that pixelflux captures — the
+# virtio-gpu/VNC console framebuffer is NOT used for the desktop; it keeps
+# showing the text console (and stays reachable as a rescue path via the
+# KubeVirt VNC subresource). Started at the RandR ceiling, not at RES: Xvfb
+# bakes its *maximum* size in from this `-screen` argument, so starting at RES
+# would permanently cap dynamic resize. Shrink to RES below. `-ac` (no access
+# control) is fine: only guest processes can reach the socket. +extension GLX
+# for workloads that want a (software) GL context.
+XVFB_MAX_RES="7680x4320"
+Xvfb "${DISPLAY}" -screen 0 "${XVFB_MAX_RES}x24" -ac +extension RANDR +extension GLX &
+for i in $(seq 1 30); do xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1 && break; sleep 0.2; done
+# Shrink to RES in the background: a just-started Xvfb rejects RandR mode adds
+# for its first ~15-20s, and retrying inline would stall startup (and with it
+# the port the portal probes) for that long.
+( for attempt in $(seq 1 60); do
+    selkies-resize "${RES}" >/dev/null 2>&1 && break
+    sleep 1
+  done & )
+
+# Selkies 2.x: pixelflux capture of $DISPLAY, x264 software encode, web client
+# + WebSocket streaming on one port. Flag spelling matters: 2.x flags are
+# dash-separated and misspellings are IGNORED SILENTLY (parse_known_args);
+# booleans take =true/=false. Basic auth is ON by default in 2.x — off here
+# explicitly; the per-session NetworkPolicy on the launcher pod is the
+# security boundary. --h264-streaming-mode stays off for XFCE (damage-based
+# capture is correct for non-GL DEs); a GL-compositor image would set it via
+# the template's streamerEnv.
+exec selkies \
+  --addr=0.0.0.0 \
+  --port="${SELKIES_PORT}" \
+  --mode="${SELKIES_MODE:-websockets}" \
+  --encoder="${SELKIES_ENCODER:-x264enc}" \
+  --h264-streaming-mode="${SELKIES_H264_STREAMING_MODE:-false}" \
+  --enable-https="${SELKIES_ENABLE_HTTPS:-false}" \
+  --enable-basic-auth=false \
+  --web-root=/opt/selkies-web

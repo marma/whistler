@@ -1047,7 +1047,7 @@ class KubeConfigManager(ConfigManager):
                        template_spec, display_port, instancetype,
                        preemptible, smb_host, smb_password,
                        user_details=None, run_strategy="Halted",
-                       portal_public_key=None):
+                       portal_public_key=None, viewer=None):
         """Build a KubeVirt VirtualMachine manifest from resolved inputs.
 
         Pure (no API calls). The VMI launcher pod inherits the template labels
@@ -1095,6 +1095,12 @@ class KubeConfigManager(ConfigManager):
         ssh_keys = list(user_details.get("publicKeys", []) or [])
         if portal_public_key:
             ssh_keys.append(portal_public_key)
+        # viewer=websockets means a desktop-VM image with the Selkies stack
+        # baked in (e.g. desktops/vm-xfce-selkies): cloud-init additionally
+        # starts the per-user DE session unit and writes the streamer env
+        # (template streamerEnv + displayPort). The vnc viewer needs no agent,
+        # so its guests get the plain (ssh-style) document.
+        desktop_stream = viewer == 'websockets'
         user_data = build_user_data(
             username=username,
             uid=resolve_uid(user_details),
@@ -1102,6 +1108,9 @@ class KubeConfigManager(ConfigManager):
             hostname=hostname,
             smb_host=smb_host,
             smb_password=smb_password,
+            desktop=desktop_stream,
+            streamer_env=template_spec.get('streamerEnv') if desktop_stream else None,
+            display_port=display_port if desktop_stream else None,
         )
 
         if image_url:
@@ -1314,6 +1323,15 @@ class KubeConfigManager(ConfigManager):
         except Exception:
             return result
 
+        # A connect (portal connect/term/vnc, or SSH) bumps this annotation
+        # before/while reconcile runs; its presence means "the user wants in
+        # now", so boot immediately even if the create and the trigger
+        # coalesced into one event. Absent a connect, the workload starts
+        # life Stopped — pods included, so a freshly-created session doesn't
+        # start running before anyone has asked to use it.
+        wants_start = 'whistler/last-connect' in (
+            cr['metadata'].get('annotations') or {})
+
         if effective_runtime == 'vm':
             # The home reaches the guest through the per-user SMB storage
             # gateway, not virtiofs (see _build_vm_spec). It must be ensured
@@ -1324,12 +1342,6 @@ class KubeConfigManager(ConfigManager):
                 username, user_ns, pvc_name)
             if not smb_password:
                 return result
-            # A connect (portal connect/term/vnc, or SSH) bumps this
-            # annotation before/while reconcile runs; its presence means
-            # "the user wants in now", so boot immediately even if the
-            # create and the trigger coalesced into one event.
-            wants_start = 'whistler/last-connect' in (
-                cr['metadata'].get('annotations') or {})
             ok = self._create_vm(
                 user_ns, full_name, session_name, username, uid,
                 template_spec, display_port,
@@ -1337,17 +1349,21 @@ class KubeConfigManager(ConfigManager):
                 smb_host=self._gateway_host(username, user_ns),
                 smb_password=smb_password,
                 start=wants_start,
+                viewer=result.get("viewer"),
             )
-            # Honest initial phase: without a connect the VM is Halted, and
-            # reporting Provisioning would show a phantom "Starting" badge
-            # until the 10s probe timer corrects it.
-            result["phase"] = "Provisioning" if wants_start else "Stopped"
-        else:
+        elif wants_start:
             ok = self._create_pod(
                 user_ns, full_name, session_name, username, uid, mode,
                 effective_runtime, template_spec, pvc_name, display_port,
                 preemptible,
             )
+        else:
+            ok = True
+
+        # Honest initial phase: without a connect the workload isn't
+        # started, and reporting Provisioning would show a phantom
+        # "Starting" badge until the phase timer corrects it.
+        result["phase"] = "Provisioning" if wants_start else "Stopped"
 
         if not ok:
             return result
@@ -1682,7 +1698,8 @@ class KubeConfigManager(ConfigManager):
 
     def _create_vm(self, user_ns, full_name, session_name, username, uid,
                    template_spec, display_port, instancetype,
-                   preemptible, smb_host, smb_password, start=False) -> bool:
+                   preemptible, smb_host, smb_password, start=False,
+                   viewer=None) -> bool:
         vm_body, cloudinit_secret = self._build_vm_spec(
             session_name=full_name,
             hostname=session_name,
@@ -1697,6 +1714,7 @@ class KubeConfigManager(ConfigManager):
             user_details=self.get_user(username),
             run_strategy="Always" if start else "Halted",
             portal_public_key=self._ensure_vm_access_key(username, user_ns),
+            viewer=viewer,
         )
         # The userData Secret must exist before the VM starts; replace on
         # conflict so key/template changes reach the guest on its next boot.
@@ -1813,13 +1831,23 @@ class KubeConfigManager(ConfigManager):
             # so it lags reality (e.g. stays "Ready" for seconds after a stop). For
             # container/kata sessions derive the phase from the live pod instead, so
             # the dashboard reacts immediately. VM-runtime sessions have no pod, so
-            # they keep the operator-reported phase.
+            # they otherwise keep the operator-reported phase -- except for
+            # termination, which is checked live below too (a stop halts the VMI
+            # without deleting the Session CR, so the CR-level deletionTimestamp
+            # check further down never catches it).
             core_api = client.CoreV1Api()
             try:
                 pods = core_api.list_namespaced_pod(user_ns)
                 pod_map = {p.metadata.name: p for p in pods.items}
             except ApiException:
                 pod_map = {}
+            try:
+                vmis = self.api.list_namespaced_custom_object(
+                    KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns, KUBEVIRT_VMI_PLURAL,
+                )
+                vmi_map = {v["metadata"]["name"]: v for v in vmis.get("items", [])}
+            except ApiException:
+                vmi_map = {}
 
             for item in resp.get("items", []):
                 spec = item.get("spec", {})
@@ -1832,6 +1860,10 @@ class KubeConfigManager(ConfigManager):
                 phase = status.get("phase", "Unknown")
                 if status.get("runtime") != "vm":
                     phase = self._pod_session_phase(pod_map.get(full_name))
+                else:
+                    vmi = vmi_map.get(full_name)
+                    if vmi and (vmi.get("metadata") or {}).get("deletionTimestamp"):
+                        phase = "Terminating"
                 # A deleting CR beats any derived phase: the operator's timer
                 # skips deleting sessions, so status.phase would stay at its
                 # last value (e.g. Ready) for the whole teardown.

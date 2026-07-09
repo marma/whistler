@@ -163,6 +163,47 @@ def test_authorized_keys_on_root_disk():
     assert "/etc/ssh/authorized_keys.d/%u" in sshd_conf["content"]
 
 
+# --- desktop mode (viewer=websockets VM images, e.g. vm-xfce-selkies) ----- #
+
+STREAMER_ENV = "/etc/whistler/streamer.env"
+
+
+def test_desktop_enables_per_user_session_unit():
+    # The image bakes whistler-desktop@.service but can't know the username;
+    # cloud-init enables it (enable --now, so CDI persistent-root guests
+    # restart the desktop on later boots too).
+    doc = _doc(desktop=True)
+    assert "systemctl enable --now whistler-desktop@alice.service" \
+        in doc["runcmd"]
+
+
+def test_desktop_streamer_env_written_and_streamer_kicked():
+    doc = _doc(desktop=True, display_port=9000,
+               streamer_env={"SELKIES_H264_STREAMING_MODE": "true"})
+    env = next(f for f in doc["write_files"] if f["path"] == STREAMER_ENV)
+    lines = env["content"].splitlines()
+    assert "SELKIES_H264_STREAMING_MODE=true" in lines
+    # SELKIES_PORT comes last: displayPort (what the Service/portal dial)
+    # must beat any streamerEnv override or the viewer can't connect.
+    assert lines[-1] == "SELKIES_PORT=9000"
+    # The baked streamer may already be up when runcmd runs; kick it so it
+    # rereads the env file.
+    assert "systemctl try-restart whistler-streamer.service" in doc["runcmd"]
+
+
+def test_desktop_without_env_skips_env_file_and_kick():
+    doc = _doc(desktop=True)
+    assert not any(f["path"] == STREAMER_ENV for f in doc["write_files"])
+    assert not any("whistler-streamer" in c for c in doc["runcmd"])
+
+
+def test_non_desktop_has_no_desktop_bits():
+    doc = _doc()
+    assert not any(f["path"] == STREAMER_ENV for f in doc["write_files"])
+    assert not any("whistler-desktop@" in c for c in doc["runcmd"])
+    assert not any("whistler-streamer" in c for c in doc["runcmd"])
+
+
 # --- resolve_uid fallback chain ------------------------------------------ #
 
 def test_resolve_uid_explicit_field_wins():

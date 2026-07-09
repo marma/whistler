@@ -1,0 +1,35 @@
+# Per-user XFCE session against the whistler-streamer display. Template unit:
+# the session user is created by cloud-init at first boot (the image can't
+# know it), so cloud-init also does `systemctl enable --now
+# whistler-desktop@<user>` once the user exists — enable (not just start) so
+# persistent-root (CDI) guests bring the desktop back on later boots.
+[Unit]
+Description=Whistler desktop session for %i
+Wants=whistler-streamer.service
+# Deliberately NOT ordered After=whistler-home.service (the SMB home mount,
+# written by cloud-init at runtime): it is a oneshot whose retry loop runs up
+# to 150s when the gateway is unreachable, and After= would keep this unit's
+# start job QUEUED (inactive, no logs, nothing to debug) that whole time.
+# The session script does its own bounded wait for the mountpoint and then
+# proceeds anyway — one place owns that policy.
+After=whistler-streamer.service systemd-user-sessions.service
+
+[Service]
+Type=simple
+User=%i
+# No WorkingDirectory=%h: pre-mount the home is the ROOT-OWNED 0700
+# mountpoint ("home not ready" signal, see whistler/cloudinit.py), so chdir
+# at spawn fails with status=200/CHDIR before the script even runs. The
+# session script cds into $HOME itself once the mount wait resolves — which
+# also means a pre-mount start never holds the soon-to-be-shadowed dir as
+# its cwd (the same reasoning as the getty respawn).
+Environment=DISPLAY=:0
+Environment=PULSE_SERVER=unix:/tmp/pulse/native
+ExecStart=/usr/local/bin/whistler-desktop-session
+# The session lifecycle mirrors the pod model: when XFCE exits, restart it
+# against the still-running display.
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

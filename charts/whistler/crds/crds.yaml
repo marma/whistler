@@ -120,7 +120,10 @@ spec:
                     Desktop-only. Extra env vars for the streamer sidecar, for
                     workload-dependent streaming knobs the sidecar cannot infer —
                     e.g. SELKIES_H264_STREAMING_MODE: "true" (required for GL
-                    compositors like GNOME Shell) or SELKIES_RESOLUTION.
+                    compositors like GNOME Shell) or SELKIES_RESOLUTION. For
+                    runtime=vm + viewer=websockets these reach the guest's
+                    baked-in streamer instead, written by cloud-init to
+                    /etc/whistler/streamer.env.
                 instancetype:
                   type: string
                   description: VM-only. KubeVirt instancetype name (e.g. "u1.medium").

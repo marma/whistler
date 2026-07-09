@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# XFCE session for a Whistler VM desktop, run as the session user by
+# whistler-desktop@<user>.service. The in-guest analog of
+# desktops/xfce-plain/entrypoint.sh: render to a display somebody else owns
+# (whistler-streamer.service here, the streamer sidecar in the pod model).
+set -e
+
+export DISPLAY="${DISPLAY:-:0}"
+export PULSE_SERVER="${PULSE_SERVER:-unix:/tmp/pulse/native}"
+
+# Wait for the streamer's X. Unit ordering (After=whistler-streamer.service)
+# only guarantees the service *started*, not that Xvfb finished coming up, so
+# keep the wait-and-fail-loudly guard; Restart=always turns a genuinely dead
+# display plane into a visible restart loop instead of a silent black screen.
+for i in $(seq 1 120); do
+  xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1 && break
+  [ "$i" = 1 ] && echo "[whistler-desktop] waiting for X display ${DISPLAY}..."
+  sleep 0.5
+done
+if ! xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1; then
+  echo "[whistler-desktop] ERROR: no X server on DISPLAY=${DISPLAY} after 60s" >&2
+  echo "[whistler-desktop] (is whistler-streamer.service running?)" >&2
+  exit 1
+fi
+
+# Wait for the network home (the SMB mount cloud-init sets up) before starting
+# the DE: XFCE writes its per-user state to $HOME immediately, and anything
+# written to the pre-mount root-owned mountpoint would be shadowed the moment
+# the share lands (same reasoning as the getty respawn in whistler/cloudinit.py).
+# Proceed after the timeout anyway — a broken-home desktop that renders is
+# more debuggable than a service that never starts.
+if ! mountpoint -q "$HOME"; then
+  echo "[whistler-desktop] waiting for $HOME to be mounted..."
+  for i in $(seq 1 90); do
+    mountpoint -q "$HOME" && break
+    sleep 1
+  done
+  mountpoint -q "$HOME" || \
+    echo "[whistler-desktop] WARNING: $HOME never mounted; starting anyway" >&2
+fi
+
+# cd only now (the unit deliberately has no WorkingDirectory: pre-mount the
+# home is a root-owned 0700 mountpoint and chdir at spawn would kill the
+# unit with status=200/CHDIR). If the home never mounted, / is an honest cwd.
+cd "$HOME" 2>/dev/null || cd /
+
+# dbus-launch gives the session its bus (logind-less: this is a systemd
+# *system* service with User=, not a PAM login session, so there is no
+# `systemd --user` and no XDG_RUNTIME_DIR — same shape as the pod images).
+exec dbus-launch --exit-with-session startxfce4

@@ -9,7 +9,11 @@ Selkies-2.x rounds that preceded it (all removed — see the banner in
 [`desktops/README.md`](../desktops/README.md) (the catalog + conventions).
 
 The display model is fixed: every desktop pod = one display-unaware workload
-container + the streamer sidecar. A **workload image** needs none of the
+container + the streamer sidecar. (`runtime: vm` desktops are the one
+exception — the sidecar can't cross the VM boundary, so
+[`desktops/vm-xfce-selkies`](../desktops/vm-xfce-selkies/) bakes the same
+stack into the guest; its README covers the differences. §§1, 4 and 5 apply
+to its in-guest streamer all the same.) A **workload image** needs none of the
 streaming stack — no Selkies, no Xvfb, no PulseAudio daemon; just a DE/app
 plus a session entrypoint against the injected `DISPLAY`/`PULSE_SERVER`
 ([`desktops/xfce-plain`](../desktops/xfce-plain/) is the minimal model,
