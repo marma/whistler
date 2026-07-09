@@ -1,12 +1,15 @@
 """cloud-init userData builder (whistler.cloudinit) — pure, no cluster."""
 import yaml
 
-from whistler.cloudinit import build_user_data, resolve_uid
+from whistler.cloudinit import build_user_data, resolve_uid, SMB_CREDENTIALS_PATH
+
+SMB_HOST = "whistler-storage-alice.whistler-user-alice.svc.cluster.local"
 
 
 def _doc(**overrides):
     args = dict(username="alice", uid=1001,
-                ssh_keys=["ssh-ed25519 AAA alice"], hostname="desk")
+                ssh_keys=["ssh-ed25519 AAA alice"], hostname="desk",
+                smb_host=SMB_HOST, smb_password="s3cret")
     args.update(overrides)
     text = build_user_data(**args)
     assert text.startswith("#cloud-config\n")
@@ -29,41 +32,127 @@ def test_no_default_user_entry():
     assert "default" not in doc["users"]
 
 
-def test_home_mounted_via_virtiofs_with_nofail():
+def test_home_mounted_via_cifs_from_gateway():
     (mount,) = _doc()["mounts"]
-    assert mount == ["home", "/home/alice", "virtiofs", "defaults,nofail", "0", "0"]
+    fs_spec, fs_file, fs_vfstype, fs_mntops, freq, passno = mount
+    assert fs_spec == f"//{SMB_HOST}/home"
+    assert fs_file == "/home/alice"
+    assert fs_vfstype == "cifs"
+    assert (freq, passno) == ("0", "0")
+    opts = fs_mntops.split(",")
+    # Server-side identity: uid=/gid=/*_mode shape the in-guest view only.
+    assert f"credentials={SMB_CREDENTIALS_PATH}" in opts
+    assert "vers=3.1.1" in opts
+    assert "seal" in opts
+    assert "uid=1001" in opts and "gid=1001" in opts
+    assert "file_mode=0664" in opts and "dir_mode=0775" in opts
+    assert "nosuid" in opts and "nodev" in opts
+    # hard (not soft): a gateway blip blocks I/O instead of corrupting it;
+    # nofail + _netdev keep first boot alive while cifs-utils installs.
+    assert "hard" in opts
+    assert "nofail" in opts and "_netdev" in opts
+
+
+def test_smb_credentials_root_only_on_root_disk():
+    doc = _doc()
+    creds = next(f for f in doc["write_files"]
+                 if f["path"] == SMB_CREDENTIALS_PATH)
+    assert creds["permissions"] == "0600"
+    assert "username=alice" in creds["content"]
+    assert "password=s3cret" in creds["content"]
+
+
+def test_no_package_install_and_mount_unit_armed():
+    # NO packages: [cifs-utils] — with the default locked-down egress apt
+    # burns ~50s timing out on unreachable mirrors, and the packages module
+    # runs before runcmd, delaying the mount that long past the login
+    # prompt. The raw kernel mount needs no helper. The unit is started
+    # non-blocking — its retry loop must not stall the rest of first boot —
+    # and enabled so persistent-root (CDI) guests remount on later boots.
+    doc = _doc()
+    assert "packages" not in doc
+    cmds = doc["runcmd"]
+    assert "systemctl enable whistler-home.service" in cmds
+    assert cmds[-1] == "systemctl start --no-block whistler-home.service"
+
+
+def test_bootcmd_kicks_mount_before_runcmd_stage():
+    # runcmd sits behind multi-user.target (snapd.seeded holds it ~30s on
+    # stock Ubuntu, well past the login prompt), so a detached bootcmd
+    # poller runs the mount script as soon as write_files lands it. It must
+    # detach (setsid, backgrounded) — bootcmd must never block boot.
+    (kick,) = _doc()["bootcmd"]
+    assert "/usr/local/sbin/whistler-mount-home" in kick
+    assert kick.startswith("setsid ")
+    assert kick.endswith("&")
+    # The pre-mount home stays root-owned on purpose ("not ready" signal):
+    # no chown/install anywhere in bootcmd.
+    assert "install" not in kick and "chown" not in kick
+
+
+def test_getty_respawned_after_mount_lands():
+    # A console shell opened pre-mount keeps the shadowed root-disk dir as
+    # its cwd forever; the mount script respawns the autologin getty after a
+    # successful mount so fresh consoles land in the real home.
+    script = next(f for f in _doc()["write_files"]
+                  if f["path"] == "/usr/local/sbin/whistler-mount-home")
+    assert "systemctl try-restart serial-getty@ttyS0.service" in script["content"]
+
+    no_autologin = next(f for f in _doc(autologin=False)["write_files"]
+                        if f["path"] == "/usr/local/sbin/whistler-mount-home")
+    assert "serial-getty" not in no_autologin["content"]
+
+
+def test_mount_unit_and_fallback_script_written():
+    doc = _doc()
+    unit = next(f for f in doc["write_files"]
+                if f["path"] == "/etc/systemd/system/whistler-home.service")
+    assert "ExecStart=/usr/local/sbin/whistler-mount-home" in unit["content"]
+    assert "WantedBy=multi-user.target" in unit["content"]
+
+    script = next(f for f in doc["write_files"]
+                  if f["path"] == "/usr/local/sbin/whistler-mount-home")
+    assert script["permissions"] == "0755"
+    body = script["content"]
+    # Prefers the fstab/mount.cifs path...
+    assert "command -v mount.cifs" in body
+    # ...and falls back to a raw kernel mount when cifs-utils is absent
+    # (locked-down egress: no package mirrors). The kernel can't resolve
+    # DNS or parse credentials=, so the script does both.
+    assert f"HOST={SMB_HOST}" in body
+    assert "getent hosts" in body
+    assert f". {SMB_CREDENTIALS_PATH}" in body
+    assert "ip=$ip,username=$username,password=$password" in body
+    assert "vers=3.1.1,seal" in body
+    # The fallback options must not carry the fstab-isms.
+    assert "nofail" not in body and "_netdev" not in body and \
+        "credentials=" not in body.replace(f". {SMB_CREDENTIALS_PATH}", "")
 
 
 def test_hostname_set():
     assert _doc()["hostname"] == "desk"
 
 
+AUTOLOGIN_DROPIN = "/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf"
+
+
 def test_serial_autologin_dropin():
     doc = _doc()
     dropin = next(f for f in doc["write_files"]
-                  if f["path"].startswith("/etc/systemd/"))
-    assert dropin["path"] == "/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf"
+                  if f["path"] == AUTOLOGIN_DROPIN)
     assert "--autologin alice" in dropin["content"]
     assert "systemctl daemon-reload" in doc["runcmd"]
 
 
 def test_autologin_disabled_omits_dropin():
     doc = _doc(autologin=False)
-    assert not any(f["path"].startswith("/etc/systemd/")
-                   for f in doc["write_files"])
+    assert not any(f["path"] == AUTOLOGIN_DROPIN for f in doc["write_files"])
     assert not any("serial-getty" in cmd for cmd in doc["runcmd"])
 
 
-def test_home_ownership_best_effort():
-    # Tolerant chown/chmod: unprivileged virtiofsd EPERMs them; must not
-    # fail the boot.
-    cmds = _doc()["runcmd"]
-    assert "chown 1001:1001 /home/alice 2>/dev/null || true" in cmds
-    assert "chmod 750 /home/alice 2>/dev/null || true" in cmds
-
-
 def test_authorized_keys_on_root_disk():
-    # Keys live on the root disk, not the virtiofs share (StrictModes).
+    # Keys live on the root disk, not the network-mounted home (StrictModes,
+    # and the share is absent for most of first boot).
     doc = _doc()
     keyfile = next(f for f in doc["write_files"]
                    if f["path"] == "/etc/ssh/authorized_keys.d/alice")

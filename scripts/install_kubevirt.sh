@@ -34,9 +34,12 @@ done
 [[ -n "$cr_applied" ]] || { echo "ERROR: could not apply the KubeVirt CR (CRD never registered)"; exit 1; }
 
 # One combined developerConfiguration patch: two separate merge-patches on
-# sibling keys would clobber each other. EnableVirtioFsStorageVolumes lets
-# Whistler expose the per-user home PVC into VMs as a virtiofs share
-# (replaces ExperimentalVirtiofsSupport, deprecated in v1.5, gone in v1.7).
+# sibling keys would clobber each other. EnableVirtioFsStorageVolumes allows
+# virtiofs-sharing PVCs into VMs (replaces ExperimentalVirtiofsSupport,
+# deprecated in v1.5, gone in v1.7). Whistler no longer uses virtiofs for VM
+# homes (the SMB storage gateway replaced it — unprivileged virtiofsd made
+# the share read-only for the guest user, kubevirt#13028); the gate is kept
+# for now pending removal of the whole virtiofs path.
 DEV_CONFIG='{"featureGates":["EnableVirtioFsStorageVolumes"]}'
 if [[ "${KUBEVIRT_USE_EMULATION:-}" == "1" ]]; then
   echo "==> Enabling emulation (no /dev/kvm on the nodes; VMs will be slow)"

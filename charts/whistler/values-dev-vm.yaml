@@ -13,7 +13,7 @@ whistler:
 
 templates:
   # containerDisk boot: the qcow2 ships inside an OCI image. Fast pull-and-boot,
-  # ephemeral root (home persists via the virtiofs-shared user PVC).
+  # ephemeral root (home persists on the user PVC via the SMB storage gateway).
   ubuntu-vm:
     description: "Ubuntu 24.04 VM (containerDisk, noVNC)"
     mode: desktop

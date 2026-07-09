@@ -1,0 +1,34 @@
+# Rendered by entrypoint.sh (@USER@ -> the Whistler username).
+#
+# Strict single-user home profile: server-side identity only. The client's
+# uids are never trusted; `force user` maps every operation to the user's
+# real account (created with their real uid at startup), so files land on
+# the PVC owned by that uid. The SMB3.1.1 POSIX-extensions profile for
+# future shared volumes is deliberately NOT enabled on this share.
+[global]
+   server role = standalone server
+   # SMB over TCP only — no NetBIOS/browsing legacy.
+   smb ports = 445
+   disable netbios = yes
+   server min protocol = SMB3_11
+   # Guests mount with `seal`; require it server-side too.
+   server smb encrypt = required
+   map to guest = never
+   restrict anonymous = 2
+   passdb backend = tdbsam
+   # No printing subsystem.
+   load printers = no
+   printing = bsd
+   printcap name = /dev/null
+   disable spoolss = yes
+
+[home]
+   path = /shares/home
+   valid users = @USER@
+   force user = @USER@
+   writeable = yes
+   browseable = yes
+   # What lands on the PVC (the guest's in-VM view comes from its cifs
+   # file_mode/dir_mode mount options, independent of this).
+   create mask = 0644
+   directory mask = 0755

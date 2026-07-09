@@ -12,7 +12,8 @@ def _manager():
     return cm
 
 
-def _build(**overrides):
+def _build_both(**overrides):
+    """(vm manifest, companion cloud-init Secret manifest)."""
     cm = _manager()
     args = dict(
         session_name="alice-desk",
@@ -20,15 +21,24 @@ def _build(**overrides):
         username="alice",
         uid="uid-123",
         template_spec={"image": "quay.io/example/desktop:latest"},
-        pvc_name="whistler-data-alice",
         display_port=5900,
         instancetype=None,
         preemptible=False,
+        smb_host="whistler-storage-alice.whistler-user-alice.svc.cluster.local",
+        smb_password="s3cret",
         user_details={"name": "alice", "uid": 1001,
                       "publicKeys": ["ssh-ed25519 AAA alice"]},
     )
     args.update(overrides)
     return cm._build_vm_spec(**args)
+
+
+def _build(**overrides):
+    return _build_both(**overrides)[0]
+
+
+def _cloud_init(**overrides):
+    return _build_both(**overrides)[1]["stringData"]["userdata"]
 
 
 def test_kind_apiversion_and_run_strategy():
@@ -62,28 +72,47 @@ def test_session_label_on_template_for_service_selection():
     assert labels["app"] == "whistler-desktop"
 
 
-def test_root_container_disk_and_home_virtiofs():
+def test_root_container_disk_and_no_home_attachment():
     spec = _build()["spec"]["template"]["spec"]
     volumes = spec["volumes"]
     root = next(v for v in volumes if v["name"] == "rootdisk")
-    home = next(v for v in volumes if v["name"] == "home")
     assert root["containerDisk"]["image"] == "quay.io/example/desktop:latest"
-    assert home["persistentVolumeClaim"]["claimName"] == "whistler-data-alice"
-    # The home PVC is a virtiofs *filesystem* device, not a disk: a
-    # filesystem-mode PVC attached as a disk expects a disk.img and would not
-    # share files with pod sessions on the same PVC.
+    # The home PVC is NOT attached to the VM (no virtiofs, no disk): it is
+    # mounted by the per-user storage gateway and reaches the guest as a
+    # cifs mount set up by cloud-init (kubevirt#13028 made virtiofs homes
+    # read-only for the guest user).
+    assert not any(v["name"] == "home" for v in volumes)
     devices = spec["domain"]["devices"]
-    assert devices["filesystems"] == [{"name": "home", "virtiofs": {}}]
+    assert "filesystems" not in devices
     disk_names = [d["name"] for d in devices["disks"]]
     assert "home" not in disk_names
 
 
-def test_cloud_init_volume_carries_identity():
-    spec = _build()["spec"]["template"]["spec"]
+def test_cloud_init_mounts_home_from_gateway():
+    user_data = _cloud_init()
+    assert "//whistler-storage-alice.whistler-user-alice.svc.cluster.local/home" in user_data
+    assert "cifs" in user_data
+    assert "s3cret" in user_data
+
+
+def test_cloud_init_travels_via_session_secret():
+    # KubeVirt caps inline cloudInitNoCloud userData at 2048 bytes and ours
+    # exceeds it, so the document lives in a per-session Secret referenced
+    # from the volume — which also keeps the SMB password out of the VM
+    # object. KubeVirt reads the `userdata` key.
+    vm, secret = _build_both()
+    spec = vm["spec"]["template"]["spec"]
     disk_names = [d["name"] for d in spec["domain"]["devices"]["disks"]]
     assert "cloudinit" in disk_names
     ci = next(v for v in spec["volumes"] if v["name"] == "cloudinit")
-    user_data = ci["cloudInitNoCloud"]["userData"]
+    assert ci["cloudInitNoCloud"] == {"secretRef": {"name": "alice-desk-cloudinit"}}
+    assert "userData" not in ci["cloudInitNoCloud"]
+
+    assert secret["metadata"]["name"] == "alice-desk-cloudinit"
+    # Same Session ownership as the VM: GC'd with the session.
+    owner = secret["metadata"]["ownerReferences"][0]
+    assert owner["kind"] == "Session" and owner["uid"] == "uid-123"
+    user_data = secret["stringData"]["userdata"]
     assert user_data.startswith("#cloud-config")
     assert "alice" in user_data
     assert "'1001'" in user_data or "1001" in user_data
@@ -91,25 +120,18 @@ def test_cloud_init_volume_carries_identity():
 
 
 def test_portal_access_key_appended_to_guest_keys():
-    vm = _build(portal_public_key="ssh-ed25519 PORTALKEY whistler-portal-alice")
-    user_data = _cloud_init(vm)
+    user_data = _cloud_init(
+        portal_public_key="ssh-ed25519 PORTALKEY whistler-portal-alice")
     # Both the user's own key and the portal's web-terminal key are authorized.
     assert "ssh-ed25519 AAA alice" in user_data
     assert "ssh-ed25519 PORTALKEY whistler-portal-alice" in user_data
 
 
 def test_uid_falls_back_to_run_as_user_then_1000():
-    via_sec_ctx = _build(user_details={"name": "alice",
-                                       "securityContext": {"runAsUser": 1234},
-                                       "publicKeys": []})
-    assert "1234" in _cloud_init(via_sec_ctx)
-    bare = _build(user_details={"name": "alice"})
-    assert "1000" in _cloud_init(bare)
-
-
-def _cloud_init(vm):
-    volumes = vm["spec"]["template"]["spec"]["volumes"]
-    return next(v for v in volumes if v["name"] == "cloudinit")["cloudInitNoCloud"]["userData"]
+    assert "1234" in _cloud_init(user_details={
+        "name": "alice", "securityContext": {"runAsUser": 1234},
+        "publicKeys": []})
+    assert "1000" in _cloud_init(user_details={"name": "alice"})
 
 
 def test_image_url_uses_data_volume_template():

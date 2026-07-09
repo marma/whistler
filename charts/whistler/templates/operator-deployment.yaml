@@ -43,6 +43,13 @@ spec:
               value: {{ .Values.whistler.security.kataRuntimeClass | quote }}
             - name: WHISTLER_STREAMER_IMAGE
               value: {{ .Values.whistler.streamer.image | quote }}
+            - name: WHISTLER_STORAGE_GATEWAY_IMAGE
+              value: {{ .Values.whistler.storageGateway.image | quote }}
+            # Maps travel as JSON (parsed by KubeConfigManager._env_json).
+            - name: WHISTLER_STORAGE_GATEWAY_NODE_SELECTOR
+              value: {{ .Values.whistler.storageGateway.nodeSelector | toJson | quote }}
+            - name: WHISTLER_STORAGE_GATEWAY_RESOURCES
+              value: {{ .Values.whistler.storageGateway.resources | toJson | quote }}
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
           # ensure_pod() runs here now, so the operator needs the same user and

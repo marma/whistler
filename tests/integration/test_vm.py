@@ -46,6 +46,31 @@ def _apis():
     return client.CustomObjectsApi(), client.CoreV1Api(), client.ApiextensionsV1Api()
 
 
+def _assert_storage_gateway(custom, core):
+    """The per-user SMB gateway (home PVC export — replaces virtiofs) must be
+    provisioned lazily with the first vm session: Secret + Deployment +
+    Service + fencing NetworkPolicy, and the VM's cloud-init must mount the
+    share from it. (The actual write path — guest write lands uid-correct on
+    the PVC — is covered by live verification; it needs a booted guest.)"""
+    from kubernetes import client
+
+    gateway = f"whistler-storage-{USER}"
+    sec = core.read_namespaced_secret(f"whistler-smb-{USER}", USER_NS)
+    assert sec.data.get("password")
+
+    apps = client.AppsV1Api()
+    deploy = apps.read_namespaced_deployment(gateway, USER_NS)
+    assert deploy.spec.strategy.type == "Recreate"
+    svc = core.read_namespaced_service(gateway, USER_NS)
+    assert svc.spec.ports[0].port == 445
+
+    net = client.NetworkingV1Api()
+    policy = net.read_namespaced_network_policy(
+        "whistler-storage-gateway", USER_NS)
+    assert policy.spec.pod_selector.match_labels == {
+        "app": "whistler-storage-gateway"}
+
+
 def _require_crd(ext_api, name, why):
     from kubernetes.client.rest import ApiException
     try:
@@ -133,6 +158,26 @@ def _run_vm_session(template_spec, template_name, session_short, observe=None):
 
         svc = core.read_namespaced_service(session, USER_NS)
         assert svc.spec.type == "ClusterIP"
+
+        _assert_storage_gateway(custom, core)
+
+        # The home is a cifs mount of the gateway share, not a VM-attached
+        # PVC (virtiofs is gone — kubevirt#13028). The cloud-init document
+        # travels via a per-session Secret (KubeVirt's 2048-byte inline cap;
+        # keeps the SMB password out of the VM object).
+        vm = custom.get_namespaced_custom_object(
+            "kubevirt.io", "v1", USER_NS, "virtualmachines", session)
+        vm_spec = vm["spec"]["template"]["spec"]
+        assert not any(v.get("persistentVolumeClaim")
+                       for v in vm_spec["volumes"])
+        assert "filesystems" not in vm_spec["domain"]["devices"]
+        ci = next(v for v in vm_spec["volumes"] if v["name"] == "cloudinit")
+        assert ci["cloudInitNoCloud"] == {
+            "secretRef": {"name": f"{session}-cloudinit"}}
+        import base64
+        ci_secret = core.read_namespaced_secret(f"{session}-cloudinit", USER_NS)
+        user_data = base64.b64decode(ci_secret.data["userdata"]).decode()
+        assert f"//whistler-storage-{USER}.{USER_NS}.svc.cluster.local/home" in user_data
     finally:
         for delete in (
             lambda: custom.delete_namespaced_custom_object(

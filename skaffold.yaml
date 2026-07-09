@@ -20,6 +20,10 @@ build:
       context: desktops/streamer-selkies2
       docker:
         dockerfile: Dockerfile
+    - image: whistler-storage-gateway
+      context: images/storage-gateway
+      docker:
+        dockerfile: Dockerfile
 deploy:
   helm:
     releases:
@@ -65,6 +69,8 @@ deploy:
           templates.gnome-desktop.image: "{{.IMAGE_REPO_whistler_desktop_gnome_plain}}:{{.IMAGE_TAG_whistler_desktop_gnome_plain}}"
           # The streamer sidecar image the operator injects into every desktop pod.
           whistler.streamer.image: "{{.IMAGE_REPO_whistler_streamer_selkies2}}:{{.IMAGE_TAG_whistler_streamer_selkies2}}"
+          # The per-user SMB storage gateway (VM homes).
+          whistler.storageGateway.image: "{{.IMAGE_REPO_whistler_storage_gateway}}:{{.IMAGE_TAG_whistler_storage_gateway}}"
           # Use the locally-built desktop images as the enforced desktop allow-list,
           # so the operator accepts them and the management UI picker shows the
           # actual build outputs (replaces the production defaults in values.yaml).
