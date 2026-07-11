@@ -21,3 +21,57 @@ code {
   word-break: break-all;
   line-height: 1.5;
 }
+
+/* Dashboard resource meters: a fixed-color track (free) with used segments
+   (whistler / whistler-preemptible / other) laid on top, left to right. The
+   3 used colors + track are the same across every meter (CPU, RAM, each GPU
+   type) so color always means the same thing. */
+.resource-meter { margin-bottom: 1.75rem; }
+.resource-meter-header {
+  display: flex;
+  justify-content: space-between;
+  font-weight: bold;
+  margin-bottom: .4rem;
+}
+.resource-meter-header .meta {
+  font-weight: normal;
+  color: #767676;
+}
+.resource-meter-bar {
+  display: flex;
+  height: 20px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: #e0e1e2;
+}
+.resource-meter-bar .seg {
+  height: 100%;
+  border-right: 2px solid #fff;
+}
+.resource-meter-bar .seg:last-child {
+  border-right: none;
+}
+.resource-meter-bar .seg.whistler { background: #00b5ad; }
+.resource-meter-bar .seg.preemptible { background: #f2711c; }
+.resource-meter-bar .seg.other { background: #6435c9; }
+
+.resource-legend {
+  display: flex;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  font-size: .85rem;
+  color: #555;
+  margin-bottom: 1.5rem;
+}
+.resource-legend .swatch {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  margin-right: .4rem;
+  vertical-align: middle;
+}
+.resource-legend .swatch.whistler { background: #00b5ad; }
+.resource-legend .swatch.preemptible { background: #f2711c; }
+.resource-legend .swatch.other { background: #6435c9; }
+.resource-legend .swatch.free { background: #e0e1e2; border: 1px solid #ccc; }

@@ -1,0 +1,21 @@
+{# Expects: title (str), view (dict from management._resource_meter_view) #}
+<div class="resource-meter">
+  <div class="resource-meter-header">
+    <span>{{ title }}</span>
+    <span class="meta">{{ view.used }} / {{ view.total }} {{ view.unit }} used</span>
+  </div>
+  <div class="resource-meter-bar">
+    {% if view.parts.whistler > 0 %}
+    <div class="seg whistler" style="width:{{ view.pct.whistler }}%"
+         title="Used by Whistler: {{ view.parts.whistler }} {{ view.unit }}"></div>
+    {% endif %}
+    {% if view.parts.whistlerPreemptible > 0 %}
+    <div class="seg preemptible" style="width:{{ view.pct.whistlerPreemptible }}%"
+         title="Used by Whistler (preemptible): {{ view.parts.whistlerPreemptible }} {{ view.unit }}"></div>
+    {% endif %}
+    {% if view.parts.other > 0 %}
+    <div class="seg other" style="width:{{ view.pct.other }}%"
+         title="Used by other processes: {{ view.parts.other }} {{ view.unit }}"></div>
+    {% endif %}
+  </div>
+</div>

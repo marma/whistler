@@ -392,6 +392,55 @@ async def instance_delete(request: Request, cm: CM, user: User, name: str):
 # Admin — overview                                                             #
 # --------------------------------------------------------------------------- #
 
+def _resource_meter_view(summary: dict, *, unit: str, to_display=float, decimals: int = 1) -> dict:
+    """Turn a get_cluster_resources() summary ({total, free, whistler,
+    whistlerPreemptible, other}) into pre-computed display values + bar
+    percentages, so the dashboard template stays free of arithmetic."""
+    parts = {k: to_display(summary[k]) for k in ("whistler", "whistlerPreemptible", "other", "free")}
+    total = to_display(summary["total"])
+    pct = {k: (v / total * 100 if total else 0) for k, v in parts.items()}
+    return {
+        "unit": unit,
+        "total": round(total, decimals),
+        "used": round(total - parts["free"], decimals),
+        "parts": {k: round(v, decimals) for k, v in parts.items()},
+        "pct": pct,
+    }
+
+
+def _dashboard_resource_views(resources: dict) -> dict:
+    """Build the CPU/memory/per-GPU-type meter view-models for dashboard.html."""
+    return {
+        "cpu": _resource_meter_view(resources["cpu"], unit="cores"),
+        "memory": _resource_meter_view(
+            resources["memory"], unit="GiB", to_display=lambda v: float(v) / (1024 ** 3)),
+        "gpus": [
+            {"type": g["type"], **_resource_meter_view(g, unit="GPUs", to_display=int, decimals=0)}
+            for g in resources["gpus"]
+        ],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Dashboard — cluster-wide capacity + running instances (all users)           #
+# --------------------------------------------------------------------------- #
+
+async def dashboard(request: Request, cm: CM, user: User, is_admin: IsAdmin):
+    resources, all_instances = await asyncio.gather(
+        request.app.state.run(cm.get_cluster_resources),
+        request.app.state.run(cm.get_all_instances),
+    )
+    running = sorted(
+        (i for i in all_instances if i.get("status") == "Running"),
+        key=lambda i: (i["username"], i["name"]),
+    )
+    return templates.TemplateResponse(
+        request=request, name="dashboard.html",
+        context=_ctx(user, is_admin=is_admin, res=_dashboard_resource_views(resources),
+                     running_instances=running),
+    )
+
+
 async def admin_index(request: Request, cm: CM, admin: Admin):
     all_instances = await request.app.state.run(cm.get_all_instances)
     all_users     = await request.app.state.run(cm.list_all_users)
@@ -815,6 +864,7 @@ def build_management_app(config_manager):
 
     # User routes
     app.add_api_route("/",                                user_index,            methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/dashboard",                       dashboard,             methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/instances/new",                   instance_create_form,  methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/instances",                       instance_create,       methods=["POST"])
     app.add_api_route("/instances/{name}",                instance_detail,       methods=["GET"],  response_class=HTMLResponse)

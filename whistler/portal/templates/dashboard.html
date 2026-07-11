@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Whistler{% endblock %}
+{% block content %}
+
+<h2 class="ui header">
+  <i class="tachometer alternate icon"></i>
+  <div class="content">Dashboard</div>
+</h2>
+
+<div class="resource-legend">
+  <span><span class="swatch whistler"></span>Used by Whistler</span>
+  <span><span class="swatch preemptible"></span>Used by Whistler (preemptible)</span>
+  <span><span class="swatch other"></span>Used by other processes</span>
+  <span><span class="swatch free"></span>Free</span>
+</div>
+
+{% with title="CPU", view=res.cpu %}
+{% include "_resource_meter.html" %}
+{% endwith %}
+
+{% with title="Memory", view=res.memory %}
+{% include "_resource_meter.html" %}
+{% endwith %}
+
+<h3 class="ui header" style="margin-top:2rem">
+  <i class="microchip icon"></i>
+  <div class="content">GPUs</div>
+</h3>
+{% if res.gpus %}
+  {% for gpu in res.gpus %}
+  {% with title=gpu.type, view=gpu %}
+  {% include "_resource_meter.html" %}
+  {% endwith %}
+  {% endfor %}
+{% else %}
+<p style="color:#767676">No GPU-capable nodes detected.</p>
+{% endif %}
+
+<h3 class="ui header" style="margin-top:2rem">
+  <i class="play icon"></i>
+  <div class="content">Running Instances</div>
+</h3>
+{% if running_instances %}
+<table class="ui celled table">
+  <thead>
+    <tr>
+      <th>User</th>
+      <th>Name</th>
+      <th>Template</th>
+      <th class="collapsing">Preemptible</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for inst in running_instances %}
+    <tr>
+      <td>{{ inst.username }}</td>
+      <td>{{ inst.name }}</td>
+      <td>{{ inst.template or "—" }}</td>
+      <td class="collapsing">{{ "Yes" if inst.preemptible else "No" }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p style="color:#767676">No instances currently running.</p>
+{% endif %}
+
+{% endblock %}

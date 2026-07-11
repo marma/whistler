@@ -132,6 +132,10 @@ class FakeConfigManager(ConfigManager):
                 result.append({"username": username, **inst})
         return result
 
+    def get_cluster_resources(self):
+        zero = {"total": 0, "free": 0, "whistler": 0, "whistlerPreemptible": 0, "other": 0}
+        return {"cpu": dict(zero), "memory": dict(zero), "gpus": []}
+
     def save_system_template(self, template_data):
         return True
 

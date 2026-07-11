@@ -18,6 +18,10 @@
        href="/?user={{ current_user }}">
       <i class="th icon"></i> My Instances
     </a>
+    <a class="item {% if request.url.path == '/dashboard' %}active{% endif %}"
+       href="/dashboard?user={{ current_user }}">
+      <i class="tachometer alternate icon"></i> Dashboard
+    </a>
     {% if is_admin %}
     <a class="item {% if request.url.path.startswith('/admin') %}active{% endif %}"
        href="/admin?user={{ current_user }}">

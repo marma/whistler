@@ -180,6 +180,11 @@ rules:
     resources: [pods]
     verbs: [get, list, watch, delete]
 
+  # Dashboard tab: node allocatable CPU/memory/GPU capacity.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list]
+
   # Web terminal: the portal shells out to `kubectl exec` into the session pod
   # (whistler.portal.terminal), so it needs the pods/exec subresource — same
   # grant the SSH server has for its interactive shells.

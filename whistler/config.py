@@ -1,11 +1,13 @@
 
 import logging
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from abc import ABC, abstractmethod
 from kubernetes import client, config as k8s_config
 from kubernetes.client import CoreV1Api, NetworkingV1Api
 from kubernetes.client.rest import ApiException
+from kubernetes.utils import parse_quantity
 import ipaddress
 import os
 import yaml
@@ -180,6 +182,11 @@ class ConfigManager(ABC):
 
     @abstractmethod
     def get_all_instances(self) -> List[Dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    def get_cluster_resources(self) -> Dict[str, Any]:
+        """Cluster-wide CPU/memory/GPU capacity vs requests, for the Dashboard tab."""
         pass
 
     @abstractmethod
@@ -2411,6 +2418,161 @@ class KubeConfigManager(ConfigManager):
                 if e.status != 404:
                     logger.error(f"Failed to list instances in {ns}: {e}")
         return instances
+
+    def get_cluster_resources(self) -> Dict[str, Any]:
+        """Cluster-wide capacity snapshot for the Dashboard tab: total CPU/RAM
+        and per-GPU-type counts, each split into free / used by whistler /
+        used by whistler (preemptible) / used by other workloads.
+
+        Accounting is by resource *requests* (the scheduler's own ledger),
+        not live utilization — the only option for GPUs, which have no
+        fractional usage metric, so CPU/RAM use the same method for one
+        consistent story.
+
+        Gathers raw node/pod data from the API, then hands the arithmetic to
+        the pure ``_summarize_cluster_resources`` (see there for the payload
+        shapes).
+        """
+        core_api = client.CoreV1Api()
+
+        try:
+            node_items = core_api.list_node().items
+        except ApiException as e:
+            logger.error(f"Failed to list nodes: {e}")
+            node_items = []
+
+        # GPU_NODE_LABEL is the node label the gpuType nodeSelector templates
+        # and overrides request GPUs by (see save_system_template / gpuType
+        # overrides) — used below both for node GPU totals and, as a
+        # fallback, to type a scheduled pod's GPU request.
+        node_gpu_type: Dict[str, Optional[str]] = {}
+        nodes = []
+        for node in node_items:
+            allocatable = node.status.allocatable or {}
+            gpu_type = (node.metadata.labels or {}).get(GPU_NODE_LABEL)
+            node_gpu_type[node.metadata.name] = gpu_type
+            nodes.append({
+                "cpu": allocatable.get("cpu", "0"),
+                "memory": allocatable.get("memory", "0"),
+                "gpuType": gpu_type,
+                "gpuCount": allocatable.get("nvidia.com/gpu", "0"),
+            })
+
+        try:
+            managed_namespaces = {
+                ns.metadata.name for ns in core_api.list_namespace(
+                    label_selector="whistler.martinmalmsten.net/managed=true").items
+            }
+        except ApiException as e:
+            logger.error(f"Failed to list managed namespaces: {e}")
+            managed_namespaces = set()
+
+        # Whether a Session is preemptible only lives on the Session CR: the
+        # VM backend (unlike the plain-pod one) never carries it onto the
+        # actual pod/VMI (see _build_vm_spec), so the running workload can't
+        # be asked directly.
+        preemptible_sessions = set()
+        try:
+            sessions = self.api.list_cluster_custom_object(self.group, self.version, SESSION_PLURAL)
+            for item in sessions.get("items", []):
+                if item.get("spec", {}).get("preemptible"):
+                    preemptible_sessions.add(item["metadata"]["name"])
+        except ApiException as e:
+            logger.error(f"Failed to list sessions: {e}")
+
+        try:
+            pod_items = core_api.list_pod_for_all_namespaces().items
+        except ApiException as e:
+            logger.error(f"Failed to list pods: {e}")
+            pod_items = []
+
+        pod_requests = []
+        for pod in pod_items:
+            if pod.status.phase in ("Succeeded", "Failed") or pod.metadata.deletion_timestamp:
+                continue
+            labels = pod.metadata.labels or {}
+            if pod.metadata.namespace in managed_namespaces:
+                session_name = labels.get("session") or labels.get("instance")
+                bucket = "whistlerPreemptible" if session_name in preemptible_sessions else "whistler"
+            else:
+                bucket = "other"
+
+            gpu_type = (pod.spec.node_selector or {}).get(GPU_NODE_LABEL) \
+                or node_gpu_type.get(pod.spec.node_name)
+
+            cpu = Decimal(0)
+            memory = Decimal(0)
+            gpu_count = 0
+            for container in (pod.spec.containers or []):
+                requests = (container.resources and container.resources.requests) or {}
+                if "cpu" in requests:
+                    cpu += parse_quantity(requests["cpu"])
+                if "memory" in requests:
+                    memory += parse_quantity(requests["memory"])
+                if "nvidia.com/gpu" in requests:
+                    gpu_count += int(parse_quantity(requests["nvidia.com/gpu"]))
+
+            pod_requests.append({
+                "bucket": bucket, "cpu": cpu, "memory": memory,
+                "gpuType": gpu_type, "gpuCount": gpu_count,
+            })
+
+        return self._summarize_cluster_resources(nodes, pod_requests)
+
+    def _summarize_cluster_resources(self, nodes: List[Dict[str, Any]],
+                                     pod_requests: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Pure aggregation behind get_cluster_resources — no API calls, so
+        it's testable with plain dicts.
+
+        ``nodes``: one entry per node with raw allocatable quantities, e.g.
+        ``{"cpu": "4", "memory": "16Gi", "gpuType": "A100" | None, "gpuCount": "2"}``.
+        ``pod_requests``: one entry per non-terminal pod, already summed
+        across its own containers, with the ownership bucket
+        (``"whistler" | "whistlerPreemptible" | "other"``) and GPU type
+        already resolved, e.g.
+        ``{"bucket": "whistler", "cpu": Decimal("0.5"), "memory": Decimal(2**30), "gpuType": "A100", "gpuCount": 1}``.
+
+        Returns ``{"cpu": summary, "memory": summary, "gpus": [{"type": ..., **summary}, ...]}``
+        where a ``summary`` is ``{"total", "free", "whistler", "whistlerPreemptible", "other"}``.
+        """
+        buckets = ("whistler", "whistlerPreemptible", "other")
+
+        cpu_total = sum((parse_quantity(n.get("cpu", 0)) for n in nodes), Decimal(0))
+        mem_total = sum((parse_quantity(n.get("memory", 0)) for n in nodes), Decimal(0))
+        gpu_total: Dict[str, int] = {}
+        for n in nodes:
+            count = int(parse_quantity(n.get("gpuCount", 0)))
+            if count:
+                gpu_type = n.get("gpuType") or "unknown"
+                gpu_total[gpu_type] = gpu_total.get(gpu_type, 0) + count
+
+        cpu_used = {b: Decimal(0) for b in buckets}
+        mem_used = {b: Decimal(0) for b in buckets}
+        gpu_used: Dict[str, Dict[str, int]] = {}
+        for req in pod_requests:
+            bucket = req["bucket"]
+            cpu_used[bucket] += parse_quantity(req.get("cpu", 0))
+            mem_used[bucket] += parse_quantity(req.get("memory", 0))
+            gpu_count = int(req.get("gpuCount") or 0)
+            if gpu_count:
+                gpu_type = req.get("gpuType") or "unknown"
+                gpu_used.setdefault(gpu_type, {b: 0 for b in buckets})[bucket] += gpu_count
+
+        def _summary(total, used):
+            free = total - sum(used.values())
+            return {"total": total, "free": free if free > 0 else type(total)(0), **used}
+
+        gpus = [
+            {"type": gpu_type, **_summary(gpu_total.get(gpu_type, 0),
+                                          gpu_used.get(gpu_type, {b: 0 for b in buckets}))}
+            for gpu_type in sorted(set(gpu_total) | set(gpu_used))
+        ]
+
+        return {
+            "cpu": _summary(cpu_total, cpu_used),
+            "memory": _summary(mem_total, mem_used),
+            "gpus": gpus,
+        }
 
     def save_system_template(self, template_data: Dict[str, Any]) -> bool:
         name = template_data.get("name")
