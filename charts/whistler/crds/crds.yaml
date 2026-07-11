@@ -165,6 +165,45 @@ spec:
                   type: string
                 preemptible:
                   type: boolean
+                overrides:
+                  type: object
+                  description: >-
+                    Per-session requests to deviate from the template's baked
+                    values. Each field is honored only if the owning user's
+                    users.yaml `overrides` grants that group; requesting an
+                    ungranted field is a hard PolicyError (see
+                    KubeConfigManager._apply_overrides). gpuType and volumes
+                    are additionally checked against allowedGpuTypes /
+                    allowedVolumes, same as a template-baked value.
+                  properties:
+                    resources:
+                      type: object
+                      properties:
+                        cpu:
+                          type: string
+                        memory:
+                          type: string
+                    gpuType:
+                      type: string
+                    gpuCount:
+                      type: integer
+                    uid:
+                      type: integer
+                    gid:
+                      type: integer
+                    securityContext:
+                      type: object
+                      properties:
+                        fsGroup:
+                          type: integer
+                        runAsUser:
+                          type: integer
+                        runAsGroup:
+                          type: integer
+                    volumes:
+                      type: object
+                      additionalProperties:
+                        type: string
             status:
               type: object
               properties:

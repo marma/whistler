@@ -59,6 +59,7 @@ STREAMER_ENV_PATH = "/etc/whistler/streamer.env"
 
 def build_user_data(*, username: str, uid: int, ssh_keys: list,
                     hostname: str, smb_host: str, smb_password: str,
+                    gid: int = None,
                     autologin: bool = True, desktop: bool = False,
                     streamer_env: dict = None,
                     display_port: int = None) -> str:
@@ -82,6 +83,7 @@ def build_user_data(*, username: str, uid: int, ssh_keys: list,
     """
     home = f"/home/{username}"
     keys = list(ssh_keys or [])
+    gid = uid if gid is None else gid
     # Mount options: server-side identity means the client-side uid=/gid=/
     # *_mode only shape the in-guest VIEW (what lands on the PVC is decided
     # by the gateway's force user + masks). vers=3.1.1 + seal to match the
@@ -89,7 +91,7 @@ def build_user_data(*, username: str, uid: int, ssh_keys: list,
     # hard (not soft) so a gateway blip blocks I/O instead of corrupting it;
     # nofail + _netdev so boot survives the gateway being unreachable.
     base_opts = (
-        f"vers=3.1.1,seal,uid={uid},gid={uid},"
+        f"vers=3.1.1,seal,uid={uid},gid={gid},"
         "file_mode=0664,dir_mode=0775,nosuid,nodev,hard"
     )
     mount_opts = (
@@ -270,3 +272,16 @@ def resolve_uid(user_details) -> int:
     if uid is None:
         uid = 1000
     return int(uid)
+
+
+def resolve_gid(user_details) -> int:
+    """POSIX gid for the guest's SMB mount view: explicit ``gid`` field, else
+    the pod securityContext's runAsGroup, else the resolved uid (single-user-
+    group convention, matching the guest's own user-private group)."""
+    user_details = user_details or {}
+    gid = user_details.get("gid")
+    if gid is None:
+        gid = (user_details.get("securityContext") or {}).get("runAsGroup")
+    if gid is None:
+        gid = resolve_uid(user_details)
+    return int(gid)

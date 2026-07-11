@@ -1,18 +1,19 @@
 """Operator-authoritative policy (KubeConfigManager._apply_policy).
 
 Covers the image allow-list (enforced for desktop mode and vm runtime, skipped
-for ssh container/kata) and the privileged->kata coercion gated by
-forceKataForPrivileged."""
+for ssh container/kata), the privileged->kata coercion gated by
+forceKataForPrivileged, and the per-user GPU-type/volumes allow-lists."""
 import pytest
 
 from whistler.config import KubeConfigManager, PolicyError
 
 
-def _manager(*, force_kata=False, images=None):
+def _manager(*, force_kata=False, images=None, users=None):
     cm = KubeConfigManager.__new__(KubeConfigManager)  # skip __init__ (no cluster)
     cm.force_kata_for_privileged = force_kata
     cm.kata_runtime_class = "kata"
     cm.images = images or {"ssh": [], "desktop": [], "vm": []}
+    cm.users = users or {}
     return cm
 
 
@@ -91,3 +92,70 @@ def test_coercion_to_kata_keeps_desktop_image_check():
     assert cm._apply_policy({"image": "good:1", "privileged": True}, "desktop", "container") == "kata"
     with pytest.raises(PolicyError):
         cm._apply_policy({"image": "bad:1", "privileged": True}, "desktop", "container")
+
+
+# --- GPU type allow-list -------------------------------------------------- #
+
+def test_gpu_type_allowed_when_no_username_given():
+    # No username (e.g. called without operator context) skips the check
+    # entirely rather than failing closed.
+    cm = _manager()
+    spec = {"image": "x", "nodeSelector": {"accelerator": "A100-SXM4-40GB"}}
+    assert cm._apply_policy(spec, "ssh", "container") == "container"
+
+
+def test_gpu_type_allowed_when_user_has_no_allow_list():
+    # Absent/empty allowedGpuTypes means "no restriction".
+    cm = _manager(users={"alice": {"name": "alice"}})
+    spec = {"image": "x", "nodeSelector": {"accelerator": "A100-SXM4-40GB"}}
+    assert cm._apply_policy(spec, "ssh", "container", "alice") == "container"
+
+
+def test_gpu_type_allowed_when_in_users_allow_list():
+    cm = _manager(users={"alice": {"name": "alice", "allowedGpuTypes": ["A100-SXM4-40GB"]}})
+    spec = {"image": "x", "nodeSelector": {"accelerator": "A100-SXM4-40GB"}}
+    assert cm._apply_policy(spec, "ssh", "container", "alice") == "container"
+
+
+def test_gpu_type_rejected_when_not_in_users_allow_list():
+    cm = _manager(users={"alice": {"name": "alice", "allowedGpuTypes": ["nvidia-tesla-p100"]}})
+    spec = {"image": "x", "nodeSelector": {"accelerator": "A100-SXM4-40GB"}}
+    with pytest.raises(PolicyError):
+        cm._apply_policy(spec, "ssh", "container", "alice")
+
+
+def test_no_gpu_requested_skips_check_even_with_allow_list():
+    cm = _manager(users={"alice": {"name": "alice", "allowedGpuTypes": ["nvidia-tesla-p100"]}})
+    assert cm._apply_policy({"image": "x"}, "ssh", "container", "alice") == "container"
+
+
+# --- volumes allow-list --------------------------------------------------- #
+
+def test_volumes_allowed_when_no_username_given():
+    cm = _manager()
+    spec = {"image": "x", "volumes": {"scratch": "/mnt/scratch"}}
+    assert cm._apply_policy(spec, "ssh", "container") == "container"
+
+
+def test_volumes_allowed_when_user_has_no_allow_list():
+    cm = _manager(users={"alice": {"name": "alice"}})
+    spec = {"image": "x", "volumes": {"scratch": "/mnt/scratch"}}
+    assert cm._apply_policy(spec, "ssh", "container", "alice") == "container"
+
+
+def test_volumes_allowed_when_in_users_allow_list():
+    cm = _manager(users={"alice": {"name": "alice", "allowedVolumes": ["scratch"]}})
+    spec = {"image": "x", "volumes": {"scratch": "/mnt/scratch"}}
+    assert cm._apply_policy(spec, "ssh", "container", "alice") == "container"
+
+
+def test_volumes_rejected_when_not_in_users_allow_list():
+    cm = _manager(users={"alice": {"name": "alice", "allowedVolumes": ["scratch"]}})
+    spec = {"image": "x", "volumes": {"other": "/mnt/other"}}
+    with pytest.raises(PolicyError):
+        cm._apply_policy(spec, "ssh", "container", "alice")
+
+
+def test_no_volumes_requested_skips_check_even_with_allow_list():
+    cm = _manager(users={"alice": {"name": "alice", "allowedVolumes": ["scratch"]}})
+    assert cm._apply_policy({"image": "x"}, "ssh", "container", "alice") == "container"

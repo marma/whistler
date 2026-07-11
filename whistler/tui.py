@@ -201,10 +201,25 @@ class TemplateEditScreen(ModalScreen):
         super().__init__()
         self.template = template or {}
 
+    def _allowed_gpu_types(self):
+        """GPU types offered in the picker: the whistler.gpuTypes catalog,
+        filtered by the current user's allowedGpuTypes when they have a
+        non-empty allow-list configured (empty/absent = no restriction)."""
+        cm = self.app.config_manager
+        if not cm:
+            return []
+        catalog = cm.get_gpu_types() or []
+        allowed = cm.get_user_allowed_gpu_types(self.app.username) if self.app.username else []
+        if not allowed:
+            return catalog
+        return [g for g in catalog if g in allowed]
+
     def compose(self) -> ComposeResult:
         resources = self.template.get("resources", {})
         node_selector = self.template.get("nodeSelector", {})
-        
+        gpu_types = self._allowed_gpu_types()
+        gpu_type_current = node_selector.get("accelerator")
+
         # Get selectors from config
         selectors_list = self.app.config_manager.get_selectors() if self.app.config_manager else []
         
@@ -248,7 +263,13 @@ class TemplateEditScreen(ModalScreen):
                 Input(value=resources.get("cpu", ""), placeholder="e.g. 500m", id="cpu"),
                 Label("Memory:"),
                 Input(value=resources.get("memory", ""), placeholder="e.g. 512Mi", id="memory"),
-                Label("GPU (optional):"),
+                Label("GPU Type (optional):"),
+                Select(
+                    [(g, g) for g in gpu_types],
+                    value=gpu_type_current if gpu_type_current in gpu_types else Select.BLANK,
+                    allow_blank=True, prompt="Select GPU type", id="gpu_type",
+                ),
+                Label("GPU Count:"),
                 Input(value=resources.get("gpu", ""), placeholder="e.g. 1", id="gpu"),
                 classes="input-grid"
             ),
@@ -324,6 +345,15 @@ class TemplateEditScreen(ModalScreen):
                             node_selector[key] = val
                     except:
                         pass
+
+            # Dedicated GPU-type picker wins over a generically-configured
+            # "accelerator" node selector, if any.
+            try:
+                gpu_type = self.query_one("#gpu_type", Select).value
+                if gpu_type != Select.BLANK:
+                    node_selector["accelerator"] = gpu_type
+            except Exception:
+                pass
 
             # Collect volumes
             volumes = {}

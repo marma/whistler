@@ -70,6 +70,10 @@ spec:
               mountPath: "/etc/whistler-config/images.yaml"
               subPath: "images.yaml"
               readOnly: true
+            - name: config
+              mountPath: "/etc/whistler-config/gpuTypes.yaml"
+              subPath: "gpuTypes.yaml"
+              readOnly: true
       volumes:
         - name: users-config
           secret:

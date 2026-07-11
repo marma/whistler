@@ -73,6 +73,48 @@
         {% endif %}
       </form>
     </div>
+
+    <div class="ui segment">
+      <h4 class="ui header"><i class="microchip icon"></i> GPU Access</h4>
+      <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/gpu-types?user={{ current_user }}">
+        {% for gt in gpu_types %}
+        <div class="field">
+          <div class="ui checkbox">
+            <input type="checkbox" name="gpu_types" value="{{ gt }}"
+                   id="gpu-{{ gt }}"
+                   {% if gt in allowed_gpu_types %}checked{% endif %}>
+            <label for="gpu-{{ gt }}">{{ gt }}</label>
+          </div>
+        </div>
+        {% else %}
+        <p class="ui grey text">No GPU types defined in whistler.gpuTypes.</p>
+        {% endfor %}
+        {% if gpu_types %}
+        <div class="ui pointing label">Checking one or more boxes restricts this user to those GPU types. Leaving all boxes unchecked applies no restriction (any catalog type is usable).</div>
+        <div class="ui divider"></div>
+        <button type="submit" class="ui teal button"><i class="save icon"></i> Save GPU Access</button>
+        {% endif %}
+      </form>
+    </div>
+
+    <div class="ui segment">
+      <h4 class="ui header"><i class="sliders horizontal icon"></i> Session Overrides</h4>
+      <p class="ui grey text">Which template values this user may override per-session when creating an instance. gpuType/volumes are still limited to the allow-lists above even when granted here.</p>
+      <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/overrides?user={{ current_user }}">
+        {% for group in override_groups %}
+        <div class="field">
+          <div class="ui checkbox">
+            <input type="checkbox" name="override_groups" value="{{ group }}"
+                   id="override-{{ group }}"
+                   {% if user_overrides.get(group) %}checked{% endif %}>
+            <label for="override-{{ group }}">{{ group }}</label>
+          </div>
+        </div>
+        {% endfor %}
+        <div class="ui divider"></div>
+        <button type="submit" class="ui teal button"><i class="save icon"></i> Save Overrides</button>
+      </form>
+    </div>
   </div>
 
   {# ---- Right: instances + edit profile ---- #}

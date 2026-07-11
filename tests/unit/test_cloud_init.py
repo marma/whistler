@@ -1,7 +1,9 @@
 """cloud-init userData builder (whistler.cloudinit) — pure, no cluster."""
 import yaml
 
-from whistler.cloudinit import build_user_data, resolve_uid, SMB_CREDENTIALS_PATH
+from whistler.cloudinit import (
+    build_user_data, resolve_uid, resolve_gid, SMB_CREDENTIALS_PATH,
+)
 
 SMB_HOST = "whistler-storage-alice.whistler-user-alice.svc.cluster.local"
 
@@ -219,3 +221,33 @@ def test_resolve_uid_defaults_to_1000():
     assert resolve_uid({"name": "ghost"}) == 1000
     assert resolve_uid(None) == 1000
     assert resolve_uid({"securityContext": {}}) == 1000
+
+
+# --- resolve_gid fallback chain ------------------------------------------- #
+
+def test_resolve_gid_explicit_field_wins():
+    assert resolve_gid({"gid": 42, "uid": 7, "securityContext": {"runAsGroup": 9}}) == 42
+
+
+def test_resolve_gid_falls_back_to_run_as_group():
+    assert resolve_gid({"uid": 7, "securityContext": {"runAsGroup": 9}}) == 9
+
+
+def test_resolve_gid_falls_back_to_resolved_uid():
+    assert resolve_gid({"uid": 1234}) == 1234
+    assert resolve_gid({"name": "ghost"}) == 1000
+    assert resolve_gid(None) == 1000
+
+
+# --- gid threaded into the SMB mount view --------------------------------- #
+
+def test_mount_uses_explicit_gid_when_given():
+    (mount,) = _doc(uid=1001, gid=2001)["mounts"]
+    opts = mount[3].split(",")
+    assert "uid=1001" in opts and "gid=2001" in opts
+
+
+def test_mount_gid_defaults_to_uid_when_omitted():
+    (mount,) = _doc(uid=1001)["mounts"]
+    opts = mount[3].split(",")
+    assert "uid=1001" in opts and "gid=1001" in opts

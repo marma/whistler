@@ -127,6 +127,27 @@
       </div>
     </div>
 
+    <div class="two fields">
+      <div class="field">
+        <label>GPU Type</label>
+        <select name="gpu_type" class="ui dropdown">
+          <option value="">None</option>
+          {% for gt in gpu_types %}
+          <option value="{{ gt }}" {% if tpl and (tpl.nodeSelector or {}).get('accelerator') == gt %}selected{% endif %}>{{ gt }}</option>
+          {% endfor %}
+        </select>
+        <div class="ui pointing label">
+          {% if gpu_types %}From whistler.gpuTypes. Requesting a type a user isn't allowed (see their GPU Access) fails provisioning.{% else %}No GPU types defined in whistler.gpuTypes.{% endif %}
+        </div>
+      </div>
+      <div class="field">
+        <label>GPU Count</label>
+        <input name="gpu" type="number" min="0" placeholder="e.g. 1"
+               value="{{ (tpl.resources or {}).get('gpu', '') if tpl else '' }}">
+        <div class="ui pointing label">Number of GPUs of the selected type (nvidia.com/gpu).</div>
+      </div>
+    </div>
+
     <div class="field">
       <label>Personal Home Mount Path</label>
       <input name="personal_mount" type="text" placeholder="/userdata"

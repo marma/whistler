@@ -119,6 +119,7 @@ cat > "$WORK/users.yaml" <<EOF
 EOF
 echo "[]" > "$WORK/volumes.yaml"
 echo "[]" > "$WORK/selectors.yaml"
+echo "[]" > "$WORK/gpuTypes.yaml"
 cat > "$WORK/networkpolicy.yaml" <<EOF
 egress:
   allowCIDRs: []

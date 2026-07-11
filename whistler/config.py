@@ -10,7 +10,7 @@ import ipaddress
 import os
 import yaml
 
-from whistler.cloudinit import build_user_data, resolve_uid
+from whistler.cloudinit import build_user_data, resolve_uid, resolve_gid
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,7 @@ SELECTORS_FILE = os.path.join(CONFIG_DIR, "selectors.yaml")
 VOLUMES_FILE = os.path.join(CONFIG_DIR, "volumes.yaml")
 NETWORKPOLICY_FILE = os.path.join(CONFIG_DIR, "networkpolicy.yaml")
 IMAGES_FILE = os.path.join(CONFIG_DIR, "images.yaml")
+GPU_TYPES_FILE = os.path.join(CONFIG_DIR, "gpuTypes.yaml")
 
 # KubeVirt API coordinates for the VM desktop backend. KubeVirt may be absent
 # from a given cluster; every call against these is guarded so the operator
@@ -44,6 +45,20 @@ CDI_DV_PLURAL = "datavolumes"
 # Session kind covers what used to be WhistlerInstance + DesktopSession.
 TEMPLATE_PLURAL = "templates"
 SESSION_PLURAL = "sessions"
+
+# Groups of template values a user may be granted permission to override per-
+# session (users.yaml `overrides`, session spec.overrides). Booleans only —
+# granting a group does not bound the requested value; allowedGpuTypes /
+# allowedVolumes remain the value-level allow-lists for the two groups that
+# have one. See KubeConfigManager._apply_overrides.
+OVERRIDE_GROUPS = (
+    "resources",        # resources.cpu / resources.memory
+    "gpuType",          # nodeSelector.accelerator (still gated by allowedGpuTypes)
+    "gpuCount",         # resources.gpu
+    "uidGid",           # user_details.uid / .gid (VM guest identity)
+    "securityContext",  # user_details.securityContext.{fsGroup,runAsUser,runAsGroup}
+    "volumes",          # template volumes (still gated by allowedVolumes)
+)
 
 
 class PolicyError(Exception):
@@ -70,7 +85,9 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
-    def add_instance(self, username: str, template_name: str, instance_name: str, preemptible: bool = False) -> bool:
+    def add_instance(self, username: str, template_name: str, instance_name: str,
+                     preemptible: bool = False,
+                     overrides: Optional[Dict[str, Any]] = None) -> bool:
         pass
 
     @abstractmethod
@@ -94,7 +111,8 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
-    def add_desktop_session(self, username: str, template_name: str, session_name: str) -> bool:
+    def add_desktop_session(self, username: str, template_name: str, session_name: str,
+                            overrides: Optional[Dict[str, Any]] = None) -> bool:
         pass
 
     @abstractmethod
@@ -107,6 +125,10 @@ class ConfigManager(ABC):
 
     @abstractmethod
     def get_volumes(self) -> List[Dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    def get_gpu_types(self) -> List[str]:
         pass
 
     @abstractmethod
@@ -166,6 +188,22 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
+    def get_user_allowed_gpu_types(self, username: str) -> List[str]:
+        pass
+
+    @abstractmethod
+    def set_user_allowed_gpu_types(self, username: str, gpu_types: List[str]) -> bool:
+        pass
+
+    @abstractmethod
+    def get_user_overrides(self, username: str) -> Dict[str, bool]:
+        pass
+
+    @abstractmethod
+    def set_user_overrides(self, username: str, overrides: Dict[str, bool]) -> bool:
+        pass
+
+    @abstractmethod
     def stop_instance(self, username: str, instance_name: str) -> bool:
         """Delete the pod but keep the Session CR (stops compute, preserves state)."""
         pass
@@ -218,6 +256,10 @@ class KubeConfigManager(ConfigManager):
         # operator-side at pod/VM build time (see _apply_policy).
         self.images = {"ssh": [], "desktop": [], "vm": []}
         self._load_images()
+
+        # Catalog of selectable GPU types (see gpuTypes.yaml / whistler.gpuTypes).
+        self.gpu_types = []
+        self._load_gpu_types()
         self.force_kata_for_privileged = os.environ.get(
             "WHISTLER_FORCE_KATA_FOR_PRIVILEGED", "false"
         ).strip().lower() in ("1", "true", "yes")
@@ -471,9 +513,19 @@ class KubeConfigManager(ConfigManager):
                 logger.error(f"Failed to list instances: {e}")
         return instances
 
-    def add_instance(self, username: str, template_name: str, instance_name: str, preemptible: bool = False) -> bool:
+    def add_instance(self, username: str, template_name: str, instance_name: str,
+                     preemptible: bool = False,
+                     overrides: Optional[Dict[str, Any]] = None) -> bool:
         user_ns = self._ensure_user_namespace(username)
-        
+
+        spec = {
+            "templateRef": template_name,
+            "user": username,
+            "preemptible": preemptible,
+        }
+        if overrides:
+            spec["overrides"] = overrides
+
         body = {
             "apiVersion": f"{self.group}/{self.version}",
             "kind": "Session",
@@ -484,11 +536,7 @@ class KubeConfigManager(ConfigManager):
                 # ssh vs desktop sessions cheaply (without resolving templates).
                 "labels": {"whistler.martinmalmsten.net/mode": "ssh"},
             },
-            "spec": {
-                "templateRef": template_name,
-                "user": username,
-                "preemptible": preemptible
-            }
+            "spec": spec,
         }
         try:
             self.api.create_namespaced_custom_object(
@@ -595,6 +643,20 @@ class KubeConfigManager(ConfigManager):
     def get_selectors(self) -> Dict[str, Any]:
         return self.selectors
 
+    def _load_gpu_types(self):
+        try:
+            with open(GPU_TYPES_FILE, "r") as f:
+                data = yaml.safe_load(f)
+                if data:
+                    self.gpu_types = data
+        except FileNotFoundError:
+            logger.warning(f"No gpuTypes.yaml found at {GPU_TYPES_FILE}")
+        except Exception as e:
+            logger.error(f"Failed to load GPU types: {e}")
+
+    def get_gpu_types(self) -> List[str]:
+        return self.gpu_types
+
     def _load_volumes(self):
         try:
             with open(VOLUMES_FILE, "r") as f:
@@ -652,7 +714,8 @@ class KubeConfigManager(ConfigManager):
                     union.append(img)
         return union
 
-    def _apply_policy(self, template_spec: Dict[str, Any], mode: str, runtime: str) -> str:
+    def _apply_policy(self, template_spec: Dict[str, Any], mode: str, runtime: str,
+                      username: Optional[str] = None) -> str:
         """Authoritative, operator-side policy applied at build time.
 
         Returns the effective runtime (possibly coerced) and raises PolicyError
@@ -661,7 +724,17 @@ class KubeConfigManager(ConfigManager):
             whistler.security.forceKataForPrivileged is on, so the privileged
             workload runs inside a lightweight VM rather than on the host kernel.
           - image allow-list is enforced when mode=desktop OR runtime=vm. SSH
-            container/kata templates may use any image (the check is skipped)."""
+            container/kata templates may use any image (the check is skipped).
+          - GPU type (template_spec.nodeSelector["accelerator"], set from the
+            gpuTypes catalog by the template editor) is checked against the
+            owning user's allowedGpuTypes, when username is given and the user
+            has a non-empty allow-list configured. An empty/absent allow-list
+            means "no restriction".
+          - Requested volumes (template_spec.volumes keys) are checked against
+            the owning user's allowedVolumes the same way. Applies regardless
+            of whether the volume came from the template or a session
+            override (see _apply_overrides) — the merge happens before this
+            runs."""
         effective_runtime = runtime
         wants_privileged = bool(template_spec.get("privileged") or template_spec.get("fuse"))
         if self.force_kata_for_privileged and wants_privileged and effective_runtime == "container":
@@ -690,7 +763,105 @@ class KubeConfigManager(ConfigManager):
                     f"image {source!r} is not in the allowed {category} image list "
                     f"(whistler.images.{category}); allowed: {allowed}"
                 )
+
+        gpu_type = (template_spec.get("nodeSelector") or {}).get("accelerator")
+        if gpu_type and username:
+            allowed_gpu_types = self.get_user_allowed_gpu_types(username)
+            if allowed_gpu_types and gpu_type not in allowed_gpu_types:
+                raise PolicyError(
+                    f"GPU type {gpu_type!r} is not allowed for user {username!r} "
+                    f"(allowedGpuTypes: {allowed_gpu_types})"
+                )
+
+        requested_volumes = template_spec.get("volumes") or {}
+        if requested_volumes and username:
+            allowed_volumes = self.get_user_allowed_volumes(username)
+            if allowed_volumes:
+                disallowed = [v for v in requested_volumes if v not in allowed_volumes]
+                if disallowed:
+                    raise PolicyError(
+                        f"volumes {disallowed} are not allowed for user {username!r} "
+                        f"(allowedVolumes: {allowed_volumes})"
+                    )
         return effective_runtime
+
+    def _apply_overrides(self, template_spec: Dict[str, Any],
+                         user_details: Optional[Dict[str, Any]],
+                         overrides: Optional[Dict[str, Any]],
+                         username: Optional[str]) -> "tuple[Dict[str, Any], Dict[str, Any]]":
+        """Merge a session's requested spec.overrides into the template/user
+        details used to build its pod or VM.
+
+        Each key present in ``overrides`` requires the matching group in the
+        owning user's users.yaml `overrides` (see get_user_overrides); an
+        ungranted key raises PolicyError rather than being silently dropped —
+        a live CR with an override the user isn't (or is no longer) granted
+        is worth surfacing loudly. gpuType/volumes values are further gated
+        by allowedGpuTypes/allowedVolumes, but that happens afterwards in
+        _apply_policy against the merged spec this method returns, so it
+        applies uniformly whether the value came from the template or here.
+
+        Returns (effective_template_spec, effective_user_details); neither
+        input dict is mutated."""
+        template_spec = template_spec or {}
+        user_details = user_details or {}
+        if not overrides:
+            return template_spec, user_details
+
+        granted = self.get_user_overrides(username) if username else {}
+
+        def _require(group: str):
+            if not granted.get(group):
+                raise PolicyError(
+                    f"user {username!r} is not granted the {group!r} override "
+                    f"(users.yaml overrides.{group})"
+                )
+
+        effective_spec = dict(template_spec)
+        effective_user = dict(user_details)
+
+        if "resources" in overrides:
+            _require("resources")
+            requested = overrides["resources"] or {}
+            merged_resources = dict(template_spec.get("resources") or {})
+            for key in ("cpu", "memory"):
+                if key in requested:
+                    merged_resources[key] = requested[key]
+            effective_spec["resources"] = merged_resources
+
+        if "gpuType" in overrides:
+            _require("gpuType")
+            effective_spec["nodeSelector"] = {
+                **(template_spec.get("nodeSelector") or {}),
+                "accelerator": overrides["gpuType"],
+            }
+
+        if "gpuCount" in overrides:
+            _require("gpuCount")
+            merged_resources = dict(effective_spec.get("resources")
+                                    or template_spec.get("resources") or {})
+            merged_resources["gpu"] = overrides["gpuCount"]
+            effective_spec["resources"] = merged_resources
+
+        if "uid" in overrides or "gid" in overrides:
+            _require("uidGid")
+            if "uid" in overrides:
+                effective_user["uid"] = overrides["uid"]
+            if "gid" in overrides:
+                effective_user["gid"] = overrides["gid"]
+
+        if "securityContext" in overrides:
+            _require("securityContext")
+            effective_user["securityContext"] = {
+                **(user_details.get("securityContext") or {}),
+                **(overrides["securityContext"] or {}),
+            }
+
+        if "volumes" in overrides:
+            _require("volumes")
+            effective_spec["volumes"] = dict(overrides["volumes"] or {})
+
+        return effective_spec, effective_user
 
     def _load_network_policy(self):
         try:
@@ -1104,6 +1275,7 @@ class KubeConfigManager(ConfigManager):
         user_data = build_user_data(
             username=username,
             uid=resolve_uid(user_details),
+            gid=resolve_gid(user_details),
             ssh_keys=ssh_keys,
             hostname=hostname,
             smb_host=smb_host,
@@ -1305,8 +1477,15 @@ class KubeConfigManager(ConfigManager):
         # templates express it via persistence. Honor either.
         preemptible = bool(spec.get('preemptible')) or persistence == 'preemptible'
 
+        # Merge any session-level spec.overrides into the template/user
+        # details used to build the workload, gated by the owning user's
+        # granted override groups (raises PolicyError if ungranted).
+        user_details = self.get_user(username)
+        template_spec, user_details = self._apply_overrides(
+            template_spec, user_details, spec.get('overrides'), username)
+
         # Authoritative policy (may raise PolicyError, may coerce runtime->kata).
-        effective_runtime = self._apply_policy(template_spec, mode, runtime)
+        effective_runtime = self._apply_policy(template_spec, mode, runtime, username)
         result["mode"] = mode
         result["runtime"] = effective_runtime
         if mode == 'desktop':
@@ -1350,12 +1529,13 @@ class KubeConfigManager(ConfigManager):
                 smb_password=smb_password,
                 start=wants_start,
                 viewer=result.get("viewer"),
+                user_details=user_details,
             )
         elif wants_start:
             ok = self._create_pod(
                 user_ns, full_name, session_name, username, uid, mode,
                 effective_runtime, template_spec, pvc_name, display_port,
-                preemptible,
+                preemptible, user_details=user_details,
             )
         else:
             ok = True
@@ -1382,7 +1562,7 @@ class KubeConfigManager(ConfigManager):
 
     def _create_pod(self, user_ns, full_name, session_name, username, uid, mode,
                     runtime, template_spec, pvc_name, display_port,
-                    preemptible) -> bool:
+                    preemptible, user_details=None) -> bool:
         pod_body = self._build_pod_spec(
             full_name=full_name,
             hostname=session_name,
@@ -1393,7 +1573,7 @@ class KubeConfigManager(ConfigManager):
             template_spec=template_spec,
             pvc_name=pvc_name,
             available_volumes=self._load_volume_definitions_from_file(),
-            user_details=self.get_user(username),
+            user_details=user_details if user_details is not None else self.get_user(username),
             preemptible=preemptible,
             display_port=display_port if mode == 'desktop' else None,
         )
@@ -1699,7 +1879,7 @@ class KubeConfigManager(ConfigManager):
     def _create_vm(self, user_ns, full_name, session_name, username, uid,
                    template_spec, display_port, instancetype,
                    preemptible, smb_host, smb_password, start=False,
-                   viewer=None) -> bool:
+                   viewer=None, user_details=None) -> bool:
         vm_body, cloudinit_secret = self._build_vm_spec(
             session_name=full_name,
             hostname=session_name,
@@ -1711,7 +1891,7 @@ class KubeConfigManager(ConfigManager):
             smb_password=smb_password,
             instancetype=instancetype,
             preemptible=preemptible,
-            user_details=self.get_user(username),
+            user_details=user_details if user_details is not None else self.get_user(username),
             run_strategy="Always" if start else "Halted",
             portal_public_key=self._ensure_vm_access_key(username, user_ns),
             viewer=viewer,
@@ -1890,8 +2070,15 @@ class KubeConfigManager(ConfigManager):
                 logger.error(f"Failed to list desktop sessions: {e}")
         return sessions
 
-    def add_desktop_session(self, username: str, template_name: str, session_name: str) -> bool:
+    def add_desktop_session(self, username: str, template_name: str, session_name: str,
+                            overrides: Optional[Dict[str, Any]] = None) -> bool:
         user_ns = self._ensure_user_namespace(username)
+        spec = {
+            "templateRef": template_name,
+            "user": username,
+        }
+        if overrides:
+            spec["overrides"] = overrides
         body = {
             "apiVersion": f"{self.group}/{self.version}",
             "kind": "Session",
@@ -1900,10 +2087,7 @@ class KubeConfigManager(ConfigManager):
                 "namespace": user_ns,
                 "labels": {"whistler.martinmalmsten.net/mode": "desktop"},
             },
-            "spec": {
-                "templateRef": template_name,
-                "user": username,
-            }
+            "spec": spec,
         }
         try:
             self.api.create_namespaced_custom_object(
@@ -2037,6 +2221,43 @@ class KubeConfigManager(ConfigManager):
             return True
         except Exception as e:
             logger.error(f"Failed to set user allowed volumes: {e}")
+            return False
+
+    def get_user_allowed_gpu_types(self, username: str) -> List[str]:
+        self._load_users()
+        user = self.users.get(username, {})
+        return user.get("allowedGpuTypes", [])
+
+    def set_user_allowed_gpu_types(self, username: str, gpu_types: List[str]) -> bool:
+        try:
+            self._load_users()
+            if username not in self.users:
+                self.users[username] = {"name": username}
+            self.users[username]["allowedGpuTypes"] = gpu_types
+            self._write_users_file(self.users)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set user allowed GPU types: {e}")
+            return False
+
+    def get_user_overrides(self, username: str) -> Dict[str, bool]:
+        self._load_users()
+        user = self.users.get(username, {})
+        overrides = user.get("overrides", {}) or {}
+        return {g: bool(overrides.get(g, False)) for g in OVERRIDE_GROUPS}
+
+    def set_user_overrides(self, username: str, overrides: Dict[str, bool]) -> bool:
+        try:
+            self._load_users()
+            if username not in self.users:
+                self.users[username] = {"name": username}
+            self.users[username]["overrides"] = {
+                g: bool(overrides.get(g, False)) for g in OVERRIDE_GROUPS
+            }
+            self._write_users_file(self.users)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set user overrides: {e}")
             return False
 
     def get_all_templates(self) -> List[Dict[str, Any]]:

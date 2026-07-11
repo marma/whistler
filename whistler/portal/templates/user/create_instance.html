@@ -31,9 +31,11 @@
     </div>
 
     {% set user_volumes = [] %}
-    {% for vol in volumes %}
-      {% if vol.name in allowed_volumes %}{% set _ = user_volumes.append(vol) %}{% endif %}
-    {% endfor %}
+    {% if overrides.volumes %}
+      {% for vol in volumes %}
+        {% if vol.name in allowed_volumes %}{% set _ = user_volumes.append(vol) %}{% endif %}
+      {% endfor %}
+    {% endif %}
 
     {% if user_volumes %}
     <div class="field">
@@ -53,11 +55,77 @@
             </div>
           </div>
           <div class="field">
-            <input type="text" name="mount_paths" placeholder="/mnt/{{ vol.name }}">
+            <input type="text" name="mount_path__{{ vol.name }}" placeholder="/mnt/{{ vol.name }}">
           </div>
         </div>
       </div>
       {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if overrides.resources %}
+    <div class="field">
+      <label>Resource overrides</label>
+      <div class="two fields">
+        <div class="field">
+          <input name="override_cpu" type="text" placeholder="cpu, e.g. 1000m">
+        </div>
+        <div class="field">
+          <input name="override_memory" type="text" placeholder="memory, e.g. 2Gi">
+        </div>
+      </div>
+      <div class="ui pointing label">Leave blank to keep the template's value.</div>
+    </div>
+    {% endif %}
+
+    {% if overrides.gpuType %}
+    <div class="field">
+      <label>GPU type override</label>
+      <select name="override_gpu_type" class="ui dropdown">
+        <option value="">— keep template's value —</option>
+        {% for gt in gpu_types %}
+        <option value="{{ gt }}">{{ gt }}</option>
+        {% endfor %}
+      </select>
+      <div class="ui pointing label">Still limited to your allowed GPU types (see your admin-granted access); requesting an unlisted type fails provisioning.</div>
+    </div>
+    {% endif %}
+
+    {% if overrides.gpuCount %}
+    <div class="field">
+      <label>GPU count override</label>
+      <input name="override_gpu_count" type="number" min="0" placeholder="e.g. 1">
+    </div>
+    {% endif %}
+
+    {% if overrides.uidGid %}
+    <div class="field">
+      <label>VM guest identity override (uid/gid)</label>
+      <div class="two fields">
+        <div class="field">
+          <input name="override_uid" type="number" placeholder="uid">
+        </div>
+        <div class="field">
+          <input name="override_gid" type="number" placeholder="gid">
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    {% if overrides.securityContext %}
+    <div class="field">
+      <label>Pod security context override</label>
+      <div class="three fields">
+        <div class="field">
+          <input name="override_run_as_user" type="number" placeholder="runAsUser">
+        </div>
+        <div class="field">
+          <input name="override_run_as_group" type="number" placeholder="runAsGroup">
+        </div>
+        <div class="field">
+          <input name="override_fs_group" type="number" placeholder="fsGroup">
+        </div>
+      </div>
     </div>
     {% endif %}
 

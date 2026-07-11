@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from whistler.config import ConfigManager
+from whistler.config import ConfigManager, OVERRIDE_GROUPS
 
 
 class FakeConfigManager(ConfigManager):
@@ -20,12 +20,13 @@ class FakeConfigManager(ConfigManager):
     """
 
     def __init__(self, users=None, templates=None, instances=None,
-                 desktop_templates=None, desktop_sessions=None):
+                 desktop_templates=None, desktop_sessions=None, gpu_types=None):
         self.users: Dict[str, Dict[str, Any]] = users or {}
         self._templates: Dict[str, List[Dict[str, Any]]] = templates or {}
         self._instances: Dict[str, List[Dict[str, Any]]] = instances or {}
         self._desktop_templates: Dict[str, List[Dict[str, Any]]] = desktop_templates or {}
         self._desktop_sessions: Dict[str, List[Dict[str, Any]]] = desktop_sessions or {}
+        self._gpu_types: List[str] = gpu_types or []
 
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
         return self.users.get(username)
@@ -42,13 +43,15 @@ class FakeConfigManager(ConfigManager):
     def get_user_instances(self, username: str) -> List[Dict[str, Any]]:
         return list(self._instances.get(username, []))
 
-    def add_instance(self, username, template_name, instance_name, preemptible=False):
+    def add_instance(self, username, template_name, instance_name, preemptible=False,
+                     overrides=None):
         self._instances.setdefault(username, []).append({
             "name": instance_name,
             "template": template_name,
             "status": "Stopped",
             "podName": None,
             "preemptible": preemptible,
+            "overrides": overrides,
         })
         return True
 
@@ -67,7 +70,7 @@ class FakeConfigManager(ConfigManager):
     def get_user_desktop_sessions(self, username):
         return list(self._desktop_sessions.get(username, []))
 
-    def add_desktop_session(self, username, template_name, session_name):
+    def add_desktop_session(self, username, template_name, session_name, overrides=None):
         self._desktop_sessions.setdefault(username, []).append({
             "name": session_name,
             "template": template_name,
@@ -75,6 +78,7 @@ class FakeConfigManager(ConfigManager):
             "runtime": None,
             "backend": None,
             "podName": None,
+            "overrides": overrides,
         })
         return True
 
@@ -86,6 +90,9 @@ class FakeConfigManager(ConfigManager):
 
     def get_volumes(self):
         return []
+
+    def get_gpu_types(self):
+        return list(self._gpu_types)
 
     def get_available_images(self, category=None):
         return []
@@ -137,6 +144,25 @@ class FakeConfigManager(ConfigManager):
     def set_user_allowed_volumes(self, username, volume_names):
         if username in self.users:
             self.users[username]["allowedVolumes"] = volume_names
+        return True
+
+    def get_user_allowed_gpu_types(self, username):
+        return (self.users.get(username) or {}).get("allowedGpuTypes", [])
+
+    def set_user_allowed_gpu_types(self, username, gpu_types):
+        if username in self.users:
+            self.users[username]["allowedGpuTypes"] = gpu_types
+        return True
+
+    def get_user_overrides(self, username):
+        overrides = (self.users.get(username) or {}).get("overrides", {}) or {}
+        return {g: bool(overrides.get(g, False)) for g in OVERRIDE_GROUPS}
+
+    def set_user_overrides(self, username, overrides):
+        if username in self.users:
+            self.users[username]["overrides"] = {
+                g: bool(overrides.get(g, False)) for g in OVERRIDE_GROUPS
+            }
         return True
 
     def stop_instance(self, username, instance_name):

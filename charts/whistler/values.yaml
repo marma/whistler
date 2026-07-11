@@ -104,6 +104,29 @@ whistler:
     #     fsGroup: 1001
     #     runAsUser: 1001
     #     ...
+    #   # Allow-list of gpuTypes (below) this user may request on a template.
+    #   # Omitted/empty means "no restriction" — any catalog GPU type is usable.
+    #   # Enforced operator-side in _apply_policy, alongside the image allow-list.
+    #   allowedGpuTypes:
+    #     - nvidia-tesla-p100
+    #   # Same idea, for the volumes catalog (below) a template's `volumes` may
+    #   # request. Omitted/empty means "no restriction".
+    #   allowedVolumes:
+    #     - shared-scratch
+    #   # Which template values this user may override per-session, via the
+    #   # session CR's spec.overrides (see whistler/config.py _apply_overrides).
+    #   # Absent/false keeps the template's baked value. gpuType/volumes are
+    #   # still further gated by allowedGpuTypes/allowedVolumes above even when
+    #   # granted here — this only controls whether an override is accepted at
+    #   # all, not which values. Requesting an ungranted override on a session
+    #   # is a hard PolicyError, not a silent fallback to the template.
+    #   overrides:
+    #     resources: false        # resources.cpu / resources.memory
+    #     gpuType: false
+    #     gpuCount: false
+    #     uidGid: false          # VM guest identity (uid/gid)
+    #     securityContext: false # fsGroup / runAsUser / runAsGroup
+    #     volumes: false
 
 
   networkPolicy:
@@ -130,16 +153,21 @@ whistler:
       #   - 192.168.0.0/16
 
   node_selectors:
-    - name: GPU type
-      key: accelerator
-      values:
-        - nvidia-tesla-p100
-        - A100-SXM4-40GB
     - name: Node name
       key: kubernetes.io/hostname
       values:
         - node_1
         - node_2
+
+  # Catalog of GPU types a template's resources.gpu can request (matched
+  # against each node's "accelerator" label, e.g. via the NVIDIA GPU
+  # Operator's node feature discovery). Drives the GPU-type picker in the TUI
+  # template editor and the admin portal (both template form and per-user
+  # allowedGpuTypes checkboxes below). Empty = no GPU types offered.
+  gpuTypes: []
+    # - nvidia-tesla-p100
+    # - A100-SXM4-40GB
+
   # Image allow-lists, by template category. Enforced operator-side at pod/VM
   # build time (see whistler/config.py _apply_policy):
   #   - ssh:     SUGGESTIONS only. An empty list means "allow any image"; ssh

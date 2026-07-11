@@ -14,4 +14,6 @@ data:
 {{ toYaml .Values.whistler.networkPolicy | indent 4 }}
   images.yaml: |
 {{ toYaml .Values.whistler.images | indent 4 }}
+  gpuTypes.yaml: |
+{{ toYaml .Values.whistler.gpuTypes | indent 4 }}
 

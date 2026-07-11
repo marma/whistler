@@ -38,6 +38,13 @@
 #   KUBECONFIG_OUT    where to write the kubeconfig
 #   METAL_REGISTRY    set to 0 to skip the in-cluster dev registry
 #   REGISTRY_PORT     host port for the dev registry   (default: 5000)
+#   GPU_OPERATOR      auto|1|0 — install the NVIDIA GPU Operator (default: auto,
+#                     meaning "install if nvidia-smi is present on this host").
+#                     Assumes the host driver is already installed (this script
+#                     never installs drivers, see above) — the operator is told
+#                     driver.enabled=false and only manages the container
+#                     toolkit, device plugin, and DCGM exporter. Needs helm.
+#   GPU_OPERATOR_NAMESPACE  namespace for the operator  (default: gpu-operator)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,6 +55,8 @@ K3S_EXTRA_ARGS="${K3S_EXTRA_ARGS:-}"
 KUBECONFIG_OUT="${KUBECONFIG_OUT:-$HOME/.kube/${CLUSTER_NAME}.yaml}"
 METAL_REGISTRY="${METAL_REGISTRY:-1}"
 REGISTRY_PORT="${REGISTRY_PORT:-5000}"
+GPU_OPERATOR="${GPU_OPERATOR:-auto}"
+GPU_OPERATOR_NAMESPACE="${GPU_OPERATOR_NAMESPACE:-gpu-operator}"
 
 command -v curl >/dev/null || { echo "ERROR: curl not found"; exit 1; }
 
@@ -191,6 +200,108 @@ if [[ ! -e /dev/kvm ]]; then
 fi
 "$SCRIPT_DIR/install_kubevirt.sh"
 
+# --- NVIDIA GPU Operator --------------------------------------------------------
+# Manages the device plugin, node feature discovery, and DCGM exporter so GPU
+# containers can request nvidia.com/gpu. driver.enabled=false because this
+# script never touches host drivers (see the preflight report above) — bring
+# your own nvidia-smi.
+#
+# toolkit.enabled=false and cdi.enabled=false: the operator's containerd
+# toolkit component is NOT used on k3s here. Its SIGHUP-based "reload
+# containerd" step is fatal on this k3s version — the embedded containerd
+# actually *exits* on SIGHUP ("Shutdown request received: containerd exited:
+# signal: hangup"), which k3s treats as fatal and restarts the whole server,
+# which reschedules the toolkit pod, which SIGHUPs again: a self-sustaining
+# crash loop, confirmed via journalctl (see git history / PR discussion for
+# the log excerpt). Instead we configure containerd's nvidia runtime once,
+# by hand, below — k3s's own startup routine auto-detects and re-applies it
+# on every future boot with no signaling needed, so this is a one-time step,
+# not something reapplied per-pod-reschedule the way the toolkit does it.
+install_gpu=0
+if [[ "$GPU_OPERATOR" == "1" ]]; then
+  install_gpu=1
+elif [[ "$GPU_OPERATOR" == "auto" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+  install_gpu=1
+fi
+
+if [[ "$install_gpu" == "1" ]]; then
+  command -v helm >/dev/null || { echo "ERROR: GPU_OPERATOR requested but helm not found"; exit 1; }
+
+  NVIDIA_RUNTIME_BIN="$(command -v nvidia-container-runtime || true)"
+  if [[ -z "$NVIDIA_RUNTIME_BIN" ]]; then
+    echo "ERROR: nvidia-container-runtime not found on PATH."
+    echo "       Install the host nvidia-container-toolkit package first"
+    echo "       (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),"
+    echo "       or set GPU_OPERATOR=0 to skip GPU support for this cluster."
+    exit 1
+  fi
+
+  echo "==> Configuring k3s containerd for the nvidia runtime (binary: ${NVIDIA_RUNTIME_BIN})"
+  CONTAINERD_TMPL=/var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl
+  sudo mkdir -p "$(dirname "$CONTAINERD_TMPL")"
+  if [[ -f "$CONTAINERD_TMPL" ]] && grep -q 'containerd.runtimes.nvidia' "$CONTAINERD_TMPL" 2>/dev/null; then
+    echo "    Already configured, leaving as-is."
+  else
+    sudo tee -a "$CONTAINERD_TMPL" >/dev/null <<EOF
+{{ template "base" . }}
+
+[plugins."io.containerd.cri.v1.runtime"]
+  default_runtime_name = "nvidia"
+
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.nvidia]
+  runtime_type = "io.containerd.runc.v2"
+
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.nvidia.options]
+  BinaryName = "${NVIDIA_RUNTIME_BIN}"
+EOF
+    # A pre-existing config.toml.tmpl (e.g. from a prior run) would now have
+    # "{{ template "base" . }}" twice; fresh files (mkdir -p just created the
+    # dir, no file yet) only get the one we just wrote. Guard against the
+    # duplicate-template case explicitly rather than silently producing a
+    # broken template.
+    if [[ "$(grep -c '{{ template "base" \. }}' "$CONTAINERD_TMPL")" -gt 1 ]]; then
+      echo "ERROR: ${CONTAINERD_TMPL} already had content before this script ran and now"
+      echo "       has a duplicate 'base' template include. Inspect and fix it by hand:"
+      echo "       ${CONTAINERD_TMPL}"
+      exit 1
+    fi
+    echo "==> Restarting k3s once to apply the new containerd config"
+    sudo systemctl restart k3s
+    echo "==> Waiting for the node to become Ready"
+    for _ in $(seq 1 60); do
+      if kubectl get node 2>/dev/null | grep -q ' Ready'; then break; fi
+      sleep 2
+    done
+    kubectl get node | grep -q ' Ready' || {
+      echo "ERROR: node did not return to Ready after the containerd config restart."
+      echo "       Check: journalctl -u k3s, kubectl get nodes -w"
+      exit 1
+    }
+  fi
+
+  echo "==> Installing NVIDIA GPU Operator (namespace: ${GPU_OPERATOR_NAMESPACE})"
+  helm repo add nvidia https://helm.ngc.nvidia.com/nvidia >/dev/null 2>&1 || true
+  helm repo update nvidia >/dev/null
+  # No --wait: nvidia-operator-validator's toolkit-validation init step may
+  # never go Ready with toolkit.enabled=false (it's checking for a component
+  # we deliberately didn't install) — that shouldn't hard-fail the script,
+  # so convergence is checked below as a non-fatal warning instead.
+  helm upgrade --install gpu-operator nvidia/gpu-operator \
+    --namespace "$GPU_OPERATOR_NAMESPACE" --create-namespace \
+    --set driver.enabled=false \
+    --set toolkit.enabled=false \
+    --set cdi.enabled=false
+
+  echo "==> Waiting for the GPU Operator to become ready (up to 10m)"
+  kubectl -n "$GPU_OPERATOR_NAMESPACE" wait --for=condition=Ready pods --all --timeout=10m \
+    || echo "    WARNING: not all GPU Operator pods are Ready yet — check: kubectl -n ${GPU_OPERATOR_NAMESPACE} get pods" \
+            "(nvidia-operator-validator's toolkit-validation step may fail since toolkit.enabled=false skips it;" \
+            " if that's the only failure, GPU scheduling itself is unaffected — the containerd runtime is already" \
+            " configured directly, see above)"
+else
+  echo "==> Skipping NVIDIA GPU Operator (GPU_OPERATOR=${GPU_OPERATOR}, nvidia-smi $(command -v nvidia-smi >/dev/null 2>&1 && echo present || echo absent))"
+fi
+
 # --- Dev registry readiness ------------------------------------------------------
 if [[ "$METAL_REGISTRY" == "1" ]]; then
   echo "==> Waiting for the dev registry"
@@ -211,7 +322,7 @@ fi
 
 cat <<EOF
 
-Cluster '$CLUSTER_NAME' is up on this host, with KubeVirt$( [[ "$METAL_REGISTRY" == "1" ]] && echo " and an in-cluster dev registry (localhost:${REGISTRY_PORT})" ).
+Cluster '$CLUSTER_NAME' is up on this host, with KubeVirt$( [[ "$METAL_REGISTRY" == "1" ]] && echo " and an in-cluster dev registry (localhost:${REGISTRY_PORT})" )$( [[ "$install_gpu" == "1" ]] && echo " and the NVIDIA GPU Operator (namespace: ${GPU_OPERATOR_NAMESPACE})" ).
 
   export KUBECONFIG=$KUBECONFIG_OUT
   kubectl get nodes

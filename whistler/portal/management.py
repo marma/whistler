@@ -22,6 +22,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from whistler.config import OVERRIDE_GROUPS
+
 logger = logging.getLogger("whistler.management")
 
 _TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "templates")
@@ -198,16 +200,21 @@ async def user_index(request: Request, cm: CM, user: User):
 # --------------------------------------------------------------------------- #
 
 async def instance_create_form(request: Request, cm: CM, user: User):
-    ssh_tpls, desk_tpls, volumes, allowed = await asyncio.gather(
-        request.app.state.run(cm.get_user_templates, user),
-        request.app.state.run(cm.get_user_desktop_templates, user),
-        request.app.state.run(cm.get_volumes),
-        request.app.state.run(cm.get_user_allowed_volumes, user),
-    )
+    ssh_tpls, desk_tpls, volumes, allowed, gpu_types, allowed_gpu_types, overrides = \
+        await asyncio.gather(
+            request.app.state.run(cm.get_user_templates, user),
+            request.app.state.run(cm.get_user_desktop_templates, user),
+            request.app.state.run(cm.get_volumes),
+            request.app.state.run(cm.get_user_allowed_volumes, user),
+            request.app.state.run(cm.get_gpu_types),
+            request.app.state.run(cm.get_user_allowed_gpu_types, user),
+            request.app.state.run(cm.get_user_overrides, user),
+        )
     return templates.TemplateResponse(
         request=request, name="user/create_instance.html",
         context=_ctx(user, tpls=ssh_tpls + desk_tpls, volumes=volumes,
-                     allowed_volumes=allowed),
+                     allowed_volumes=allowed, gpu_types=gpu_types,
+                     allowed_gpu_types=allowed_gpu_types, overrides=overrides),
     )
 
 
@@ -216,6 +223,16 @@ async def instance_create(
     template_name: Annotated[str, Form()],
     instance_name: Annotated[str, Form()],
     preemptible:   Annotated[Optional[str], Form()] = None,
+    volume_names:  Annotated[Optional[list[str]], Form()] = None,
+    override_cpu:          Annotated[Optional[str], Form()] = None,
+    override_memory:       Annotated[Optional[str], Form()] = None,
+    override_gpu_type:     Annotated[Optional[str], Form()] = None,
+    override_gpu_count:    Annotated[Optional[str], Form()] = None,
+    override_uid:          Annotated[Optional[str], Form()] = None,
+    override_gid:          Annotated[Optional[str], Form()] = None,
+    override_run_as_user:  Annotated[Optional[str], Form()] = None,
+    override_run_as_group: Annotated[Optional[str], Form()] = None,
+    override_fs_group:     Annotated[Optional[str], Form()] = None,
 ):
     name = instance_name.strip()
     # The template carries the access mode; create the matching Session. Desktop
@@ -228,14 +245,36 @@ async def instance_create(
                 if t.get("fullName") == template_name or t.get("name") == template_name), None)
     mode = (tpl or {}).get("mode", "ssh")
 
+    # Volume mount paths are keyed per-volume (mount_path__<name>) rather than
+    # a parallel list, since volume_names only carries the *checked* boxes —
+    # a positional zip would misalign whenever a box in the middle is left
+    # unchecked.
+    volumes_override = None
+    if volume_names:
+        form = await request.form()
+        volumes_override = {
+            v: (form.get(f"mount_path__{v}") or f"/mnt/{v}").strip()
+            for v in volume_names
+        }
+    overrides = _build_session_overrides(
+        volumes=volumes_override,
+        cpu=override_cpu, memory=override_memory,
+        gpu_type=override_gpu_type, gpu_count=override_gpu_count,
+        uid=override_uid, gid=override_gid,
+        run_as_user=override_run_as_user, run_as_group=override_run_as_group,
+        fs_group=override_fs_group,
+    )
+
     if mode == "desktop":
-        ok = await request.app.state.run(cm.add_desktop_session, user, template_name, name)
+        ok = await request.app.state.run(
+            cm.add_desktop_session, user, template_name, name, overrides,
+        )
         if not ok:
             raise HTTPException(status_code=500, detail="Failed to create desktop session.")
         return _tr("/", user)
 
     ok = await request.app.state.run(
-        cm.add_instance, user, template_name, name, preemptible == "on",
+        cm.add_instance, user, template_name, name, preemptible == "on", overrides,
     )
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to create instance.")
@@ -345,10 +384,13 @@ async def admin_templates(request: Request, cm: CM, admin: Admin):
 
 
 async def admin_template_new(request: Request, cm: CM, admin: Admin):
-    images = await request.app.state.run(cm.get_available_images)
+    images, gpu_types = await asyncio.gather(
+        request.app.state.run(cm.get_available_images),
+        request.app.state.run(cm.get_gpu_types),
+    )
     return templates.TemplateResponse(
         request=request, name="admin/template_form.html",
-        context=_ctx(admin, tpl=None, available_images=images),
+        context=_ctx(admin, tpl=None, available_images=images, gpu_types=gpu_types),
     )
 
 
@@ -360,6 +402,8 @@ async def admin_template_create(
     description:    Annotated[Optional[str], Form()] = None,
     cpu:            Annotated[Optional[str], Form()] = None,
     memory:         Annotated[Optional[str], Form()] = None,
+    gpu:            Annotated[Optional[str], Form()] = None,
+    gpu_type:       Annotated[Optional[str], Form()] = None,
     personal_mount: Annotated[Optional[str], Form()] = "/userdata",
     mode:           Annotated[str, Form()] = "ssh",
     runtime:        Annotated[str, Form()] = "container",
@@ -370,7 +414,8 @@ async def admin_template_create(
 ):
     data = _template_form_data(
         name=slug.strip(), display_name=display_name, image=image,
-        description=description, cpu=cpu, memory=memory, personal_mount=personal_mount,
+        description=description, cpu=cpu, memory=memory, gpu=gpu, gpu_type=gpu_type,
+        personal_mount=personal_mount,
         mode=mode, runtime=runtime, privileged=privileged, fuse=fuse,
         display_port=display_port, protocol=protocol,
     )
@@ -381,16 +426,17 @@ async def admin_template_create(
 
 
 async def admin_template_edit(request: Request, cm: CM, admin: Admin, name: str):
-    tpls, images = await asyncio.gather(
+    tpls, images, gpu_types = await asyncio.gather(
         request.app.state.run(cm.get_all_templates),
         request.app.state.run(cm.get_available_images),
+        request.app.state.run(cm.get_gpu_types),
     )
     tpl = next((t for t in tpls if t.get("fullName") == name or t.get("name") == name), None)
     if not tpl:
         raise HTTPException(status_code=404, detail="Template not found.")
     return templates.TemplateResponse(
         request=request, name="admin/template_form.html",
-        context=_ctx(admin, tpl=tpl, available_images=images),
+        context=_ctx(admin, tpl=tpl, available_images=images, gpu_types=gpu_types),
     )
 
 
@@ -401,6 +447,8 @@ async def admin_template_update(
     description:    Annotated[Optional[str], Form()] = None,
     cpu:            Annotated[Optional[str], Form()] = None,
     memory:         Annotated[Optional[str], Form()] = None,
+    gpu:            Annotated[Optional[str], Form()] = None,
+    gpu_type:       Annotated[Optional[str], Form()] = None,
     personal_mount: Annotated[Optional[str], Form()] = "/userdata",
     mode:           Annotated[str, Form()] = "ssh",
     runtime:        Annotated[str, Form()] = "container",
@@ -411,7 +459,8 @@ async def admin_template_update(
 ):
     data = _template_form_data(
         name=name, display_name=display_name, image=image,
-        description=description, cpu=cpu, memory=memory, personal_mount=personal_mount,
+        description=description, cpu=cpu, memory=memory, gpu=gpu, gpu_type=gpu_type,
+        personal_mount=personal_mount,
         mode=mode, runtime=runtime, privileged=privileged, fuse=fuse,
         display_port=display_port, protocol=protocol,
     )
@@ -469,10 +518,15 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
     instances = await request.app.state.run(cm.get_user_instances, username)
     volumes   = await request.app.state.run(cm.get_volumes)
     allowed   = await request.app.state.run(cm.get_user_allowed_volumes, username)
+    gpu_types = await request.app.state.run(cm.get_gpu_types)
+    allowed_gpu_types = await request.app.state.run(cm.get_user_allowed_gpu_types, username)
+    user_overrides = await request.app.state.run(cm.get_user_overrides, username)
     return templates.TemplateResponse(
         request=request, name="admin/user_detail.html",
         context=_ctx(admin, user_obj=user_obj, instances=instances,
-                     volumes=volumes, allowed_volumes=allowed),
+                     volumes=volumes, allowed_volumes=allowed,
+                     gpu_types=gpu_types, allowed_gpu_types=allowed_gpu_types,
+                     user_overrides=user_overrides, override_groups=OVERRIDE_GROUPS),
     )
 
 
@@ -501,6 +555,24 @@ async def admin_user_set_volumes(
     volume_names: Annotated[Optional[list[str]], Form()] = None,
 ):
     await request.app.state.run(cm.set_user_allowed_volumes, username, volume_names or [])
+    return _tr(f"/admin/users/{username}", admin)
+
+
+async def admin_user_set_gpu_types(
+    request: Request, cm: CM, admin: Admin, username: str,
+    gpu_types: Annotated[Optional[list[str]], Form()] = None,
+):
+    await request.app.state.run(cm.set_user_allowed_gpu_types, username, gpu_types or [])
+    return _tr(f"/admin/users/{username}", admin)
+
+
+async def admin_user_set_overrides(
+    request: Request, cm: CM, admin: Admin, username: str,
+    override_groups: Annotated[Optional[list[str]], Form()] = None,
+):
+    checked = set(override_groups or [])
+    overrides = {g: g in checked for g in OVERRIDE_GROUPS}
+    await request.app.state.run(cm.set_user_overrides, username, overrides)
     return _tr(f"/admin/users/{username}", admin)
 
 
@@ -584,18 +656,66 @@ def _nonempty(d: dict) -> dict:
     return {k: v.strip() for k, v in d.items() if v and v.strip()}
 
 
+def _build_session_overrides(*, volumes=None, cpu=None, memory=None,
+                             gpu_type=None, gpu_count=None,
+                             uid=None, gid=None,
+                             run_as_user=None, run_as_group=None,
+                             fs_group=None) -> Optional[dict]:
+    """Assemble a Session spec.overrides payload from the create-instance
+    form. A group is only included when the form actually supplied a value
+    for it — the form only renders fields for groups the user's users.yaml
+    `overrides` grants (see instance_create_form), but an unfilled field
+    should still be a no-op rather than an empty override the operator has
+    to authorize against nothing."""
+    overrides: dict = {}
+
+    resources = _nonempty({"cpu": cpu, "memory": memory})
+    if resources:
+        overrides["resources"] = resources
+
+    if gpu_type and gpu_type.strip():
+        overrides["gpuType"] = gpu_type.strip()
+
+    if gpu_count not in (None, ""):
+        overrides["gpuCount"] = int(gpu_count)
+
+    if uid not in (None, ""):
+        overrides["uid"] = int(uid)
+    if gid not in (None, ""):
+        overrides["gid"] = int(gid)
+
+    security_context = {}
+    if run_as_user not in (None, ""):
+        security_context["runAsUser"] = int(run_as_user)
+    if run_as_group not in (None, ""):
+        security_context["runAsGroup"] = int(run_as_group)
+    if fs_group not in (None, ""):
+        security_context["fsGroup"] = int(fs_group)
+    if security_context:
+        overrides["securityContext"] = security_context
+
+    if volumes:
+        overrides["volumes"] = volumes
+
+    return overrides or None
+
+
 def _template_form_data(*, name, display_name, image, description, cpu, memory,
                         personal_mount, mode, runtime, privileged, fuse,
-                        display_port, protocol) -> dict:
+                        display_port, protocol, gpu=None, gpu_type=None) -> dict:
     """Assemble a save_system_template payload from the admin template form,
     including the access mode / runtime / privileged toggles. Desktop-only
-    fields are only included when mode == 'desktop'."""
+    fields are only included when mode == 'desktop'. gpu (count) maps to
+    resources.gpu; gpu_type (from the gpuTypes catalog) maps to
+    nodeSelector.accelerator, the key _apply_policy checks against a user's
+    allowedGpuTypes."""
     data = {
         "name": name,
         "displayName": display_name.strip(),
         "image": image.strip(),
         "description": (description or "").strip(),
-        "resources": _nonempty({"cpu": cpu, "memory": memory}),
+        "resources": _nonempty({"cpu": cpu, "memory": memory, "gpu": gpu}),
+        "nodeSelector": _nonempty({"accelerator": gpu_type}),
         "personalMountPath": personal_mount or "/userdata",
         "mode": mode if mode in ("ssh", "desktop") else "ssh",
         "runtime": runtime if runtime in ("container", "kata", "vm") else "container",
@@ -679,6 +799,8 @@ def build_management_app(config_manager):
     app.add_api_route("/admin/users/{username}/update",           admin_user_update,      methods=["POST"])
     app.add_api_route("/admin/users/{username}/delete",           admin_user_delete,      methods=["POST"])
     app.add_api_route("/admin/users/{username}/volumes",          admin_user_set_volumes, methods=["POST"])
+    app.add_api_route("/admin/users/{username}/gpu-types",        admin_user_set_gpu_types, methods=["POST"])
+    app.add_api_route("/admin/users/{username}/overrides",        admin_user_set_overrides, methods=["POST"])
     app.add_api_route("/admin/volumes",                           admin_volumes,          methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/volumes/new",                       admin_volume_new,       methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/volumes",                           admin_volume_create,    methods=["POST"])
