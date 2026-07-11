@@ -6,6 +6,8 @@ from textual.screen import ModalScreen, Screen
 import asyncio
 import logging
 
+from whistler.config import GPU_NODE_LABEL
+
 logger = logging.getLogger("whistler.tui")
 
 class InstanceCreateScreen(ModalScreen):
@@ -218,7 +220,7 @@ class TemplateEditScreen(ModalScreen):
         resources = self.template.get("resources", {})
         node_selector = self.template.get("nodeSelector", {})
         gpu_types = self._allowed_gpu_types()
-        gpu_type_current = node_selector.get("accelerator")
+        gpu_type_current = node_selector.get(GPU_NODE_LABEL)
 
         # Get selectors from config
         selectors_list = self.app.config_manager.get_selectors() if self.app.config_manager else []
@@ -347,11 +349,11 @@ class TemplateEditScreen(ModalScreen):
                         pass
 
             # Dedicated GPU-type picker wins over a generically-configured
-            # "accelerator" node selector, if any.
+            # GPU_NODE_LABEL node selector, if any.
             try:
                 gpu_type = self.query_one("#gpu_type", Select).value
                 if gpu_type != Select.BLANK:
-                    node_selector["accelerator"] = gpu_type
+                    node_selector[GPU_NODE_LABEL] = gpu_type
             except Exception:
                 pass
 

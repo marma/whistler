@@ -49,6 +49,14 @@ TEMPLATE_PLURAL = "templates"
 SESSION_PLURAL = "sessions"
 USER_PLURAL = "users"
 
+# Node label a template/override's gpuType is matched against, both as the
+# nodeSelector key that schedules onto a GPU of that type and as the node
+# label the Dashboard reads to type a node's GPUs. This is the NVIDIA GPU
+# Operator's node-feature-discovery label (auto-applied to GPU nodes, e.g.
+# "NVIDIA-A100-SXM4-40GB") — not a whistler-specific label an admin has to
+# set by hand, unlike the "accelerator" shorthand this used to be.
+GPU_NODE_LABEL = "nvidia.com/gpu.product"
+
 # Groups of template values a user may be granted permission to override per-
 # session (User CR `overrides`, session spec.overrides). Booleans only —
 # granting a group does not bound the requested value; allowedGpuTypes /
@@ -56,7 +64,7 @@ USER_PLURAL = "users"
 # have one. See KubeConfigManager._apply_overrides.
 OVERRIDE_GROUPS = (
     "resources",        # resources.cpu / resources.memory
-    "gpuType",          # nodeSelector.accelerator (still gated by allowedGpuTypes)
+    "gpuType",          # nodeSelector[GPU_NODE_LABEL] (still gated by allowedGpuTypes)
     "gpuCount",         # resources.gpu
     "uidGid",           # user_details.uid / .gid (VM guest identity)
     "securityContext",  # user_details.securityContext.{fsGroup,runAsUser,runAsGroup}
@@ -271,6 +279,14 @@ class KubeConfigManager(ConfigManager):
             "WHISTLER_FORCE_KATA_FOR_PRIVILEGED", "false"
         ).strip().lower() in ("1", "true", "yes")
         self.kata_runtime_class = os.environ.get("WHISTLER_KATA_RUNTIME_CLASS", "kata")
+        # RuntimeClass applied to pods requesting a GPU (resources.gpu), so
+        # they actually run under nvidia-container-runtime rather than plain
+        # runc — without it, the device plugin still bind-mounts the device
+        # nodes (kubelet does that independently), but the driver userspace
+        # (nvidia-smi, libcuda.so, ...) is never injected, since only the
+        # NVIDIA runtime's hook does that. Empty disables this (e.g. a
+        # cluster using containerd-native CDI with no RuntimeClass at all).
+        self.gpu_runtime_class = os.environ.get("WHISTLER_GPU_RUNTIME_CLASS", "nvidia")
         # Default image for the streamer sidecar every desktop pod gets;
         # a template's streamerImage overrides it.
         self.streamer_image = os.environ.get(
@@ -743,7 +759,7 @@ class KubeConfigManager(ConfigManager):
             workload runs inside a lightweight VM rather than on the host kernel.
           - image allow-list is enforced when mode=desktop OR runtime=vm. SSH
             container/kata templates may use any image (the check is skipped).
-          - GPU type (template_spec.nodeSelector["accelerator"], set from the
+          - GPU type (template_spec.nodeSelector[GPU_NODE_LABEL], set from the
             gpuTypes catalog by the template editor) is checked against the
             owning user's allowedGpuTypes, when username is given and the user
             has a non-empty allow-list configured. An empty/absent allow-list
@@ -782,7 +798,7 @@ class KubeConfigManager(ConfigManager):
                     f"(whistler.images.{category}); allowed: {allowed}"
                 )
 
-        gpu_type = (template_spec.get("nodeSelector") or {}).get("accelerator")
+        gpu_type = (template_spec.get("nodeSelector") or {}).get(GPU_NODE_LABEL)
         if gpu_type and username:
             allowed_gpu_types = self.get_user_allowed_gpu_types(username)
             if allowed_gpu_types and gpu_type not in allowed_gpu_types:
@@ -851,7 +867,7 @@ class KubeConfigManager(ConfigManager):
             _require("gpuType")
             effective_spec["nodeSelector"] = {
                 **(template_spec.get("nodeSelector") or {}),
-                "accelerator": overrides["gpuType"],
+                GPU_NODE_LABEL: overrides["gpuType"],
             }
 
         if "gpuCount" in overrides:
@@ -1197,6 +1213,12 @@ class KubeConfigManager(ConfigManager):
 
         if runtime == "kata":
             pod_body["spec"]["runtimeClassName"] = getattr(self, "kata_runtime_class", "kata")
+        elif resources.get('gpu'):
+            # Kata handles its own device passthrough story, so this only
+            # applies to the plain-container path — see gpu_runtime_class.
+            gpu_runtime_class = getattr(self, "gpu_runtime_class", "nvidia")
+            if gpu_runtime_class:
+                pod_body["spec"]["runtimeClassName"] = gpu_runtime_class
 
         if preemptible:
             pod_body["spec"]["priorityClassName"] = "whistler-preemptible"

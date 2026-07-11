@@ -134,13 +134,14 @@ whistler:
         - node_2
 
   # Catalog of GPU types a template's resources.gpu can request (matched
-  # against each node's "accelerator" label, e.g. via the NVIDIA GPU
-  # Operator's node feature discovery). Drives the GPU-type picker in the TUI
-  # template editor and the admin portal (both template form and per-user
-  # allowedGpuTypes checkboxes below). Empty = no GPU types offered.
+  # against each node's "nvidia.com/gpu.product" label — auto-applied by the
+  # NVIDIA GPU Operator's node feature discovery, not something an admin sets
+  # by hand). Drives the GPU-type picker in the TUI template editor and the
+  # admin portal (both template form and per-user allowedGpuTypes checkboxes
+  # below). Empty = no GPU types offered.
   gpuTypes: []
-    # - nvidia-tesla-p100
-    # - A100-SXM4-40GB
+    # - Tesla-P100-PCIE-16GB
+    # - NVIDIA-A100-SXM4-40GB
 
   # Image allow-lists, by template category. Enforced operator-side at pod/VM
   # build time (see whistler/config.py _apply_policy):
@@ -195,6 +196,14 @@ whistler:
     forceKataForPrivileged: true
     # RuntimeClass name applied to pods with runtime=kata.
     kataRuntimeClass: kata
+    # RuntimeClass name applied to pods requesting a GPU (resources.gpu), so
+    # they run under nvidia-container-runtime rather than plain runc — that's
+    # what actually injects the driver userspace (nvidia-smi, libcuda.so, ...)
+    # into the container; the device nodes alone (which kubelet bind-mounts
+    # regardless) aren't enough. Set by the NVIDIA GPU Operator's
+    # ClusterPolicy. Empty disables this (e.g. skaffold's k3d dev cluster,
+    # which has no GPU RuntimeClass).
+    gpuRuntimeClass: nvidia
 
   #volumes:
   #  - name: data

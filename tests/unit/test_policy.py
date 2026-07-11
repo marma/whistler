@@ -5,7 +5,7 @@ for ssh container/kata), the privileged->kata coercion gated by
 forceKataForPrivileged, and the per-user GPU-type/volumes allow-lists."""
 import pytest
 
-from whistler.config import KubeConfigManager, PolicyError
+from whistler.config import GPU_NODE_LABEL, KubeConfigManager, PolicyError
 
 
 def _manager(*, force_kata=False, images=None, users=None):
@@ -100,26 +100,26 @@ def test_gpu_type_allowed_when_no_username_given():
     # No username (e.g. called without operator context) skips the check
     # entirely rather than failing closed.
     cm = _manager()
-    spec = {"image": "x", "nodeSelector": {"accelerator": "A100-SXM4-40GB"}}
+    spec = {"image": "x", "nodeSelector": {GPU_NODE_LABEL: "A100-SXM4-40GB"}}
     assert cm._apply_policy(spec, "ssh", "container") == "container"
 
 
 def test_gpu_type_allowed_when_user_has_no_allow_list():
     # Absent/empty allowedGpuTypes means "no restriction".
     cm = _manager(users={"alice": {"name": "alice"}})
-    spec = {"image": "x", "nodeSelector": {"accelerator": "A100-SXM4-40GB"}}
+    spec = {"image": "x", "nodeSelector": {GPU_NODE_LABEL: "A100-SXM4-40GB"}}
     assert cm._apply_policy(spec, "ssh", "container", "alice") == "container"
 
 
 def test_gpu_type_allowed_when_in_users_allow_list():
     cm = _manager(users={"alice": {"name": "alice", "allowedGpuTypes": ["A100-SXM4-40GB"]}})
-    spec = {"image": "x", "nodeSelector": {"accelerator": "A100-SXM4-40GB"}}
+    spec = {"image": "x", "nodeSelector": {GPU_NODE_LABEL: "A100-SXM4-40GB"}}
     assert cm._apply_policy(spec, "ssh", "container", "alice") == "container"
 
 
 def test_gpu_type_rejected_when_not_in_users_allow_list():
     cm = _manager(users={"alice": {"name": "alice", "allowedGpuTypes": ["nvidia-tesla-p100"]}})
-    spec = {"image": "x", "nodeSelector": {"accelerator": "A100-SXM4-40GB"}}
+    spec = {"image": "x", "nodeSelector": {GPU_NODE_LABEL: "A100-SXM4-40GB"}}
     with pytest.raises(PolicyError):
         cm._apply_policy(spec, "ssh", "container", "alice")
 

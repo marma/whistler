@@ -61,7 +61,8 @@ deploy:
           whistler.bootstrapAdmin.publicKeys[0]: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMNj07CelG2QAh7IogB+vlS4tRjuxOTr3mt0z3fX8jlX marma"
           # Dummy GPU types for exercising the picker UI (TUI + portal) and the
           # per-user allowedGpuTypes checkboxes without real GPU hardware — k3d
-          # has no accelerator-labeled nodes, so nothing here actually schedules.
+          # has no nodes labeled nvidia.com/gpu.product, so nothing here
+          # actually schedules.
           whistler.gpuTypes[0]: dummy-gpu-small
           whistler.gpuTypes[1]: dummy-gpu-large
           whistler.gpuTypes[2]: NVIDIA-GeForce-RTX-4090

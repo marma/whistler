@@ -40,6 +40,8 @@ spec:
               value: {{ .Values.whistler.security.forceKataForPrivileged | quote }}
             - name: WHISTLER_KATA_RUNTIME_CLASS
               value: {{ .Values.whistler.security.kataRuntimeClass | quote }}
+            - name: WHISTLER_GPU_RUNTIME_CLASS
+              value: {{ .Values.whistler.security.gpuRuntimeClass | quote }}
             - name: WHISTLER_STREAMER_IMAGE
               value: {{ .Values.whistler.streamer.image | quote }}
             - name: WHISTLER_STORAGE_GATEWAY_IMAGE

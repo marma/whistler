@@ -143,3 +143,51 @@ def test_no_security_context_when_user_details_missing():
 def test_preemptible_sets_priority_class():
     assert _build(preemptible=True)["spec"]["priorityClassName"] == "whistler-preemptible"
     assert "priorityClassName" not in _build(preemptible=False)["spec"]
+
+
+# --- GPU RuntimeClass ------------------------------------------------------ #
+# The device plugin bind-mounts /dev/nvidia* regardless of runtime, but only
+# nvidia-container-runtime's hook injects the driver userspace (nvidia-smi,
+# libcuda.so, ...) — so a GPU request needs its own RuntimeClass, separate
+# from (and lower-priority than) kata's.
+
+def test_gpu_request_sets_nvidia_runtime_class_by_default():
+    pod = _build(template_spec={"resources": {"gpu": 1}})
+    assert pod["spec"]["runtimeClassName"] == "nvidia"
+
+
+def test_gpu_runtime_class_configurable():
+    cm = _manager()
+    cm.gpu_runtime_class = "nvidia-experimental"
+    pod = cm._build_pod_spec(
+        full_name="alice-box", hostname="box", username="alice", uid="u",
+        mode="ssh", runtime="container", template_spec={"resources": {"gpu": 1}},
+        pvc_name="pvc", available_volumes={}, user_details=None, preemptible=False,
+    )
+    assert pod["spec"]["runtimeClassName"] == "nvidia-experimental"
+
+
+def test_gpu_runtime_class_empty_disables_it():
+    cm = _manager()
+    cm.gpu_runtime_class = ""
+    pod = cm._build_pod_spec(
+        full_name="alice-box", hostname="box", username="alice", uid="u",
+        mode="ssh", runtime="container", template_spec={"resources": {"gpu": 1}},
+        pvc_name="pvc", available_volumes={}, user_details=None, preemptible=False,
+    )
+    assert "runtimeClassName" not in pod["spec"]
+
+
+def test_kata_runtime_class_wins_over_gpu():
+    cm = _manager()
+    cm.kata_runtime_class = "kata"
+    pod = cm._build_pod_spec(
+        full_name="alice-box", hostname="box", username="alice", uid="u",
+        mode="ssh", runtime="kata", template_spec={"resources": {"gpu": 1}},
+        pvc_name="pvc", available_volumes={}, user_details=None, preemptible=False,
+    )
+    assert pod["spec"]["runtimeClassName"] == "kata"
+
+
+def test_no_gpu_requested_leaves_runtime_class_unset():
+    assert "runtimeClassName" not in _build(template_spec={"image": "ubuntu:22.04"})["spec"]

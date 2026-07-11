@@ -133,7 +133,7 @@
         <select name="gpu_type" class="ui dropdown">
           <option value="">None</option>
           {% for gt in gpu_types %}
-          <option value="{{ gt }}" {% if tpl and (tpl.nodeSelector or {}).get('accelerator') == gt %}selected{% endif %}>{{ gt }}</option>
+          <option value="{{ gt }}" {% if tpl and (tpl.nodeSelector or {}).get(GPU_NODE_LABEL) == gt %}selected{% endif %}>{{ gt }}</option>
           {% endfor %}
         </select>
         <div class="ui pointing label">

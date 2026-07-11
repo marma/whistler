@@ -22,7 +22,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from whistler.config import OVERRIDE_GROUPS
+from whistler.config import GPU_NODE_LABEL, OVERRIDE_GROUPS
 
 logger = logging.getLogger("whistler.management")
 
@@ -72,6 +72,7 @@ def _status_group(status: str, ready: bool = True) -> str:
 # Jinja2 globals: consolidated status label + its Fomantic UI label color.
 templates.env.globals["status_label"] = _status_group
 templates.env.globals["status_color"] = lambda s, ready=True: _GROUP_COLORS[_status_group(s, ready)]
+templates.env.globals["GPU_NODE_LABEL"] = GPU_NODE_LABEL
 
 _ADMIN_USERS: set[str] = set(
     u.strip() for u in os.environ.get("WHISTLER_ADMIN_USERS", "").split(",") if u.strip()
@@ -742,15 +743,15 @@ def _template_form_data(*, name, display_name, image, description, cpu, memory,
     including the access mode / runtime / privileged toggles. Desktop-only
     fields are only included when mode == 'desktop'. gpu (count) maps to
     resources.gpu; gpu_type (from the gpuTypes catalog) maps to
-    nodeSelector.accelerator, the key _apply_policy checks against a user's
-    allowedGpuTypes."""
+    nodeSelector[GPU_NODE_LABEL], the key _apply_policy checks against a
+    user's allowedGpuTypes."""
     data = {
         "name": name,
         "displayName": display_name.strip(),
         "image": image.strip(),
         "description": (description or "").strip(),
         "resources": _nonempty({"cpu": cpu, "memory": memory, "gpu": gpu}),
-        "nodeSelector": _nonempty({"accelerator": gpu_type}),
+        "nodeSelector": _nonempty({GPU_NODE_LABEL: gpu_type}),
         "personalMountPath": personal_mount or "/userdata",
         "mode": mode if mode in ("ssh", "desktop") else "ssh",
         "runtime": runtime if runtime in ("container", "kata", "vm") else "container",

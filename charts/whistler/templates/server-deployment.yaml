@@ -44,6 +44,8 @@ spec:
               value: {{ .Values.whistler.security.forceKataForPrivileged | quote }}
             - name: WHISTLER_KATA_RUNTIME_CLASS
               value: {{ .Values.whistler.security.kataRuntimeClass | quote }}
+            - name: WHISTLER_GPU_RUNTIME_CLASS
+              value: {{ .Values.whistler.security.gpuRuntimeClass | quote }}
           ports:
             - containerPort: 8022
               name: ssh

@@ -5,7 +5,7 @@ details used to build its pod or VM, gated by the owning user's granted
 override groups (users.yaml `overrides`)."""
 import pytest
 
-from whistler.config import KubeConfigManager, PolicyError
+from whistler.config import GPU_NODE_LABEL, KubeConfigManager, PolicyError
 
 
 def _manager(*, users=None):
@@ -62,7 +62,7 @@ def test_granted_gpu_type_override_sets_node_selector():
         {"nodeSelector": {"other": "x"}}, {"name": "alice"},
         {"gpuType": "A100"}, "alice",
     )
-    assert spec["nodeSelector"] == {"other": "x", "accelerator": "A100"}
+    assert spec["nodeSelector"] == {"other": "x", GPU_NODE_LABEL: "A100"}
 
 
 def test_ungranted_gpu_count_override_raises():
