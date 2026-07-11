@@ -17,7 +17,6 @@ spec:
         app: whistler-portal
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        checksum/users: {{ include (print $.Template.BasePath "/users-secret.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ .Release.Name }}-portal
       containers:
@@ -61,12 +60,9 @@ spec:
               port: 8080
             initialDelaySeconds: 3
             periodSeconds: 10
-          # KubeConfigManager loads users (securityContext) and networkpolicy
-          # egress config, same as the operator/server.
+          # KubeConfigManager loads networkpolicy egress config, same as the
+          # operator/server; users are read live via the K8s API (User CRs).
           volumeMounts:
-            - name: users-config
-              mountPath: "/etc/whistler"
-              readOnly: true
             - name: config
               mountPath: "/etc/whistler-config/volumes.yaml"
               subPath: "volumes.yaml"
@@ -86,9 +82,6 @@ spec:
           resources:
             {{- toYaml .Values.portal.resources | nindent 12 }}
       volumes:
-        - name: users-config
-          secret:
-            secretName: {{ .Release.Name }}-users
         - name: config
           configMap:
             name: {{ .Release.Name }}-config

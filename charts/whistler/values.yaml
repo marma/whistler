@@ -92,41 +92,15 @@ portal:
 whistler:
   auth:
     allowAny: false
-  users: []
-    # - name: someuser
-    #   publicKeys:
-    #     - "ssh-rsa ..."
-    #   # POSIX uid injected into VM sessions via cloud-init (the in-guest user
-    #   # is created with this uid; falls back to securityContext.runAsUser,
-    #   # then 1000).
-    #   uid: 1001
-    #   securityContext:
-    #     fsGroup: 1001
-    #     runAsUser: 1001
-    #     ...
-    #   # Allow-list of gpuTypes (below) this user may request on a template.
-    #   # Omitted/empty means "no restriction" — any catalog GPU type is usable.
-    #   # Enforced operator-side in _apply_policy, alongside the image allow-list.
-    #   allowedGpuTypes:
-    #     - nvidia-tesla-p100
-    #   # Same idea, for the volumes catalog (below) a template's `volumes` may
-    #   # request. Omitted/empty means "no restriction".
-    #   allowedVolumes:
-    #     - shared-scratch
-    #   # Which template values this user may override per-session, via the
-    #   # session CR's spec.overrides (see whistler/config.py _apply_overrides).
-    #   # Absent/false keeps the template's baked value. gpuType/volumes are
-    #   # still further gated by allowedGpuTypes/allowedVolumes above even when
-    #   # granted here — this only controls whether an override is accepted at
-    #   # all, not which values. Requesting an ungranted override on a session
-    #   # is a hard PolicyError, not a silent fallback to the template.
-    #   overrides:
-    #     resources: false        # resources.cpu / resources.memory
-    #     gpuType: false
-    #     gpuCount: false
-    #     uidGid: false          # VM guest identity (uid/gid)
-    #     securityContext: false # fsGroup / runAsUser / runAsGroup
-    #     volumes: false
+  # Seeds the first admin account (whistler/config.py KubeConfigManager.
+  # ensure_bootstrap_admin, run once by the operator at startup) as a `User` CR.
+  # Create-if-absent only: once the User CR exists, changing this and running
+  # `helm upgrade` will NOT overwrite it — manage the account via the portal or
+  # `kubectl edit user <name>` after the first install. Further users are
+  # created by an admin through the portal, not through values.yaml.
+  bootstrapAdmin:
+    name: ""
+    publicKeys: []
 
 
   networkPolicy:

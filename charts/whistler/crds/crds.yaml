@@ -170,7 +170,7 @@ spec:
                   description: >-
                     Per-session requests to deviate from the template's baked
                     values. Each field is honored only if the owning user's
-                    users.yaml `overrides` grants that group; requesting an
+                    User CR `overrides` grants that group; requesting an
                     ungranted field is a hard PolicyError (see
                     KubeConfigManager._apply_overrides). gpuType and volumes
                     are additionally checked against allowedGpuTypes /
@@ -250,3 +250,86 @@ spec:
     kind: Session
     shortNames:
     - ses
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: users.whistler.martinmalmsten.net
+spec:
+  group: whistler.martinmalmsten.net
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                publicKeys:
+                  type: array
+                  items:
+                    type: string
+                admin:
+                  type: boolean
+                  default: false
+                  description: >-
+                    Grants portal admin rights (template/user/session management
+                    across all users). Only an existing admin can set this.
+                uid:
+                  type: integer
+                  description: >-
+                    POSIX uid injected into VM sessions via cloud-init; falls
+                    back to securityContext.runAsUser, then 1000.
+                securityContext:
+                  type: object
+                  properties:
+                    runAsUser:
+                      type: integer
+                    runAsGroup:
+                      type: integer
+                    fsGroup:
+                      type: integer
+                allowedGpuTypes:
+                  type: array
+                  items:
+                    type: string
+                  description: >-
+                    Allow-list of gpuTypes this user may request on a template.
+                    Omitted/empty means no restriction.
+                allowedVolumes:
+                  type: array
+                  items:
+                    type: string
+                  description: >-
+                    Allow-list of the volumes catalog this user's templates may
+                    request. Omitted/empty means no restriction.
+                overrides:
+                  type: object
+                  description: >-
+                    Which template values this user may override per-session via
+                    the session CR's spec.overrides (see
+                    whistler/config.py _apply_overrides).
+                  properties:
+                    resources:
+                      type: boolean
+                    gpuType:
+                      type: boolean
+                    gpuCount:
+                      type: boolean
+                    uidGid:
+                      type: boolean
+                    securityContext:
+                      type: boolean
+                    volumes:
+                      type: boolean
+  scope: Namespaced
+  names:
+    plural: users
+    singular: user
+    kind: User
+    shortNames:
+    - usr

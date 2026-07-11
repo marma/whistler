@@ -16,7 +16,6 @@ spec:
         app: whistler-operator
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        checksum/users: {{ include (print $.Template.BasePath "/users-secret.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ .Release.Name }}-operator
       containers:
@@ -55,9 +54,6 @@ spec:
           # ensure_pod() runs here now, so the operator needs the same user and
           # network-policy configuration the server has (securityContext, egress).
           volumeMounts:
-            - name: users-config
-              mountPath: "/etc/whistler"
-              readOnly: true
             - name: config
               mountPath: "/etc/whistler-config/volumes.yaml"
               subPath: "volumes.yaml"
@@ -74,10 +70,13 @@ spec:
               mountPath: "/etc/whistler-config/gpuTypes.yaml"
               subPath: "gpuTypes.yaml"
               readOnly: true
+            # Only the operator seeds the bootstrap admin (ensure_bootstrap_admin,
+            # called once at startup) — server/portal don't need this file.
+            - name: config
+              mountPath: "/etc/whistler-config/bootstrapAdmin.yaml"
+              subPath: "bootstrapAdmin.yaml"
+              readOnly: true
       volumes:
-        - name: users-config
-          secret:
-            secretName: {{ .Release.Name }}-users
         - name: config
           configMap:
             name: {{ .Release.Name }}-config

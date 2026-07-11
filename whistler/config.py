@@ -17,13 +17,15 @@ logger = logging.getLogger(__name__)
 # Config file locations. Defaults match the in-cluster mount paths used by the
 # Helm chart; override via env so the server/operator can run as host processes
 # (e.g. local k3d integration testing) without writing to /etc.
-USERS_FILE = os.environ.get("WHISTLER_USERS_FILE", "/etc/whistler/users.yaml")
 CONFIG_DIR = os.environ.get("WHISTLER_CONFIG_DIR", "/etc/whistler-config")
 SELECTORS_FILE = os.path.join(CONFIG_DIR, "selectors.yaml")
 VOLUMES_FILE = os.path.join(CONFIG_DIR, "volumes.yaml")
 NETWORKPOLICY_FILE = os.path.join(CONFIG_DIR, "networkpolicy.yaml")
 IMAGES_FILE = os.path.join(CONFIG_DIR, "images.yaml")
 GPU_TYPES_FILE = os.path.join(CONFIG_DIR, "gpuTypes.yaml")
+# Seeds the first admin User CR at operator startup (KubeConfigManager.
+# ensure_bootstrap_admin); create-if-absent only, see values.yaml bootstrapAdmin.
+BOOTSTRAP_ADMIN_FILE = os.path.join(CONFIG_DIR, "bootstrapAdmin.yaml")
 
 # KubeVirt API coordinates for the VM desktop backend. KubeVirt may be absent
 # from a given cluster; every call against these is guarded so the operator
@@ -45,9 +47,10 @@ CDI_DV_PLURAL = "datavolumes"
 # Session kind covers what used to be WhistlerInstance + DesktopSession.
 TEMPLATE_PLURAL = "templates"
 SESSION_PLURAL = "sessions"
+USER_PLURAL = "users"
 
 # Groups of template values a user may be granted permission to override per-
-# session (users.yaml `overrides`, session spec.overrides). Booleans only —
+# session (User CR `overrides`, session spec.overrides). Booleans only —
 # granting a group does not bound the requested value; allowedGpuTypes /
 # allowedVolumes remain the value-level allow-lists for the two groups that
 # have one. See KubeConfigManager._apply_overrides.
@@ -160,6 +163,10 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
+    def is_user_admin(self, username: str) -> bool:
+        pass
+
+    @abstractmethod
     def get_all_templates(self) -> List[Dict[str, Any]]:
         pass
 
@@ -238,7 +245,7 @@ class KubeConfigManager(ConfigManager):
             except FileNotFoundError:
                 self.namespace = "whistler" # Default fallback
 
-        self.users = {} # Not really used in Kube mode but kept for compat if needed
+        self.users = {}
         self._load_users()
 
         # Initialize containers
@@ -353,27 +360,34 @@ class KubeConfigManager(ConfigManager):
         return ns_name
 
     def _load_users(self):
+        # On failure, leave self.users as-is (stale-but-valid) rather than
+        # wiping it to empty — a transient API error shouldn't lock out every
+        # user. Also lets tests construct a KubeConfigManager via __new__ and
+        # set cm.users directly, bypassing __init__ (no self.api) entirely.
         try:
-            with open(USERS_FILE, "r") as f:
-                import yaml
-                data = yaml.safe_load(f)
-                if data:
-                    for u in data:
-                        self.users[u["name"]] = u
-        except FileNotFoundError:
-            logger.warning(f"No users.yaml found at {USERS_FILE}")
-        except Exception as e:
+            resp = self.api.list_namespaced_custom_object(
+                self.group, self.version, self.namespace, USER_PLURAL
+            )
+        except (ApiException, AttributeError) as e:
             logger.error(f"Failed to load users: {e}")
+            return
+        self.users = {
+            item["metadata"]["name"]: {**(item.get("spec") or {}), "name": item["metadata"]["name"]}
+            for item in resp.get("items", [])
+        }
 
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
-        # In K8s mode, we assume users exist or are managed externally.
-        # For now, we return a dummy user object to satisfy the interface.
+        self._load_users()
+        # Falls back to a dummy object so callers that don't gate on
+        # user_exists() first still get a usable default identity.
         return self.users.get(username, {"name": username})
 
     def user_exists(self, username: str) -> bool:
+        self._load_users()
         return username in self.users
 
     def get_user_public_keys(self, username: str) -> List[str]:
+        self._load_users()
         user = self.users.get(username)
         if user:
             return user.get("publicKeys", [])
@@ -478,14 +492,17 @@ class KubeConfigManager(ConfigManager):
                 pod_status = "Stopped" # Default if no pod
                 pod_name = None
                 pod_ip = None
-                
+                pod_ready = False
+
                 if pod:
                     pod_name = pod.metadata.name
                     pod_status = pod.status.phase
                     if pod.metadata.deletion_timestamp:
                         pod_status = "Terminating"
                     pod_ip = pod.status.pod_ip
-                    
+                    statuses = pod.status.container_statuses or []
+                    pod_ready = bool(statuses) and all(cs.ready for cs in statuses)
+
                 mounts = []
                 if pod and pod.spec and pod.spec.containers:
                         # Assume first container is the main one
@@ -499,6 +516,7 @@ class KubeConfigManager(ConfigManager):
                     "name": display_name,
                     "template": spec.get("templateRef"),
                     "status": pod_status,
+                    "ready": pod_ready,
                     "podName": pod_name,
                     "namespace": user_ns,
                     "ip": pod_ip,
@@ -793,7 +811,7 @@ class KubeConfigManager(ConfigManager):
         details used to build its pod or VM.
 
         Each key present in ``overrides`` requires the matching group in the
-        owning user's users.yaml `overrides` (see get_user_overrides); an
+        owning user's User CR `overrides` (see get_user_overrides); an
         ungranted key raises PolicyError rather than being silently dropped —
         a live CR with an override the user isn't (or is no longer) granted
         is worth surfacing loudly. gpuType/volumes values are further gated
@@ -814,7 +832,7 @@ class KubeConfigManager(ConfigManager):
             if not granted.get(group):
                 raise PolicyError(
                     f"user {username!r} is not granted the {group!r} override "
-                    f"(users.yaml overrides.{group})"
+                    f"(User CR overrides.{group})"
                 )
 
         effective_spec = dict(template_spec)
@@ -1996,6 +2014,8 @@ class KubeConfigManager(ConfigManager):
             return "Ready"
         if phase == "Failed":
             return "Failed"
+        if phase == "Pending":
+            return "Pending"
         return "Booting"
 
     def get_user_desktop_sessions(self, username: str) -> List[Dict[str, Any]]:
@@ -2172,39 +2192,107 @@ class KubeConfigManager(ConfigManager):
     # Admin / management operations                                        #
     # ------------------------------------------------------------------ #
 
-    def _write_users_file(self, users_dict: Dict[str, Any]):
-        users_list = list(users_dict.values())
-        with open(USERS_FILE, "w") as f:
-            yaml.safe_dump(users_list, f, default_flow_style=False, allow_unicode=True)
+    def _save_user_spec(self, username: str, spec_updates: Dict[str, Any]) -> bool:
+        """Get-merge-replace-or-create a single User CR, mirroring
+        save_system_template: only the keys in spec_updates are touched, so
+        concurrent partial updates (e.g. set_user_overrides) don't clobber the
+        rest of the spec."""
+        try:
+            try:
+                existing = self.api.get_namespaced_custom_object(
+                    self.group, self.version, self.namespace, USER_PLURAL, username
+                )
+                merged = {**(existing.get("spec") or {}), **spec_updates}
+                body = {
+                    "apiVersion": f"{self.group}/{self.version}",
+                    "kind": "User",
+                    "metadata": {"name": username, "namespace": self.namespace,
+                                 "resourceVersion": existing["metadata"]["resourceVersion"]},
+                    "spec": merged,
+                }
+                self.api.replace_namespaced_custom_object(
+                    self.group, self.version, self.namespace, USER_PLURAL, username, body
+                )
+            except ApiException as e:
+                if e.status == 404:
+                    body = {
+                        "apiVersion": f"{self.group}/{self.version}",
+                        "kind": "User",
+                        "metadata": {"name": username, "namespace": self.namespace},
+                        "spec": spec_updates,
+                    }
+                    self.api.create_namespaced_custom_object(
+                        self.group, self.version, self.namespace, USER_PLURAL, body
+                    )
+                else:
+                    raise
+            return True
+        except ApiException as e:
+            logger.error(f"Failed to save user {username}: {e}")
+            return False
 
     def list_all_users(self) -> List[Dict[str, Any]]:
         self._load_users()
         return list(self.users.values())
 
     def save_user(self, user_data: Dict[str, Any]) -> bool:
-        try:
-            self._load_users()
-            username = user_data.get("name")
-            if not username:
-                return False
-            self.users[username] = user_data
-            self._write_users_file(self.users)
-            return True
-        except Exception as e:
-            logger.error(f"Failed to save user: {e}")
+        username = user_data.get("name")
+        if not username:
             return False
+        spec = {k: v for k, v in user_data.items() if k != "name"}
+        return self._save_user_spec(username, spec)
 
     def delete_user(self, username: str) -> bool:
         try:
-            self._load_users()
-            if username not in self.users:
-                return False
-            del self.users[username]
-            self._write_users_file(self.users)
+            self.api.delete_namespaced_custom_object(
+                self.group, self.version, self.namespace, USER_PLURAL, username
+            )
             return True
-        except Exception as e:
-            logger.error(f"Failed to delete user: {e}")
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to delete user {username}: {e}")
             return False
+
+    def is_user_admin(self, username: str) -> bool:
+        self._load_users()
+        return bool(self.users.get(username, {}).get("admin", False))
+
+    def ensure_bootstrap_admin(self):
+        """Create-if-absent seed of the first admin User CR from
+        whistler.bootstrapAdmin (values.yaml). Called once by the operator at
+        startup (kopf.on.startup); never overwrites an existing User CR of the
+        same name, so later edits (via the portal or kubectl) stick across
+        Helm upgrades."""
+        try:
+            with open(BOOTSTRAP_ADMIN_FILE, "r") as f:
+                data = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            return
+        name = (data.get("name") or "").strip()
+        if not name:
+            return
+        try:
+            self.api.get_namespaced_custom_object(
+                self.group, self.version, self.namespace, USER_PLURAL, name
+            )
+            logger.info(f"Bootstrap admin '{name}' already exists, skipping.")
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to check bootstrap admin '{name}': {e}")
+                return
+            body = {
+                "apiVersion": f"{self.group}/{self.version}",
+                "kind": "User",
+                "metadata": {"name": name, "namespace": self.namespace},
+                "spec": {"publicKeys": data.get("publicKeys") or [], "admin": True},
+            }
+            try:
+                self.api.create_namespaced_custom_object(
+                    self.group, self.version, self.namespace, USER_PLURAL, body
+                )
+                logger.info(f"Created bootstrap admin user '{name}'.")
+            except ApiException as ce:
+                logger.error(f"Failed to create bootstrap admin '{name}': {ce}")
 
     def get_user_allowed_volumes(self, username: str) -> List[str]:
         self._load_users()
@@ -2212,16 +2300,7 @@ class KubeConfigManager(ConfigManager):
         return user.get("allowedVolumes", [])
 
     def set_user_allowed_volumes(self, username: str, volume_names: List[str]) -> bool:
-        try:
-            self._load_users()
-            if username not in self.users:
-                self.users[username] = {"name": username}
-            self.users[username]["allowedVolumes"] = volume_names
-            self._write_users_file(self.users)
-            return True
-        except Exception as e:
-            logger.error(f"Failed to set user allowed volumes: {e}")
-            return False
+        return self._save_user_spec(username, {"allowedVolumes": volume_names})
 
     def get_user_allowed_gpu_types(self, username: str) -> List[str]:
         self._load_users()
@@ -2229,16 +2308,7 @@ class KubeConfigManager(ConfigManager):
         return user.get("allowedGpuTypes", [])
 
     def set_user_allowed_gpu_types(self, username: str, gpu_types: List[str]) -> bool:
-        try:
-            self._load_users()
-            if username not in self.users:
-                self.users[username] = {"name": username}
-            self.users[username]["allowedGpuTypes"] = gpu_types
-            self._write_users_file(self.users)
-            return True
-        except Exception as e:
-            logger.error(f"Failed to set user allowed GPU types: {e}")
-            return False
+        return self._save_user_spec(username, {"allowedGpuTypes": gpu_types})
 
     def get_user_overrides(self, username: str) -> Dict[str, bool]:
         self._load_users()
@@ -2247,18 +2317,8 @@ class KubeConfigManager(ConfigManager):
         return {g: bool(overrides.get(g, False)) for g in OVERRIDE_GROUPS}
 
     def set_user_overrides(self, username: str, overrides: Dict[str, bool]) -> bool:
-        try:
-            self._load_users()
-            if username not in self.users:
-                self.users[username] = {"name": username}
-            self.users[username]["overrides"] = {
-                g: bool(overrides.get(g, False)) for g in OVERRIDE_GROUPS
-            }
-            self._write_users_file(self.users)
-            return True
-        except Exception as e:
-            logger.error(f"Failed to set user overrides: {e}")
-            return False
+        normalized = {g: bool(overrides.get(g, False)) for g in OVERRIDE_GROUPS}
+        return self._save_user_spec(username, {"overrides": normalized})
 
     def get_all_templates(self) -> List[Dict[str, Any]]:
         """List all Templates (ssh + desktop) across the system namespace."""

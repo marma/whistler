@@ -29,7 +29,7 @@ rules:
 
   # Application: watching & handling for the custom resources we declare.
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [sessions, templates, sessions/status]
+    resources: [sessions, templates, sessions/status, users]
     verbs: [list, watch, patch, get, update, create, delete]
 
   # KubeVirt VM desktop backend. The CRDs may be absent in a given cluster;
@@ -103,7 +103,7 @@ rules:
 
   # Managing custom resources
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [sessions, templates, sessions/status]
+    resources: [sessions, templates, sessions/status, users]
     verbs: [create, delete, get, list, patch, update, watch]
 
 ---
@@ -161,9 +161,10 @@ metadata:
   name: {{ .Release.Name }}-portal
 rules:
   # Unified templates + sessions (desktop portal/Guacamole flow AND the
-  # management UI's SSH template/instance CRUD + trigger).
+  # management UI's SSH template/instance CRUD + trigger) + users (admin user
+  # management).
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [sessions, templates, sessions/status]
+    resources: [sessions, templates, sessions/status, users]
     verbs: [get, list, create, update, patch, delete, watch]
 
   # add_desktop_session / _ensure_user_namespace.
@@ -203,8 +204,8 @@ rules:
     resources: [virtualmachineinstances/console, virtualmachineinstances/vnc]
     verbs: [get]
 
-  # Read services and configmaps cluster-wide; secrets are read-only here
-  # (write access to the users Secret is granted by the namespaced Role below).
+  # Read services, configmaps and secrets cluster-wide (read-only — the portal
+  # no longer needs write access now that users are CRs, not a Secret).
   - apiGroups: [""]
     resources: [services, configmaps]
     verbs: [get, list]
@@ -221,34 +222,6 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: {{ .Release.Name }}-portal
-subjects:
-  - kind: ServiceAccount
-    name: {{ .Release.Name }}-portal
-    namespace: {{ .Release.Namespace }}
-
----
-# Namespaced role: allows the portal to update the users Secret so that
-# admin user management (save_user / delete_user) can persist changes.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: {{ .Release.Name }}-portal-secrets
-  namespace: {{ .Release.Namespace }}
-rules:
-  - apiGroups: [""]
-    resources: [secrets]
-    verbs: [get, list, watch, update, patch]
-
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: {{ .Release.Name }}-portal-secrets
-  namespace: {{ .Release.Namespace }}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: {{ .Release.Name }}-portal-secrets
 subjects:
   - kind: ServiceAccount
     name: {{ .Release.Name }}-portal

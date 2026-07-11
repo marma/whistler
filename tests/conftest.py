@@ -116,6 +116,9 @@ class FakeConfigManager(ConfigManager):
         self.users.pop(username, None)
         return True
 
+    def is_user_admin(self, username):
+        return bool((self.users.get(username) or {}).get("admin", False))
+
     def get_all_templates(self):
         result = []
         for templates in self._templates.values():

@@ -64,8 +64,9 @@ cleanup() {
     k3d cluster delete "$CLUSTER" >/dev/null 2>&1
   elif [[ "$PROVIDER" == "existing" ]]; then
     # Only remove what we created; leave the cluster itself alone.
-    echo "==> Cleaning up test namespaces and template"
+    echo "==> Cleaning up test namespaces, template and user"
     kubectl delete template "$TEST_TEMPLATE" -n "$SYS_NS" --ignore-not-found >/dev/null 2>&1
+    kubectl delete user "$TEST_USER" -n "$SYS_NS" --ignore-not-found >/dev/null 2>&1
     kubectl delete namespace "$USER_NS" "$SYS_NS" --ignore-not-found --wait=false >/dev/null 2>&1
   fi
   rm -rf "$WORK"
@@ -109,11 +110,16 @@ spec:
     memory: "128Mi"
 EOF
 
-echo "==> Generating test key and config"
+echo "==> Generating test key and test user"
 ssh-keygen -t ed25519 -N "" -f "$WORK/id" -q
 PUBKEY="$(cat "$WORK/id.pub")"
-cat > "$WORK/users.yaml" <<EOF
-- name: ${TEST_USER}
+kubectl apply -f - <<EOF
+apiVersion: whistler.martinmalmsten.net/v1
+kind: User
+metadata:
+  name: ${TEST_USER}
+  namespace: ${SYS_NS}
+spec:
   publicKeys:
     - "${PUBKEY}"
 EOF
@@ -146,7 +152,6 @@ EOF
 COMMON_ENV=(
   "KUBECONFIG=$KUBECONFIG"
   "POD_NAMESPACE=$SYS_NS"
-  "WHISTLER_USERS_FILE=$WORK/users.yaml"
   "WHISTLER_CONFIG_DIR=$WORK"
   "USER_VOLUME_ACCESS_MODE=ReadWriteOnce"
   "USER_VOLUME_SIZE=100Mi"

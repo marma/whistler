@@ -15,11 +15,11 @@
     </div>
     <div class="four wide column" style="padding-top:1.2rem;text-align:right">
       <span id="status-{{ inst.name }}"
-            class="ui {{ status_color(inst.status) }} large label"
+            class="ui {{ status_color(inst.status, inst.get('ready', true)) }} large label"
             hx-get="/instances/{{ inst.name }}/status-badge?user={{ current_user }}"
             hx-trigger="every 3s"
             hx-swap="outerHTML">
-        {{ inst.status }}
+        {{ status_label(inst.status, inst.get('ready', true)) }}
       </span>
     </div>
   </div>
@@ -59,7 +59,7 @@
     <div class="ui segment">
       <h4 class="ui header"><i class="lightning icon"></i> Actions</h4>
 
-      {% if status_label(inst.status) == "Running" %}
+      {% if status_label(inst.status, inst.get('ready', true)) == "Running" %}
       <form method="post" action="/instances/{{ inst.name }}/stop?user={{ current_user }}">
         <button class="ui yellow fluid button" style="margin-bottom:.75rem">
           <i class="stop icon"></i> Stop Instance
@@ -69,7 +69,7 @@
       <form method="post" action="/instances/{{ inst.name }}/connect?user={{ current_user }}">
         <button class="ui green fluid button" style="margin-bottom:.75rem">
           <i class="play icon"></i>
-          {% if status_label(inst.status) == "Stopped" %}Start &amp; Connect{% else %}Connect{% endif %}
+          {% if status_label(inst.status, inst.get('ready', true)) == "Stopped" %}Start &amp; Connect{% else %}Connect{% endif %}
         </button>
       </form>
       {% endif %}
@@ -86,7 +86,7 @@
       </a>
     </div>
 
-    {% if status_label(inst.status) in ("Starting", "Running") %}
+    {% if status_label(inst.status, inst.get('ready', true)) in ("Pending", "Starting", "Running") %}
     <div class="ui info message">
       <i class="info circle icon"></i>
       Status updates automatically every few seconds.

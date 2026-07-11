@@ -56,9 +56,9 @@ deploy:
           whistler.volumes[0].persistentVolumeClaim.claimName: whistler-data-pvc
           whistler.volumes[1].name: data2
           whistler.volumes[1].persistentVolumeClaim.claimName: whistler-data2-pvc
-          # Example: Configure securityContext for a user
-          whistler.users[0].name: marma
-          whistler.users[0].publicKeys[0]: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMNj07CelG2QAh7IogB+vlS4tRjuxOTr3mt0z3fX8jlX marma"
+          # Seed the initial admin account for local dev.
+          whistler.bootstrapAdmin.name: marma
+          whistler.bootstrapAdmin.publicKeys[0]: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMNj07CelG2QAh7IogB+vlS4tRjuxOTr3mt0z3fX8jlX marma"
           # Dummy GPU types for exercising the picker UI (TUI + portal) and the
           # per-user allowedGpuTypes checkboxes without real GPU hardware — k3d
           # has no accelerator-labeled nodes, so nothing here actually schedules.

@@ -45,7 +45,11 @@ def configure(settings: kopf.OperatorSettings, **_):
     level = os.environ.get("OPERATOR_LOG_LEVEL", "INFO").upper()
     logging.getLogger("whistler").setLevel(level)
     # Instantiate eagerly so config-loading problems surface at startup.
-    _get_config_manager()
+    cm = _get_config_manager()
+    # Seed the first admin account (whistler.bootstrapAdmin) if it doesn't
+    # exist yet. Only the operator does this, to avoid server/portal racing
+    # to create the same object.
+    cm.ensure_bootstrap_admin()
 
 
 # --------------------------------------------------------------------------- #

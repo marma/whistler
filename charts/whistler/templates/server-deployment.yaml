@@ -16,7 +16,6 @@ spec:
         app: whistler-server
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        checksum/users: {{ include (print $.Template.BasePath "/users-secret.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ .Release.Name }}-server
       containers:
@@ -49,9 +48,6 @@ spec:
             - containerPort: 8022
               name: ssh
           volumeMounts:
-            - name: users-config
-              mountPath: "/etc/whistler"
-              readOnly: true
             - name: selectors-config
               mountPath: "/etc/whistler-config/selectors.yaml"
               subPath: "selectors.yaml"
@@ -76,9 +72,6 @@ spec:
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}
       volumes:
-        - name: users-config
-          secret:
-            secretName: {{ .Release.Name }}-users
         - name: selectors-config
           configMap:
             name: {{ .Release.Name }}-config

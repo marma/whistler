@@ -31,38 +31,47 @@ _STATIC_DIR   = os.path.join(os.path.dirname(__file__), "static")
 
 templates = Jinja2Templates(directory=_TEMPLATE_DIR)
 
-# The various raw pod/CR phases are consolidated into a few user-facing states.
+# The various raw pod/CR phases are consolidated into a few user-facing states,
+# mirroring the actual pod lifecycle: no pod -> Stopped, deleting -> Stopping,
+# scheduled but not started -> Pending, running but not yet ready -> Starting,
+# running and ready -> Running.
 _STATUS_GROUPS = {
     "running":      "Running",
     "ready":        "Running",
-    "pending":      "Starting",
+    "pending":      "Pending",
     "initializing": "Starting",
     "provisioning": "Starting",
     "booting":      "Starting",
     "importing":    "Starting",
-    "stopping":     "Stopping …",
-    "terminating":  "Stopping …",
+    "stopping":     "Stopping",
+    "terminating":  "Stopping",
     "stopped":      "Stopped",
     "unknown":      "Stopped",
     "failed":       "Error",
 }
 _GROUP_COLORS = {
-    "Running":    "green",
-    "Starting":   "yellow",
-    "Stopping …": "orange",
-    "Stopped":    "grey",
-    "Error":      "red",
+    "Running":  "green",
+    "Starting": "yellow",
+    "Pending":  "blue",
+    "Stopping": "orange",
+    "Stopped":  "grey",
+    "Error":    "red",
 }
 
 
-def _status_group(status: str) -> str:
-    """Collapse a raw pod/CR phase into one of the user-facing states."""
-    return _STATUS_GROUPS.get((status or "").lower(), "Stopped")
+def _status_group(status: str, ready: bool = True) -> str:
+    """Collapse a raw pod/CR phase into one of the user-facing states. A
+    "running" phase pod whose containers aren't all ready yet reads as
+    Starting rather than Running."""
+    s = (status or "").lower()
+    if s == "running" and not ready:
+        return "Starting"
+    return _STATUS_GROUPS.get(s, "Stopped")
 
 
 # Jinja2 globals: consolidated status label + its Fomantic UI label color.
 templates.env.globals["status_label"] = _status_group
-templates.env.globals["status_color"] = lambda s: _GROUP_COLORS[_status_group(s)]
+templates.env.globals["status_color"] = lambda s, ready=True: _GROUP_COLORS[_status_group(s, ready)]
 
 _ADMIN_USERS: set[str] = set(
     u.strip() for u in os.environ.get("WHISTLER_ADMIN_USERS", "").split(",") if u.strip()
@@ -91,9 +100,15 @@ def require_user(request: Request):
     return user
 
 
+def _is_admin(request: Request, user: str) -> bool:
+    if _ALLOW_ADMIN or user in _ADMIN_USERS:
+        return True
+    return bool(request.app.state.cm.is_user_admin(user))
+
+
 def require_admin(request: Request):
     user = require_user(request)
-    if not _ALLOW_ADMIN and user not in _ADMIN_USERS:
+    if not _is_admin(request, user):
         raise HTTPException(status_code=403, detail="Admin access required.")
     return user
 
@@ -111,9 +126,19 @@ User = Annotated[str, Depends(require_user)]
 Admin = Annotated[str, Depends(require_admin)]
 
 
-def _ctx(user: str, **extra) -> dict:
-    """Build template context (request is passed separately to TemplateResponse)."""
-    is_admin = _ALLOW_ADMIN or user in _ADMIN_USERS
+def _is_admin_dep(request: Request, user: User) -> bool:
+    return _is_admin(request, user)
+
+
+IsAdmin = Annotated[bool, Depends(_is_admin_dep)]
+
+
+def _ctx(user: str, is_admin: bool = False, **extra) -> dict:
+    """Build template context (request is passed separately to TemplateResponse).
+    Callers gated by `Admin` already know is_admin is True; callers gated only
+    by `User` should resolve it via the `IsAdmin` dependency (a CR lookup) and
+    pass it through, since this helper runs inline in async routes and can't
+    itself make a blocking call."""
     return {"current_user": user, "is_admin": is_admin, **extra}
 
 
@@ -123,7 +148,8 @@ def _tr(url: str, user: str) -> RedirectResponse:
 
 
 def _render_status_html(name: str, status: str, user: str, controls: bool,
-                        connect_url: str = None, term_url: str = None) -> str:
+                        connect_url: str = None, term_url: str = None,
+                        ready: bool = True) -> str:
     """Render the polling status badge. With `controls`, also emit an out-of-band
     swap that re-renders the action buttons (connect/ssh/start/stop) so they stay
     enabled/disabled in step with the status (used on the dashboard; the detail
@@ -131,7 +157,7 @@ def _render_status_html(name: str, status: str, user: str, controls: bool,
     tpl = "user/_status_controls.html" if controls else "user/_status_badge.html"
     return templates.env.get_template(tpl).render(
         name=name, status=status, user=user, controls=controls,
-        connect_url=connect_url, term_url=term_url,
+        connect_url=connect_url, term_url=term_url, ready=ready,
     )
 
 
@@ -163,13 +189,14 @@ def _merge_sessions(instances: list, desktop_sessions: list, user: str) -> list[
     for i in instances:
         rows.append({
             "name": i["name"], "template": i.get("template"),
-            "status": i.get("status"), "mode": "ssh", "connect_url": None,
+            "status": i.get("status"), "ready": i.get("ready", True),
+            "mode": "ssh", "connect_url": None,
             "term_url": _terminal_url(user, i["name"]),
         })
     for s in desktop_sessions:
         rows.append({
             "name": s["name"], "template": s.get("template"),
-            "status": s.get("phase"), "mode": "desktop",
+            "status": s.get("phase"), "ready": True, "mode": "desktop",
             "connect_url": _desktop_viewer_url(user, s["name"]),
             "term_url": _terminal_url(user, s["name"]),
         })
@@ -181,7 +208,7 @@ def _merge_sessions(instances: list, desktop_sessions: list, user: str) -> list[
 # User — dashboard                                                             #
 # --------------------------------------------------------------------------- #
 
-async def user_index(request: Request, cm: CM, user: User):
+async def user_index(request: Request, cm: CM, user: User, is_admin: IsAdmin):
     instances, ssh_tpls, desk_tpls, desktop_sessions = await asyncio.gather(
         request.app.state.run(cm.get_user_instances, user),
         request.app.state.run(cm.get_user_templates, user),
@@ -190,7 +217,8 @@ async def user_index(request: Request, cm: CM, user: User):
     )
     return templates.TemplateResponse(
         request=request, name="user/index.html",
-        context=_ctx(user, instances=_merge_sessions(instances, desktop_sessions, user),
+        context=_ctx(user, is_admin=is_admin,
+                     instances=_merge_sessions(instances, desktop_sessions, user),
                      tpls=ssh_tpls + desk_tpls),
     )
 
@@ -199,7 +227,7 @@ async def user_index(request: Request, cm: CM, user: User):
 # User — instance CRUD                                                         #
 # --------------------------------------------------------------------------- #
 
-async def instance_create_form(request: Request, cm: CM, user: User):
+async def instance_create_form(request: Request, cm: CM, user: User, is_admin: IsAdmin):
     ssh_tpls, desk_tpls, volumes, allowed, gpu_types, allowed_gpu_types, overrides = \
         await asyncio.gather(
             request.app.state.run(cm.get_user_templates, user),
@@ -212,7 +240,7 @@ async def instance_create_form(request: Request, cm: CM, user: User):
         )
     return templates.TemplateResponse(
         request=request, name="user/create_instance.html",
-        context=_ctx(user, tpls=ssh_tpls + desk_tpls, volumes=volumes,
+        context=_ctx(user, is_admin=is_admin, tpls=ssh_tpls + desk_tpls, volumes=volumes,
                      allowed_volumes=allowed, gpu_types=gpu_types,
                      allowed_gpu_types=allowed_gpu_types, overrides=overrides),
     )
@@ -281,7 +309,7 @@ async def instance_create(
     return _tr(f"/instances/{name}", user)
 
 
-async def instance_detail(request: Request, cm: CM, user: User, name: str):
+async def instance_detail(request: Request, cm: CM, user: User, is_admin: IsAdmin, name: str):
     instances, desktop_sessions = await asyncio.gather(
         request.app.state.run(cm.get_user_instances, user),
         request.app.state.run(cm.get_user_desktop_sessions, user),
@@ -292,12 +320,12 @@ async def instance_detail(request: Request, cm: CM, user: User, name: str):
         # so the shared detail template renders them too.
         sess = next((s for s in desktop_sessions if s["name"] == name), None)
         if sess is not None:
-            inst = {**sess, "status": sess.get("phase")}
+            inst = {**sess, "status": sess.get("phase"), "ready": True}
     if not inst:
         raise HTTPException(status_code=404, detail="Instance not found.")
     return templates.TemplateResponse(
         request=request, name="user/instance_detail.html",
-        context=_ctx(user, inst=inst),
+        context=_ctx(user, is_admin=is_admin, inst=inst),
     )
 
 
@@ -312,17 +340,20 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
     inst = next((i for i in instances if i["name"] == name), None)
     if inst:
         status, connect_url = inst["status"], None
+        ready = inst.get("ready", True)
         term_url = _terminal_url(user, name)
     else:
         sess = next((s for s in desktop_sessions if s["name"] == name), None)
         if sess:
             status = sess["phase"]
+            ready = True
             connect_url = _desktop_viewer_url(user, name)
             term_url = _terminal_url(user, name)
         else:
             status, connect_url, term_url = "Unknown", None, None
+            ready = True
     return HTMLResponse(
-        _render_status_html(name, status, user, controls, connect_url, term_url))
+        _render_status_html(name, status, user, controls, connect_url, term_url, ready))
 
 
 async def instance_status_badge(request: Request, cm: CM, user: User, name: str):
@@ -366,7 +397,7 @@ async def admin_index(request: Request, cm: CM, admin: Admin):
     all_templates = await request.app.state.run(cm.get_all_templates)
     return templates.TemplateResponse(
         request=request, name="admin/index.html",
-        context=_ctx(admin, all_instances=all_instances,
+        context=_ctx(admin, is_admin=True, all_instances=all_instances,
                      all_users=all_users, all_templates=all_templates),
     )
 
@@ -379,7 +410,7 @@ async def admin_templates(request: Request, cm: CM, admin: Admin):
     tpls = await request.app.state.run(cm.get_all_templates)
     return templates.TemplateResponse(
         request=request, name="admin/templates.html",
-        context=_ctx(admin, tpls=tpls),
+        context=_ctx(admin, is_admin=True, tpls=tpls),
     )
 
 
@@ -390,7 +421,7 @@ async def admin_template_new(request: Request, cm: CM, admin: Admin):
     )
     return templates.TemplateResponse(
         request=request, name="admin/template_form.html",
-        context=_ctx(admin, tpl=None, available_images=images, gpu_types=gpu_types),
+        context=_ctx(admin, is_admin=True, tpl=None, available_images=images, gpu_types=gpu_types),
     )
 
 
@@ -436,7 +467,7 @@ async def admin_template_edit(request: Request, cm: CM, admin: Admin, name: str)
         raise HTTPException(status_code=404, detail="Template not found.")
     return templates.TemplateResponse(
         request=request, name="admin/template_form.html",
-        context=_ctx(admin, tpl=tpl, available_images=images, gpu_types=gpu_types),
+        context=_ctx(admin, is_admin=True, tpl=tpl, available_images=images, gpu_types=gpu_types),
     )
 
 
@@ -483,14 +514,14 @@ async def admin_users(request: Request, cm: CM, admin: Admin):
     users = await request.app.state.run(cm.list_all_users)
     return templates.TemplateResponse(
         request=request, name="admin/users.html",
-        context=_ctx(admin, users=users),
+        context=_ctx(admin, is_admin=True, users=users),
     )
 
 
 async def admin_user_new(request: Request, cm: CM, admin: Admin):
     return templates.TemplateResponse(
         request=request, name="admin/user_form.html",
-        context=_ctx(admin, user_obj=None),
+        context=_ctx(admin, is_admin=True, user_obj=None),
     )
 
 
@@ -502,8 +533,10 @@ async def admin_user_create(
     run_as_user:  Annotated[Optional[str], Form()] = None,
     run_as_group: Annotated[Optional[str], Form()] = None,
     fs_group:     Annotated[Optional[str], Form()] = None,
+    is_admin_flag: Annotated[Optional[str], Form(alias="admin")] = None,
 ):
-    user_data = _build_user_data(name, public_keys, run_as_user, run_as_group, fs_group, uid)
+    user_data = _build_user_data(name, public_keys, run_as_user, run_as_group, fs_group,
+                                  uid, is_admin_flag)
     ok = await request.app.state.run(cm.save_user, user_data)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to create user.")
@@ -523,7 +556,7 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
     user_overrides = await request.app.state.run(cm.get_user_overrides, username)
     return templates.TemplateResponse(
         request=request, name="admin/user_detail.html",
-        context=_ctx(admin, user_obj=user_obj, instances=instances,
+        context=_ctx(admin, is_admin=True, user_obj=user_obj, instances=instances,
                      volumes=volumes, allowed_volumes=allowed,
                      gpu_types=gpu_types, allowed_gpu_types=allowed_gpu_types,
                      user_overrides=user_overrides, override_groups=OVERRIDE_GROUPS),
@@ -537,8 +570,10 @@ async def admin_user_update(
     run_as_user:  Annotated[Optional[str], Form()] = None,
     run_as_group: Annotated[Optional[str], Form()] = None,
     fs_group:     Annotated[Optional[str], Form()] = None,
+    is_admin_flag: Annotated[Optional[str], Form(alias="admin")] = None,
 ):
-    user_data = _build_user_data(username, public_keys, run_as_user, run_as_group, fs_group, uid)
+    user_data = _build_user_data(username, public_keys, run_as_user, run_as_group, fs_group,
+                                  uid, is_admin_flag)
     ok = await request.app.state.run(cm.save_user, user_data)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to update user.")
@@ -584,14 +619,14 @@ async def admin_volumes(request: Request, cm: CM, admin: Admin):
     volumes = await request.app.state.run(cm.get_volumes)
     return templates.TemplateResponse(
         request=request, name="admin/volumes.html",
-        context=_ctx(admin, volumes=volumes),
+        context=_ctx(admin, is_admin=True, volumes=volumes),
     )
 
 
 async def admin_volume_new(request: Request, cm: CM, admin: Admin):
     return templates.TemplateResponse(
         request=request, name="admin/volume_form.html",
-        context=_ctx(admin, vol=None),
+        context=_ctx(admin, is_admin=True, vol=None),
     )
 
 
@@ -621,7 +656,7 @@ async def admin_sessions(request: Request, cm: CM, admin: Admin):
     all_instances = await request.app.state.run(cm.get_all_instances)
     return templates.TemplateResponse(
         request=request, name="admin/sessions.html",
-        context=_ctx(admin, all_instances=all_instances),
+        context=_ctx(admin, is_admin=True, all_instances=all_instances),
     )
 
 
@@ -640,7 +675,7 @@ async def admin_sessions_rows(request: Request, cm: CM, admin: Admin):
     all_instances = await request.app.state.run(cm.get_all_instances)
     return templates.TemplateResponse(
         request=request, name="admin/_sessions_rows.html",
-        context=_ctx(admin, all_instances=all_instances),
+        context=_ctx(admin, is_admin=True, all_instances=all_instances),
     )
 
 
@@ -663,7 +698,7 @@ def _build_session_overrides(*, volumes=None, cpu=None, memory=None,
                              fs_group=None) -> Optional[dict]:
     """Assemble a Session spec.overrides payload from the create-instance
     form. A group is only included when the form actually supplied a value
-    for it — the form only renders fields for groups the user's users.yaml
+    for it — the form only renders fields for groups the user's User CR
     `overrides` grants (see instance_create_form), but an unfilled field
     should still be a no-op rather than an empty override the operator has
     to authorize against nothing."""
@@ -731,9 +766,12 @@ def _template_form_data(*, name, display_name, image, description, cpu, memory,
 
 
 def _build_user_data(name, public_keys, run_as_user, run_as_group, fs_group,
-                     uid=None) -> dict:
+                     uid=None, admin=None) -> dict:
     keys = [k.strip() for k in (public_keys or "").splitlines() if k.strip()]
-    data: dict = {"name": name.strip(), "publicKeys": keys}
+    # admin is always set (not omitted when falsy) so unchecking the "Admin"
+    # box in the edit form actually revokes it, rather than leaving whatever
+    # was already on the CR untouched (save_user only merges present keys).
+    data: dict = {"name": name.strip(), "publicKeys": keys, "admin": bool(admin)}
     if uid and str(uid).strip():
         data["uid"] = int(uid)
     sec_ctx = _nonempty({

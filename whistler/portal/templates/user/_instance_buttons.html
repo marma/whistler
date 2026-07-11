@@ -1,7 +1,7 @@
-{% set state = status_label(status) %}
+{% set state = status_label(status, ready|default(true)) %}
 {% set can_connect = state in ("Stopped", "Running") %}
 {% set can_start = state == "Stopped" %}
-{% set can_stop = state not in ("Stopped", "Stopping …") %}
+{% set can_stop = state not in ("Stopped", "Stopping") %}
 {% if connect_url %}
 <a class="ui blue tiny icon button{% if not can_connect %} disabled{% endif %}" title="Connect to desktop"
    {% if can_connect %}href="{{ connect_url }}" target="_blank"{% endif %}>

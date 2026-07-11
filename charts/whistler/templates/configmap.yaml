@@ -16,4 +16,6 @@ data:
 {{ toYaml .Values.whistler.images | indent 4 }}
   gpuTypes.yaml: |
 {{ toYaml .Values.whistler.gpuTypes | indent 4 }}
+  bootstrapAdmin.yaml: |
+{{ toYaml .Values.whistler.bootstrapAdmin | indent 4 }}
 

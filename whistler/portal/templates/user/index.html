@@ -36,13 +36,13 @@
       </td>
       <td>{{ inst.template or "—" }}</td>
       <td class="collapsing right aligned">
-        {% with name=inst.name, status=inst.status, user=current_user, controls=True %}
+        {% with name=inst.name, status=inst.status, ready=inst.ready, user=current_user, controls=True %}
         {% include "user/_status_badge.html" %}
         {% endwith %}
       </td>
       <td class="collapsing right aligned">
         <span id="actions-{{ inst.name }}">
-          {% with name=inst.name, status=inst.status, user=current_user,
+          {% with name=inst.name, status=inst.status, ready=inst.ready, user=current_user,
                   connect_url=inst.connect_url, term_url=inst.term_url %}
           {% include "user/_instance_buttons.html" %}
           {% endwith %}
