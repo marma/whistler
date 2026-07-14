@@ -6,6 +6,7 @@ def _manager():
     cm = KubeConfigManager.__new__(KubeConfigManager)  # skip __init__ (no cluster)
     cm.group = "whistler.martinmalmsten.net"
     cm.version = "v1"
+    cm.zones = {"default": {}}
     return cm
 
 

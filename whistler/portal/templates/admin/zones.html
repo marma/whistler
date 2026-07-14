@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}Zones — Admin — Whistler{% endblock %}
+{% block content %}
+
+<div class="ui stackable grid">
+  <div class="twelve wide column">
+    <h2 class="ui header"><i class="shield alternate icon"></i> Network Zones</h2>
+  </div>
+  <div class="four wide column" style="text-align:right;padding-top:1.2rem">
+    <a href="/admin/zones/new?user={{ current_user }}" class="ui primary button">
+      <i class="plus icon"></i> New Zone
+    </a>
+  </div>
+</div>
+
+<p class="ui grey text">
+  Egress postures sessions run under. Templates pin a zone; users with the
+  <code>zone</code> override grant may pick one per-session (limited by their
+  Zone Access). Edits apply to all user namespaces immediately — running
+  sessions are re-fenced in place; a session's zone <em>membership</em> only
+  changes on its next start.
+</p>
+
+{% if zones %}
+<table class="ui selectable celled table">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Description</th>
+      <th>Egress</th>
+      <th>DNS</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for z in zones %}
+    <tr>
+      <td><strong>{{ z.name }}</strong></td>
+      <td>{{ z.description or "—" }}</td>
+      <td>
+        {% set egress = z.egress or {} %}
+        {% if egress.get("allowCIDRs") %}
+          <div class="ui tiny green label">{{ egress["allowCIDRs"] | length }} allowed</div>
+        {% endif %}
+        {% if egress.get("blockCIDRs") %}
+          <div class="ui tiny red label">{{ egress["blockCIDRs"] | length }} blocked</div>
+        {% endif %}
+        {% if not egress.get("allowCIDRs") and not egress.get("blockCIDRs") %}
+          <span class="ui grey text">deny all</span>
+        {% endif %}
+      </td>
+      <td>
+        {% set dns = z.dns or {} %}
+        {% if dns.get("servers") %}<code>{{ dns["servers"] | join(", ") }}</code>
+        {% elif dns.get("clusterOnly") %}cluster only
+        {% else %}<span class="ui grey text">any resolver</span>{% endif %}
+      </td>
+      <td class="collapsing">
+        <a href="/admin/zones/{{ z.name }}/edit?user={{ current_user }}" class="ui tiny button">
+          <i class="edit icon"></i> Edit
+        </a>
+        {% if z.name != "default" %}
+        <form method="post" action="/admin/zones/{{ z.name }}/delete?user={{ current_user }}"
+              style="display:inline"
+              onsubmit="return confirm('Delete zone {{ z.name }}? Sessions still referencing it will fail to start until they are re-zoned.')">
+          <button class="ui red tiny button"><i class="trash icon"></i> Delete</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% endblock %}

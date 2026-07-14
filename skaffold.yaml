@@ -66,6 +66,13 @@ deploy:
           whistler.gpuTypes[0]: dummy-gpu-small
           whistler.gpuTypes[1]: dummy-gpu-large
           whistler.gpuTypes[2]: NVIDIA-GeForce-RTX-4090
+          # Sample zones for exercising the zone picker and per-zone
+          # NetworkPolicies: green = internet-but-not-internal, red =
+          # cluster-only DNS and no other egress. default stays deny-all+DNS.
+          whistler.zones.green.egress.blockCIDRs[0]: 10.0.0.0/8
+          whistler.zones.green.egress.blockCIDRs[1]: 172.16.0.0/12
+          whistler.zones.green.egress.blockCIDRs[2]: 192.168.0.0/16
+          whistler.zones.red.dns.clusterOnly: "true"
         setValueTemplates:
           image.repository: "{{.IMAGE_REPO_whistler}}"
           # tag@digest: the git-dirty tag alone doesn't change between edits,

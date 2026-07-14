@@ -103,28 +103,65 @@ whistler:
     publicKeys: []
 
 
-  networkPolicy:
-    egress:
-      # allowCIDRs: whitelist specific destinations. Each entry becomes an egress rule.
-      # If ports is omitted, all ports are allowed to that CIDR.
-      # Use this for strict control (default-deny + explicit allows).
-      allowCIDRs: []
-      #   - cidr: 203.0.113.0/24          # allow all ports to this CIDR
-      #   - cidr: 0.0.0.0/0               # allow internet
-      #     ports:
-      #       - port: 443
-      #         protocol: TCP
-      #       - port: 80
-      #         protocol: TCP
-
-      # blockCIDRs: blacklist specific destinations.
-      # Generates a rule allowing 0.0.0.0/0 EXCEPT these CIDRs.
-      # Use this for broad access (allow internet but block internal ranges).
-      # Note: if allowCIDRs is also set, its rules are evaluated independently (OR logic).
-      blockCIDRs: []
-      #   - 10.0.0.0/8
-      #   - 172.16.0.0/12
-      #   - 192.168.0.0/16
+  # Network zones: named egress postures a session runs under, selected by the
+  # template's `zone` field (or a per-session override, if the user holds the
+  # "zone" override grant, further narrowed by their allowedZones). Each zone
+  # becomes one NetworkPolicy per user namespace, selecting pods by a zone
+  # label stamped at build time — so a session changes zone on reboot, never
+  # live. "default" always exists (deny-all egress except DNS when left empty)
+  # and applies to any template that names no zone.
+  #
+  # Zones defined here render as Zone CRs (templates/zones.yaml) and are
+  # Helm-owned: an upgrade overwrites portal edits to them. Zones created in
+  # the portal's admin Zones section live only as CRs and are untouched by
+  # upgrades. `kubectl get zones -n <release-ns>` shows the live catalog.
+  #
+  # Legacy: a pre-zones `whistler.networkPolicy.egress` block is still honored
+  # as the default zone's egress when no default zone is defined — which is
+  # why this ships empty rather than with an explicit default entry.
+  #
+  # Each zone supports:
+  #   egress.allowCIDRs: whitelist. Each entry becomes an egress rule; omit
+  #     ports to allow all ports to that CIDR. Use for strict control
+  #     (default-deny + explicit allows).
+  #   egress.blockCIDRs: blacklist. Generates a rule allowing 0.0.0.0/0
+  #     EXCEPT these CIDRs. Use for broad access (internet yes, internal no).
+  #     If allowCIDRs is also set, its rules apply independently (OR logic).
+  #   dns: every zone allows port 53 anywhere unless narrowed here.
+  #     clusterOnly: true pins DNS egress to the cluster resolver (CoreDNS;
+  #       external names still resolve via its upstream forwarding, but pods
+  #       can't tunnel to arbitrary resolvers).
+  #     servers: [ip, ...] forces specific resolvers: port-53 egress is pinned
+  #       to them AND the pod's resolv.conf (a VM guest's too, via masquerade
+  #       DHCP) is pointed at them. Cluster-internal names (e.g. the storage
+  #       gateway for VM homes) then only resolve if that server handles them.
+  zones: {}
+    # default:            # deny-all egress except DNS when omitted
+    #   egress:
+    #     allowCIDRs: []
+    #     #   - cidr: 203.0.113.0/24          # allow all ports to this CIDR
+    #     #   - cidr: 0.0.0.0/0               # allow internet
+    #     #     ports:
+    #     #       - port: 443
+    #     #         protocol: TCP
+    #     blockCIDRs: []
+    # green:              # internet yes, internal networks no
+    #   egress:
+    #     blockCIDRs:
+    #       - 10.0.0.0/8
+    #       - 172.16.0.0/12
+    #       - 192.168.0.0/16
+    #   dns:
+    #     clusterOnly: true
+    # red:                # deny-all with punched holes
+    #   egress:
+    #     allowCIDRs:
+    #       - cidr: 203.0.113.10/32
+    #         ports:
+    #           - port: 443
+    #             protocol: TCP
+    #   dns:
+    #     clusterOnly: true
 
   node_selectors:
     - name: Node name

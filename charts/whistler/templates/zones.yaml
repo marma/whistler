@@ -1,0 +1,19 @@
+{{- /*
+Network zones from whistler.zones, rendered as Zone CRs — the operator/server
+read the catalog live from these (whistler/config.py _load_zones), and admins
+manage them in the portal's Zones section. Helm owns the zones defined here:
+portal edits to a values-defined zone are overwritten on the next upgrade,
+same as chart-defined templates. The "default" zone needs no CR — it is
+synthesized when absent (deny-all egress except DNS, or the legacy
+whistler.networkPolicy.egress when set).
+*/ -}}
+{{- range $name, $zone := .Values.whistler.zones }}
+---
+apiVersion: whistler.martinmalmsten.net/v1
+kind: Zone
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+{{ toYaml (default dict $zone) | indent 2 }}
+{{- end }}

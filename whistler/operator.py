@@ -19,7 +19,7 @@ from whistler.config import (
 logger = logging.getLogger("whistler.operator")
 
 # Single ConfigManager shared across handlers. It loads in-cluster config and
-# the mounted users/volumes/networkpolicy/images configuration once at startup.
+# the mounted users/volumes/zones/images configuration once at startup.
 _config_manager = None
 
 

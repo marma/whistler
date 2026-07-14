@@ -58,10 +58,13 @@ spec:
               mountPath: "/etc/whistler-config/volumes.yaml"
               subPath: "volumes.yaml"
               readOnly: true
+            {{- if .Values.whistler.networkPolicy }}
+            # Legacy pre-zones egress config (seeds the default zone).
             - name: selectors-config
               mountPath: "/etc/whistler-config/networkpolicy.yaml"
               subPath: "networkpolicy.yaml"
               readOnly: true
+            {{- end }}
             - name: selectors-config
               mountPath: "/etc/whistler-config/images.yaml"
               subPath: "images.yaml"

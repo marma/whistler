@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}{% if zone %}Edit Zone{% else %}New Zone{% endif %} — Admin — Whistler{% endblock %}
+{% block content %}
+
+<h2 class="ui header">
+  <i class="shield alternate icon"></i>
+  <div class="content">{% if zone %}Edit Zone: {{ zone.name }}{% else %}New Zone{% endif %}</div>
+</h2>
+
+<div class="ui segment" style="max-width:640px">
+  <form class="ui form" method="post"
+        action="{% if zone %}/admin/zones/{{ zone.name }}{% else %}/admin/zones{% endif %}?user={{ current_user }}">
+
+    {% if not zone %}
+    <div class="field">
+      <label>Zone Name</label>
+      <input name="name" type="text" required placeholder="green"
+             pattern="[a-z0-9]([\-a-z0-9]*[a-z0-9])?" maxlength="63">
+      <div class="ui pointing label">Lowercase alphanumerics and "-" (a Kubernetes object name). Cannot be renamed later.</div>
+    </div>
+    {% endif %}
+
+    <div class="field">
+      <label>Description <span class="ui grey tiny label">optional</span></label>
+      <input name="description" type="text" placeholder="Internet access, internal networks blocked"
+             value="{{ zone.description if zone else '' }}">
+    </div>
+
+    <div class="ui divider"></div>
+    <h4 class="ui header">Egress</h4>
+    <p class="ui grey text">Zones start from deny-all (DNS excepted). Allowed and blocked
+      lists apply independently (OR): use <em>allowed</em> for punched holes, <em>blocked</em>
+      for "everything except these ranges".</p>
+
+    <div class="field">
+      <label>Allowed destinations <span class="ui grey tiny label">one per line</span></label>
+      <textarea name="allow_cidrs" rows="4"
+                placeholder="203.0.113.0/24&#10;198.51.100.10/32 443/tcp 80/tcp">{{ allow_cidrs_text }}</textarea>
+      <div class="ui pointing label"><code>CIDR</code> allows all ports; append <code>port/tcp</code> / <code>port/udp</code> specs to restrict.</div>
+    </div>
+
+    <div class="field">
+      <label>Blocked destinations <span class="ui grey tiny label">one CIDR per line</span></label>
+      <textarea name="block_cidrs" rows="4"
+                placeholder="10.0.0.0/8&#10;172.16.0.0/12&#10;192.168.0.0/16">{{ block_cidrs_text }}</textarea>
+      <div class="ui pointing label">Allows everything <em>except</em> these ranges (rendered as an explicit complement, not ipBlock.except).</div>
+    </div>
+
+    <div class="ui divider"></div>
+    <h4 class="ui header">DNS</h4>
+
+    <div class="field">
+      <div class="ui checkbox">
+        <input type="checkbox" name="dns_cluster_only" id="dns-cluster-only"
+               {% if zone and (zone.dns or {}).get("clusterOnly") %}checked{% endif %}>
+        <label for="dns-cluster-only">Cluster resolver only</label>
+      </div>
+      <div class="ui pointing label">Pins port-53 egress to CoreDNS. External names still resolve through its forwarding, but sessions can't tunnel to arbitrary resolvers.</div>
+    </div>
+
+    <div class="field">
+      <label>Forced DNS servers <span class="ui grey tiny label">optional, comma-separated IPs</span></label>
+      <input name="dns_servers" type="text" placeholder="10.0.0.53" value="{{ dns_servers_text }}">
+      <div class="ui pointing label">Port-53 egress is pinned to these IPs and sessions' resolv.conf points at them (VM guests too). Cluster-internal names (e.g. VM home storage) only resolve if the server handles them.</div>
+    </div>
+
+    <div class="ui divider"></div>
+    <button type="submit" class="ui primary button">
+      <i class="save icon"></i> {% if zone %}Save Changes{% else %}Create Zone{% endif %}
+    </button>
+    <a href="/admin/zones?user={{ current_user }}" class="ui button">Cancel</a>
+  </form>
+</div>
+
+<div class="ui info message" style="max-width:640px">
+  <div class="header">How changes apply</div>
+  <p>Saving pushes the zone's NetworkPolicy to every user namespace immediately —
+  running sessions in this zone are re-fenced in place. Which zone a session
+  <em>belongs to</em> is fixed at start, so moving a session between zones takes a
+  restart.</p>
+</div>
+
+{% endblock %}

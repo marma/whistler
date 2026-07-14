@@ -99,8 +99,27 @@
     </div>
 
     <div class="ui segment">
+      <h4 class="ui header"><i class="shield alternate icon"></i> Zone Access</h4>
+      <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/zones?user={{ current_user }}">
+        {% for z in zones %}
+        <div class="field">
+          <div class="ui checkbox">
+            <input type="checkbox" name="zone_names" value="{{ z }}"
+                   id="zone-{{ z }}"
+                   {% if z in allowed_zones %}checked{% endif %}>
+            <label for="zone-{{ z }}">{{ z }}</label>
+          </div>
+        </div>
+        {% endfor %}
+        <div class="ui pointing label">Checking one or more boxes restricts this user to those zones — for template-baked zones and the zone override alike. Leaving all boxes unchecked applies no restriction; the implicit default zone is never gated.</div>
+        <div class="ui divider"></div>
+        <button type="submit" class="ui teal button"><i class="save icon"></i> Save Zone Access</button>
+      </form>
+    </div>
+
+    <div class="ui segment">
       <h4 class="ui header"><i class="sliders horizontal icon"></i> Session Overrides</h4>
-      <p class="ui grey text">Which template values this user may override per-session when creating an instance. gpuType/volumes are still limited to the allow-lists above even when granted here.</p>
+      <p class="ui grey text">Which template values this user may override per-session when creating an instance. gpuType/volumes/zone are still limited to the allow-lists above even when granted here.</p>
       <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/overrides?user={{ current_user }}">
         {% for group in override_groups %}
         <div class="field">

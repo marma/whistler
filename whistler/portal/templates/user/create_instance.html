@@ -98,6 +98,19 @@
     </div>
     {% endif %}
 
+    {% if overrides.zone %}
+    <div class="field">
+      <label>Network zone override</label>
+      <select name="override_zone" class="ui dropdown">
+        <option value="">— keep template's zone —</option>
+        {% for z in zones %}
+        <option value="{{ z }}">{{ z }}</option>
+        {% endfor %}
+      </select>
+      <div class="ui pointing label">Egress posture the instance runs under; applies from the next start/reboot.</div>
+    </div>
+    {% endif %}
+
     {% if overrides.uidGid %}
     <div class="field">
       <label>VM guest identity override (uid/gid)</label>

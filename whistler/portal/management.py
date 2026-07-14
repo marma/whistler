@@ -13,8 +13,10 @@ Set WHISTLER_ADMIN_USERS=alice,bob to grant admin to specific users, or
 WHISTLER_AUTH_ALLOW_ADMIN=true to treat every authenticated user as admin (dev).
 """
 import asyncio
+import ipaddress
 import logging
 import os
+import re
 from typing import Annotated, Optional
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
@@ -229,7 +231,8 @@ async def user_index(request: Request, cm: CM, user: User, is_admin: IsAdmin):
 # --------------------------------------------------------------------------- #
 
 async def instance_create_form(request: Request, cm: CM, user: User, is_admin: IsAdmin):
-    ssh_tpls, desk_tpls, volumes, allowed, gpu_types, allowed_gpu_types, overrides = \
+    (ssh_tpls, desk_tpls, volumes, allowed, gpu_types, allowed_gpu_types,
+     overrides, zones, allowed_zones) = \
         await asyncio.gather(
             request.app.state.run(cm.get_user_templates, user),
             request.app.state.run(cm.get_user_desktop_templates, user),
@@ -238,12 +241,18 @@ async def instance_create_form(request: Request, cm: CM, user: User, is_admin: I
             request.app.state.run(cm.get_gpu_types),
             request.app.state.run(cm.get_user_allowed_gpu_types, user),
             request.app.state.run(cm.get_user_overrides, user),
+            request.app.state.run(cm.get_zones),
+            request.app.state.run(cm.get_user_allowed_zones, user),
         )
+    # The zone picker offers only what _apply_policy would accept: an empty
+    # allowedZones means every defined zone.
+    selectable_zones = [z for z in zones if not allowed_zones or z in allowed_zones]
     return templates.TemplateResponse(
         request=request, name="user/create_instance.html",
         context=_ctx(user, is_admin=is_admin, tpls=ssh_tpls + desk_tpls, volumes=volumes,
                      allowed_volumes=allowed, gpu_types=gpu_types,
-                     allowed_gpu_types=allowed_gpu_types, overrides=overrides),
+                     allowed_gpu_types=allowed_gpu_types, overrides=overrides,
+                     zones=selectable_zones),
     )
 
 
@@ -262,6 +271,7 @@ async def instance_create(
     override_run_as_user:  Annotated[Optional[str], Form()] = None,
     override_run_as_group: Annotated[Optional[str], Form()] = None,
     override_fs_group:     Annotated[Optional[str], Form()] = None,
+    override_zone:         Annotated[Optional[str], Form()] = None,
 ):
     name = instance_name.strip()
     # The template carries the access mode; create the matching Session. Desktop
@@ -291,7 +301,7 @@ async def instance_create(
         gpu_type=override_gpu_type, gpu_count=override_gpu_count,
         uid=override_uid, gid=override_gid,
         run_as_user=override_run_as_user, run_as_group=override_run_as_group,
-        fs_group=override_fs_group,
+        fs_group=override_fs_group, zone=override_zone,
     )
 
     if mode == "desktop":
@@ -465,13 +475,15 @@ async def admin_templates(request: Request, cm: CM, admin: Admin):
 
 
 async def admin_template_new(request: Request, cm: CM, admin: Admin):
-    images, gpu_types = await asyncio.gather(
+    images, gpu_types, zones = await asyncio.gather(
         request.app.state.run(cm.get_available_images),
         request.app.state.run(cm.get_gpu_types),
+        request.app.state.run(cm.get_zones),
     )
     return templates.TemplateResponse(
         request=request, name="admin/template_form.html",
-        context=_ctx(admin, is_admin=True, tpl=None, available_images=images, gpu_types=gpu_types),
+        context=_ctx(admin, is_admin=True, tpl=None, available_images=images,
+                     gpu_types=gpu_types, zones=zones),
     )
 
 
@@ -492,13 +504,14 @@ async def admin_template_create(
     fuse:           Annotated[Optional[str], Form()] = None,
     display_port:   Annotated[Optional[str], Form()] = None,
     protocol:       Annotated[Optional[str], Form()] = None,
+    zone:           Annotated[Optional[str], Form()] = None,
 ):
     data = _template_form_data(
         name=slug.strip(), display_name=display_name, image=image,
         description=description, cpu=cpu, memory=memory, gpu=gpu, gpu_type=gpu_type,
         personal_mount=personal_mount,
         mode=mode, runtime=runtime, privileged=privileged, fuse=fuse,
-        display_port=display_port, protocol=protocol,
+        display_port=display_port, protocol=protocol, zone=zone,
     )
     ok = await request.app.state.run(cm.save_system_template, data)
     if not ok:
@@ -507,17 +520,19 @@ async def admin_template_create(
 
 
 async def admin_template_edit(request: Request, cm: CM, admin: Admin, name: str):
-    tpls, images, gpu_types = await asyncio.gather(
+    tpls, images, gpu_types, zones = await asyncio.gather(
         request.app.state.run(cm.get_all_templates),
         request.app.state.run(cm.get_available_images),
         request.app.state.run(cm.get_gpu_types),
+        request.app.state.run(cm.get_zones),
     )
     tpl = next((t for t in tpls if t.get("fullName") == name or t.get("name") == name), None)
     if not tpl:
         raise HTTPException(status_code=404, detail="Template not found.")
     return templates.TemplateResponse(
         request=request, name="admin/template_form.html",
-        context=_ctx(admin, is_admin=True, tpl=tpl, available_images=images, gpu_types=gpu_types),
+        context=_ctx(admin, is_admin=True, tpl=tpl, available_images=images,
+                     gpu_types=gpu_types, zones=zones),
     )
 
 
@@ -537,13 +552,14 @@ async def admin_template_update(
     fuse:           Annotated[Optional[str], Form()] = None,
     display_port:   Annotated[Optional[str], Form()] = None,
     protocol:       Annotated[Optional[str], Form()] = None,
+    zone:           Annotated[Optional[str], Form()] = None,
 ):
     data = _template_form_data(
         name=name, display_name=display_name, image=image,
         description=description, cpu=cpu, memory=memory, gpu=gpu, gpu_type=gpu_type,
         personal_mount=personal_mount,
         mode=mode, runtime=runtime, privileged=privileged, fuse=fuse,
-        display_port=display_port, protocol=protocol,
+        display_port=display_port, protocol=protocol, zone=zone,
     )
     ok = await request.app.state.run(cm.save_system_template, data)
     if not ok:
@@ -604,12 +620,15 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
     gpu_types = await request.app.state.run(cm.get_gpu_types)
     allowed_gpu_types = await request.app.state.run(cm.get_user_allowed_gpu_types, username)
     user_overrides = await request.app.state.run(cm.get_user_overrides, username)
+    zones = await request.app.state.run(cm.get_zones)
+    allowed_zones = await request.app.state.run(cm.get_user_allowed_zones, username)
     return templates.TemplateResponse(
         request=request, name="admin/user_detail.html",
         context=_ctx(admin, is_admin=True, user_obj=user_obj, instances=instances,
                      volumes=volumes, allowed_volumes=allowed,
                      gpu_types=gpu_types, allowed_gpu_types=allowed_gpu_types,
-                     user_overrides=user_overrides, override_groups=OVERRIDE_GROUPS),
+                     user_overrides=user_overrides, override_groups=OVERRIDE_GROUPS,
+                     zones=zones, allowed_zones=allowed_zones),
     )
 
 
@@ -648,6 +667,14 @@ async def admin_user_set_gpu_types(
     gpu_types: Annotated[Optional[list[str]], Form()] = None,
 ):
     await request.app.state.run(cm.set_user_allowed_gpu_types, username, gpu_types or [])
+    return _tr(f"/admin/users/{username}", admin)
+
+
+async def admin_user_set_zones(
+    request: Request, cm: CM, admin: Admin, username: str,
+    zone_names: Annotated[Optional[list[str]], Form()] = None,
+):
+    await request.app.state.run(cm.set_user_allowed_zones, username, zone_names or [])
     return _tr(f"/admin/users/{username}", admin)
 
 
@@ -699,6 +726,90 @@ async def admin_volume_delete(request: Request, cm: CM, admin: Admin, name: str)
 
 
 # --------------------------------------------------------------------------- #
+# Admin — zones (network postures; Zone CRs)                                    #
+# --------------------------------------------------------------------------- #
+
+async def admin_zones(request: Request, cm: CM, admin: Admin):
+    zone_defs = await request.app.state.run(cm.get_zone_definitions)
+    zones = [{"name": name, **(cfg or {})} for name, cfg in sorted(zone_defs.items())]
+    return templates.TemplateResponse(
+        request=request, name="admin/zones.html",
+        context=_ctx(admin, is_admin=True, zones=zones),
+    )
+
+
+async def admin_zone_new(request: Request, cm: CM, admin: Admin):
+    return templates.TemplateResponse(
+        request=request, name="admin/zone_form.html",
+        context=_ctx(admin, is_admin=True, zone=None,
+                     allow_cidrs_text="", block_cidrs_text="", dns_servers_text=""),
+    )
+
+
+async def admin_zone_create(
+    request: Request, cm: CM, admin: Admin,
+    name:             Annotated[str, Form()],
+    description:      Annotated[Optional[str], Form()] = None,
+    allow_cidrs:      Annotated[Optional[str], Form()] = None,
+    block_cidrs:      Annotated[Optional[str], Form()] = None,
+    dns_cluster_only: Annotated[Optional[str], Form()] = None,
+    dns_servers:      Annotated[Optional[str], Form()] = None,
+):
+    name = name.strip()
+    if not re.fullmatch(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?", name):
+        raise HTTPException(status_code=400,
+                            detail="Zone name must be a DNS-1123 label "
+                                   "(lowercase alphanumerics and '-', max 63 chars).")
+    zone_data = _build_zone_data(name, description, allow_cidrs, block_cidrs,
+                                 dns_cluster_only, dns_servers)
+    ok = await request.app.state.run(cm.save_zone, zone_data)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to create zone.")
+    return _tr("/admin/zones", admin)
+
+
+async def admin_zone_edit(request: Request, cm: CM, admin: Admin, name: str):
+    zone_defs = await request.app.state.run(cm.get_zone_definitions)
+    if name not in zone_defs:
+        raise HTTPException(status_code=404, detail="Zone not found.")
+    cfg = zone_defs[name] or {}
+    egress = cfg.get("egress") or {}
+    dns = cfg.get("dns") or {}
+    return templates.TemplateResponse(
+        request=request, name="admin/zone_form.html",
+        context=_ctx(admin, is_admin=True, zone={"name": name, **cfg},
+                     allow_cidrs_text=_format_allow_cidrs(egress.get("allowCIDRs")),
+                     block_cidrs_text="\n".join(egress.get("blockCIDRs") or []),
+                     dns_servers_text=", ".join(dns.get("servers") or [])),
+    )
+
+
+async def admin_zone_update(
+    request: Request, cm: CM, admin: Admin, name: str,
+    description:      Annotated[Optional[str], Form()] = None,
+    allow_cidrs:      Annotated[Optional[str], Form()] = None,
+    block_cidrs:      Annotated[Optional[str], Form()] = None,
+    dns_cluster_only: Annotated[Optional[str], Form()] = None,
+    dns_servers:      Annotated[Optional[str], Form()] = None,
+):
+    zone_data = _build_zone_data(name, description, allow_cidrs, block_cidrs,
+                                 dns_cluster_only, dns_servers)
+    ok = await request.app.state.run(cm.save_zone, zone_data)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to update zone.")
+    return _tr("/admin/zones", admin)
+
+
+async def admin_zone_delete(request: Request, cm: CM, admin: Admin, name: str):
+    ok = await request.app.state.run(cm.delete_zone, name)
+    if not ok:
+        raise HTTPException(
+            status_code=400,
+            detail="Failed to delete zone. The default zone cannot be deleted.")
+    return _tr("/admin/zones", admin)
+
+
+# --------------------------------------------------------------------------- #
 # Admin — sessions (all users)                                                 #
 # --------------------------------------------------------------------------- #
 
@@ -745,7 +856,7 @@ def _build_session_overrides(*, volumes=None, cpu=None, memory=None,
                              gpu_type=None, gpu_count=None,
                              uid=None, gid=None,
                              run_as_user=None, run_as_group=None,
-                             fs_group=None) -> Optional[dict]:
+                             fs_group=None, zone=None) -> Optional[dict]:
     """Assemble a Session spec.overrides payload from the create-instance
     form. A group is only included when the form actually supplied a value
     for it — the form only renders fields for groups the user's User CR
@@ -782,18 +893,23 @@ def _build_session_overrides(*, volumes=None, cpu=None, memory=None,
     if volumes:
         overrides["volumes"] = volumes
 
+    if zone and zone.strip():
+        overrides["zone"] = zone.strip()
+
     return overrides or None
 
 
 def _template_form_data(*, name, display_name, image, description, cpu, memory,
                         personal_mount, mode, runtime, privileged, fuse,
-                        display_port, protocol, gpu=None, gpu_type=None) -> dict:
+                        display_port, protocol, gpu=None, gpu_type=None,
+                        zone=None) -> dict:
     """Assemble a save_system_template payload from the admin template form,
     including the access mode / runtime / privileged toggles. Desktop-only
     fields are only included when mode == 'desktop'. gpu (count) maps to
     resources.gpu; gpu_type (from the gpuTypes catalog) maps to
     nodeSelector[GPU_NODE_LABEL], the key _apply_policy checks against a
-    user's allowedGpuTypes."""
+    user's allowedGpuTypes. zone names a network zone; empty means the
+    implicit default."""
     data = {
         "name": name,
         "displayName": display_name.strip(),
@@ -807,6 +923,10 @@ def _template_form_data(*, name, display_name, image, description, cpu, memory,
         "privileged": privileged == "on",
         "fuse": fuse == "on",
     }
+    # Always present (form select; "" = implicit default) so switching a
+    # template back to the default zone actually clears the field — the
+    # save merges present keys over the existing spec.
+    data["zone"] = (zone or "").strip()
     if data["mode"] == "desktop":
         if display_port and display_port.strip():
             data["displayPort"] = int(display_port)
@@ -842,6 +962,102 @@ def _build_volume_data(name, pvc_name, sub_path) -> dict:
     if sub_path and sub_path.strip():
         vol["subPath"] = sub_path.strip()
     return vol
+
+
+def _parse_block_cidrs(text) -> list:
+    """One CIDR per line. Invalid entries are a 400, not a silent drop — a
+    typo'd blockCIDR would otherwise widen the zone."""
+    cidrs = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            cidrs.append(str(ipaddress.IPv4Network(line, strict=False)))
+        except ValueError:
+            raise HTTPException(status_code=400,
+                                detail=f"Invalid CIDR in blocked list: {line!r}")
+    return cidrs
+
+
+def _parse_allow_cidrs(text) -> list:
+    """One entry per line: ``CIDR`` (all ports) or ``CIDR port/proto ...``
+    (e.g. ``203.0.113.0/24 443/tcp 53/udp``). This is the flat-text form of
+    the Zone CR's egress.allowCIDRs; _format_allow_cidrs is its inverse."""
+    entries = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        try:
+            cidr = str(ipaddress.IPv4Network(parts[0], strict=False))
+        except ValueError:
+            raise HTTPException(status_code=400,
+                                detail=f"Invalid CIDR in allowed list: {parts[0]!r}")
+        entry: dict = {"cidr": cidr}
+        ports = []
+        for spec in parts[1:]:
+            m = re.fullmatch(r"(\d{1,5})/(tcp|udp|sctp)", spec.lower())
+            if not m or not 0 < int(m.group(1)) <= 65535:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid port spec {spec!r} (expected port/tcp, "
+                           f"port/udp or port/sctp)")
+            ports.append({"port": int(m.group(1)), "protocol": m.group(2).upper()})
+        if ports:
+            entry["ports"] = ports
+        entries.append(entry)
+    return entries
+
+
+def _format_allow_cidrs(entries) -> str:
+    lines = []
+    for entry in entries or []:
+        parts = [entry.get("cidr", "")]
+        for p in entry.get("ports") or []:
+            parts.append(f"{p.get('port')}/{str(p.get('protocol', 'TCP')).lower()}")
+        lines.append(" ".join(parts))
+    return "\n".join(lines)
+
+
+def _parse_dns_servers(text) -> list:
+    servers = []
+    for token in re.split(r"[,\s]+", text or ""):
+        if not token:
+            continue
+        try:
+            servers.append(str(ipaddress.IPv4Address(token)))
+        except ValueError:
+            raise HTTPException(status_code=400,
+                                detail=f"Invalid DNS server IP: {token!r}")
+    return servers
+
+
+def _build_zone_data(name, description, allow_cidrs, block_cidrs,
+                     dns_cluster_only, dns_servers) -> dict:
+    """Assemble a save_zone payload from the zone form. Always carries the
+    full config: save_zone replaces the CR spec, so cleared fields clear."""
+    zone: dict = {"name": name.strip()}
+    if description and description.strip():
+        zone["description"] = description.strip()
+    egress: dict = {}
+    allow = _parse_allow_cidrs(allow_cidrs)
+    block = _parse_block_cidrs(block_cidrs)
+    if allow:
+        egress["allowCIDRs"] = allow
+    if block:
+        egress["blockCIDRs"] = block
+    if egress:
+        zone["egress"] = egress
+    dns: dict = {}
+    if dns_cluster_only == "on":
+        dns["clusterOnly"] = True
+    servers = _parse_dns_servers(dns_servers)
+    if servers:
+        dns["servers"] = servers
+    if dns:
+        zone["dns"] = dns
+    return zone
 
 
 # --------------------------------------------------------------------------- #
@@ -889,11 +1105,18 @@ def build_management_app(config_manager):
     app.add_api_route("/admin/users/{username}/delete",           admin_user_delete,      methods=["POST"])
     app.add_api_route("/admin/users/{username}/volumes",          admin_user_set_volumes, methods=["POST"])
     app.add_api_route("/admin/users/{username}/gpu-types",        admin_user_set_gpu_types, methods=["POST"])
+    app.add_api_route("/admin/users/{username}/zones",            admin_user_set_zones, methods=["POST"])
     app.add_api_route("/admin/users/{username}/overrides",        admin_user_set_overrides, methods=["POST"])
     app.add_api_route("/admin/volumes",                           admin_volumes,          methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/volumes/new",                       admin_volume_new,       methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/volumes",                           admin_volume_create,    methods=["POST"])
     app.add_api_route("/admin/volumes/{name}/delete",             admin_volume_delete,    methods=["POST"])
+    app.add_api_route("/admin/zones",                             admin_zones,            methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/admin/zones/new",                         admin_zone_new,         methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/admin/zones",                             admin_zone_create,      methods=["POST"])
+    app.add_api_route("/admin/zones/{name}/edit",                 admin_zone_edit,        methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/admin/zones/{name}",                      admin_zone_update,      methods=["POST"])
+    app.add_api_route("/admin/zones/{name}/delete",               admin_zone_delete,      methods=["POST"])
     app.add_api_route("/admin/sessions",                          admin_sessions,         methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/sessions/{username}/{name}/stop",   admin_session_stop,     methods=["POST"])
     app.add_api_route("/admin/sessions/{username}/{name}/delete", admin_session_delete,   methods=["POST"])

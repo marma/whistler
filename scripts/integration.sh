@@ -126,11 +126,8 @@ EOF
 echo "[]" > "$WORK/volumes.yaml"
 echo "[]" > "$WORK/selectors.yaml"
 echo "[]" > "$WORK/gpuTypes.yaml"
-cat > "$WORK/networkpolicy.yaml" <<EOF
-egress:
-  allowCIDRs: []
-  blockCIDRs: []
-EOF
+# Zones live as Zone CRs (none defined -> the default zone is synthesized:
+# deny-all egress except DNS); zones.yaml is only an API-failure fallback.
 # Image allow-lists. ssh is unrestricted (empty); desktop/vm are enforced by the
 # operator, so every desktop test image must be listed here or provisioning
 # fails (test_desktop.py uses the pause image; test_display.py uses an RDP image).

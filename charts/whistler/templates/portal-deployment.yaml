@@ -62,17 +62,20 @@ spec:
               port: 8080
             initialDelaySeconds: 3
             periodSeconds: 10
-          # KubeConfigManager loads networkpolicy egress config, same as the
+          # KubeConfigManager loads the zone/egress config, same as the
           # operator/server; users are read live via the K8s API (User CRs).
           volumeMounts:
             - name: config
               mountPath: "/etc/whistler-config/volumes.yaml"
               subPath: "volumes.yaml"
               readOnly: true
+            {{- if .Values.whistler.networkPolicy }}
+            # Legacy pre-zones egress config (seeds the default zone).
             - name: config
               mountPath: "/etc/whistler-config/networkpolicy.yaml"
               subPath: "networkpolicy.yaml"
               readOnly: true
+            {{- end }}
             - name: config
               mountPath: "/etc/whistler-config/images.yaml"
               subPath: "images.yaml"

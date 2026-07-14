@@ -54,16 +54,19 @@ spec:
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
           # ensure_pod() runs here now, so the operator needs the same user and
-          # network-policy configuration the server has (securityContext, egress).
+          # zone/egress configuration the server has (securityContext, zones).
           volumeMounts:
             - name: config
               mountPath: "/etc/whistler-config/volumes.yaml"
               subPath: "volumes.yaml"
               readOnly: true
+            {{- if .Values.whistler.networkPolicy }}
+            # Legacy pre-zones egress config (seeds the default zone).
             - name: config
               mountPath: "/etc/whistler-config/networkpolicy.yaml"
               subPath: "networkpolicy.yaml"
               readOnly: true
+            {{- end }}
             - name: config
               mountPath: "/etc/whistler-config/images.yaml"
               subPath: "images.yaml"

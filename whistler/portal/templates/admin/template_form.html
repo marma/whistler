@@ -154,6 +154,21 @@
              value="{{ tpl.personalMountPath if tpl else '/userdata' }}">
     </div>
 
+    <div class="field">
+      <label>Network Zone</label>
+      <select name="zone" class="ui dropdown">
+        {% for z in zones %}
+        <option value="{{ '' if z == 'default' else z }}"
+                {% if tpl and (tpl.zone or 'default') == z %}selected{% endif %}>{{ z }}</option>
+        {% endfor %}
+      </select>
+      <div class="ui pointing label">
+        Egress posture sessions run under (whistler.zones). Users with an allowedZones
+        restriction can only use templates whose zone they're allowed. Takes effect on
+        the next session start.
+      </div>
+    </div>
+
     <div class="ui divider"></div>
     <button type="submit" class="ui primary button">
       <i class="save icon"></i> {% if tpl %}Save Changes{% else %}Create Template{% endif %}

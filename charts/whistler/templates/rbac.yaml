@@ -29,7 +29,7 @@ rules:
 
   # Application: watching & handling for the custom resources we declare.
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [sessions, templates, sessions/status, users]
+    resources: [sessions, templates, sessions/status, users, zones]
     verbs: [list, watch, patch, get, update, create, delete]
 
   # KubeVirt VM desktop backend. The CRDs may be absent in a given cluster;
@@ -87,9 +87,11 @@ rules:
     resources: [namespaces]
     verbs: [create, get, list, watch]
   
+  # delete: _ensure_user_namespace prunes per-zone policies whose zone was
+  # removed from the catalog.
   - apiGroups: [networking.k8s.io]
     resources: [networkpolicies]
-    verbs: [create, get, list, watch, update, patch]
+    verbs: [create, get, list, watch, update, patch, delete]
 
   # Managing user pods and PVCs
   - apiGroups: [""]
@@ -103,7 +105,7 @@ rules:
 
   # Managing custom resources
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [sessions, templates, sessions/status, users]
+    resources: [sessions, templates, sessions/status, users, zones]
     verbs: [create, delete, get, list, patch, update, watch]
 
 ---
@@ -164,16 +166,18 @@ rules:
   # management UI's SSH template/instance CRUD + trigger) + users (admin user
   # management).
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [sessions, templates, sessions/status, users]
+    resources: [sessions, templates, sessions/status, users, zones]
     verbs: [get, list, create, update, patch, delete, watch]
 
   # add_desktop_session / _ensure_user_namespace.
   - apiGroups: [""]
     resources: [namespaces]
     verbs: [get, list, create]
+  # delete: _ensure_user_namespace prunes per-zone policies whose zone was
+  # removed from the catalog.
   - apiGroups: [networking.k8s.io]
     resources: [networkpolicies]
-    verbs: [get, list, create, update, patch]
+    verbs: [get, list, create, update, patch, delete]
 
   # stop_instance deletes the pod (keeps the CR); list pods for status.
   - apiGroups: [""]

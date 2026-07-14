@@ -9,6 +9,7 @@ def _manager():
     cm = KubeConfigManager.__new__(KubeConfigManager)
     cm.group = "whistler.martinmalmsten.net"
     cm.version = "v1"
+    cm.zones = {"default": {}}
     return cm
 
 

@@ -8,7 +8,9 @@ from kubernetes import client, config as k8s_config
 from kubernetes.client import CoreV1Api, NetworkingV1Api
 from kubernetes.client.rest import ApiException
 from kubernetes.utils import parse_quantity
+import hashlib
 import ipaddress
+import json
 import os
 import yaml
 
@@ -23,6 +25,7 @@ CONFIG_DIR = os.environ.get("WHISTLER_CONFIG_DIR", "/etc/whistler-config")
 SELECTORS_FILE = os.path.join(CONFIG_DIR, "selectors.yaml")
 VOLUMES_FILE = os.path.join(CONFIG_DIR, "volumes.yaml")
 NETWORKPOLICY_FILE = os.path.join(CONFIG_DIR, "networkpolicy.yaml")
+ZONES_FILE = os.path.join(CONFIG_DIR, "zones.yaml")
 IMAGES_FILE = os.path.join(CONFIG_DIR, "images.yaml")
 GPU_TYPES_FILE = os.path.join(CONFIG_DIR, "gpuTypes.yaml")
 # Seeds the first admin User CR at operator startup (KubeConfigManager.
@@ -50,6 +53,7 @@ CDI_DV_PLURAL = "datavolumes"
 TEMPLATE_PLURAL = "templates"
 SESSION_PLURAL = "sessions"
 USER_PLURAL = "users"
+ZONE_PLURAL = "zones"
 
 # Node label a template/override's gpuType is matched against, both as the
 # nodeSelector key that schedules onto a GPU of that type and as the node
@@ -58,6 +62,22 @@ USER_PLURAL = "users"
 # "NVIDIA-A100-SXM4-40GB") — not a whistler-specific label an admin has to
 # set by hand, unlike the "accelerator" shorthand this used to be.
 GPU_NODE_LABEL = "nvidia.com/gpu.product"
+
+# Zones: admin-defined network postures (whistler.zones) a session runs under.
+# Each zone renders to one NetworkPolicy per user namespace selecting pods by
+# this label; the label is stamped at pod/VM build time, so a session changes
+# zone on reboot, never live. ZONE_HASH_ANNOTATION records a digest of the zone
+# config the pod was built under — "what rules was this actually running with"
+# stays answerable after the zone definition changes.
+ZONE_LABEL = "whistler.martinmalmsten.net/zone"
+ZONE_POLICY_LABEL = "whistler.martinmalmsten.net/zone-policy"
+ZONE_HASH_ANNOTATION = "whistler.martinmalmsten.net/zone-config-hash"
+DEFAULT_ZONE = "default"
+
+# The cluster resolver's canonical labels (CoreDNS/kube-dns on k3s, kubeadm,
+# and managed clusters alike) — target of the dns.clusterOnly zone knob.
+CLUSTER_DNS_NAMESPACE = "kube-system"
+CLUSTER_DNS_POD_LABELS = {"k8s-app": "kube-dns"}
 
 # Groups of template values a user may be granted permission to override per-
 # session (User CR `overrides`, session spec.overrides). Booleans only —
@@ -71,6 +91,7 @@ OVERRIDE_GROUPS = (
     "uidGid",           # user_details.uid / .gid (VM guest identity)
     "securityContext",  # user_details.securityContext.{fsGroup,runAsUser,runAsGroup}
     "volumes",          # template volumes (still gated by allowedVolumes)
+    "zone",             # network zone (still gated by allowedZones)
 )
 
 
@@ -145,6 +166,11 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
+    def get_zones(self) -> List[str]:
+        """Names of the defined network zones ("default" always among them)."""
+        pass
+
+    @abstractmethod
     def get_available_images(self, category: Optional[str] = None) -> List[str]:
         pass
 
@@ -202,6 +228,19 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
+    def get_zone_definitions(self) -> Dict[str, Dict[str, Any]]:
+        """Full zone catalog (name -> config) for the admin zones editor."""
+        pass
+
+    @abstractmethod
+    def save_zone(self, zone_data: Dict[str, Any]) -> bool:
+        pass
+
+    @abstractmethod
+    def delete_zone(self, zone_name: str) -> bool:
+        pass
+
+    @abstractmethod
     def get_user_allowed_volumes(self, username: str) -> List[str]:
         pass
 
@@ -215,6 +254,14 @@ class ConfigManager(ABC):
 
     @abstractmethod
     def set_user_allowed_gpu_types(self, username: str, gpu_types: List[str]) -> bool:
+        pass
+
+    @abstractmethod
+    def get_user_allowed_zones(self, username: str) -> List[str]:
+        pass
+
+    @abstractmethod
+    def set_user_allowed_zones(self, username: str, zones: List[str]) -> bool:
         pass
 
     @abstractmethod
@@ -271,8 +318,11 @@ class KubeConfigManager(ConfigManager):
         self.volume_definitions = {}
         self._load_volumes()
 
-        self.network_policy_egress = {"allowCIDRs": [], "blockCIDRs": []}
-        self._load_network_policy()
+        # Named network zones (whistler.zones); "default" always exists. The
+        # legacy networkpolicy.yaml egress config seeds the default zone when
+        # zones.yaml doesn't define one.
+        self.zones = {DEFAULT_ZONE: {}}
+        self._load_zones()
 
         # Image allow-lists (by template category) + security policy. Enforced
         # operator-side at pod/VM build time (see _apply_policy).
@@ -352,35 +402,72 @@ class KubeConfigManager(ConfigManager):
             else:
                 raise
 
-        # Ensure NetworkPolicy
-        policy_name = "isolate-user-pods"
+        # Baseline NetworkPolicy: selects every pod (deny-by-default posture),
+        # carrying only the ingress carve-outs and the egress every zone needs.
+        # Zone-specific egress lives in the per-zone policies below — allows
+        # are union'd across policies, so anything granted here is
+        # irrevocable by a zone.
         policy_body = {
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
             "metadata": {
-                "name": policy_name,
+                "name": "isolate-user-pods",
                 "namespace": ns_name
             },
             "spec": {
                 "podSelector": {},
                 "policyTypes": ["Ingress", "Egress"],
                 "ingress": self._build_ingress_rules(),
-                "egress": self._build_egress_rules()
+                "egress": self._build_baseline_egress_rules()
             }
         }
-        logger.debug(f"Applying NetworkPolicy {policy_name} in {ns_name}:\n{yaml.dump(policy_body, default_flow_style=False)}")
+        self._apply_network_policy(net_api, ns_name, policy_body)
+
+        # Eager per-zone policies: every defined zone gets its policy in every
+        # user namespace (an idle policy selecting no pods costs nothing, and
+        # `kubectl get netpol` stays self-documenting).
+        self._load_zones()
+        self._apply_zone_policies(net_api, ns_name)
+
+        return ns_name
+
+    def _apply_zone_policies(self, net_api, ns_name: str):
+        """Apply the current zone catalog to one user namespace: one policy
+        per zone, pruning policies for zones that no longer exist so a
+        deleted zone's allows don't linger. Shared by _ensure_user_namespace
+        (connect/reconcile path) and _propagate_zone_policies (admin edits)."""
+        for zone in self.zones:
+            zone_policy = self._build_zone_network_policy(zone)
+            zone_policy["metadata"]["namespace"] = ns_name
+            self._apply_network_policy(net_api, ns_name, zone_policy)
         try:
-            net_api.read_namespaced_network_policy(policy_name, ns_name)
-            logger.info(f"Updating NetworkPolicy {policy_name} in {ns_name}")
-            net_api.replace_namespaced_network_policy(policy_name, ns_name, policy_body)
+            existing = net_api.list_namespaced_network_policy(
+                ns_name, label_selector=f"{ZONE_POLICY_LABEL}=true")
+            for pol in existing.items:
+                zone = (pol.metadata.labels or {}).get(ZONE_LABEL)
+                if zone not in self.zones:
+                    logger.info(f"Pruning NetworkPolicy {pol.metadata.name} in "
+                                f"{ns_name} (zone {zone!r} no longer defined)")
+                    net_api.delete_namespaced_network_policy(
+                        pol.metadata.name, ns_name)
+        except ApiException as e:
+            logger.error(f"Failed to prune stale zone policies in {ns_name}: {e}")
+
+    @staticmethod
+    def _apply_network_policy(net_api, ns_name: str, policy_body: Dict[str, Any]):
+        name = policy_body["metadata"]["name"]
+        logger.debug(f"Applying NetworkPolicy {name} in {ns_name}:\n"
+                     f"{yaml.dump(policy_body, default_flow_style=False)}")
+        try:
+            net_api.read_namespaced_network_policy(name, ns_name)
+            logger.info(f"Updating NetworkPolicy {name} in {ns_name}")
+            net_api.replace_namespaced_network_policy(name, ns_name, policy_body)
         except ApiException as e:
             if e.status == 404:
-                logger.info(f"Creating NetworkPolicy {policy_name} in {ns_name}")
+                logger.info(f"Creating NetworkPolicy {name} in {ns_name}")
                 net_api.create_namespaced_network_policy(ns_name, policy_body)
             else:
                 raise
-        
-        return ns_name
 
     def _load_users(self):
         # On failure, leave self.users as-is (stale-but-valid) rather than
@@ -775,7 +862,13 @@ class KubeConfigManager(ConfigManager):
             the owning user's allowedVolumes the same way. Applies regardless
             of whether the volume came from the template or a session
             override (see _apply_overrides) — the merge happens before this
-            runs."""
+            runs.
+          - An explicit zone (template-baked or overridden) must exist in the
+            zone catalog — an unknown zone fails closed rather than falling
+            back to default, whose posture may be laxer — and is checked
+            against the owning user's allowedZones like gpuType/volumes. An
+            absent zone (implicit default) skips both checks so a
+            misconfigured allow-list can't brick plain templates."""
         effective_runtime = runtime
         wants_privileged = bool(template_spec.get("privileged") or template_spec.get("fuse"))
         if self.force_kata_for_privileged and wants_privileged and effective_runtime == "container":
@@ -824,6 +917,28 @@ class KubeConfigManager(ConfigManager):
                         f"volumes {disallowed} are not allowed for user {username!r} "
                         f"(allowedVolumes: {allowed_volumes})"
                     )
+
+        zone = template_spec.get("zone")
+        if zone:
+            if zone not in self.zones:
+                # The catalog is admin-editable at runtime (Zone CRs); a miss
+                # may just mean it changed since the last load. (A deleted
+                # zone lingering in the cache is fail-safe the other way: its
+                # policies are already pruned, so the label selects nothing
+                # and the pod gets baseline-only egress.)
+                self._load_zones()
+            if zone not in self.zones:
+                raise PolicyError(
+                    f"zone {zone!r} is not defined (whistler.zones); "
+                    f"defined zones: {sorted(self.zones)}"
+                )
+            if username:
+                allowed_zones = self.get_user_allowed_zones(username)
+                if allowed_zones and zone not in allowed_zones:
+                    raise PolicyError(
+                        f"zone {zone!r} is not allowed for user {username!r} "
+                        f"(allowedZones: {allowed_zones})"
+                    )
         return effective_runtime
 
     def _apply_overrides(self, template_spec: Dict[str, Any],
@@ -837,10 +952,11 @@ class KubeConfigManager(ConfigManager):
         owning user's User CR `overrides` (see get_user_overrides); an
         ungranted key raises PolicyError rather than being silently dropped —
         a live CR with an override the user isn't (or is no longer) granted
-        is worth surfacing loudly. gpuType/volumes values are further gated
-        by allowedGpuTypes/allowedVolumes, but that happens afterwards in
-        _apply_policy against the merged spec this method returns, so it
-        applies uniformly whether the value came from the template or here.
+        is worth surfacing loudly. gpuType/volumes/zone values are further
+        gated by allowedGpuTypes/allowedVolumes/allowedZones, but that happens
+        afterwards in _apply_policy against the merged spec this method
+        returns, so it applies uniformly whether the value came from the
+        template or here.
 
         Returns (effective_template_spec, effective_user_details); neither
         input dict is mutated."""
@@ -902,18 +1018,168 @@ class KubeConfigManager(ConfigManager):
             _require("volumes")
             effective_spec["volumes"] = dict(overrides["volumes"] or {})
 
+        if "zone" in overrides:
+            _require("zone")
+            effective_spec["zone"] = overrides["zone"]
+
         return effective_spec, effective_user
 
-    def _load_network_policy(self):
+    def _load_zones(self):
+        """Load the zone catalog from Zone CRs (live, admin-editable via the
+        portal; the chart renders whistler.zones values as Zone CRs).
+
+        A zone is {egress: {allowCIDRs, blockCIDRs}, dns: {clusterOnly,
+        servers}}; each becomes a per-user-namespace NetworkPolicy selecting
+        pods labeled with the zone (see _build_zone_network_policy). The
+        "default" zone always exists — synthesized when no default CR is
+        defined, seeded from the legacy networkpolicy.yaml `egress` config
+        so pre-zones values keep their meaning.
+
+        On API failure, fall back to the mounted zones.yaml file (host-process
+        dev without the CRD), and past that keep the previous catalog
+        (stale-but-valid, like _load_users) rather than wiping it — a
+        transient API error must not flip every session to a wrong zone."""
+        try:
+            resp = self.api.list_namespaced_custom_object(
+                self.group, self.version, self.namespace, ZONE_PLURAL
+            )
+            zones = {
+                item["metadata"]["name"]: (item.get("spec") or {})
+                for item in resp.get("items", [])
+            }
+        except (ApiException, AttributeError) as e:
+            logger.debug(f"Zone CRs unavailable ({e}); falling back to zones.yaml")
+            zones = self._load_zones_file()
+            if zones is None:  # file also unreadable: keep the stale catalog
+                return
+
+        if DEFAULT_ZONE not in zones:
+            zones[DEFAULT_ZONE] = self._load_legacy_default_zone()
+
+        self.zones = zones
+
+    @staticmethod
+    def _load_zones_file() -> Optional[Dict[str, Any]]:
+        try:
+            with open(ZONES_FILE, "r") as f:
+                data = yaml.safe_load(f)
+                if isinstance(data, dict):
+                    return {str(name): (cfg or {}) for name, cfg in data.items()}
+            return {}
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            logger.error(f"Failed to load zones.yaml: {e}")
+            return None
+
+    @staticmethod
+    def _load_legacy_default_zone() -> Dict[str, Any]:
         try:
             with open(NETWORKPOLICY_FILE, "r") as f:
                 data = yaml.safe_load(f)
                 if data and "egress" in data:
-                    self.network_policy_egress = data["egress"]
+                    return {"egress": data["egress"]}
         except FileNotFoundError:
-            pass  # Use defaults (deny-all egress except DNS)
+            pass  # default zone stays deny-all-egress-except-DNS
         except Exception as e:
             logger.error(f"Failed to load networkpolicy.yaml: {e}")
+        return {}
+
+    def get_zones(self) -> List[str]:
+        self._load_zones()
+        return sorted(self.zones.keys())
+
+    def get_zone_definitions(self) -> Dict[str, Dict[str, Any]]:
+        """Full zone catalog (name -> config), freshly loaded — drives the
+        admin zones editor."""
+        self._load_zones()
+        return {name: dict(cfg or {}) for name, cfg in self.zones.items()}
+
+    def save_zone(self, zone_data: Dict[str, Any]) -> bool:
+        """Create or update a Zone CR from the admin editor, then push the
+        resulting NetworkPolicy to every managed user namespace so the change
+        applies now, not at each user's next reconcile. (Running sessions keep
+        their label; the rules behind that label change in place.)"""
+        data = dict(zone_data)
+        name = (data.pop("name", "") or "").strip()
+        if not name:
+            return False
+        spec = {k: v for k, v in data.items() if v not in (None, "")}
+        try:
+            try:
+                existing = self.api.get_namespaced_custom_object(
+                    self.group, self.version, self.namespace, ZONE_PLURAL, name
+                )
+                body = {
+                    "apiVersion": f"{self.group}/{self.version}",
+                    "kind": "Zone",
+                    "metadata": {"name": name, "namespace": self.namespace,
+                                 "resourceVersion": existing["metadata"]["resourceVersion"]},
+                    # Replace, don't merge: the form always carries the full
+                    # zone config, and a cleared field must actually clear.
+                    "spec": spec,
+                }
+                self.api.replace_namespaced_custom_object(
+                    self.group, self.version, self.namespace, ZONE_PLURAL, name, body
+                )
+            except ApiException as e:
+                if e.status != 404:
+                    raise
+                body = {
+                    "apiVersion": f"{self.group}/{self.version}",
+                    "kind": "Zone",
+                    "metadata": {"name": name, "namespace": self.namespace},
+                    "spec": spec,
+                }
+                self.api.create_namespaced_custom_object(
+                    self.group, self.version, self.namespace, ZONE_PLURAL, body
+                )
+        except ApiException as e:
+            logger.error(f"Failed to save zone {name!r}: {e}")
+            return False
+        self._propagate_zone_policies()
+        return True
+
+    def delete_zone(self, zone_name: str) -> bool:
+        """Delete a Zone CR and prune its NetworkPolicy from every managed
+        user namespace. The default zone is undeletable — it is the fallback
+        every unzoned template lands in. Sessions still referencing a deleted
+        zone fail closed at their next build (_apply_policy)."""
+        if zone_name == DEFAULT_ZONE:
+            logger.warning("Refusing to delete the default zone")
+            return False
+        try:
+            self.api.delete_namespaced_custom_object(
+                self.group, self.version, self.namespace, ZONE_PLURAL, zone_name
+            )
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to delete zone {zone_name!r}: {e}")
+                return False
+        self._propagate_zone_policies()
+        return True
+
+    def _propagate_zone_policies(self):
+        """Re-apply the (freshly loaded) zone catalog to every managed user
+        namespace: update/create each zone's policy, prune deleted ones.
+        Best-effort — a namespace that fails here is corrected by its next
+        _ensure_user_namespace, and new namespaces always get the current
+        catalog."""
+        self._load_zones()
+        core_api = CoreV1Api()
+        net_api = NetworkingV1Api()
+        try:
+            namespaces = core_api.list_namespace(
+                label_selector="whistler.martinmalmsten.net/managed=true")
+        except ApiException as e:
+            logger.error(f"Failed to list user namespaces for zone propagation: {e}")
+            return
+        for ns in namespaces.items:
+            try:
+                self._apply_zone_policies(net_api, ns.metadata.name)
+            except ApiException as e:
+                logger.error(f"Failed to propagate zone policies to "
+                             f"{ns.metadata.name}: {e}")
 
     def _build_ingress_rules(self) -> list:
         """Ingress for a user namespace: deny everything except the trusted portal
@@ -933,29 +1199,52 @@ class KubeConfigManager(ConfigManager):
             ]
         }]
 
-    def _build_egress_rules(self) -> list:
+    def _build_baseline_egress_rules(self) -> list:
+        """Egress every pod in a user namespace gets, regardless of zone.
+        Deliberately minimal: NetworkPolicy allows are union'd across all
+        policies selecting a pod, so anything granted here can never be
+        revoked by a zone. DNS is per-zone (a zone may pin resolvers)."""
+        return [
+            # Session pods (including VM virt-launcher pods, whose guest
+            # traffic is masqueraded through them) may reach the user's own
+            # storage gateway on SMB. Same-namespace podSelector; the
+            # gateway's dedicated policy (_build_gateway_network_policy)
+            # narrows the ingress side.
+            {
+                "to": [{"podSelector": {
+                    "matchLabels": {"app": "whistler-storage-gateway"}}}],
+                "ports": [{"port": 445, "protocol": "TCP"}],
+            },
+        ]
+
+    def _build_egress_rules(self, zone: str) -> list:
+        zone_cfg = self.zones.get(zone) or {}
+        egress = zone_cfg.get("egress") or {}
         rules = []
 
-        # DNS is always allowed so pods can resolve hostnames
-        rules.append({
-            "ports": [
-                {"port": 53, "protocol": "UDP"},
-                {"port": 53, "protocol": "TCP"}
-            ]
-        })
-
-        # Session pods (including VM virt-launcher pods, whose guest traffic
-        # is masqueraded through them) may reach the user's own storage
-        # gateway on SMB. Same-namespace podSelector; the gateway's dedicated
-        # policy (_build_gateway_network_policy) narrows the ingress side.
-        rules.append({
-            "to": [{"podSelector": {
-                "matchLabels": {"app": "whistler-storage-gateway"}}}],
-            "ports": [{"port": 445, "protocol": "TCP"}],
-        })
+        # DNS. Default: port 53 anywhere (pods must resolve hostnames). A zone
+        # may narrow it — clusterOnly pins it to the cluster resolver (closing
+        # direct-to-Internet DNS tunnels; upstream names still resolve through
+        # CoreDNS forwarding), servers pins it to specific resolver IPs (which
+        # _apply_zone_dns also steers the pod's resolv.conf at).
+        dns = zone_cfg.get("dns") or {}
+        dns_ports = [{"port": 53, "protocol": "UDP"}, {"port": 53, "protocol": "TCP"}]
+        dns_to = []
+        if dns.get("clusterOnly"):
+            dns_to.append({
+                "namespaceSelector": {"matchLabels": {
+                    "kubernetes.io/metadata.name": CLUSTER_DNS_NAMESPACE}},
+                "podSelector": {"matchLabels": dict(CLUSTER_DNS_POD_LABELS)},
+            })
+        for server in dns.get("servers") or []:
+            dns_to.append({"ipBlock": {"cidr": f"{server}/32"}})
+        dns_rule = {"ports": dns_ports}
+        if dns_to:
+            dns_rule["to"] = dns_to
+        rules.append(dns_rule)
 
         # Whitelist: explicit allow rules per destination CIDR
-        for entry in self.network_policy_egress.get("allowCIDRs", []) or []:
+        for entry in egress.get("allowCIDRs", []) or []:
             rule = {"to": [{"ipBlock": {"cidr": entry["cidr"]}}]}
             if "ports" in entry:
                 rule["ports"] = entry["ports"]
@@ -963,7 +1252,7 @@ class KubeConfigManager(ConfigManager):
 
         # Blacklist: compute the complement CIDRs explicitly rather than using
         # ipBlock.except, which is silently ignored by several CNI plugins.
-        block_cidrs = self.network_policy_egress.get("blockCIDRs", []) or []
+        block_cidrs = egress.get("blockCIDRs", []) or []
         if block_cidrs:
             remaining = [ipaddress.IPv4Network("0.0.0.0/0")]
             for block in block_cidrs:
@@ -980,6 +1269,46 @@ class KubeConfigManager(ConfigManager):
             rules.append({"to": [{"ipBlock": {"cidr": cidr}} for cidr in allowed]})
 
         return rules
+
+    def _zone_config_hash(self, zone: str) -> str:
+        """Short digest of a zone's config, stamped on workloads at build time
+        (ZONE_HASH_ANNOTATION) so the rules a session was built under stay
+        auditable after the zone definition changes."""
+        canonical = json.dumps(self.zones.get(zone) or {}, sort_keys=True)
+        return hashlib.sha256(canonical.encode()).hexdigest()[:12]
+
+    def _build_zone_network_policy(self, zone: str) -> Dict[str, Any]:
+        """One NetworkPolicy per zone per user namespace, selecting pods by
+        the zone label. Egress-only: ingress is owned entirely by the baseline
+        isolate-user-pods policy (portal carve-out) and the gateway's own
+        policy — a zone never widens what can reach a pod."""
+        return {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": f"whistler-zone-{zone}",
+                "labels": {ZONE_POLICY_LABEL: "true", ZONE_LABEL: zone},
+            },
+            "spec": {
+                "podSelector": {"matchLabels": {ZONE_LABEL: zone}},
+                "policyTypes": ["Egress"],
+                "egress": self._build_egress_rules(zone),
+            },
+        }
+
+    def _apply_zone_dns(self, pod_spec: Dict[str, Any], zone: str) -> None:
+        """Steer a pod (or VMI template) spec at a zone's forced resolvers.
+        Enforcement is the zone's port-53 egress rule; this makes resolution
+        actually work against those servers. VMs inherit it too: KubeVirt's
+        masquerade DHCP advertises the launcher pod's resolv.conf to the
+        guest. Note cluster-internal names (e.g. the storage gateway Service)
+        only resolve if the forced server handles them — a zone combining
+        dns.servers with runtime=vm needs a resolver that forwards cluster
+        zones, or clusterOnly instead."""
+        servers = ((self.zones.get(zone) or {}).get("dns") or {}).get("servers")
+        if servers:
+            pod_spec["dnsPolicy"] = "None"
+            pod_spec["dnsConfig"] = {"nameservers": [str(s) for s in servers]}
 
     def _ensure_pvc(self, user, namespace, logger=None):
         pvc_name = f"whistler-data-{user}"
@@ -1176,6 +1505,7 @@ class KubeConfigManager(ConfigManager):
         # supported shape.)
 
         app_label = "whistler-instance" if mode == "ssh" else "whistler-desktop"
+        zone = template_spec.get('zone') or DEFAULT_ZONE
         pod_body = {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -1188,6 +1518,12 @@ class KubeConfigManager(ConfigManager):
                     "instance": full_name,
                     "session": full_name,
                     "user": username,
+                    # Selects the zone's NetworkPolicy; stamped at build time,
+                    # so a session changes zone on reboot, never live.
+                    ZONE_LABEL: zone,
+                },
+                "annotations": {
+                    ZONE_HASH_ANNOTATION: self._zone_config_hash(zone),
                 },
                 "ownerReferences": [self._session_owner_reference(full_name, uid)],
             },
@@ -1200,6 +1536,7 @@ class KubeConfigManager(ConfigManager):
                 "automountServiceAccountToken": False,
             },
         }
+        self._apply_zone_dns(pod_body["spec"], zone)
 
         if streamer_sidecar is not None:
             pod_body["spec"]["initContainers"] = [streamer_sidecar]
@@ -1289,11 +1626,17 @@ class KubeConfigManager(ConfigManager):
         resources = template_spec.get('resources', {}) or {}
         node_selector = template_spec.get('nodeSelector', {})
         user_details = user_details or {}
+        zone = template_spec.get('zone') or DEFAULT_ZONE
 
         labels = {
             "app": "whistler-desktop",
             "session": session_name,
             "user": username,
+            # Inherited by the virt-launcher pod (like the Service's session
+            # label), where the zone's NetworkPolicy selects it — guest
+            # traffic is masqueraded through that pod, so the VM is zoned
+            # with no guest-side wiring.
+            ZONE_LABEL: zone,
         }
 
         devices = {
@@ -1364,7 +1707,12 @@ class KubeConfigManager(ConfigManager):
             # pages bump whistler/last-connect), not on session creation.
             "runStrategy": run_strategy,
             "template": {
-                "metadata": {"labels": labels},
+                "metadata": {
+                    "labels": labels,
+                    "annotations": {
+                        ZONE_HASH_ANNOTATION: self._zone_config_hash(zone),
+                    },
+                },
                 "spec": {
                     "nodeSelector": node_selector,
                     "domain": domain,
@@ -1378,6 +1726,9 @@ class KubeConfigManager(ConfigManager):
                 },
             },
         }
+        # Forced resolvers reach the guest through KubeVirt's masquerade DHCP,
+        # which advertises the launcher pod's resolv.conf.
+        self._apply_zone_dns(vm_spec["template"]["spec"], zone)
         if image_url:
             # `storage:` (not `pvc:`) lets CDI's StorageProfile pick the
             # access/volume modes for the root-disk PVC.
@@ -2339,6 +2690,14 @@ class KubeConfigManager(ConfigManager):
     def set_user_allowed_gpu_types(self, username: str, gpu_types: List[str]) -> bool:
         return self._save_user_spec(username, {"allowedGpuTypes": gpu_types})
 
+    def get_user_allowed_zones(self, username: str) -> List[str]:
+        self._load_users()
+        user = self.users.get(username, {})
+        return user.get("allowedZones", [])
+
+    def set_user_allowed_zones(self, username: str, zones: List[str]) -> bool:
+        return self._save_user_spec(username, {"allowedZones": zones})
+
     def get_user_overrides(self, username: str) -> Dict[str, bool]:
         self._load_users()
         user = self.users.get(username, {})
@@ -2587,7 +2946,7 @@ class KubeConfigManager(ConfigManager):
                     "rootDiskSize", "description",
                     "resources", "nodeSelector", "personalMountPath", "volumes",
                     "displayPort", "viewer", "streamerImage", "streamerEnv",
-                    "privileged", "fuse", "instancetype", "persistence"):
+                    "privileged", "fuse", "instancetype", "persistence", "zone"):
             if template_data.get(key) is not None:
                 spec[key] = template_data[key]
         try:

@@ -10,8 +10,12 @@ data:
 {{ toYaml .Values.whistler.node_selectors | indent 4 }}
   volumes.yaml: |
 {{ toYaml .Values.whistler.volumes | indent 4 }}
+{{- if .Values.whistler.networkPolicy }}
+  # Legacy pre-zones egress config; read as the default zone when
+  # zones.default is absent (whistler/config.py _load_zones).
   networkpolicy.yaml: |
 {{ toYaml .Values.whistler.networkPolicy | indent 4 }}
+{{- end }}
   images.yaml: |
 {{ toYaml .Values.whistler.images | indent 4 }}
   gpuTypes.yaml: |

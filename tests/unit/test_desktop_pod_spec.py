@@ -8,6 +8,7 @@ def _manager():
     cm.version = "v1"
     cm.kata_runtime_class = "kata"
     cm.streamer_image = "ghcr.io/example/streamer:test"
+    cm.zones = {"default": {}}
     return cm
 
 

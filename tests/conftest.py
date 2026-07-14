@@ -20,13 +20,15 @@ class FakeConfigManager(ConfigManager):
     """
 
     def __init__(self, users=None, templates=None, instances=None,
-                 desktop_templates=None, desktop_sessions=None, gpu_types=None):
+                 desktop_templates=None, desktop_sessions=None, gpu_types=None,
+                 zones=None):
         self.users: Dict[str, Dict[str, Any]] = users or {}
         self._templates: Dict[str, List[Dict[str, Any]]] = templates or {}
         self._instances: Dict[str, List[Dict[str, Any]]] = instances or {}
         self._desktop_templates: Dict[str, List[Dict[str, Any]]] = desktop_templates or {}
         self._desktop_sessions: Dict[str, List[Dict[str, Any]]] = desktop_sessions or {}
         self._gpu_types: List[str] = gpu_types or []
+        self._zones: Dict[str, Dict[str, Any]] = zones or {"default": {}}
 
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
         return self.users.get(username)
@@ -94,6 +96,26 @@ class FakeConfigManager(ConfigManager):
     def get_gpu_types(self):
         return list(self._gpu_types)
 
+    def get_zones(self):
+        return sorted(self._zones.keys())
+
+    def get_zone_definitions(self):
+        return {name: dict(cfg or {}) for name, cfg in self._zones.items()}
+
+    def save_zone(self, zone_data):
+        data = dict(zone_data)
+        name = (data.pop("name", "") or "").strip()
+        if not name:
+            return False
+        self._zones[name] = data
+        return True
+
+    def delete_zone(self, zone_name):
+        if zone_name == "default":
+            return False
+        self._zones.pop(zone_name, None)
+        return True
+
     def get_available_images(self, category=None):
         return []
 
@@ -159,6 +181,14 @@ class FakeConfigManager(ConfigManager):
     def set_user_allowed_gpu_types(self, username, gpu_types):
         if username in self.users:
             self.users[username]["allowedGpuTypes"] = gpu_types
+        return True
+
+    def get_user_allowed_zones(self, username):
+        return (self.users.get(username) or {}).get("allowedZones", [])
+
+    def set_user_allowed_zones(self, username, zones):
+        if username in self.users:
+            self.users[username]["allowedZones"] = zones
         return True
 
     def get_user_overrides(self, username):

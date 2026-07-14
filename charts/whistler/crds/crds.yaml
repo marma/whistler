@@ -131,6 +131,15 @@ spec:
                   type: string
                   enum: ["ephemeral", "persistent", "preemptible"]
                   default: ephemeral
+                zone:
+                  type: string
+                  description: >-
+                    Network zone (whistler.zones) sessions from this template
+                    run under; omitted means "default". Must name a defined
+                    zone — an unknown zone fails the session closed rather
+                    than falling back. Applied as a pod label at build time,
+                    so a zone change takes effect on the next session
+                    start/reboot, never live.
   scope: Namespaced
   names:
     plural: templates
@@ -204,6 +213,12 @@ spec:
                       type: object
                       additionalProperties:
                         type: string
+                    zone:
+                      type: string
+                      description: >-
+                        Network zone override (requires the "zone" grant;
+                        further gated by the user's allowedZones). Takes
+                        effect on the next session start/reboot.
             status:
               type: object
               properties:
@@ -307,6 +322,15 @@ spec:
                   description: >-
                     Allow-list of the volumes catalog this user's templates may
                     request. Omitted/empty means no restriction.
+                allowedZones:
+                  type: array
+                  items:
+                    type: string
+                  description: >-
+                    Allow-list of network zones this user's sessions may
+                    explicitly request (template-baked or via the zone
+                    override). Omitted/empty means no restriction; the
+                    implicit default zone is never gated.
                 overrides:
                   type: object
                   description: >-
@@ -326,6 +350,8 @@ spec:
                       type: boolean
                     volumes:
                       type: boolean
+                    zone:
+                      type: boolean
   scope: Namespaced
   names:
     plural: users
@@ -333,3 +359,82 @@ spec:
     kind: User
     shortNames:
     - usr
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: zones.whistler.martinmalmsten.net
+spec:
+  group: whistler.martinmalmsten.net
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                description:
+                  type: string
+                egress:
+                  type: object
+                  properties:
+                    allowCIDRs:
+                      type: array
+                      description: >-
+                        Whitelist: each entry becomes an egress rule to that
+                        CIDR; omit ports to allow all ports.
+                      items:
+                        type: object
+                        properties:
+                          cidr:
+                            type: string
+                          ports:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                port:
+                                  type: integer
+                                protocol:
+                                  type: string
+                                  enum: ["TCP", "UDP", "SCTP"]
+                    blockCIDRs:
+                      type: array
+                      description: >-
+                        Blacklist: allow 0.0.0.0/0 EXCEPT these CIDRs (the
+                        operator emits the explicit complement — ipBlock.except
+                        is silently ignored by several CNIs). Evaluated
+                        independently of allowCIDRs (OR logic).
+                      items:
+                        type: string
+                dns:
+                  type: object
+                  properties:
+                    clusterOnly:
+                      type: boolean
+                      description: >-
+                        Pin port-53 egress to the cluster resolver (CoreDNS).
+                        External names still resolve via its upstream
+                        forwarding, but pods can't tunnel to arbitrary
+                        resolvers.
+                    servers:
+                      type: array
+                      description: >-
+                        Force specific resolver IPs: port-53 egress is pinned
+                        to them AND the pod's resolv.conf (a VM guest's too,
+                        via masquerade DHCP) points at them. Cluster-internal
+                        names then only resolve if that server handles them.
+                      items:
+                        type: string
+  scope: Namespaced
+  names:
+    plural: zones
+    singular: zone
+    kind: Zone
+    shortNames:
+    - zn
