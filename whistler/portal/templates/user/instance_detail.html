@@ -74,6 +74,13 @@
       </form>
       {% endif %}
 
+      {% if inst.get('editable') and status_label(inst.status, inst.get('ready', true)) in ("Stopped", "Error") %}
+      <a href="/instances/{{ inst.name }}/edit?user={{ current_user }}"
+         class="ui fluid button" style="margin-bottom:.75rem">
+        <i class="edit icon"></i> Edit Instance
+      </a>
+      {% endif %}
+
       <form method="post" action="/instances/{{ inst.name }}/delete?user={{ current_user }}"
             onsubmit="return confirm('Delete instance {{ inst.name }}? This cannot be undone.')">
         <button class="ui red fluid button" style="margin-bottom:.75rem">

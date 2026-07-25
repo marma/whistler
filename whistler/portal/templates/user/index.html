@@ -43,7 +43,8 @@
       <td class="collapsing right aligned">
         <span id="actions-{{ inst.name }}">
           {% with name=inst.name, status=inst.status, ready=inst.ready, user=current_user,
-                  connect_url=inst.connect_url, term_url=inst.term_url %}
+                  connect_url=inst.connect_url, term_url=inst.term_url,
+                  editable=true %}
           {% include "user/_instance_buttons.html" %}
           {% endwith %}
         </span>

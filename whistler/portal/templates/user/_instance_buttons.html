@@ -22,3 +22,9 @@
         {% if can_start %}hx-post="/instances/{{ name }}/connect?user={{ user }}" hx-target="#status-{{ name }}" hx-swap="outerHTML"{% else %}disabled{% endif %}>
   <i class="play icon"></i>
 </button>
+{% if editable|default(false) %}
+<a class="ui tiny icon button{% if state not in ("Stopped", "Error") %} disabled{% endif %}" title="Edit"
+   {% if state in ("Stopped", "Error") %}href="/instances/{{ name }}/edit?user={{ user }}"{% endif %}>
+  <i class="edit icon"></i>
+</a>
+{% endif %}

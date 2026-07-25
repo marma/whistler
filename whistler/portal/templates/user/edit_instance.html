@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% block title %}Edit {{ inst.name }} — Whistler{% endblock %}
+{% block content %}
+
+{% set ov = cur.overrides or {} %}
+{% set ov_res = ov.resources or {} %}
+{% set ov_sec = ov.securityContext or {} %}
+{% set ov_vols = ov.volumes or {} %}
+
+<h2 class="ui header">
+  <i class="edit icon"></i>
+  <div class="content">
+    Edit Instance
+    <div class="sub header">{{ inst.name }}</div>
+  </div>
+</h2>
+
+<div class="ui info message">
+  <i class="info circle icon"></i>
+  Changes apply on the next start/reboot — this instance is not running, so
+  they'll be picked up when you start it. The template can't be changed.
+</div>
+
+<div class="ui segment" style="max-width:640px">
+  <form class="ui form" method="post" action="/instances/{{ inst.name }}/update?user={{ current_user }}">
+
+    <div class="field">
+      <label>Instance name</label>
+      <input type="text" value="{{ inst.name }}" disabled>
+    </div>
+
+    <div class="field">
+      <label>Template</label>
+      <input type="text" value="{{ cur.templateRef or inst.template or '—' }}" disabled>
+    </div>
+
+    {% set user_volumes = [] %}
+    {% if overrides.volumes %}
+      {% for vol in volumes %}
+        {% if vol.name in allowed_volumes %}{% set _ = user_volumes.append(vol) %}{% endif %}
+      {% endfor %}
+    {% endif %}
+
+    {% if user_volumes %}
+    <div class="field">
+      <label>Volumes to mount</label>
+      {% for vol in user_volumes %}
+      <div class="ui segment" style="padding:.75rem;margin-bottom:.5rem">
+        <div class="two fields">
+          <div class="field">
+            <div class="ui checkbox">
+              <input type="checkbox" name="volume_names" value="{{ vol.name }}" id="vol-{{ vol.name }}"
+                     {% if vol.name in ov_vols %}checked{% endif %}>
+              <label for="vol-{{ vol.name }}">
+                <strong>{{ vol.name }}</strong>
+                {% if vol.persistentVolumeClaim %}
+                  <span class="ui grey mini label">{{ vol.persistentVolumeClaim.claimName }}</span>
+                {% endif %}
+              </label>
+            </div>
+          </div>
+          <div class="field">
+            <input type="text" name="mount_path__{{ vol.name }}" placeholder="/mnt/{{ vol.name }}"
+                   value="{{ ov_vols.get(vol.name, '') }}">
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if overrides.resources %}
+    <div class="field">
+      <label>Resource overrides</label>
+      <div class="two fields">
+        <div class="field">
+          <input name="override_cpu" type="text" placeholder="cpu, e.g. 1000m"
+                 value="{{ ov_res.cpu or '' }}">
+        </div>
+        <div class="field">
+          <input name="override_memory" type="text" placeholder="memory, e.g. 2Gi"
+                 value="{{ ov_res.memory or '' }}">
+        </div>
+      </div>
+      <div class="ui pointing label">Leave blank to keep the template's value.</div>
+    </div>
+    {% endif %}
+
+    {% if overrides.gpuType %}
+    <div class="field">
+      <label>GPU type override</label>
+      <select name="override_gpu_type" class="ui dropdown">
+        <option value="">— keep template's value —</option>
+        {% for gt in gpu_types %}
+        <option value="{{ gt }}" {% if ov.gpuType == gt %}selected{% endif %}>{{ gt }}</option>
+        {% endfor %}
+      </select>
+      <div class="ui pointing label">Still limited to your allowed GPU types (see your admin-granted access); requesting an unlisted type fails provisioning.</div>
+    </div>
+    {% endif %}
+
+    {% if overrides.gpuCount %}
+    <div class="field">
+      <label>GPU count override</label>
+      <input name="override_gpu_count" type="number" min="0" placeholder="e.g. 1"
+             value="{{ ov.gpuCount if ov.gpuCount is not none else '' }}">
+    </div>
+    {% endif %}
+
+    {% if overrides.zone %}
+    <div class="field">
+      <label>Network zone override</label>
+      <select name="override_zone" class="ui dropdown">
+        <option value="">— keep template's zone —</option>
+        {% for z in zones %}
+        <option value="{{ z }}" {% if ov.zone == z %}selected{% endif %}>{{ z }}</option>
+        {% endfor %}
+      </select>
+      <div class="ui pointing label">Egress posture the instance runs under; applies from the next start/reboot.</div>
+    </div>
+    {% endif %}
+
+    {% if overrides.uidGid %}
+    <div class="field">
+      <label>VM guest identity override (uid/gid)</label>
+      <div class="two fields">
+        <div class="field">
+          <input name="override_uid" type="number" placeholder="uid"
+                 value="{{ ov.uid if ov.uid is not none else '' }}">
+        </div>
+        <div class="field">
+          <input name="override_gid" type="number" placeholder="gid"
+                 value="{{ ov.gid if ov.gid is not none else '' }}">
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    {% if overrides.securityContext %}
+    <div class="field">
+      <label>Pod security context override</label>
+      <div class="three fields">
+        <div class="field">
+          <input name="override_run_as_user" type="number" placeholder="runAsUser"
+                 value="{{ ov_sec.runAsUser if ov_sec.runAsUser is not none else '' }}">
+        </div>
+        <div class="field">
+          <input name="override_run_as_group" type="number" placeholder="runAsGroup"
+                 value="{{ ov_sec.runAsGroup if ov_sec.runAsGroup is not none else '' }}">
+        </div>
+        <div class="field">
+          <input name="override_fs_group" type="number" placeholder="fsGroup"
+                 value="{{ ov_sec.fsGroup if ov_sec.fsGroup is not none else '' }}">
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    <div class="field">
+      <div class="ui checkbox">
+        <input type="checkbox" name="preemptible" value="on" id="preemptible"
+               {% if cur.preemptible %}checked{% endif %}>
+        <label for="preemptible">Preemptible (lower priority, may be evicted)</label>
+      </div>
+    </div>
+
+    <div class="ui divider"></div>
+    <button type="submit" class="ui primary button">
+      <i class="save icon"></i> Save Changes
+    </button>
+    <a href="/instances/{{ inst.name }}?user={{ current_user }}" class="ui button">Cancel</a>
+  </form>
+</div>
+
+<script>
+  $(document).ready(function() {
+    $('.ui.dropdown').dropdown();
+    $('.ui.checkbox').checkbox();
+  });
+</script>
+{% endblock %}

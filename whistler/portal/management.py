@@ -152,15 +152,15 @@ def _tr(url: str, user: str) -> RedirectResponse:
 
 def _render_status_html(name: str, status: str, user: str, controls: bool,
                         connect_url: str = None, term_url: str = None,
-                        ready: bool = True) -> str:
+                        ready: bool = True, editable: bool = False) -> str:
     """Render the polling status badge. With `controls`, also emit an out-of-band
-    swap that re-renders the action buttons (connect/ssh/start/stop) so they stay
-    enabled/disabled in step with the status (used on the dashboard; the detail
-    view omits it)."""
+    swap that re-renders the action buttons (connect/ssh/start/stop/edit) so they
+    stay enabled/disabled in step with the status (used on the dashboard; the
+    detail view omits it)."""
     tpl = "user/_status_controls.html" if controls else "user/_status_badge.html"
     return templates.env.get_template(tpl).render(
         name=name, status=status, user=user, controls=controls,
-        connect_url=connect_url, term_url=term_url, ready=ready,
+        connect_url=connect_url, term_url=term_url, ready=ready, editable=editable,
     )
 
 
@@ -320,6 +320,89 @@ async def instance_create(
     return _tr(f"/instances/{name}", user)
 
 
+async def instance_edit_form(request: Request, cm: CM, user: User, is_admin: IsAdmin, name: str):
+    (instances, desktop_sessions, ssh_tpls, desk_tpls, volumes, allowed, gpu_types,
+     allowed_gpu_types, overrides, zones, allowed_zones, cur) = \
+        await asyncio.gather(
+            request.app.state.run(cm.get_user_instances, user),
+            request.app.state.run(cm.get_user_desktop_sessions, user),
+            request.app.state.run(cm.get_user_templates, user),
+            request.app.state.run(cm.get_user_desktop_templates, user),
+            request.app.state.run(cm.get_volumes),
+            request.app.state.run(cm.get_user_allowed_volumes, user),
+            request.app.state.run(cm.get_gpu_types),
+            request.app.state.run(cm.get_user_allowed_gpu_types, user),
+            request.app.state.run(cm.get_user_overrides, user),
+            request.app.state.run(cm.get_zones),
+            request.app.state.run(cm.get_user_allowed_zones, user),
+            request.app.state.run(cm.get_instance_config, user, name),
+        )
+    # ssh instances and desktop/VM sessions are both Session CRs with an editable
+    # spec.overrides — resolve either (desktop phase normalises to "status").
+    inst = next((i for i in instances if i["name"] == name), None)
+    if inst is None:
+        sess = next((s for s in desktop_sessions if s["name"] == name), None)
+        if sess is not None:
+            inst = {**sess, "status": sess.get("phase"), "ready": True}
+    if inst is None or cur is None:
+        raise HTTPException(status_code=404, detail="Instance not found.")
+    # Overrides only take effect on the next start/reboot, so only allow editing
+    # once the instance is fully at rest (no pod). While it's Pending/Starting/
+    # Running a change would silently not apply to the live session.
+    if _status_group(inst["status"], inst.get("ready", True)) not in ("Stopped", "Error"):
+        raise HTTPException(status_code=409, detail="Stop the instance before editing it.")
+
+    selectable_zones = [z for z in zones if not allowed_zones or z in allowed_zones]
+    return templates.TemplateResponse(
+        request=request, name="user/edit_instance.html",
+        context=_ctx(user, is_admin=is_admin, inst=inst, cur=cur,
+                     tpls=ssh_tpls + desk_tpls, volumes=volumes,
+                     allowed_volumes=allowed, gpu_types=gpu_types,
+                     allowed_gpu_types=allowed_gpu_types, overrides=overrides,
+                     zones=selectable_zones),
+    )
+
+
+async def instance_update(
+    request: Request, cm: CM, user: User, name: str,
+    preemptible:   Annotated[Optional[str], Form()] = None,
+    volume_names:  Annotated[Optional[list[str]], Form()] = None,
+    override_cpu:          Annotated[Optional[str], Form()] = None,
+    override_memory:       Annotated[Optional[str], Form()] = None,
+    override_gpu_type:     Annotated[Optional[str], Form()] = None,
+    override_gpu_count:    Annotated[Optional[str], Form()] = None,
+    override_uid:          Annotated[Optional[str], Form()] = None,
+    override_gid:          Annotated[Optional[str], Form()] = None,
+    override_run_as_user:  Annotated[Optional[str], Form()] = None,
+    override_run_as_group: Annotated[Optional[str], Form()] = None,
+    override_fs_group:     Annotated[Optional[str], Form()] = None,
+    override_zone:         Annotated[Optional[str], Form()] = None,
+):
+    # Same override-assembly as instance_create (per-volume mount paths keyed by
+    # name so unchecked boxes don't misalign a positional zip).
+    volumes_override = None
+    if volume_names:
+        form = await request.form()
+        volumes_override = {
+            v: (form.get(f"mount_path__{v}") or f"/mnt/{v}").strip()
+            for v in volume_names
+        }
+    overrides = _build_session_overrides(
+        volumes=volumes_override,
+        cpu=override_cpu, memory=override_memory,
+        gpu_type=override_gpu_type, gpu_count=override_gpu_count,
+        uid=override_uid, gid=override_gid,
+        run_as_user=override_run_as_user, run_as_group=override_run_as_group,
+        fs_group=override_fs_group, zone=override_zone,
+    )
+    ok = await request.app.state.run(
+        cm.update_instance, user, name, preemptible == "on", overrides,
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to update instance.")
+    return _tr(f"/instances/{name}", user)
+
+
 async def instance_detail(request: Request, cm: CM, user: User, is_admin: IsAdmin, name: str):
     instances, desktop_sessions = await asyncio.gather(
         request.app.state.run(cm.get_user_instances, user),
@@ -334,6 +417,9 @@ async def instance_detail(request: Request, cm: CM, user: User, is_admin: IsAdmi
             inst = {**sess, "status": sess.get("phase"), "ready": True}
     if not inst:
         raise HTTPException(status_code=404, detail="Instance not found.")
+    # Both ssh instances and desktop/VM sessions are Session CRs whose
+    # spec.overrides can be edited while at rest.
+    inst = {**inst, "editable": True}
     return templates.TemplateResponse(
         request=request, name="user/instance_detail.html",
         context=_ctx(user, is_admin=is_admin, inst=inst),
@@ -349,10 +435,14 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
         request.app.state.run(cm.get_user_desktop_sessions, user),
     )
     inst = next((i for i in instances if i["name"] == name), None)
+    # Both ssh instances and desktop/VM sessions are Session CRs with an editable
+    # spec.overrides, so both get an Edit action.
+    editable = False
     if inst:
         status, connect_url = inst["status"], None
         ready = inst.get("ready", True)
         term_url = _terminal_url(user, name)
+        editable = True
     else:
         sess = next((s for s in desktop_sessions if s["name"] == name), None)
         if sess:
@@ -360,11 +450,13 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
             ready = True
             connect_url = _desktop_viewer_url(user, name)
             term_url = _terminal_url(user, name)
+            editable = True
         else:
             status, connect_url, term_url = "Unknown", None, None
             ready = True
     return HTMLResponse(
-        _render_status_html(name, status, user, controls, connect_url, term_url, ready))
+        _render_status_html(name, status, user, controls, connect_url, term_url,
+                            ready, editable))
 
 
 async def instance_status_badge(request: Request, cm: CM, user: User, name: str):
@@ -1084,6 +1176,8 @@ def build_management_app(config_manager):
     app.add_api_route("/instances/new",                   instance_create_form,  methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/instances",                       instance_create,       methods=["POST"])
     app.add_api_route("/instances/{name}",                instance_detail,       methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/instances/{name}/edit",           instance_edit_form,    methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/instances/{name}/update",         instance_update,       methods=["POST"])
     app.add_api_route("/instances/{name}/status-badge",   instance_status_badge, methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/instances/{name}/connect",        instance_connect,      methods=["POST"])
     app.add_api_route("/instances/{name}/stop",           instance_stop,         methods=["POST"])

@@ -57,6 +57,25 @@ class FakeConfigManager(ConfigManager):
         })
         return True
 
+    def get_instance_config(self, username, instance_name):
+        for inst in self._instances.get(username, []):
+            if inst["name"] == instance_name:
+                return {
+                    "templateRef": inst.get("template"),
+                    "preemptible": inst.get("preemptible", False),
+                    "overrides": inst.get("overrides") or {},
+                }
+        return None
+
+    def update_instance(self, username, instance_name, preemptible=False,
+                        overrides=None):
+        for inst in self._instances.get(username, []):
+            if inst["name"] == instance_name:
+                inst["preemptible"] = preemptible
+                inst["overrides"] = overrides
+                return True
+        return False
+
     def save_template(self, username, template_data):
         return True
 

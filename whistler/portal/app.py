@@ -101,6 +101,7 @@ _STATIC_FILES = {
     "xterm.min.css": "text/css",
     "xterm-addon-fit.min.js": "application/javascript",
     "style.css": "text/css",
+    "favicon.svg": "image/svg+xml",
 }
 _static_cache: dict[str, bytes] = {}
 

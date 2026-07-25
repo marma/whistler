@@ -125,6 +125,23 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
+    def get_instance_config(self, username: str,
+                            instance_name: str) -> Optional[Dict[str, Any]]:
+        """Return the editable slice of a Session CR spec (templateRef,
+        preemptible, overrides) for pre-filling the edit form, or None if the
+        instance doesn't exist."""
+        pass
+
+    @abstractmethod
+    def update_instance(self, username: str, instance_name: str,
+                        preemptible: bool = False,
+                        overrides: Optional[Dict[str, Any]] = None) -> bool:
+        """Replace a Session CR's editable spec fields (preemptible, overrides).
+        Changes take effect on the next start/reboot, so this is only meant for
+        non-running instances."""
+        pass
+
+    @abstractmethod
     def save_template(self, username: str, template_data: Dict[str, Any]) -> bool:
         pass
 
@@ -673,6 +690,58 @@ class KubeConfigManager(ConfigManager):
             return True
         except ApiException as e:
             logger.error(f"Failed to create instance: {e}")
+            return False
+
+    def get_instance_config(self, username: str,
+                            instance_name: str) -> Optional[Dict[str, Any]]:
+        user_ns = self._get_user_namespace(username)
+        full_name = f"{username}-{instance_name}"
+        try:
+            cr = self.api.get_namespaced_custom_object(
+                self.group, self.version, user_ns, SESSION_PLURAL, full_name
+            )
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to read instance {full_name}: {e}")
+            return None
+        spec = cr.get("spec", {})
+        return {
+            "templateRef": spec.get("templateRef"),
+            "preemptible": spec.get("preemptible", False),
+            "overrides": spec.get("overrides") or {},
+        }
+
+    def update_instance(self, username: str, instance_name: str,
+                        preemptible: bool = False,
+                        overrides: Optional[Dict[str, Any]] = None) -> bool:
+        user_ns = self._get_user_namespace(username)
+        full_name = f"{username}-{instance_name}"
+        try:
+            cr = self.api.get_namespaced_custom_object(
+                self.group, self.version, user_ns, SESSION_PLURAL, full_name
+            )
+        except ApiException as e:
+            logger.error(f"Failed to read instance {full_name} for update: {e}")
+            return False
+
+        spec = cr.setdefault("spec", {})
+        spec["preemptible"] = preemptible
+        # Replace the overrides wholesale (a merge patch would leave stale nested
+        # keys behind when a group is cleared), so drop the key entirely when the
+        # form supplied no overrides.
+        if overrides:
+            spec["overrides"] = overrides
+        else:
+            spec.pop("overrides", None)
+
+        try:
+            self.api.replace_namespaced_custom_object(
+                self.group, self.version, user_ns, SESSION_PLURAL, full_name, cr
+            )
+            logger.info(f"Updated instance {full_name}")
+            return True
+        except ApiException as e:
+            logger.error(f"Failed to update instance {full_name}: {e}")
             return False
 
     def save_template(self, username: str, template_data: Dict[str, Any]) -> bool:
