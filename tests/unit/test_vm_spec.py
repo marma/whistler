@@ -215,3 +215,76 @@ def test_vnc_viewer_gets_plain_guest():
         user_data = _cloud_init(viewer=viewer)
         assert "whistler-desktop@" not in user_data
         assert "SELKIES_PORT" not in user_data
+
+
+# --- _build_vm_spec_patch: reconciling an already-created VM ------------------
+# A VM object outlives every template edit and per-session override change, so
+# reconcile has to bring its spec forward. Merge-patch semantics mean removals
+# need explicit nulls, and unchanged specs must produce no write at all.
+
+def _patch(current_spec, **build_overrides):
+    desired = _build(**build_overrides)["spec"]
+    return KubeConfigManager._build_vm_spec_patch(current_spec, desired)
+
+
+def test_patch_carries_resource_changes_to_existing_vm():
+    # The bug this guards: a session whose cpu/memory was raised kept booting
+    # with the values its VM was created with.
+    current = _build(template_spec={"image": "x",
+                                    "resources": {"cpu": "4", "memory": "8Gi"}})["spec"]
+    patch = _patch(current, template_spec={"image": "x",
+                                           "resources": {"cpu": "12", "memory": "32Gi"}})
+    domain = patch["template"]["spec"]["domain"]
+    assert domain["cpu"] == {"cores": 12}
+    assert domain["resources"] == {"requests": {"memory": "32Gi"}}
+
+
+def test_patch_is_none_when_nothing_changed():
+    current = _build()["spec"]
+    # Server-defaulted fields we never set must not read as drift.
+    current["template"]["spec"]["architecture"] = "amd64"
+    current["template"]["spec"]["domain"]["machine"] = {"type": "q35"}
+    current["template"]["spec"]["domain"]["firmware"] = {"uuid": "abc"}
+    assert _patch(current) is None
+
+
+def test_patch_excludes_run_strategy():
+    # start/stop is _create_vm's own decision; a reconcile must not resurrect
+    # (or halt) a VM as a side effect of a spec update.
+    current = _build(run_strategy="Halted")["spec"]
+    patch = _patch(current, run_strategy="Always",
+                   template_spec={"image": "y"})
+    assert patch is not None and "runStrategy" not in patch
+
+
+def test_patch_nulls_dropped_gpu_and_node_selector():
+    current = _build(template_spec={"image": "x", "resources": {"gpu": 1},
+                                    "nodeSelector": {"gpu": "true"}})["spec"]
+    patch = _patch(current, template_spec={"image": "x"})
+    assert patch["template"]["spec"]["domain"]["devices"]["gpus"] is None
+    assert patch["template"]["spec"]["nodeSelector"] is None
+
+
+def test_patch_nulls_resources_when_switching_to_instancetype():
+    # KubeVirt rejects instancetype together with domain.cpu/domain.resources.
+    current = _build(template_spec={"image": "x",
+                                    "resources": {"cpu": "4", "memory": "8Gi"}})["spec"]
+    patch = _patch(current, instancetype="u1.medium", template_spec={"image": "x"})
+    assert patch["instancetype"] == {"name": "u1.medium"}
+    domain = patch["template"]["spec"]["domain"]
+    assert domain["cpu"] is None and domain["resources"] is None
+
+
+def test_patch_leaves_root_disk_import_alone():
+    # The root-disk DataVolume is imported once; KubeVirt won't re-drive it, so
+    # a changed imageURL needs a new session rather than a silent no-op patch.
+    current = _build(template_spec={"imageURL": "http://ex/a.qcow2"})["spec"]
+    patch = _patch(current, template_spec={"imageURL": "http://ex/b.qcow2"})
+    assert patch is None or "dataVolumeTemplates" not in patch
+
+
+def test_patch_updates_image_and_zone_labels():
+    current = _build(template_spec={"image": "old:1"})["spec"]
+    patch = _patch(current, template_spec={"image": "new:2"})
+    volumes = patch["template"]["spec"]["volumes"]
+    assert volumes[0]["containerDisk"]["image"] == "new:2"

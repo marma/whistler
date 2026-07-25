@@ -8,6 +8,7 @@ from kubernetes import client, config as k8s_config
 from kubernetes.client import CoreV1Api, NetworkingV1Api
 from kubernetes.client.rest import ApiException
 from kubernetes.utils import parse_quantity
+import copy
 import hashlib
 import ipaddress
 import json
@@ -39,6 +40,21 @@ KUBEVIRT_GROUP = "kubevirt.io"
 KUBEVIRT_VERSION = "v1"
 KUBEVIRT_VM_PLURAL = "virtualmachines"
 KUBEVIRT_VMI_PLURAL = "virtualmachineinstances"
+
+# Optional fields of a VirtualMachine spec that _build_vm_spec owns and may
+# stop emitting between builds (drop a GPU, move to an instancetype, leave a
+# DNS-forcing zone). A JSON merge patch never removes what it doesn't mention,
+# so KubeConfigManager._build_vm_spec_patch nulls these explicitly when the
+# freshly built spec no longer sets them.
+_VM_MANAGED_FIELDS = (
+    ("instancetype",),
+    ("template", "spec", "nodeSelector"),
+    ("template", "spec", "dnsPolicy"),
+    ("template", "spec", "dnsConfig"),
+    ("template", "spec", "domain", "cpu"),
+    ("template", "spec", "domain", "resources"),
+    ("template", "spec", "domain", "devices", "gpus"),
+)
 
 # CDI (Containerized Data Importer) coordinates — used for the imageURL boot
 # source (HTTP qcow2/raw imported into a per-session root PVC). Like KubeVirt,
@@ -93,6 +109,41 @@ OVERRIDE_GROUPS = (
     "volumes",          # template volumes (still gated by allowedVolumes)
     "zone",             # network zone (still gated by allowedZones)
 )
+
+
+def _dig(obj, path):
+    """Value at a nested dict path, or None if any level is missing."""
+    for key in path:
+        if not isinstance(obj, dict):
+            return None
+        obj = obj.get(key)
+    return obj
+
+
+def _set_at(patch, path, value):
+    """Set a nested dict path in a patch body, creating levels as needed."""
+    for key in path[:-1]:
+        patch = patch.setdefault(key, {})
+    patch[path[-1]] = value
+
+
+def _merge_patch_is_noop(current, patch) -> bool:
+    """True when applying JSON merge patch `patch` to `current` would change
+    nothing. Lets callers skip a write (and the resource churn it causes) on
+    the common reconcile where the built spec already matches the cluster.
+    A missing key and an empty dict are equivalent here — sending `{}` for an
+    absent field is not a meaningful change."""
+    for key, value in (patch or {}).items():
+        cur = (current or {}).get(key)
+        if value is None:
+            if cur is not None:
+                return False
+        elif isinstance(value, dict):
+            if not _merge_patch_is_noop(cur if isinstance(cur, dict) else {}, value):
+                return False
+        elif cur != value:
+            return False
+    return True
 
 
 class PolicyError(Exception):
@@ -1852,6 +1903,28 @@ class KubeConfigManager(ConfigManager):
         }
         return vm_body, cloudinit_secret
 
+    @staticmethod
+    def _build_vm_spec_patch(current_spec, desired_spec):
+        """Merge patch bringing an existing VirtualMachine's spec in line with
+        a freshly built one — or None when nothing we own differs. Pure.
+
+        Excluded on purpose: ``runStrategy`` (start/stop is its own decision,
+        see _create_vm) and ``dataVolumeTemplates`` (the root-disk DataVolume
+        is imported once and KubeVirt won't re-drive it, so changing an
+        imageURL needs a new session, not a patch).
+
+        A JSON merge patch only ever merges, so fields the new spec no longer
+        sets have to be nulled explicitly (_VM_MANAGED_FIELDS) or they linger
+        — e.g. domain.cpu after a template moved to an instancetype, which
+        KubeVirt then rejects as mutually exclusive.
+        """
+        patch = {k: copy.deepcopy(v) for k, v in desired_spec.items()
+                 if k not in ("runStrategy", "dataVolumeTemplates")}
+        for path in _VM_MANAGED_FIELDS:
+            if not _dig(desired_spec, path) and _dig(current_spec, path):
+                _set_at(patch, path, None)
+        return None if _merge_patch_is_noop(current_spec, patch) else patch
+
     def _build_session_service(self, *, session_name, username, uid, display_port):
         """Build the per-session ClusterIP Service manifest (pure). It selects
         the desktop pod / VMI launcher pod by the ``session`` label and exposes
@@ -2421,6 +2494,14 @@ class KubeConfigManager(ConfigManager):
         except ApiException as e:
             if e.status == 409:
                 # Already exists — created Halted, or halted by stop_instance.
+                # Reconcile its spec against the freshly built one so template
+                # edits and per-session overrides (cpu/memory/gpu, image, zone,
+                # nodeSelector) actually reach it; without this a VM keeps
+                # whatever it was created with forever. KubeVirt applies
+                # spec.template changes to the *next* VMI, so a running guest
+                # picks them up on reboot — the same change-on-reboot contract
+                # zones already have.
+                self._patch_vm_spec(user_ns, full_name, vm_body["spec"])
                 # Only a connect (start=True, i.e. the last-connect annotation
                 # is present) flips it to running; other reconciles (admin
                 # edits etc.) must leave a stopped VM stopped.
@@ -2438,6 +2519,33 @@ class KubeConfigManager(ConfigManager):
             logger.error(f"Failed to create VirtualMachine {full_name} "
                          f"(is KubeVirt installed?): {e}")
             return False
+
+    def _patch_vm_spec(self, user_ns, full_name, desired_spec) -> None:
+        """Reconcile an existing VirtualMachine toward the freshly built spec.
+        Best-effort: a failure here leaves the VM on its old shape and the next
+        reconcile retries. KubeVirt hands spec.template to the *next* VMI, so
+        the guest sees the change on its next boot (the VM carries a
+        RestartRequired condition meanwhile) — CPU/memory edits to a running VM
+        therefore need a stop/start, matching how zones already behave."""
+        try:
+            current = self.api.get_namespaced_custom_object(
+                KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns,
+                KUBEVIRT_VM_PLURAL, full_name)
+        except ApiException as e:
+            logger.warning(f"Could not read VirtualMachine {full_name}: {e}")
+            return
+
+        patch = self._build_vm_spec_patch(current.get("spec") or {}, desired_spec)
+        if patch is None:
+            return
+        try:
+            self.api.patch_namespaced_custom_object(
+                KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns,
+                KUBEVIRT_VM_PLURAL, full_name, {"spec": patch})
+            logger.info(f"Updated VirtualMachine {full_name} spec "
+                        f"(applies on next boot): {json.dumps(patch)}")
+        except ApiException as e:
+            logger.warning(f"Could not update VirtualMachine {full_name}: {e}")
 
     def get_user_desktop_templates(self, username: str) -> List[Dict[str, Any]]:
         templates = []
