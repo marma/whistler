@@ -65,6 +65,15 @@ bigger disk) in and tags the result `:dev-cuda`; only GPU templates (e.g.
 `CUDA_TOOLKIT_PACKAGE` overrides which toolkit (default: the archive
 `nvidia-cuda-toolkit`; empty for driver-only).
 
+The driver is **not** display-neutral: it brings `libnvidia-encode`, and
+Selkies' `--use-cpu` defaults to false, so on a `:dev-cuda` passthrough session
+pixelflux encodes the stream on **NVENC** rather than software x264 — even
+though `--encoder=x264enc` (an output-mode label, not an implementation) is
+unchanged. XFCE's rendering is llvmpipe either way; only the encode stage moves.
+See the comment in
+[`guest/usr/local/bin/whistler-streamer`](guest/usr/local/bin/whistler-streamer)
+and [`../vm-gnome-selkies/README.md`](../vm-gnome-selkies/README.md#streaming-is-h264--but-not-x264).
+
 Needs docker, `qemu-system-x86_64` and `/dev/kvm` — **no libguestfs**: the
 bake boots the Ubuntu cloud image once under qemu with a NoCloud seed served
 over HTTP (`-smbios … ds=nocloud-net;s=http://10.0.2.2:<port>/`, so no ISO

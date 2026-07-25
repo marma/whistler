@@ -37,10 +37,19 @@ catalog for its packages lives in the Dockerfile comments.
   `streamerEnv` — the operator passes any `streamerEnv` entries straight into
   this container, which is how templates tune workload-dependent knobs the
   sidecar can't infer.
-- `SELKIES_ENCODER` (default `x264enc`) / `SELKIES_MODE` (default
-  `websockets`) / `SELKIES_ENABLE_HTTPS` (default `false`; the 2.x web client
-  needs a browser secure context, so any non-`http://localhost` dev access
-  needs HTTPS).
+- `SELKIES_ENCODER` (default `x264enc`) — the **output mode**, not the encoder
+  implementation: the enum is only `{x264enc, x264enc-striped, jpeg}` =
+  full-frame H.264 / striped H.264 / JPEG. The backend is the separate
+  `SELKIES_USE_CPU` (default **false**, unset here), so pixelflux tries NVENC
+  (CUDA) first and only falls back to bundled libx264 if that fails — a GPU pod
+  encodes on the GPU while still reporting encoder `x264enc`. VA-API, pixelflux's
+  middle choice, is unreachable from a pod (`_build_pod_spec` exposes no
+  `/dev/dri`). `jpeg` and `x264enc-striped` are always CPU. Which backend ran is
+  in this container's log (`NVENC Encoder Initialized successfully.` /
+  `... Falling back to x264`).
+- `SELKIES_MODE` (default `websockets`) / `SELKIES_ENABLE_HTTPS` (default
+  `false`; the 2.x web client needs a browser secure context, so any
+  non-`http://localhost` dev access needs HTTPS).
 
 Xvfb runs with `+extension GLX` so GL workloads (GNOME's llvmpipe compositing)
 get a software GL context; X clients additionally use MIT-SHM, which needs a

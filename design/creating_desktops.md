@@ -39,6 +39,28 @@ streamer-selkies2 Dockerfile) — client/server version lock by construction. Tr
 `pixelflux`/`pcmflux` (PyPI, linuxserver-maintained) as pinned upstream *code*
 dependencies; we do not consume anyone's prebuilt desktop images.
 
+**`--encoder` is an output mode, not an encoder.** Selkies' enum is only
+`{x264enc, x264enc-striped, jpeg}` = full-frame H.264 / striped H.264 / JPEG,
+and the name it reports never changes. The *backend* is a separate setting,
+`--use-cpu` / `SELKIES_USE_CPU`, which defaults to **false** and which none of
+our streamers set — so pixelflux tries **NVENC** (CUDA driver API), then
+**VA-API** (`/dev/dri` render node), and only then its bundled libx264. Consequences
+worth remembering before reading a profile or a bug report:
+
+- A session with a GPU **encodes on the GPU** while still displaying encoder
+  `x264enc`. GPU utilisation under a "software" encoder name is correct
+  behaviour, not a misconfiguration. This needs the encode libraries present:
+  pods get them from the nvidia runtime class (`resources.gpu`), VMs from the
+  `:dev-cuda` image's baked driver (`libnvidia-encode`) — so the CUDA variant of
+  a VM image is *not* display-neutral.
+- VA-API never applies to pods: `_build_pod_spec` exposes no `/dev/dri`.
+- `jpeg` and `x264enc-striped` force `use_cpu=true` server-side — always CPU.
+- Only the encode stage can move. Capture is XShm from Xvfb, and DE rendering
+  stays llvmpipe (Xvfb's GLX is Mesa swrast; a passthrough GPU does not change
+  that) — so "has a GPU" never means "renders on the GPU" in this architecture.
+- The tell is in the streamer's log: `NVENC Encoder Initialized successfully.` /
+  `VAAPI Encoder Initialized successfully.` / `... Falling back to x264|CPU`.
+
 ## 2. Choose the process architecture (workload image)
 
 Two patterns exist; the DE dictates which one you get, not preference:

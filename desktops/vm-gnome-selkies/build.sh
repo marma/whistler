@@ -36,8 +36,11 @@
 # default driver is nvidia-driver-550-open (24.04's open-kernel branch) and the
 # toolkit is 24.04's archive nvidia-cuda-toolkit (CUDA 12.x); override
 # NVIDIA_DRIVER_PACKAGE / CUDA_TOOLKIT_PACKAGE for different ones (a wrong name
-# fails the bake). GNOME itself renders on llvmpipe and the streamer captures
-# Xvfb regardless, so CUDA here only matters for GPU-compute workloads in-guest.
+# fails the bake). GNOME renders on llvmpipe in both variants (Xvfb's GLX is
+# Mesa swrast), but the driver is not desktop-neutral: it brings
+# libnvidia-encode, so a -cuda passthrough session encodes the Selkies stream on
+# NVENC rather than software x264 (see guest/usr/local/bin/whistler-streamer).
+# The CUDA toolkit on top of that is for GPU-compute workloads in-guest.
 #
 # amd64-only: the bake runs the target-arch guest under KVM; producing arm64
 # needs an arm64 host (or an emulated ~hour-long TCG bake nobody wants).

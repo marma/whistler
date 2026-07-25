@@ -111,6 +111,34 @@ for a GL compositor). Templates should also set
 `ubuntu-vm-gnome-selkies` sample does) so the intent is explicit even though the
 in-guest default already covers it.
 
+## Streaming is H.264 — but not x264
+
+`--encoder=x264enc` names the **output mode**, not the encoder implementation.
+Selkies' enum is only `{x264enc, x264enc-striped, jpeg}` (full-frame H.264 /
+striped H.264 / JPEG) — there is no `nvenc` value, and the reported encoder name
+never changes. The backend is a *separate* setting, `--use-cpu`
+(`SELKIES_USE_CPU`), which defaults to **false** and which the streamer does not
+set; with it false pixelflux tries **NVENC** (CUDA driver API) first, then
+**VA-API** (`/dev/dri` render node), and falls back to its bundled libx264 only
+if both fail.
+
+So a GPU-passthrough session on `:dev-cuda` encodes on the GPU while still
+displaying encoder `x264enc` — GPU utilisation with a "software" encoder name is
+expected, not a misconfiguration. The lean image and GPU-less sessions get
+software x264 from the identical config. `jpeg` and `x264enc-striped` force
+`use_cpu=true` server-side and are always CPU.
+
+Only the encode stage moves: capture stays XShm from Xvfb, and GNOME still
+renders on llvmpipe. To see which backend a session picked:
+
+```bash
+journalctl -u whistler-streamer | grep -Ei 'nvenc|vaapi|x264'
+# "NVENC Encoder Initialized successfully."  → GPU
+# "VAAPI Encoder Initialized successfully."  → GPU
+# "... Falling back to x264" / "to CPU"      → software libx264
+nvidia-smi -q -d UTILIZATION | grep -i -A2 encoder   # in-guest confirmation
+```
+
 ## Known limitation: overview backdrop at HiDPI
 
 Inherited unchanged from `gnome-selkies2`: gnome-shell 46's Activities/overview
@@ -132,9 +160,13 @@ make vm-gnome-desktop-image PUSH=1   # …and push to the dev registry
 Like [`../vm-xfce-selkies`](../vm-xfce-selkies/), the default `:dev` image
 carries **no** NVIDIA driver; `CUDA=1` bakes the driver **and the CUDA toolkit**
 (`nvcc` + cuda runtime libs; several GB, so the CUDA build gets a bigger disk)
-in and tags `:dev-cuda`. GNOME renders on llvmpipe and the streamer captures
-Xvfb regardless, so CUDA here only matters for GPU-compute workloads inside the
-guest — the desktop itself is identical in both variants. NOTE the 24.04
+in and tags `:dev-cuda`. GNOME still renders on llvmpipe in both variants (Xvfb
+serves Mesa swrast GLX — a passthrough GPU can't change that), but the two are
+**not** otherwise identical: the driver brings `libnvidia-encode`, so on a
+`:dev-cuda` passthrough session pixelflux encodes the stream on **NVENC**
+instead of software x264 (see [Streaming is H.264 — but not
+x264](#streaming-is-h264--but-not-x264) below). CUDA on top of that is for
+GPU-compute workloads in the guest. NOTE the 24.04
 packages differ from 26.04's: default driver `nvidia-driver-550-open`, default
 toolkit the archive `nvidia-cuda-toolkit` (CUDA 12.x); override via
 `NVIDIA_DRIVER_PACKAGE` / `CUDA_TOOLKIT_PACKAGE` (a wrong name fails the bake).

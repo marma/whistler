@@ -63,7 +63,7 @@ for i in $(seq 1 30); do xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1 && break
     sleep 1
   done & )
 
-# Selkies 2.x: pixelflux capture of $DISPLAY, x264 software encode, web client
+# Selkies 2.x: pixelflux capture of $DISPLAY, H.264 encode, web client
 # + WebSocket streaming on one port. Flag spelling matters: 2.x CLI flags are
 # dash-separated (--web-root, not --web_root) and the parser uses
 # parse_known_args, so a misspelled flag is IGNORED SILENTLY and the default
@@ -72,6 +72,22 @@ for i in $(seq 1 30); do xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1 && break
 # explicitly; the per-session NetworkPolicy is the security boundary. This
 # port is also the startupProbe target: it only opens once X is up, which is
 # what lets the workload container assume DISPLAY works.
+# --encoder names the OUTPUT MODE, not the encoder implementation. The enum is
+# only {x264enc, x264enc-striped, jpeg} = full-frame H.264 / striped H.264 /
+# JPEG; there is no "nvenc" value. What actually encodes is chosen by a
+# separate knob, --use-cpu (SELKIES_USE_CPU), which defaults to FALSE and is
+# not set here — so pixelflux tries NVENC (via the CUDA driver API) first, then
+# VA-API (a /dev/dri render node), and drops to its bundled libx264 only if
+# both fail. So a GPU pod (resources.gpu → the nvidia runtime class injects
+# libnvidia-encode + /dev/nvidia*) encodes on the GPU while still *reporting*
+# encoder "x264enc", and a GPU-less pod gets software x264 from the same
+# config. VA-API is unreachable from a pod either way: _build_pod_spec never
+# exposes /dev/dri. Which backend ran is in this container's log — "NVENC
+# Encoder Initialized successfully." / "VAAPI Encoder Initialized
+# successfully." / "... Falling back to x264|CPU". (`jpeg` and
+# `x264enc-striped` force use_cpu=true server-side, so they are always CPU.)
+# Capture (XShm from Xvfb) and GNOME's rendering (llvmpipe) stay on the CPU
+# regardless — only the encode stage can move to the GPU.
 # --h264-streaming-mode: OFF by default (damage-based capture — static content
 # sends ~nothing, right for XFCE-style X11 DEs) but REQUIRED =true for GL
 # compositors like GNOME Shell: mutter composits once and emits no further

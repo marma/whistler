@@ -30,7 +30,10 @@
 # They're baked (not session-time installed) precisely because the default zone
 # blocks package mirrors — so a GPU session boots ready. NVIDIA_DRIVER_PACKAGE /
 # CUDA_TOOLKIT_PACKAGE override which packages (the guest is 26.04; defaults are
-# nvidia-driver-595-open and the archive nvidia-cuda-toolkit).
+# nvidia-driver-595-open and the archive nvidia-cuda-toolkit). Note the driver
+# also changes the DISPLAY path: libnvidia-encode makes pixelflux encode the
+# Selkies stream on NVENC instead of software x264 (see
+# guest/usr/local/bin/whistler-streamer).
 #
 # amd64-only: the bake runs the target-arch guest under KVM; producing arm64
 # needs an arm64 host (or an emulated ~hour-long TCG bake nobody wants).
