@@ -37,6 +37,12 @@ Manifests are built in `KubeConfigManager._build_gateway_manifests`
 ([whistler/config.py](../../whistler/config.py)); the guest mount in
 [whistler/cloudinit.py](../../whistler/cloudinit.py).
 
-The share uses a strict single-user profile. The SMB3.1.1 POSIX-extensions
-profile (for user-managed group permissions on future *shared* volume
-exports) is deliberately not enabled on the home share.
+The share uses a strict single-user profile. SMB3.1.1 POSIX extensions are
+enabled (`smb3 unix extensions = yes`, needs Samba >=4.19 — hence the trixie
+base) so the guest gets real, durable per-file modes / a working `chmod`. The
+guest **must** mount with the `posix` option to actually use them; without it
+the cifs client negotiates the dialect but ignores POSIX mode semantics (drops
+chmod, shows a fixed mode). chmod then maps to the true on-disk POSIX mode, so
+it survives gateway restarts and is consistent with pod sessions that mount the
+same PVC directly. `force user` still pins on-disk ownership regardless of what
+the client sends.

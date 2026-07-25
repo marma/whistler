@@ -47,7 +47,14 @@ def test_home_mounted_via_cifs_from_gateway():
     assert "vers=3.1.1" in opts
     assert "seal" in opts
     assert "uid=1001" in opts and "gid=1001" in opts
-    assert "file_mode=0664" in opts and "dir_mode=0775" in opts
+    # `posix` makes the client use the gateway's SMB3.1.1 POSIX extensions, so
+    # per-file chmod round-trips to the real on-disk mode. No file_mode/dir_mode
+    # — those would override the real POSIX modes with a fixed blanket bit.
+    assert "posix" in opts
+    assert "file_mode" not in fs_mntops and "dir_mode" not in fs_mntops
+    # mfsymlinks: native POSIX symlinks can't take lutimes (EOPNOTSUPP) which
+    # breaks pixi/conda linking versioned .so symlinks; M+F symlinks can.
+    assert "mfsymlinks" in opts
     assert "nosuid" in opts and "nodev" in opts
     # hard (not soft): a gateway blip blocks I/O instead of corrupting it;
     # nofail + _netdev keep first boot alive while cifs-utils installs.

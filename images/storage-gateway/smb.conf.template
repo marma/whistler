@@ -3,10 +3,24 @@
 # Strict single-user home profile: server-side identity only. The client's
 # uids are never trusted; `force user` maps every operation to the user's
 # real account (created with their real uid at startup), so files land on
-# the PVC owned by that uid. The SMB3.1.1 POSIX-extensions profile for
-# future shared volumes is deliberately NOT enabled on this share.
+# the PVC owned by that uid.
+#
+# SMB3.1.1 POSIX extensions carry per-file unix modes so the guest gets a real,
+# durable `chmod` / executable bit. Two things are BOTH required: the server
+# opts in with `smb3 unix extensions = yes` (Samba >=4.19; trixie ships 4.22),
+# AND the guest mounts with the `posix` option — without `posix` the cifs
+# client negotiates the dialect but does NOT use POSIX attribute/mode semantics
+# (it silently drops chmod and shows a fixed file_mode). With both, chmod maps
+# to the actual on-disk POSIX mode: durable across gateway restarts, and
+# consistent for pod sessions that mount the same PVC directly. Ownership stays
+# pinned by `force user` regardless of what the client sends; a guest chown to
+# another uid fails EPERM (the force-user account is unprivileged).
 [global]
    server role = standalone server
+   # Per-file unix modes over the wire (guest chmod / x bit). Requires the
+   # guest to mount with `posix`. Does NOT loosen the uid model — `force user`
+   # still pins on-disk ownership.
+   smb3 unix extensions = yes
    # SMB over TCP only — no NetBIOS/browsing legacy.
    smb ports = 445
    disable netbios = yes
@@ -28,7 +42,8 @@
    force user = @USER@
    writeable = yes
    browseable = yes
-   # What lands on the PVC (the guest's in-VM view comes from its cifs
-   # file_mode/dir_mode mount options, independent of this).
-   create mask = 0644
-   directory mask = 0755
+   # Ceiling on the mode a create() may set (NOT a floor): normal files stay
+   # 0644, but a directly-created executable (cp of a binary, compiler output)
+   # keeps its x bit instead of being clamped. Explicit chmod is never clamped.
+   create mask = 0775
+   directory mask = 0775

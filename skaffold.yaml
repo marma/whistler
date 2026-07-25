@@ -83,8 +83,13 @@ deploy:
           templates.gnome-desktop.image: "{{.IMAGE_REPO_whistler_desktop_gnome_plain}}:{{.IMAGE_TAG_whistler_desktop_gnome_plain}}"
           # The streamer sidecar image the operator injects into every desktop pod.
           whistler.streamer.image: "{{.IMAGE_REPO_whistler_streamer_selkies2}}:{{.IMAGE_TAG_whistler_streamer_selkies2}}"
-          # The per-user SMB storage gateway (VM homes).
-          whistler.storageGateway.image: "{{.IMAGE_REPO_whistler_storage_gateway}}:{{.IMAGE_TAG_whistler_storage_gateway}}"
+          # The per-user SMB storage gateway (VM homes). tag@digest like the
+          # main image: the git-dirty tag doesn't change between edits, so
+          # without the digest a gateway rebuild wouldn't roll the operator-
+          # created gateway Deployment and the node would serve a stale image
+          # (e.g. an old Samba that lacks smb3 unix extensions → guest `posix`
+          # mounts hard-fail and the home doesn't mount at all).
+          whistler.storageGateway.image: "{{.IMAGE_REPO_whistler_storage_gateway}}:{{.IMAGE_TAG_whistler_storage_gateway}}@{{.IMAGE_DIGEST_whistler_storage_gateway}}"
           # Use the locally-built desktop images as the enforced desktop allow-list,
           # so the operator accepts them and the management UI picker shows the
           # actual build outputs (replaces the production defaults in values.yaml).

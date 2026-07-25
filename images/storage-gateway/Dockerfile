@@ -14,11 +14,13 @@
 #   /etc/whistler-smb/password — random per-user password (Secret whistler-smb-<user>)
 # The user's PVC is mounted at /shares/home.
 #
-# Debian (not Alpine) for the battle-tested Samba build; bookworm ships 4.17.
-# The SMB3.1.1 POSIX-extensions profile planned for future *shared* volumes is
-# deliberately NOT enabled here — the home share is single-user and `force
-# user` covers it (see smb.conf.template).
-FROM debian:bookworm-slim
+# Debian (not Alpine) for the battle-tested Samba build. Trixie (Samba 4.22),
+# NOT bookworm (4.17): the home share enables SMB3.1.1 POSIX extensions
+# (`smb3 unix extensions`, a parameter that does not exist before Samba 4.19)
+# so the guest gets real per-file modes / a working chmod. Guests must mount
+# with the `posix` option to use them (see smb.conf.template and
+# whistler/cloudinit.py).
+FROM debian:trixie-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 

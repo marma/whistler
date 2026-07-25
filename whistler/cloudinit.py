@@ -84,15 +84,33 @@ def build_user_data(*, username: str, uid: int, ssh_keys: list,
     home = f"/home/{username}"
     keys = list(ssh_keys or [])
     gid = uid if gid is None else gid
-    # Mount options: server-side identity means the client-side uid=/gid=/
-    # *_mode only shape the in-guest VIEW (what lands on the PVC is decided
-    # by the gateway's force user + masks). vers=3.1.1 + seal to match the
-    # gateway's `server min protocol` / `server smb encrypt = required`;
-    # hard (not soft) so a gateway blip blocks I/O instead of corrupting it;
-    # nofail + _netdev so boot survives the gateway being unreachable.
+    # Mount options: server-side identity means the client-side uid=/gid= only
+    # shape the in-guest VIEW (what lands on the PVC is decided by the gateway's
+    # force user). vers=3.1.1 + seal to match the gateway's `server min
+    # protocol` / `server smb encrypt = required`; hard (not soft) so a gateway
+    # blip blocks I/O instead of corrupting it; nofail + _netdev so boot
+    # survives the gateway being unreachable.
+    #
+    # `posix` is load-bearing: it makes the cifs client actually USE the SMB3.1.1
+    # POSIX extensions the gateway advertises (smb3 unix extensions = yes), so
+    # per-file chmod / the executable bit round-trips to the real on-disk mode —
+    # durable and consistent with pod sessions on the same PVC. WITHOUT `posix`
+    # the client negotiates the dialect but ignores POSIX mode semantics: it
+    # drops chmod silently and pins a fixed file_mode. Deliberately NO
+    # file_mode/dir_mode here — those would override the real POSIX modes.
+    #
+    # `mfsymlinks` is required alongside `posix`: cifs's native SMB3.1.1 POSIX
+    # symlinks can't take utimensat(AT_SYMLINK_NOFOLLOW) — lutimes on a symlink
+    # returns EOPNOTSUPP (os error 95) and some tools even hit ELOOP on the
+    # link. That breaks anything that stamps symlink times, e.g. pixi/conda
+    # linking a versioned .so (libz.so.1 -> libz.so.1.3.2). mfsymlinks stores
+    # symlinks as Minshall+French regular files, where time-setting works, and
+    # coexists with `posix` (chmod still maps to the real mode). Trade-off: to a
+    # pod mounting the PVC directly a VM-created symlink is a small regular file
+    # with an XSym header, not a native symlink — acceptable, VMs own their home.
     base_opts = (
-        f"vers=3.1.1,seal,uid={uid},gid={gid},"
-        "file_mode=0664,dir_mode=0775,nosuid,nodev,hard"
+        f"vers=3.1.1,seal,posix,mfsymlinks,uid={uid},gid={gid},"
+        "nosuid,nodev,hard"
     )
     mount_opts = (
         f"credentials={SMB_CREDENTIALS_PATH},{base_opts},nofail,_netdev"
