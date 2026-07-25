@@ -190,10 +190,22 @@ def reconcile_session_fn(spec, name, namespace, meta, patch, logger, **kwargs):
     try:
         result = cm.ensure_session(user, session_name)
     except PolicyError as e:
-        # Hard, non-retryable: the template violates an operator policy.
+        # Hard, non-retryable: the template violates an operator policy. No
+        # workload was created, so mark this a terminal policy failure with its
+        # reason — the phase timer keys off policyFailed to leave this Failed
+        # alone instead of probing a nonexistent pod/VMI and reporting Stopped
+        # (which masked exactly this: image not in the vm allow-list).
         logger.error(f"Session {name} rejected by policy: {e}")
         patch.status['phase'] = 'Failed'
+        patch.status['statusMessage'] = str(e)
+        patch.status['policyFailed'] = True
         return
+
+    # Past policy: clear any prior policy-failure marker so a fixed template
+    # recovers (the timer resumes probing once policyFailed is False). A
+    # reconnect re-fires this handler, which is how a Failed session comes back.
+    patch.status['policyFailed'] = False
+    patch.status['statusMessage'] = None
 
     # Denormalize mode/runtime into status (when known) so the timer and delete
     # handler can dispatch without re-resolving the template.
@@ -225,6 +237,11 @@ def session_phase_timer(spec, name, namespace, meta, status, patch, logger, **kw
     status = status or {}
     if not status.get('phase'):
         return  # not reconciled yet
+    if status.get('policyFailed'):
+        # Terminal policy rejection owned by the reconcile handler — there is no
+        # workload to probe, and overwriting its Failed with a probe result
+        # would report a misleading Stopped. Leave phase/statusMessage intact.
+        return
 
     runtime = status.get('runtime')
     if runtime == 'vm':

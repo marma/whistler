@@ -42,6 +42,8 @@ spec:
               value: {{ .Values.whistler.security.kataRuntimeClass | quote }}
             - name: WHISTLER_GPU_RUNTIME_CLASS
               value: {{ .Values.whistler.security.gpuRuntimeClass | quote }}
+            - name: WHISTLER_GPU_VM_RESOURCE_NAME
+              value: {{ .Values.whistler.security.gpuVmResourceName | quote }}
             - name: WHISTLER_STREAMER_IMAGE
               value: {{ .Values.whistler.streamer.image | quote }}
             - name: WHISTLER_STORAGE_GATEWAY_IMAGE

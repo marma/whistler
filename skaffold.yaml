@@ -66,6 +66,13 @@ deploy:
           whistler.gpuTypes[0]: dummy-gpu-small
           whistler.gpuTypes[1]: dummy-gpu-large
           whistler.gpuTypes[2]: NVIDIA-GeForce-RTX-4090
+          # k3s-metal only: the real RTX 4090's KubeVirt passthrough resource
+          # name, as advertised by the NVIDIA GPU Operator's kubevirt sandbox
+          # device plugin (sandboxWorkloads/vm-passthrough mode) — derived
+          # from the card's PCI codename, not the generic pod-mode
+          # nvidia.com/gpu. No-op on k3d (no such resource there, VM GPU
+          # templates just stay unschedulable).
+          whistler.security.gpuVmResourceName: nvidia.com/AD102_GEFORCE_RTX_4090
           # Sample zones for exercising the zone picker and per-zone
           # NetworkPolicies: green = internet-but-not-internal, red =
           # cluster-only DNS and no other egress. default stays deny-all+DNS.

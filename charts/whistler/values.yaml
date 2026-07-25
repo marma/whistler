@@ -241,6 +241,15 @@ whistler:
     # ClusterPolicy. Empty disables this (e.g. skaffold's k3d dev cluster,
     # which has no GPU RuntimeClass).
     gpuRuntimeClass: nvidia
+    # KubeVirt device-plugin resource name a VM's domain.devices.gpus[]
+    # requests for passthrough (resources.gpu on a runtime: vm template).
+    # Product-specific — a kubevirt-flavored sandbox device plugin (e.g. the
+    # NVIDIA GPU Operator's, in sandboxWorkloads/vm-passthrough mode) derives
+    # it from the GPU's PCI codename (e.g. "nvidia.com/AD102_GEFORCE_RTX_4090"),
+    # not the generic pod-mode "nvidia.com/gpu" resource above. Must match
+    # both the cluster's device plugin and the KubeVirt CR's
+    # permittedHostDevices.resourceName for the same PCI device.
+    gpuVmResourceName: nvidia.com/gpu
 
   #volumes:
   #  - name: data

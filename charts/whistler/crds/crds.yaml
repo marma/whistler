@@ -229,6 +229,18 @@ spec:
                     Failed/Terminating for all runtimes; VM sessions additionally
                     use Importing (CDI is pulling the root disk image) and
                     Stopped (the VirtualMachine exists but is halted).
+                statusMessage:
+                  type: string
+                  description: >-
+                    Human-readable reason for the current phase — set to the
+                    rejection text when a reconcile fails on policy (Failed),
+                    cleared once a reconcile gets past policy.
+                policyFailed:
+                  type: boolean
+                  description: >-
+                    True when the last reconcile rejected the session on policy
+                    (a terminal Failed the phase timer must NOT overwrite with a
+                    probe result, since no workload was created to probe).
                 mode:
                   type: string
                   description: Denormalized from the referenced template.

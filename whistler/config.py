@@ -361,6 +361,15 @@ class KubeConfigManager(ConfigManager):
         # NVIDIA runtime's hook does that. Empty disables this (e.g. a
         # cluster using containerd-native CDI with no RuntimeClass at all).
         self.gpu_runtime_class = os.environ.get("WHISTLER_GPU_RUNTIME_CLASS", "nvidia")
+        # KubeVirt device-plugin resource name a VM's domain.devices.gpus[]
+        # requests for passthrough. Product-specific — a kubevirt-flavored
+        # sandbox device plugin (e.g. the NVIDIA GPU Operator's) derives it
+        # from the GPU's PCI codename (e.g. "nvidia.com/AD102_GEFORCE_RTX_4090"),
+        # not the generic pod-mode "nvidia.com/gpu" resource. Must match both
+        # the cluster's device plugin and the KubeVirt CR's
+        # permittedHostDevices.resourceName for the same PCI device.
+        self.gpu_vm_resource_name = os.environ.get(
+            "WHISTLER_GPU_VM_RESOURCE_NAME", "nvidia.com/gpu")
         # Default image for the streamer sidecar every desktop pod gets;
         # a template's streamerImage overrides it.
         self.streamer_image = os.environ.get(
@@ -1716,7 +1725,8 @@ class KubeConfigManager(ConfigManager):
             "interfaces": [{"name": "default", "masquerade": {}}],
         }
         if 'gpu' in resources:
-            devices["gpus"] = [{"name": "gpu0", "deviceName": "nvidia.com/gpu"}]
+            gpu_resource_name = getattr(self, "gpu_vm_resource_name", "nvidia.com/gpu")
+            devices["gpus"] = [{"name": "gpu0", "deviceName": gpu_resource_name}]
 
         # The guest's authorized_keys: the user's own keys plus the portal's
         # per-user access key, which backs the web terminal (an SSH session
@@ -1748,8 +1758,17 @@ class KubeConfigManager(ConfigManager):
             root_volume = {"name": "rootdisk",
                            "dataVolume": {"name": f"{session_name}-root"}}
         else:
+            # imagePullPolicy: Always — our dev containerDisk tags (e.g.
+            # localhost:5000/whistler-vm-*-selkies:dev) are MUTABLE: a rebuild
+            # overwrites :dev in place. KubeVirt defaults non-:latest tags to
+            # IfNotPresent, so without this the node keeps booting the stale
+            # cached qcow2 after a rebuild (symptom: a fixed image still shows
+            # the old bug, and the only other fix is `crictl rmi` on the node).
+            # Always re-checks the registry; unchanged digests reuse cached
+            # layers, so the cost on immutable tags is just a manifest lookup.
             root_volume = {"name": "rootdisk",
-                           "containerDisk": {"image": image or 'ubuntu:latest'}}
+                           "containerDisk": {"image": image or 'ubuntu:latest',
+                                             "imagePullPolicy": "Always"}}
 
         # The userData travels via a per-session Secret (userDataSecretRef),
         # not inline: KubeVirt's admission webhook caps inline userData at
@@ -2009,8 +2028,18 @@ class KubeConfigManager(ConfigManager):
 
         # Honest initial phase: without a connect the workload isn't
         # started, and reporting Provisioning would show a phantom
-        # "Starting" badge until the phase timer corrects it.
-        result["phase"] = "Provisioning" if wants_start else "Stopped"
+        # "Starting" badge until the phase timer corrects it. But a re-connect
+        # to an already-Ready session (e.g. opening a second view onto a
+        # running desktop/VM) hits this same path — don't regress an already
+        # up workload back to Provisioning, or the phase timer's next probe
+        # (up to 10s away) briefly makes the session look down, and anything
+        # gating on phase=="Ready" right after the connect (the web terminal's
+        # readiness check) can spuriously fail.
+        current_phase = (cr.get('status') or {}).get('phase')
+        if current_phase == "Ready":
+            result["phase"] = current_phase
+        else:
+            result["phase"] = "Provisioning" if wants_start else "Stopped"
 
         if not ok:
             return result
