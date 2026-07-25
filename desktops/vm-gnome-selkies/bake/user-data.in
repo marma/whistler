@@ -1,0 +1,153 @@
+#cloud-config
+# Bake-time cloud-config (NOT the per-session userData — that comes from
+# whistler/cloudinit.py). build.sh serves this over NoCloud-net (qemu SMBIOS
+# serial points cloud-init at http://10.0.2.2:@HTTP_PORT@/) for a one-shot
+# boot that installs the GNOME desktop + streamer stack, then resets cloud-init
+# so the published image treats every session's seed as a fresh first boot.
+#
+# The GNOME sibling of ../../vm-xfce-selkies/bake/user-data.in. The guest is
+# Ubuntu 24.04 (GNOME 46 is the last Shell with an X11 backend — see build.sh /
+# README), so this installs the GNOME Shell session instead of XFCE, drops in
+# the vendored libva 2.22 the streamer needs (24.04 ships 2.20; pixelflux needs
+# >= 2.21), and regenerates the gdk-pixbuf loader cache so Adwaita's SVG icons
+# aren't blurry.
+#
+# users: [] — do NOT create the image's default `ubuntu` user. The session
+# userData suppresses the default user to keep uid 1000 free for the real
+# Whistler user (see whistler/cloudinit.py); a bake that let cloud-init create
+# `ubuntu` would permanently occupy uid 1000 in the published image.
+users: []
+
+write_files:
+  - path: /run/whistler-bake.sh
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # The actual bake. /run is tmpfs, so this script never ships.
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      SEED=http://10.0.2.2:@HTTP_PORT@
+
+      # The bake races the boot's own apt jobs (apt-news, esm-cache,
+      # apt-daily): the lock timeout waits them out instead of dying, and the
+      # retry absorbs transient mirror hiccups — an `update` failure here
+      # killed a whole bake once, mid-lists-store, with nothing else wrong.
+      APT="apt-get -o DPkg::Lock::Timeout=120"
+      i=0
+      until $APT update; do
+        i=$((i + 1)); [ "$i" -ge 3 ] && exit 1
+        sleep 15
+      done
+
+      # --- Firefox from Mozilla's APT repo, NOT Ubuntu's -------------------
+      # On 24.04 the `firefox` apt package is a transitional shim that installs
+      # the Firefox *snap* — and we purge snapd below (snapd.seeded otherwise
+      # delays every session boot ~30s). Mozilla's own APT repo ships a real
+      # .deb; the pin (priority 1000) keeps the snap shim from ever winning.
+      $APT install -y --no-install-recommends wget gpg ca-certificates
+      install -d -m 0755 /etc/apt/keyrings
+      wget -qO- https://packages.mozilla.org/apt/repo-signing-key.gpg \
+        > /etc/apt/keyrings/packages.mozilla.org.asc
+      echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
+        > /etc/apt/sources.list.d/mozilla.list
+      printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' \
+        > /etc/apt/preferences.d/mozilla
+      $APT update
+
+      # The runtime union of the retired desktops/gnome-selkies2 (the GNOME
+      # Shell half — see its README/Dockerfile in git history for the why of
+      # every package; the silent failure modes are documented there and in
+      # design/creating_desktops.md §5, §8) and the streamer runtime deps.
+      # Build-time-only packages (build-essential, python3-dev,
+      # libxkbcommon-dev, meson) are NOT needed: the selkies venv and vendored
+      # libva arrive prebuilt in artifacts.tar.gz; libxkbcommon0 is the venv's
+      # one runtime shared lib.
+      $APT install -y --no-install-recommends \
+        gnome-session gnome-shell gnome-settings-daemon \
+        gnome-terminal nautilus gnome-text-editor gnome-control-center \
+        firefox \
+        adwaita-icon-theme fonts-ubuntu fonts-dejavu-core \
+        librsvg2-common \
+        libgl1-mesa-dri libglx-mesa0 mesa-utils \
+        dbus dbus-x11 gnome-keyring \
+        xvfb x11-xserver-utils xcvt x11-utils xclip xdotool \
+        pulseaudio pulseaudio-utils \
+        python3 python3-venv libxkbcommon0 \
+        ssl-cert ca-certificates curl \
+        cifs-utils
+
+      # NVIDIA driver for KubeVirt GPU-passthrough sessions. Only present in
+      # the CUDA variant (build.sh CUDA=1 sets NVIDIA_DRIVER_PACKAGE — a valid
+      # 24.04 package, default nvidia-driver-550-open — and tags :<TAG>-cuda;
+      # the lean default leaves it empty and skips this block). GNOME itself
+      # renders on llvmpipe and the streamer captures Xvfb regardless, so this
+      # only matters for GPU-compute workloads inside the guest.
+      if [ -n "@NVIDIA_DRIVER_PACKAGE@" ]; then
+        $APT install -y --no-install-recommends "@NVIDIA_DRIVER_PACKAGE@"
+      fi
+
+      # CUDA toolkit (nvcc + cuda runtime libs) for GPU-compute workloads in the
+      # guest. Only in the CUDA variant (build.sh CUDA=1 sets
+      # CUDA_TOOLKIT_PACKAGE, default 24.04's archive nvidia-cuda-toolkit; the
+      # lean default leaves it empty and skips this). Not --no-install-recommends
+      # here: the toolkit's recommends (gcc host compiler, headers) are what make
+      # nvcc actually usable. Several GB — build.sh gives the CUDA build a bigger
+      # disk to fit it.
+      if [ -n "@CUDA_TOOLKIT_PACKAGE@" ]; then
+        $APT install -y "@CUDA_TOOLKIT_PACKAGE@"
+      fi
+
+      # Selkies venv + web client + vendored libva 2.22 (all built on 24.04 by
+      # bake/Dockerfile.builder, ABI-matched to this guest) plus the
+      # whistler-streamer / whistler-desktop@ units, session scripts and the
+      # wtype shim (guest/). --no-overwrite-dir: never restore the archive's
+      # metadata onto existing system dirs (/etc, /usr, ...) — a group-writable
+      # /etc from the build host's umask breaks sshd StrictModes for
+      # /etc/ssh/authorized_keys.d.
+      curl -fsS "$SEED/artifacts.tar.gz" | tar -xz --no-overwrite-dir -C /
+      chmod 0755 /usr/local/bin/whistler-streamer \
+                 /usr/local/bin/whistler-desktop-session \
+                 /usr/local/bin/gnome-session-launch.sh \
+                 /usr/local/bin/wtype
+
+      # Make the vendored libva 2.22 authoritative: /usr/local/lib precedes
+      # /usr/lib in the default ld.so order, so this libva.so.2 wins over the
+      # 24.04 stock 2.20 that GNOME's deps pull in. Rebuild the cache so it
+      # takes effect (else pixelflux fails to load with "undefined symbol:
+      # vaMapBuffer2", surfaced only as "Legacy screen_capture_module.so not
+      # found" on client connect).
+      ldconfig
+
+      # Regenerate the gdk-pixbuf loader cache so the SVG loader from
+      # librsvg2-common is registered — the packaging trigger doesn't reliably
+      # fire here, and without it Adwaita's scalable icons render as blurry
+      # blobs (text stays crisp — the tell is "text sharp, icons blurry").
+      /usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache
+
+      # The streamer has no per-session inputs (its env file is optional), so
+      # it is enabled at bake; the per-user whistler-desktop@<user> unit is
+      # enabled by the session's cloud-init once the user exists.
+      systemctl enable whistler-streamer.service
+
+      # Session boots must be fast: snapd.seeded alone holds multi-user.target
+      # (and with it cloud-init's runcmd stage) for ~30s on stock images —
+      # measured, see whistler/cloudinit.py. No snaps are used (firefox is the
+      # Mozilla .deb); purge it.
+      $APT purge -y snapd unattended-upgrades || true
+      $APT autoremove -y --purge
+      apt-get clean
+      rm -rf /var/lib/apt/lists/*
+
+      # Reset so the published image runs the per-session seed as a true
+      # first boot: instance state gone, logs gone, machine-id regenerates.
+      cloud-init clean --logs --machine-id
+      # Return freed blocks so the compressed qcow2 doesn't carry them.
+      fstrim -av || true
+
+runcmd:
+  # One wrapper, not a list of runcmd items: runcmd does not stop on failure,
+  # so the bake runs under its own `set -e` and reports a single verdict on
+  # the serial console for build.sh to grep. Output lands in a persistent log
+  # (live-tailed to ttyS0 for console.log; getty escape codes once ATE the
+  # only copy of an apt error, hence the file) whose tail is replayed on FAIL.
+  - [sh, -c, "tail -F /var/log/whistler-bake.log >/dev/ttyS0 2>/dev/null & sh /run/whistler-bake.sh >/var/log/whistler-bake.log 2>&1 && echo WHISTLER-BAKE-OK >/dev/ttyS0 || { echo WHISTLER-BAKE-FAIL >/dev/ttyS0; tail -40 /var/log/whistler-bake.log >/dev/ttyS0; }; shutdown -P now"]

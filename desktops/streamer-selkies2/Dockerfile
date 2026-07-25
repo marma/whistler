@@ -29,6 +29,17 @@
 # two in lock (the client/server version match falls out by construction).
 ARG SELKIES_COMMIT=5686f6c4d20ed63a27e253bac00fb89ef99828c8
 
+# pixelflux/pcmflux MUST be pinned — selkies at this commit does NOT pin them,
+# and their 2.0.0 releases are a BREAKING API change (selkies here does
+# `from pcmflux import AudioChunkCallback`, removed in 2.0.0 -> ImportError,
+# streamer crash-loops, nothing on :8082). This image runs today only because
+# it was built before 2.0.0 and cached 1.x; a fresh rebuild WITHOUT these pins
+# resolves 2.0.0 and breaks — and vm-xfce-selkies extracts this venv, so it
+# would take the VM and every pod desktop down too. Bump in lockstep with
+# SELKIES_COMMIT (a newer commit may require the 2.x line).
+ARG PCMFLUX_VERSION=1.0.8
+ARG PIXELFLUX_VERSION=1.6.4
+
 ##############################################################################
 # Stage 1 — web client. The 2.x frontend is a React/Vite dashboard
 # (addons/selkies-dashboard) around the protocol lib (addons/selkies-web-core,
@@ -63,6 +74,8 @@ RUN cd /src/addons/selkies-dashboard \
 ##############################################################################
 FROM ubuntu:26.04
 ARG SELKIES_COMMIT
+ARG PCMFLUX_VERSION
+ARG PIXELFLUX_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -118,15 +131,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Selkies server from the pinned commit, in its own venv. Pulls
 # pixelflux/pcmflux (+ the WebRTC stack, unused in websockets mode) from PyPI —
 # both ship amd64 AND arm64 manylinux wheels, so the image is multi-arch.
-# setuptools is not a selkies dependency but IS required at runtime: GPUtil
-# does `from distutils import spawn`, and distutils left the stdlib in Python
-# 3.12 — setuptools' shim puts it back.
+# pixelflux/pcmflux are pinned on the command line (see the ARG header) so they
+# win over selkies' unpinned deps; the version assert fails the build loudly if
+# a resolver quirk overrides them. setuptools is not a selkies dependency but IS
+# required at runtime: GPUtil does `from distutils import spawn`, and distutils
+# left the stdlib in Python 3.12 — setuptools' shim puts it back.
 ADD https://github.com/selkies-project/selkies/archive/${SELKIES_COMMIT}.tar.gz /tmp/selkies.tar.gz
 RUN mkdir /tmp/selkies-src \
  && tar -xzf /tmp/selkies.tar.gz -C /tmp/selkies-src --strip-components=1 \
  && python3 -m venv /opt/venv \
- && /opt/venv/bin/pip install --no-cache-dir /tmp/selkies-src setuptools \
- && rm -rf /tmp/selkies-src /tmp/selkies.tar.gz
+ && /opt/venv/bin/pip install --no-cache-dir \
+      "pcmflux==${PCMFLUX_VERSION}" "pixelflux==${PIXELFLUX_VERSION}" \
+      /tmp/selkies-src setuptools \
+ && rm -rf /tmp/selkies-src /tmp/selkies.tar.gz \
+ && /opt/venv/bin/pip show pcmflux  | grep -qx "Version: ${PCMFLUX_VERSION}" \
+ && /opt/venv/bin/pip show pixelflux | grep -qx "Version: ${PIXELFLUX_VERSION}"
 
 # The web client built from the same commit. Served by selkies itself
 # (aiohttp) via --web-root — no nginx needed.

@@ -1,0 +1,6 @@
+# KubeVirt containerDisk wrapper for the baked qcow2 (build context is
+# build.sh's output dir). Convention per quay.io/containerdisks: the disk
+# image under /disk/, owned by 107 (the qemu uid in virt-launcher) so the
+# unprivileged containerDisk mounter can read it.
+FROM scratch
+ADD --chown=107:107 disk.qcow2 /disk/

@@ -10,10 +10,15 @@ whistler:
     vm:
       - quay.io/containerdisks/ubuntu:24.04
       - https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
-      # Baked desktop VM (XFCE + in-guest Selkies) — build & push with
-      # `make vm-desktop-image PUSH=1` (desktops/vm-xfce-selkies/build.sh);
-      # not a skaffold artifact because the qcow2 bake needs qemu/KVM.
+      # Baked desktop VMs (in-guest Selkies) — build & push with
+      # `make vm-desktop-image PUSH=1` / `make vm-gnome-desktop-image PUSH=1`
+      # (+ CUDA=1 for the -cuda tag); not skaffold artifacts because the qcow2
+      # bake needs qemu/KVM. Every tag a template references must be listed here
+      # or ensure_session fails closed with a PolicyError.
       - localhost:5000/whistler-vm-xfce-selkies:dev
+      - localhost:5000/whistler-vm-xfce-selkies:dev-cuda
+      - localhost:5000/whistler-vm-gnome-selkies:dev
+      - localhost:5000/whistler-vm-gnome-selkies:dev-cuda
 
 templates:
   # containerDisk boot: the qcow2 ships inside an OCI image. Fast pull-and-boot,
@@ -53,6 +58,15 @@ templates:
   # displayPort, exactly like a pod desktop: per-session Service -> launcher
   # pod -> masquerade -> guest. The VNC subresource console stays available
   # as a rescue path (shows the text console, not the desktop).
+  #
+  # Four VM-desktop templates below, two DEs x {lean, CUDA}. The `-cuda`
+  # variants use the :dev-cuda image (built with CUDA=1 — bakes the NVIDIA open
+  # driver) and request the RTX 4090 via nodeSelector + resources.gpu; the lean
+  # ones use the driver-free :dev image and run anywhere. Build all four with:
+  #   make vm-desktop-image        make vm-desktop-image CUDA=1
+  #   make vm-gnome-desktop-image  make vm-gnome-desktop-image CUDA=1
+
+  # XFCE, lean (no GPU) — runs on any node.
   ubuntu-vm-selkies:
     description: "Ubuntu 26.04 VM + XFCE (containerDisk, Selkies)"
     mode: desktop
@@ -60,6 +74,82 @@ templates:
     image: "localhost:5000/whistler-vm-xfce-selkies:dev"
     viewer: websockets
     persistence: ephemeral
+    displayPort: 8082
     resources:
-      cpu: "2"
-      memory: 4Gi
+      cpu: "4"
+      memory: 6Gi
+
+  # XFCE, CUDA (RTX 4090 passthrough) — k3s-metal only.
+  ubuntu-vm-selkies-cuda:
+    description: "Ubuntu 26.04 VM + XFCE + RTX 4090 (containerDisk, Selkies)"
+    mode: desktop
+    runtime: vm
+    image: "localhost:5000/whistler-vm-xfce-selkies:dev-cuda"
+    viewer: websockets
+    persistence: ephemeral
+    displayPort: 8082
+    nodeSelector:
+      nvidia.com/gpu.product: NVIDIA-GeForce-RTX-4090
+    resources:
+      cpu: "4"
+      memory: 8Gi
+      gpu: "1"
+
+  # Same VM/Selkies arrangement, but the *real GNOME Shell* (46, X11 backend)
+  # instead of XFCE — baked into desktops/vm-gnome-selkies on a 24.04 guest
+  # (GNOME 46 is the last Shell with an X11 backend; see that image's README).
+  # streamerEnv pins H264 streaming mode ON: mutter is a GL compositor and emits
+  # no damage for static content, so without it static windows render black on
+  # the client. GNOME on llvmpipe is heavier than XFCE, hence the memory floor.
+
+  # GNOME, lean (no GPU) — runs on any node.
+  ubuntu-vm-gnome-selkies:
+    description: "Ubuntu 24.04 VM + GNOME Shell (containerDisk, Selkies)"
+    mode: desktop
+    runtime: vm
+    image: "localhost:5000/whistler-vm-gnome-selkies:dev"
+    viewer: websockets
+    persistence: ephemeral
+    displayPort: 8082
+    streamerEnv:
+      SELKIES_H264_STREAMING_MODE: "true"
+    resources:
+      cpu: "4"
+      memory: 6Gi
+
+  # GNOME, CUDA (RTX 4090 passthrough) — k3s-metal only.
+  ubuntu-vm-gnome-selkies-cuda:
+    description: "Ubuntu 24.04 VM + GNOME Shell + RTX 4090 (containerDisk, Selkies)"
+    mode: desktop
+    runtime: vm
+    image: "localhost:5000/whistler-vm-gnome-selkies:dev-cuda"
+    viewer: websockets
+    persistence: ephemeral
+    displayPort: 8082
+    streamerEnv:
+      SELKIES_H264_STREAMING_MODE: "true"
+    nodeSelector:
+      nvidia.com/gpu.product: NVIDIA-GeForce-RTX-4090
+    resources:
+      cpu: "4"
+      memory: 8Gi
+      gpu: "1"
+
+  # GPU passthrough smoke test (k3s-metal only): requests the RTX 4090 via
+  # KubeVirt's domain.devices.gpus (see whistler.security.gpuVmResourceName).
+  # nodeSelector pins it to a node labeled with this GPU product, same as the
+  # pod-mode path — moot on the single-node dev cluster but keeps the
+  # template honest about what it actually needs.
+  ubuntu-vm-gpu:
+    description: "Ubuntu 24.04 VM + RTX 4090 passthrough (containerDisk, noVNC)"
+    mode: desktop
+    runtime: vm
+    image: "quay.io/containerdisks/ubuntu:24.04"
+    viewer: vnc
+    persistence: ephemeral
+    nodeSelector:
+      nvidia.com/gpu.product: NVIDIA-GeForce-RTX-4090
+    resources:
+      cpu: "4"
+      memory: 8Gi
+      gpu: "1"

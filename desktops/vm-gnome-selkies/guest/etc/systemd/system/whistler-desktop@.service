@@ -1,0 +1,94 @@
+# Per-user GNOME Shell session against the whistler-streamer display. Template
+# unit: the session user is created by cloud-init at first boot (the image can't
+# know it), so cloud-init also does `systemctl enable --now
+# whistler-desktop@<user>` once the user exists — enable (not just start) so
+# persistent-root (CDI) guests bring the desktop back on later boots.
+#
+# The GNOME analog of ../../vm-xfce-selkies's whistler-desktop@.service. Two
+# things differ, both because this runs the real GNOME Shell (46, X11 backend)
+# instead of XFCE: the big Environment= block below (the session env the
+# retired gnome-selkies2 set via `su -c env ...`), and the /run/systemd shadow
+# under [Service] (see the comment there — the load-bearing bit).
+[Unit]
+Description=Whistler GNOME desktop session for %i
+Wants=whistler-streamer.service
+# Deliberately NOT ordered After=whistler-home.service (the SMB home mount,
+# written by cloud-init at runtime): it is a oneshot whose retry loop runs up
+# to 150s when the gateway is unreachable, and After= would keep this unit's
+# start job QUEUED (inactive, no logs, nothing to debug) that whole time.
+# The session script does its own bounded wait for the mountpoint and then
+# proceeds anyway — one place owns that policy.
+After=whistler-streamer.service systemd-user-sessions.service dbus.service
+
+[Service]
+Type=simple
+User=%i
+
+# --- GNOME Shell session environment ------------------------------------------
+# Cloud-init already created the user, so (unlike the container entrypoint) this
+# unit only supplies the session env; the session script does the X/home waits
+# and execs gnome-session-launch.sh under dbus-run-session. Each var, per the
+# retired gnome-selkies2 (and design/creating_desktops.md §8):
+#   LIBGL_ALWAYS_SOFTWARE/GALLIUM_DRIVER/__GLX_VENDOR_LIBRARY_NAME - force Mesa
+#     llvmpipe: mutter's GL context comes from the streamer's software Xvfb GLX.
+#   XDG_SESSION_TYPE=x11 / GDK_BACKEND=x11 - keep Shell and GTK on X11 (without
+#     them mutter may try Wayland on Xvfb and fail).
+#   XDG_CURRENT_DESKTOP=GNOME - app-visibility / portal hints expect it.
+#   GSK_RENDERER=cairo - REQUIRED for GTK4 apps (Files/Text Editor/Settings):
+#     GTK4's default GSK GL renderer produces garbage under llvmpipe (window
+#     shows a stale copy of the desktop). gnome-shell (Clutter/Cogl) and GTK3
+#     apps are unaffected.
+#   NO_AT_BRIDGE / GTK_A11Y=none - no accessibility bus here; silence at-spi.
+Environment=DISPLAY=:0
+Environment=PULSE_SERVER=unix:/tmp/pulse/native
+Environment=XDG_SESSION_TYPE=x11
+Environment=GDK_BACKEND=x11
+Environment=XDG_CURRENT_DESKTOP=GNOME
+Environment=LIBGL_ALWAYS_SOFTWARE=1
+Environment=GALLIUM_DRIVER=llvmpipe
+Environment=__GLX_VENDOR_LIBRARY_NAME=mesa
+Environment=GSK_RENDERER=cairo
+Environment=NO_AT_BRIDGE=1
+Environment=GTK_A11Y=none
+
+# GNOME needs a private 0700 runtime dir (dconf/gvfs/keyring/session-bus socket
+# dir). A systemd *system* service with User= is NOT a logind session, so there
+# is no logind-managed /run/user/<uid>; have systemd make and chown one for us
+# and point XDG_RUNTIME_DIR at it. (Path need not be /run/user/<uid> — GNOME
+# only needs *a* per-user 0700 dir.)
+Environment=XDG_RUNTIME_DIR=/run/whistler-desktop-%i
+RuntimeDirectory=whistler-desktop-%i
+RuntimeDirectoryMode=0700
+
+# --- logind: we trust the VM's live logind (no /run/systemd shadow) -----------
+# The container images (../../gnome-plain, retired gnome-selkies2) do
+# `rm -rf /run/systemd` before starting gnome-shell — but that is NOT "removing
+# systemd", it works around a *broken* logind: the systemd package bakes an
+# empty /run/systemd/seats into the image, so gnome-shell's loginManager.js
+# picks LoginManagerSystemd, then every login1 D-Bus call fails HARD (no logind
+# daemon is alive to answer without systemd as pid 1) and the session dies.
+#
+# In this VM systemd IS pid 1 and logind is alive, so login1 answers. This
+# service is still a `User=` system service, not a logind *session* (those come
+# from PAM logins), so gnome-shell is in the "logind present, not in a session"
+# state — login1's GetSessionByPID returns a clean "no session" error, which
+# gnome-shell 46 tolerates (it just forgoes lock/suspend/idle, meaningless for a
+# streamed single-user desktop). So we deliberately do NOT shadow /run/systemd.
+#
+# FALLBACK (only if a bake shows gnome-shell dying at startup or apps refusing
+# to launch from the overview — i.e. it really does need the systemd-invisible
+# path): give this one service a private mount namespace hiding /run/systemd,
+# re-exposing only the journal socket so it still logs. Uncomment:
+#   TemporaryFileSystem=/run/systemd
+#   BindReadOnlyPaths=/run/systemd/journal
+# The rest of the system's systemd stays untouched (root namespace; /run/dbus,
+# the streamer's /tmp sockets and RuntimeDirectory above are all outside it).
+
+ExecStart=/usr/local/bin/whistler-desktop-session
+# The session lifecycle mirrors the pod model: when the Shell exits, restart it
+# against the still-running display.
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

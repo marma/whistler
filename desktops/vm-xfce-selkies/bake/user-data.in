@@ -45,6 +45,29 @@ write_files:
         ssl-cert ca-certificates curl \
         cifs-utils
 
+      # NVIDIA driver for KubeVirt GPU-passthrough sessions (vfio-pci hands
+      # the guest a raw PCI device — same as bare metal, there is no
+      # host-driver-injection path for VMs the way there is for pod-mode GPU
+      # containers, so the guest needs its own real driver). Only present in
+      # the CUDA variant (build.sh CUDA=1 sets NVIDIA_DRIVER_PACKAGE and tags
+      # :<TAG>-cuda; the lean default leaves it empty and skips this block).
+      # Baked at image-build time, not installed by the per-session cloud-init:
+      # the default zone's egress blocks package mirrors, so a GPU session boots
+      # ready instead of installing a driver on first connect.
+      if [ -n "@NVIDIA_DRIVER_PACKAGE@" ]; then
+        $APT install -y --no-install-recommends "@NVIDIA_DRIVER_PACKAGE@"
+      fi
+
+      # CUDA toolkit (nvcc + cuda runtime libs) for GPU-compute workloads in the
+      # guest. Only in the CUDA variant (build.sh CUDA=1 sets CUDA_TOOLKIT_PACKAGE,
+      # default 26.04's archive nvidia-cuda-toolkit; the lean default leaves it
+      # empty and skips this). Not --no-install-recommends here: the toolkit's
+      # recommends (gcc host compiler, headers) are what make nvcc usable.
+      # Several GB — build.sh gives the CUDA build a bigger disk to fit it.
+      if [ -n "@CUDA_TOOLKIT_PACKAGE@" ]; then
+        $APT install -y "@CUDA_TOOLKIT_PACKAGE@"
+      fi
+
       # Selkies venv + web client (extracted from the streamer-selkies2 docker
       # build — same pinned SELKIES_COMMIT, client/server lock preserved) plus
       # the whistler-streamer / whistler-desktop@ units and scripts (guest/).

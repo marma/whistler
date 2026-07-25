@@ -17,9 +17,20 @@
 #   3. Wrap the qcow2 as a containerDisk (Dockerfile.containerdisk).
 #
 # Knobs (env): IMAGE (default localhost:5000/whistler-vm-xfce-selkies),
-# TAG (dev), PUSH=1 to docker-push, DISK_SIZE (12G), QEMU_MEM (4096),
-# QEMU_SMP (min(8,nproc)), BASE_IMAGE_URL, CACHE_DIR (~/.cache/whistler/vm-images),
-# BAKE_TIMEOUT (2700s).
+# TAG (dev), PUSH=1 to docker-push, DISK_SIZE (12G lean / 22G CUDA),
+# QEMU_MEM (4096), QEMU_SMP (min(8,nproc)), BASE_IMAGE_URL, CACHE_DIR
+# (~/.cache/whistler/vm-images), BAKE_TIMEOUT (2700s),
+# CUDA/NVIDIA_DRIVER_PACKAGE/CUDA_TOOLKIT_PACKAGE (see below).
+#
+# CUDA=1 bakes the NVIDIA open driver + the CUDA toolkit in and tags the result
+# :<TAG>-cuda; the default (CUDA=0) is a LEAN image with neither. Two variants,
+# not one: the driver+toolkit are dead weight (and the driver a first-boot
+# install over the egress-locked guest net) on the vast majority of sessions
+# that have no passthrough GPU, so only GPU templates pull the -cuda image.
+# They're baked (not session-time installed) precisely because the default zone
+# blocks package mirrors — so a GPU session boots ready. NVIDIA_DRIVER_PACKAGE /
+# CUDA_TOOLKIT_PACKAGE override which packages (the guest is 26.04; defaults are
+# nvidia-driver-595-open and the archive nvidia-cuda-toolkit).
 #
 # amd64-only: the bake runs the target-arch guest under KVM; producing arm64
 # needs an arm64 host (or an emulated ~hour-long TCG bake nobody wants).
@@ -29,12 +40,27 @@ cd "$(dirname "$0")"
 IMAGE="${IMAGE:-localhost:5000/whistler-vm-xfce-selkies}"
 TAG="${TAG:-dev}"
 PUSH="${PUSH:-0}"
-DISK_SIZE="${DISK_SIZE:-12G}"
+CUDA="${CUDA:-0}"
 QEMU_MEM="${QEMU_MEM:-4096}"
 QEMU_SMP="${QEMU_SMP:-$(( $(nproc) < 8 ? $(nproc) : 8 ))}"
 BASE_IMAGE_URL="${BASE_IMAGE_URL:-https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img}"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/whistler/vm-images}"
 BAKE_TIMEOUT="${BAKE_TIMEOUT:-2700}"
+# CUDA=1 → bake the NVIDIA driver + CUDA toolkit and suffix the tag; else a
+# lean image with neither. CUDA_TOOLKIT_PACKAGE defaults to 26.04's archive
+# nvidia-cuda-toolkit (nvcc + cuda runtime libs); empty it for driver-only, or
+# point it at a cuda-toolkit-XX-Y package from NVIDIA's CUDA apt repo for a
+# specific release. The toolkit adds several GB, so CUDA builds get a bigger disk.
+if [ "$CUDA" = "1" ]; then
+  NVIDIA_DRIVER_PACKAGE="${NVIDIA_DRIVER_PACKAGE:-nvidia-driver-595-open}"
+  CUDA_TOOLKIT_PACKAGE="${CUDA_TOOLKIT_PACKAGE:-nvidia-cuda-toolkit}"
+  TAG="${TAG}-cuda"
+  DISK_SIZE="${DISK_SIZE:-22G}"
+else
+  NVIDIA_DRIVER_PACKAGE=""
+  CUDA_TOOLKIT_PACKAGE=""
+  DISK_SIZE="${DISK_SIZE:-12G}"
+fi
 # Fixed port is fine: it only exists inside the bake container's netns.
 HTTP_PORT=8099
 
@@ -74,7 +100,10 @@ BASE_IMG="$CACHE_DIR/$(basename "$BASE_IMAGE_URL")"
 [ -s "$BASE_IMG" ] || curl -fL --progress-bar -o "$BASE_IMG" "$BASE_IMAGE_URL"
 
 echo "==> [3/4] Bake boot (qemu/KVM in docker; console: $BUILD_DIR/console.log)"
-sed "s/@HTTP_PORT@/$HTTP_PORT/g" bake/user-data.in > "$SEED_DIR/user-data"
+sed -e "s/@HTTP_PORT@/$HTTP_PORT/g" \
+    -e "s/@NVIDIA_DRIVER_PACKAGE@/$NVIDIA_DRIVER_PACKAGE/g" \
+    -e "s/@CUDA_TOOLKIT_PACKAGE@/$CUDA_TOOLKIT_PACKAGE/g" \
+    bake/user-data.in > "$SEED_DIR/user-data"
 printf 'instance-id: whistler-bake\nlocal-hostname: bake\n' > "$SEED_DIR/meta-data"
 docker build -f bake/Dockerfile.bake -t whistler-vm-bake bake/
 # --user + --group-add: bake as the invoking user so /build output isn't

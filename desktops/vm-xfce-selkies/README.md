@@ -50,9 +50,20 @@ home mount, streamer env, session-unit start — see
 ## Build
 
 ```bash
-make vm-desktop-image          # → localhost:5000/whistler-vm-xfce-selkies:dev
+make vm-desktop-image          # → localhost:5000/whistler-vm-xfce-selkies:dev  (lean, no GPU driver)
+make vm-desktop-image CUDA=1   # → …:dev-cuda  (bakes NVIDIA driver + CUDA toolkit for passthrough sessions)
 make vm-desktop-image PUSH=1   # …and push to the dev registry
 ```
+
+The default `:dev` image carries **no** NVIDIA driver — most sessions have no
+passthrough GPU, and the driver is dead weight (plus a first-boot install over
+the egress-locked guest net) on them. `CUDA=1` bakes the open driver **and the
+CUDA toolkit** (`nvcc` + cuda runtime libs; several GB, so the CUDA build gets a
+bigger disk) in and tags the result `:dev-cuda`; only GPU templates (e.g.
+`ubuntu-vm-selkies-cuda` in
+[values-dev-vm.yaml](../../charts/whistler/values-dev-vm.yaml)) pull that tag.
+`CUDA_TOOLKIT_PACKAGE` overrides which toolkit (default: the archive
+`nvidia-cuda-toolkit`; empty for driver-only).
 
 Needs docker, `qemu-system-x86_64` and `/dev/kvm` — **no libguestfs**: the
 bake boots the Ubuntu cloud image once under qemu with a NoCloud seed served

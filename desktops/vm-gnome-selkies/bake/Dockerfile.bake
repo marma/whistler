@@ -1,0 +1,15 @@
+# Toolbox for the bake boot: qemu + python3 (NoCloud seed HTTP server).
+# The bake runs qemu in a container so the only host requirements are docker
+# and a /dev/kvm *node* — `--device /dev/kvm --group-add <kvm gid>` grants
+# access without the invoking user being in the host kvm group.
+#
+# NOTE: this is only the qemu *host* toolbox and is arch-/release-independent
+# of the guest — the baked guest is Ubuntu 24.04 (see build.sh / user-data.in),
+# but the runner staying on 26.04 is fine and keeps it identical to
+# ../../vm-xfce-selkies/bake/Dockerfile.bake.
+FROM ubuntu:26.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      qemu-system-x86 qemu-utils python3-minimal \
+ && rm -rf /var/lib/apt/lists/*
+COPY boot.sh /boot.sh
+ENTRYPOINT ["/bin/sh", "/boot.sh"]
