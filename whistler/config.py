@@ -1663,6 +1663,10 @@ class KubeConfigManager(ConfigManager):
                 "hostname": hostname,
                 "subdomain": "whistler",
                 "automountServiceAccountToken": False,
+                # ssh pods run `sleep` as PID 1, which never exits on SIGTERM,
+                # so the default 30s grace is always burned in full; nothing in
+                # a session needs a long drain either way.
+                "terminationGracePeriodSeconds": 5,
             },
         }
         self._apply_zone_dns(pod_body["spec"], zone)
@@ -1853,6 +1857,10 @@ class KubeConfigManager(ConfigManager):
                     },
                 },
                 "spec": {
+                    # terminationGracePeriodSeconds stays at KubeVirt's 30s
+                    # default on purpose (unlike session pods): it is the ACPI
+                    # shutdown window, and a full guest OS needs the time to
+                    # stop cleanly before being forced off.
                     "nodeSelector": node_selector,
                     "domain": domain,
                     "networks": [{"name": "default", "pod": {}}],
@@ -2305,6 +2313,10 @@ class KubeConfigManager(ConfigManager):
                         # Values-level pinning to fast/storage nodes — the
                         # gateway is deliberately NOT co-scheduled with VMs.
                         "nodeSelector": node_selector or {},
+                        # smbd exits promptly on SIGTERM, and with the
+                        # Recreate strategy on an RWO PVC the new pod cannot
+                        # start until the old one is fully gone.
+                        "terminationGracePeriodSeconds": 5,
                         "containers": [{
                             "name": "samba",
                             "image": image,
