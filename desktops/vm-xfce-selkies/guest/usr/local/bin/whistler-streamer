@@ -49,6 +49,20 @@ pactl set-default-source output.monitor 2>/dev/null || \
 # can reach the socket Xvfb drops in it. Sticky like a real X11 dir.
 mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
+# The CUDA image ships the NVIDIA EGL ICD (glvnd vendor file). On a boot with
+# NO GPU visible (test.sh's qemu, or a -cuda session without passthrough),
+# glvnd probing that ICD segfaults Xvfb inside its GLX init (crash in
+# InitExtensions via libEGL) — the streamer then "runs" with Selkies serving
+# but no X, and the desktop unit loops on "no X server on :0". Pin EGL to the
+# Mesa ICD for this process tree when no GPU answers: Xvfb's GLX is Mesa
+# swrast either way, so GPU sessions (where nvidia-smi succeeds and this
+# branch is skipped) lose nothing. Lean images take the branch too, where
+# Mesa is already the only vendor — a no-op.
+if ! nvidia-smi -L >/dev/null 2>&1 \
+   && [ -e /usr/share/glvnd/egl_vendor.d/50_mesa.json ]; then
+  export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+fi
+
 # Headless X server (software framebuffer) that pixelflux captures — the
 # virtio-gpu/VNC console framebuffer is NOT used for the desktop; it keeps
 # showing the text console (and stays reachable as a rescue path via the

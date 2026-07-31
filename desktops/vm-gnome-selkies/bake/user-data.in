@@ -62,6 +62,9 @@ write_files:
       # libxkbcommon-dev, meson) are NOT needed: the selkies venv and vendored
       # libva arrive prebuilt in artifacts.tar.gz; libxkbcommon0 is the venv's
       # one runtime shared lib.
+      # x11-apps is here for `xwd` alone (it is NOT in x11-utils): the portal
+      # SSHes in periodically and grabs the display for the session thumbnail
+      # — see whistler/portal/screenshots.py.
       $APT install -y --no-install-recommends \
         gnome-session gnome-shell gnome-settings-daemon \
         gnome-terminal nautilus gnome-text-editor gnome-control-center \
@@ -81,9 +84,27 @@ write_files:
       # 24.04 package, default nvidia-driver-550-open — and tags :<TAG>-cuda;
       # the lean default leaves it empty and skips this block). GNOME itself
       # renders on llvmpipe and the streamer captures Xvfb regardless, so this
-      # only matters for GPU-compute workloads inside the guest.
+      # matters for GPU-compute workloads and (via VirtualGL below) for GL apps
+      # that opt in to drawing on the GPU.
       if [ -n "@NVIDIA_DRIVER_PACKAGE@" ]; then
         $APT install -y --no-install-recommends "@NVIDIA_DRIVER_PACKAGE@"
+      fi
+
+      # VirtualGL (CUDA variant only; pinned upstream .deb — Ubuntu doesn't
+      # package it). Xvfb's GLX is Mesa swrast, so *all* OpenGL — Blender's
+      # viewport, GTK4's GL renderer — draws on llvmpipe even with a GPU
+      # passed through; only CUDA and NVENC can reach it. VirtualGL's EGL
+      # backend fixes that per-app: `vgl <app>` (the guest wrapper around
+      # `vglrun -d egl`) interposes the app's GLX and renders it on the NVIDIA
+      # EGL device — no GPU-owning X server needed — then blits the frames into
+      # the Xvfb display, where mutter composits and pixelflux captures them as
+      # usual. Desktop compositing itself stays llvmpipe; this accelerates the
+      # apps a user wraps, nothing else.
+      if [ -n "@VIRTUALGL_VERSION@" ]; then
+        curl -fL -o /run/virtualgl.deb \
+          "https://github.com/VirtualGL/virtualgl/releases/download/@VIRTUALGL_VERSION@/virtualgl_@VIRTUALGL_VERSION@_amd64.deb"
+        $APT install -y --no-install-recommends /run/virtualgl.deb
+        rm -f /run/virtualgl.deb
       fi
 
       # CUDA toolkit (nvcc + cuda runtime libs) for GPU-compute workloads in the
@@ -108,7 +129,8 @@ write_files:
       chmod 0755 /usr/local/bin/whistler-streamer \
                  /usr/local/bin/whistler-desktop-session \
                  /usr/local/bin/gnome-session-launch.sh \
-                 /usr/local/bin/wtype
+                 /usr/local/bin/wtype \
+                 /usr/local/bin/vgl
 
       # Make the vendored libva 2.22 authoritative: /usr/local/lib precedes
       # /usr/lib in the default ld.so order, so this libva.so.2 wins over the

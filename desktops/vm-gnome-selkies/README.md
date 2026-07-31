@@ -97,7 +97,9 @@ Check `journalctl -u whistler-desktop@<user>` in the guest first.
 - The GNOME app set (Terminal, Files, Text Editor, Settings) plus **Firefox from
   Mozilla's APT repo** (24.04's `firefox` apt package is a snap shim, and snapd
   is purged); llvmpipe software GL for mutter; `librsvg2-common` + a regenerated
-  gdk-pixbuf loader cache so Adwaita's SVG icons aren't blurry.
+  gdk-pixbuf loader cache so Adwaita's SVG icons aren't blurry. The CUDA variant
+  adds **VirtualGL** and a `vgl` wrapper so GL apps can render on a passthrough
+  GPU — see [Three graphics tiers](#three-graphics-tiers).
 
 ## Streaming mode is required
 
@@ -129,7 +131,9 @@ software x264 from the identical config. `jpeg` and `x264enc-striped` force
 `use_cpu=true` server-side and are always CPU.
 
 Only the encode stage moves: capture stays XShm from Xvfb, and GNOME still
-renders on llvmpipe. To see which backend a session picked:
+renders on llvmpipe (apps can individually opt out of that via `vgl` — see
+[Three graphics tiers](#three-graphics-tiers)). To see which backend a session
+picked:
 
 ```bash
 journalctl -u whistler-streamer | grep -Ei 'nvenc|vaapi|x264'
@@ -138,6 +142,39 @@ journalctl -u whistler-streamer | grep -Ei 'nvenc|vaapi|x264'
 # "... Falling back to x264" / "to CPU"      → software libx264
 nvidia-smi -q -d UTILIZATION | grep -i -A2 encoder   # in-guest confirmation
 ```
+
+## Three graphics tiers
+
+A passthrough GPU is reachable three different ways, and they are independent:
+
+| Tier | What the GPU does | How you get it |
+|---|---|---|
+| software | nothing (or NVENC stream encode only) | `:dev` image, or `:dev-cuda` + GPU with no GL apps wrapped |
+| compute | CUDA (Cycles, ML) + NVENC encode; all drawing stays llvmpipe | `:dev-cuda` + GPU passthrough — the default behavior |
+| accelerated GL (per app) | the wrapped app's OpenGL renders on the GPU | `:dev-cuda` + GPU passthrough + `vgl <app>` |
+
+The reason drawing doesn't accelerate by itself: Xvfb's GLX is Mesa swrast, so
+*every* GL context — mutter's compositing, Blender's viewport, GTK4's
+renderer — is llvmpipe regardless of what hardware the guest owns. That's why
+Blender's Cycles (CUDA) is fast while its viewport (OpenGL) crawls. CUDA and
+NVENC bypass the display stack entirely; GLX cannot.
+
+**VirtualGL** (baked into the CUDA variant only, pinned upstream .deb —
+`VIRTUALGL_VERSION` in [build.sh](build.sh)) bridges that per app: the guest
+wrapper [`vgl`](guest/usr/local/bin/vgl) runs `vglrun -d egl`, which interposes
+the app's GLX calls and renders them on the NVIDIA **EGL device** (no
+GPU-owning X server needed), then blits the finished frames into the Xvfb
+display where mutter composits and pixelflux captures them as usual.
+
+```bash
+vgl glxinfo -B     # "OpenGL renderer string" must name the NVIDIA GPU
+vgl blender        # viewport now draws on the GPU (Cycles was already CUDA)
+```
+
+The desktop itself (mutter, GNOME's own chrome) still composits on llvmpipe —
+whole-desktop acceleration would mean replacing Xvfb with an NVIDIA-owning
+Xorg, a separate future tier. On the lean image or a GPU-less session `vgl`
+fails fast with a clear message instead of silently running llvmpipe.
 
 ## Known limitation: overview backdrop at HiDPI
 
@@ -161,12 +198,14 @@ Like [`../vm-xfce-selkies`](../vm-xfce-selkies/), the default `:dev` image
 carries **no** NVIDIA driver; `CUDA=1` bakes the driver **and the CUDA toolkit**
 (`nvcc` + cuda runtime libs; several GB, so the CUDA build gets a bigger disk)
 in and tags `:dev-cuda`. GNOME still renders on llvmpipe in both variants (Xvfb
-serves Mesa swrast GLX — a passthrough GPU can't change that), but the two are
-**not** otherwise identical: the driver brings `libnvidia-encode`, so on a
-`:dev-cuda` passthrough session pixelflux encodes the stream on **NVENC**
-instead of software x264 (see [Streaming is H.264 — but not
-x264](#streaming-is-h264--but-not-x264) below). CUDA on top of that is for
-GPU-compute workloads in the guest. NOTE the 24.04
+serves Mesa swrast GLX — a passthrough GPU can't change that by itself), but
+the two are **not** otherwise identical: the driver brings `libnvidia-encode`,
+so on a `:dev-cuda` passthrough session pixelflux encodes the stream on
+**NVENC** instead of software x264 (see [Streaming is H.264 — but not
+x264](#streaming-is-h264--but-not-x264)). CUDA on top of that is for
+GPU-compute workloads in the guest, and **VirtualGL** (`VIRTUALGL_VERSION`,
+default 3.1.4) lets individual GL apps draw on the GPU via `vgl <app>` — see
+[Three graphics tiers](#three-graphics-tiers). NOTE the 24.04
 packages differ from 26.04's: default driver `nvidia-driver-550-open`, default
 toolkit the archive `nvidia-cuda-toolkit` (CUDA 12.x); override via
 `NVIDIA_DRIVER_PACKAGE` / `CUDA_TOOLKIT_PACKAGE` (a wrong name fails the bake).

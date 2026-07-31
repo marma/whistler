@@ -40,7 +40,9 @@
 # Mesa swrast), but the driver is not desktop-neutral: it brings
 # libnvidia-encode, so a -cuda passthrough session encodes the Selkies stream on
 # NVENC rather than software x264 (see guest/usr/local/bin/whistler-streamer).
-# The CUDA toolkit on top of that is for GPU-compute workloads in-guest.
+# The CUDA toolkit on top of that is for GPU-compute workloads in-guest, and
+# VirtualGL (VIRTUALGL_VERSION, CUDA variant only) lets individual GL apps
+# render on the GPU via `vgl <app>` — see README "Three graphics tiers".
 #
 # amd64-only: the bake runs the target-arch guest under KVM; producing arm64
 # needs an arm64 host (or an emulated ~hour-long TCG bake nobody wants).
@@ -65,11 +67,17 @@ BAKE_TIMEOUT="${BAKE_TIMEOUT:-2700}"
 if [ "$CUDA" = "1" ]; then
   NVIDIA_DRIVER_PACKAGE="${NVIDIA_DRIVER_PACKAGE:-nvidia-driver-550-open}"
   CUDA_TOOLKIT_PACKAGE="${CUDA_TOOLKIT_PACKAGE:-nvidia-cuda-toolkit}"
+  # VirtualGL (pinned upstream .deb) rides along with the driver so GL apps can
+  # opt in to *drawing* on the passthrough GPU via `vgl <app>` (EGL backend) —
+  # without it the GPU can only do CUDA + NVENC while all OpenGL stays on
+  # llvmpipe (Xvfb's GLX is swrast). Empty it to skip.
+  VIRTUALGL_VERSION="${VIRTUALGL_VERSION:-3.1.4}"
   TAG="${TAG}-cuda"
   DISK_SIZE="${DISK_SIZE:-24G}"
 else
   NVIDIA_DRIVER_PACKAGE=""
   CUDA_TOOLKIT_PACKAGE=""
+  VIRTUALGL_VERSION=""
   DISK_SIZE="${DISK_SIZE:-14G}"
 fi
 # Fixed port is fine: it only exists inside the bake container's netns.
@@ -119,6 +127,7 @@ echo "==> [3/4] Bake boot (qemu/KVM in docker; console: $BUILD_DIR/console.log)"
 sed -e "s/@HTTP_PORT@/$HTTP_PORT/g" \
     -e "s/@NVIDIA_DRIVER_PACKAGE@/$NVIDIA_DRIVER_PACKAGE/g" \
     -e "s/@CUDA_TOOLKIT_PACKAGE@/$CUDA_TOOLKIT_PACKAGE/g" \
+    -e "s/@VIRTUALGL_VERSION@/$VIRTUALGL_VERSION/g" \
     bake/user-data.in > "$SEED_DIR/user-data"
 printf 'instance-id: whistler-bake\nlocal-hostname: bake\n' > "$SEED_DIR/meta-data"
 docker build -f bake/Dockerfile.bake -t whistler-vm-bake bake/

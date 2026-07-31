@@ -1,0 +1,21 @@
+#!/bin/sh
+# `vgl <app>` — run one GL app with its OpenGL on the passthrough GPU, via
+# VirtualGL's EGL backend (`vglrun -d egl`; the deb is baked into the CUDA
+# image only — see bake/user-data.in). Only the wrapped app moves: GNOME/mutter
+# keep compositing on llvmpipe and pixelflux keeps capturing Xvfb, so this
+# fixes app-viewport speed (Blender, CAD, games) without touching the display
+# plane. Verify with:  vgl glxinfo -B   (renderer should name the NVIDIA GPU).
+#
+# On the lean image, or a session without a GPU attached, fail fast and loud
+# instead of half-working on llvmpipe.
+command -v vglrun >/dev/null 2>&1 || {
+  echo "vgl: VirtualGL is not in this image (lean build) — GPU GL unavailable" >&2
+  exit 127
+}
+if ! nvidia-smi -L >/dev/null 2>&1; then
+  echo "vgl: no NVIDIA GPU visible in this session (nvidia-smi failed) — GPU GL unavailable" >&2
+  exit 1
+fi
+# -d is authoritative over the VGL_DISPLAY env var, so pass the env through it
+# to keep the default (egl = first EGL device) overridable per-invocation.
+exec vglrun -d "${VGL_DISPLAY:-egl}" "$@"
