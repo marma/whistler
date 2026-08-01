@@ -1,0 +1,87 @@
+# macOS client keyboard fixes (apply to SELKIES_COMMIT
+# 5686f6c4d20ed63a27e253bac00fb89ef99828c8; re-derive when bumping the pin —
+# upstream main has since rewritten this code and, as of 877cf202b4 (Jul 2026),
+# regressed it further: the keysym-keyed modifier heal releases Cmd's stored
+# Alt_L on the first chord keydown, so verify before assuming a bump fixes it).
+#
+# Fix 1 — repeated Cmd chords. Upstream's Cmd->Ctrl swap only fires while
+# MetaLeft/MetaRight is still in _keyDownList, but the first swap removes it —
+# and macOS reports ctrlKey=false on Cmd-chord key events, so the modifier-sync
+# loop then releases the virtual ControlLeft. Net effect on a real Mac: the
+# FIRST Cmd chord per Cmd hold works, every following one (Cmd-A then Cmd-C,
+# double Cmd-V) sends the letter bare and types it. Two changes, both gated on
+# _macCmdSwapped so non-Mac paths are untouched: the sync loop keeps the
+# swapped virtual ControlLeft alive while Cmd is physically held, and the swap
+# branch also fires when _macCmdSwapped is already set, re-pressing Ctrl only
+# if it is not already held.
+#
+# Fix 2 — app-aware copy/paste. Plain Cmd-C/Cmd-V are sent as dedicated
+# XF86Copy/XF86Paste taps instead of the Ctrl swap, because Ctrl+C is SIGINT in
+# a terminal (copy there is Ctrl+Shift+C, and Shift+Insert pastes PRIMARY, not
+# CLIPBOARD). The in-session whistler-copy-agent grabs the XF86 keys and
+# re-injects the chord the focused window expects — Mac-native semantics:
+# Cmd-C copies everywhere, physical Ctrl-C still interrupts. Cmd-Shift-C/V and
+# all other Cmd chords keep the Ctrl swap.
+#
+# All verified against a live session with a MacIntel-spoofed Chromium driving
+# the real client bundle; guest-side X events confirmed via XTEST replay.
+--- a/addons/selkies-web-core/lib/input.js
++++ b/addons/selkies-web-core/lib/input.js
+@@ -1347,7 +1347,15 @@
+             for (const code in this._keyDownList) {
+                 const keysym = this._keyDownList[code];
+                 if ((code === 'ControlLeft' || code === 'ControlRight') && !event.ctrlKey) {
+-                    this._sendKeyEvent(keysym, code, false);
++                    // macOS Cmd->Ctrl swap: the virtual ControlLeft stands in for a
++                    // physically-held Cmd, whose key events report ctrlKey=false.
++                    // Healing it away here strips Ctrl from every chord after the
++                    // first while Cmd stays held (Cmd-A then Cmd-C typed a 'c' over
++                    // the selection). Keep it while the swap is active and Cmd is
++                    // still down.
++                    if (!(this._macCmdSwapped && event.metaKey && code === 'ControlLeft')) {
++                        this._sendKeyEvent(keysym, code, false);
++                    }
+                 }
+                 if ((code === 'MetaLeft' || code === 'MetaRight') && !event.metaKey) {
+                     this._sendKeyEvent(keysym, code, false);
+@@ -1396,9 +1404,28 @@
+             return;
+         }
+ 
++        if (browser.isMac() && (code === "KeyC" || code === "KeyV") &&
++            event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) {
++            // Plain Cmd-C / Cmd-V: no single X chord means "copy" in every app
++            // (GUI wants Ctrl+C/V; a terminal treats Ctrl+C as SIGINT and copies
++            // on Ctrl+Shift+C — and Shift+Insert pastes PRIMARY, not CLIPBOARD).
++            // Send dedicated XF86Copy/XF86Paste taps instead and let the
++            // in-session whistler-copy-agent, which can see the focused window,
++            // re-inject the chord that app expects. Cmd-Shift-C/V and every
++            // other Cmd chord keep the Ctrl swap below.
++            const clipSym = (code === "KeyC") ? 0x1008FF57 : 0x1008FF6D;
++            this._sendKeyEvent(clipSym, code, true);
++            this._sendKeyEvent(clipSym, code, false);
++            _stopEvent(event);
++            return;
++        }
++
+         if (browser.isMac() && code !== "MetaLeft" && code !== "MetaRight" &&
+             event.metaKey && !event.ctrlKey && !event.altKey) {
+-            if (this._keyDownList["MetaLeft"] || this._keyDownList["MetaRight"]) {
++            // _macCmdSwapped covers follow-up chords: the first swap released Meta
++            // from _keyDownList, so the Meta-in-list test alone fired only once per
++            // Cmd hold and the second chord's letter went in bare.
++            if (this._keyDownList["MetaLeft"] || this._keyDownList["MetaRight"] || this._macCmdSwapped) {
+                 console.log(`macOS: Cmd+key detected for code '${code}'. Remapping Cmd to Ctrl.`);
+                 if (this._keyDownList["MetaLeft"]) {
+                     this._sendKeyEvent(this._keyDownList["MetaLeft"], "MetaLeft", false);
+@@ -1406,7 +1433,9 @@
+                 if (this._keyDownList["MetaRight"]) {
+                     this._sendKeyEvent(this._keyDownList["MetaRight"], "MetaRight", false);
+                 }
+-                this._sendKeyEvent(KeyTable.XK_Control_L, "ControlLeft", true);
++                if (!("ControlLeft" in this._keyDownList)) {
++                    this._sendKeyEvent(KeyTable.XK_Control_L, "ControlLeft", true);
++                }
+                 this._macCmdSwapped = true;
+             }
+         }

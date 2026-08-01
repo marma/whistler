@@ -88,6 +88,7 @@ mkdir -p "$STAGE_DIR/opt" "$STAGE_DIR/usr/local/bin"
 docker cp "$BAKE_CTR:/opt/venv" "$STAGE_DIR/opt/venv"
 docker cp "$BAKE_CTR:/opt/selkies-web" "$STAGE_DIR/opt/selkies-web"
 docker cp "$BAKE_CTR:/usr/local/bin/wtype" "$STAGE_DIR/usr/local/bin/wtype"
+docker cp "$BAKE_CTR:/usr/local/bin/whistler-copy-agent" "$STAGE_DIR/usr/local/bin/whistler-copy-agent"
 cp -a guest/. "$STAGE_DIR/"
 # --owner/--group 0: the tar is created by an ordinary user but extracted by
 # root in the guest, where tar would otherwise faithfully restore this uid.

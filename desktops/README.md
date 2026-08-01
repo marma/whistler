@@ -40,6 +40,29 @@ Service, which reaches the guest through the launcher pod's masquerade. The
 agentless `viewer: vnc` (noVNC over the KubeVirt VNC subresource) remains the
 rescue path / default for unbaked VM images.
 
+## Client keyboard notes
+
+- **macOS clients**: the Selkies web client remaps Cmd+key chords to
+  Ctrl+key in the session, patched at image build time
+  (`streamer-selkies2/mac-cmd-chords.patch`) to survive repeated chords per
+  Cmd hold **and** to give plain Cmd-C/Cmd-V native Mac semantics: they are
+  sent as XF86Copy/XF86Paste taps, which the in-session
+  [`whistler-copy-agent`](streamer-selkies2/whistler-copy-agent) (launched by
+  every streamer flavor) re-injects as the chord the **focused** window
+  expects — Ctrl+C/V in GUI apps, Ctrl+Shift+C/V in terminals (by WM_CLASS).
+  So Cmd-C copies to the real CLIPBOARD everywhere, Cmd-V pastes it, physical
+  Ctrl-C still means SIGINT, and PRIMARY/middle-click is untouched. No single
+  X chord could do this (Ctrl+C is SIGINT in a terminal; VTE's Shift+Insert
+  pastes PRIMARY, not CLIPBOARD — measured). Cmd-Shift-C/V still arrive
+  verbatim as Ctrl+Shift+C/V.
+- **Non-US client layouts**: the session's X server starts with a US keymap,
+  so characters outside it (å/ä/ö, …) are injected via a temporary
+  keymap-rewrite fallback — it works, but each such character stalls ~1s while
+  the compositor re-parses the keymap. Fix: add your layout inside the session
+  (GNOME Settings → Keyboard → Input Sources, or `setxkbmap se`) — with the
+  keysym present in the keymap, injection takes the direct XTEST path
+  (measured: ~1s → 0 ms). The choice persists in dconf on the home volume.
+
 ## Conventions
 
 - **Workload images self-start their session** as the image entrypoint (the

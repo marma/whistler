@@ -63,6 +63,15 @@ for i in $(seq 1 30); do xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1 && break
     sleep 1
   done & )
 
+# App-aware copy/paste for macOS clients: grabs the XF86Copy/XF86Paste taps
+# the Mac web client sends for plain Cmd-C/Cmd-V (see mac-cmd-chords.patch)
+# and re-injects Ctrl+C/V or Ctrl+Shift+C/V depending on the focused window.
+# Supervised loop: the agent is stateless, so a crash just restarts it.
+( while true; do
+    /usr/local/bin/whistler-copy-agent
+    sleep 2
+  done & )
+
 # Selkies 2.x: pixelflux capture of $DISPLAY, H.264 encode, web client
 # + WebSocket streaming on one port. Flag spelling matters: 2.x CLI flags are
 # dash-separated (--web-root, not --web_root) and the parser uses

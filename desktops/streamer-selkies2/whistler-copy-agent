@@ -1,0 +1,197 @@
+#!/opt/venv/bin/python3
+"""App-aware copy/paste for macOS clients.
+
+The Mac web client sends dedicated XF86Copy / XF86Paste taps for plain
+Cmd-C / Cmd-V (see mac-cmd-chords.patch) because no single X chord means
+"copy" everywhere: GUI apps want Ctrl+C/V, but in a terminal Ctrl+C is SIGINT
+and VTE's copy/paste is Ctrl+Shift+C/V (Shift+Insert pastes PRIMARY, not
+CLIPBOARD — measured, so the classic Insert chords are out). The client cannot
+see which app has focus; this agent runs inside the display plane, where the
+answer is one property read away.
+
+It grabs the XF86Copy/XF86Paste keycodes on the root window (XTEST-injected
+events hit X grabs like real ones) and re-injects the chord the focused window
+expects, picked by WM_CLASS. Modifier handling mirrors xdotool
+--clearmodifiers: the client may legitimately have Ctrl (the Cmd swap) and/or
+Alt (Cmd's initial Super->Alt mapping) held around the tap, so held modifiers
+the chord doesn't want are released for the tap and pressed back afterwards —
+the client's idea of what is held stays true. PRIMARY/middle-click is never
+touched.
+
+Not macOS-specific by construction: any client that sends XF86Copy/XF86Paste
+gets the same treatment. Non-Mac clients never send them, so this is inert for
+everyone else.
+
+Runs from the streamer's venv (python-Xlib is a selkies dependency). One
+instance per X display; crashes are cheap (the launcher loops it).
+"""
+import logging
+import os
+import sys
+import time
+
+from Xlib import X, display
+from Xlib.ext import xtest
+
+logging.basicConfig(level=logging.INFO, format="[copy-agent] %(message)s")
+log = logging.getLogger()
+
+XF86_COPY = 0x1008FF57
+XF86_PASTE = 0x1008FF6D
+KS_CONTROL_L = 0xFFE3
+KS_SHIFT_L = 0xFFE1
+KS_ALT_L = 0xFFE9
+KS_SUPER_L = 0xFFEB
+KS_C = 0x63
+KS_V = 0x76
+
+# WM_CLASS tokens (lowercased, exact match) that mean "Ctrl+C is not copy
+# here". Everything else gets the plain GUI chords.
+TERMINAL_CLASSES = {
+    "gnome-terminal", "gnome-terminal-server", "kgx", "org.gnome.console",
+    "xterm", "uxterm", "xfce4-terminal", "konsole", "alacritty", "kitty",
+    "terminator", "tilix", "urxvt", "rxvt", "st", "st-256color", "wezterm",
+    "guake", "eterm", "sakura", "terminology",
+}
+
+# Modifier mask bits we normalize around the injected chord. Lock bits
+# (Caps/Num) are left alone — X applies them orthogonally.
+MOD_KEYSYMS = {
+    X.ShiftMask: KS_SHIFT_L,
+    X.ControlMask: KS_CONTROL_L,
+    X.Mod1Mask: KS_ALT_L,
+    X.Mod4Mask: KS_SUPER_L,
+}
+
+
+def ensure_keycode(d, keysym):
+    """Keycode for keysym, mapping it onto a spare keycode if the current
+    keymap lacks it (Xvfb's bare default may; pc105+inet has both XF86 keys).
+    The one-time MappingNotify at startup is harmless."""
+    kc = d.keysym_to_keycode(keysym)
+    if kc:
+        return kc
+    setup = d.display.info
+    for candidate in range(setup.max_keycode, setup.min_keycode - 1, -1):
+        if not any(d.keycode_to_keysym(candidate, i) for i in range(4)):
+            d.change_keyboard_mapping(candidate, [(keysym, keysym)])
+            d.sync()
+            log.info(f"mapped keysym {keysym:#x} onto spare keycode {candidate}")
+            return candidate
+    raise RuntimeError(f"no spare keycode for keysym {keysym:#x}")
+
+
+def active_window_class(d, root, net_active_window):
+    prop = root.get_full_property(net_active_window, X.AnyPropertyType)
+    if not prop or not prop.value:
+        return set()
+    w = d.create_resource_object("window", int(prop.value[0]))
+    for _ in range(4):  # WM_CLASS may sit on an ancestor of the focus window
+        try:
+            cls = w.get_wm_class()
+            if cls:
+                return {c.lower() for c in cls}
+            w = w.query_tree().parent
+            if not w:
+                break
+        except Exception:
+            break
+    return set()
+
+
+def tap(d, keycode):
+    xtest.fake_input(d, X.KeyPress, keycode)
+    xtest.fake_input(d, X.KeyRelease, keycode)
+
+
+def inject_chord(d, root, want_shift, letter_kc, mod_kc):
+    """Inject Ctrl[+Shift]+letter, releasing held modifiers the chord doesn't
+    want and restoring them afterwards (xdotool --clearmodifiers semantics)."""
+    held_mask = root.query_pointer().mask
+    want = {X.ControlMask} | ({X.ShiftMask} if want_shift else set())
+    parked = []   # held but unwanted -> released for the tap, pressed back
+    pressed = []  # wanted but not held -> pressed for the tap, released after
+    for mask_bit, keysym in MOD_KEYSYMS.items():
+        kc = mod_kc[keysym]
+        if held_mask & mask_bit and mask_bit not in want:
+            xtest.fake_input(d, X.KeyRelease, kc)
+            parked.append(kc)
+        elif mask_bit in want and not held_mask & mask_bit:
+            xtest.fake_input(d, X.KeyPress, kc)
+            pressed.append(kc)
+    tap(d, letter_kc)
+    for kc in reversed(pressed):
+        xtest.fake_input(d, X.KeyRelease, kc)
+    for kc in parked:
+        xtest.fake_input(d, X.KeyPress, kc)
+    d.sync()
+
+
+def main():
+    d = display.Display(os.environ.get("DISPLAY", ":0"))
+    root = d.screen().root
+    net_active_window = d.intern_atom("_NET_ACTIVE_WINDOW")
+
+    copy_kc = ensure_keycode(d, XF86_COPY)
+    paste_kc = ensure_keycode(d, XF86_PASTE)
+    mod_kc = {ks: d.keysym_to_keycode(ks) for ks in MOD_KEYSYMS.values()}
+    letter_kc = {"copy": d.keysym_to_keycode(KS_C),
+                 "paste": d.keysym_to_keycode(KS_V)}
+
+    # grab_key fails ASYNCHRONOUSLY (BadAccess) when another client already
+    # holds the combo — e.g. a not-yet-dead previous agent instance. Unchecked,
+    # the agent would idle grabless forever, so collect the errors and retry.
+    from Xlib import error as xerror
+    for attempt in range(20):
+        catcher = xerror.CatchError(xerror.BadAccess)
+        for kc in (copy_kc, paste_kc):
+            root.grab_key(kc, X.AnyModifier, False,
+                          X.GrabModeAsync, X.GrabModeAsync, onerror=catcher)
+        d.sync()
+        if not catcher.get_error():
+            break
+        root.ungrab_key(copy_kc, X.AnyModifier)
+        root.ungrab_key(paste_kc, X.AnyModifier)
+        d.sync()
+        log.info("grab busy (previous holder still alive?), retrying")
+        time.sleep(0.5)
+    else:
+        raise RuntimeError("could not grab XF86Copy/XF86Paste (held elsewhere)")
+    log.info(f"grabbed XF86Copy (kc {copy_kc}) / XF86Paste (kc {paste_kc}) on {d.get_display_name()}")
+
+    # A grabbed key press activates an AUTOMATIC keyboard grab that lasts until
+    # its release — anything injected inside that window is reported to this
+    # client instead of the focus window and silently lost. So: note the action
+    # on KeyPress, inject on the matching KeyRelease (the client sends
+    # press+release back-to-back, so this adds no perceptible latency).
+    pending = None
+    while True:
+        event = d.next_event()
+        if event.type not in (X.KeyPress, X.KeyRelease):
+            continue  # MappingNotify etc. carry no .detail
+        action = "copy" if event.detail == copy_kc else \
+                 "paste" if event.detail == paste_kc else None
+        if action is None:
+            continue
+        if event.type == X.KeyPress:
+            pending = action
+            continue
+        if event.type != X.KeyRelease or pending != action:
+            continue
+        pending = None
+        classes = active_window_class(d, root, net_active_window)
+        in_terminal = bool(classes & TERMINAL_CLASSES)
+        log.info(f"{action} -> {'terminal' if in_terminal else 'gui'} chord (focus class: {sorted(classes) or 'unknown'})")
+        inject_chord(d, root, want_shift=in_terminal,
+                     letter_kc=letter_kc[action], mod_kc=mod_kc)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as e:
+        log.error(f"fatal: {e}")
+        time.sleep(1)  # keep a supervisor loop from spinning hot
+        sys.exit(1)

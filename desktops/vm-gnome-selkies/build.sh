@@ -109,6 +109,11 @@ docker cp "$BAKE_CTR:/usr/local/bin/wtype" "$STAGE_DIR/usr/local/bin/wtype"
 # /opt/libva/usr/local so this copy lands the lib/ (and pkgconfig/include)
 # tree straight at the guest's /usr/local.
 docker cp "$BAKE_CTR:/opt/libva/usr/local/." "$STAGE_DIR/usr/local/"
+# Copy-agent is a plain script, so unlike the venv it needs no 24.04 rebuild —
+# take the canonical copy from the streamer context (shell copy: only the
+# docker build contexts can't cross directories, build.sh can).
+cp ../streamer-selkies2/whistler-copy-agent "$STAGE_DIR/usr/local/bin/whistler-copy-agent"
+chmod +x "$STAGE_DIR/usr/local/bin/whistler-copy-agent"
 cp -a guest/. "$STAGE_DIR/"
 # --owner/--group 0: the tar is created by an ordinary user but extracted by
 # root in the guest, where tar would otherwise faithfully restore this uid.

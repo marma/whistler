@@ -53,8 +53,19 @@ ARG PIXELFLUX_VERSION=1.6.4
 FROM node:22-bookworm-slim AS web
 ARG SELKIES_COMMIT
 
+RUN apt-get update && apt-get install -y --no-install-recommends patch \
+ && rm -rf /var/lib/apt/lists/*
+
 ADD https://github.com/selkies-project/selkies/archive/${SELKIES_COMMIT}.tar.gz /tmp/selkies.tar.gz
 RUN mkdir /src && tar -xzf /tmp/selkies.tar.gz -C /src --strip-components=1
+
+# Repeated Cmd chords from macOS clients type the letter instead of firing the
+# shortcut at this commit — see the patch header. Copy of
+# ../../streamer-selkies2/mac-cmd-chords.patch (this context can't reach it —
+# same story as the wtype shim); keep the two in sync. `patch` exits non-zero,
+# failing the build, if a pin bump makes it stale.
+COPY mac-cmd-chords.patch /tmp/
+RUN patch -p1 -d /src < /tmp/mac-cmd-chords.patch
 
 RUN cd /src/addons/selkies-web-core \
  && npm install \

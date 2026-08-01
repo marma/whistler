@@ -49,8 +49,20 @@ ARG PIXELFLUX_VERSION=1.6.4
 FROM node:22-bookworm-slim AS web
 ARG SELKIES_COMMIT
 
+RUN apt-get update && apt-get install -y --no-install-recommends patch \
+ && rm -rf /var/lib/apt/lists/*
+
 ADD https://github.com/selkies-project/selkies/archive/${SELKIES_COMMIT}.tar.gz /tmp/selkies.tar.gz
 RUN mkdir /src && tar -xzf /tmp/selkies.tar.gz -C /src --strip-components=1
+
+# Repeated Cmd chords from macOS clients type the letter instead of firing the
+# shortcut at this commit — see the patch header. Applied before the build so
+# both the vendored core lib and the dashboard bundle carry it; `patch` exits
+# non-zero (failing the build) if a pin bump makes it stale. Same file as
+# ../vm-gnome-selkies/bake/mac-cmd-chords.patch — keep in sync (that builder
+# can't reach this context, same story as the wtype shim).
+COPY mac-cmd-chords.patch /tmp/
+RUN patch -p1 -d /src < /tmp/mac-cmd-chords.patch
 
 RUN cd /src/addons/selkies-web-core \
  && npm install \
@@ -163,8 +175,11 @@ ENV PATH=/opt/venv/bin:$PATH \
     DISPLAY=:0
 
 COPY wtype-x11-shim /usr/local/bin/wtype
+# App-aware Cmd-C/Cmd-V for macOS clients (pairs with mac-cmd-chords.patch
+# fix 2); runs on the venv's python-Xlib, launched by the entrypoint.
+COPY whistler-copy-agent /usr/local/bin/whistler-copy-agent
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh /usr/local/bin/wtype
+RUN chmod +x /entrypoint.sh /usr/local/bin/wtype /usr/local/bin/whistler-copy-agent
 
 EXPOSE 8082
 ENTRYPOINT ["/entrypoint.sh"]
