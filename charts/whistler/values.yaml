@@ -85,12 +85,30 @@ portal:
   # session's X display (`xwd` via kubectl exec / SSH) and keeps ONE current
   # thumbnail per session in memory — no history, nothing on disk, gone when
   # the session or the portal goes away. Shown on the dashboard's session rows.
-  # This is monitoring: an admin holding a portal shell can see what a user has
-  # on screen. Set intervalSeconds to 0 to turn it off entirely.
+  #
+  # This is monitoring. Be deliberate about which kind you are enabling:
+  # maxWidth is the whole policy, because whatever is stored is retrievable at
+  # full stored resolution from /screenshot/<id> — the size the dashboard
+  # *displays* it at is not a boundary.
+  #
+  #   ~320 (default)  activity overview. A 1920px desktop downscaled 6x: you
+  #                   can see a session is in use, and roughly what kind of
+  #                   window is open. Body text does not survive.
+  #   ~640            window titles and large text start to become readable.
+  #   >=1280          readable monitoring of what the user is doing.
+  #
+  # intervalSeconds: 0 turns capture off entirely. Note that this does not make
+  # sessions unobservable: Selkies is multi-client by design (one stream
+  # broadcast to every attached client, with a read-only `viewer` role) and the
+  # in-session server has no auth of its own, so anything that can reach a
+  # session's display port can watch it live. The portal's per-user proxy scope
+  # is the access control there. See whistler/portal/screenshots.py.
+  #
+  # The store is per portal process — keep replicaCount at 1 while this is on,
+  # or each replica will grab every session and serve only its own captures.
   screenshots:
     intervalSeconds: 300
-    # Thumbnails are downscaled to at most this width before PNG encoding.
-    maxWidth: 640
+    maxWidth: 320
   resources:
     limits:
       cpu: 1000m

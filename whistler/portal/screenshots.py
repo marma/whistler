@@ -26,7 +26,36 @@ Storage is a process-wide dict, newest-only, never written to disk: one PNG per
 (user, session), replaced on each pass and dropped when the session goes away.
 A portal restart loses them all and the next pass refills — which is the whole
 lifetime worth having, since a screenshot that outlives its session is worse
-than no screenshot at all.
+than no screenshot at all. **This assumes a single portal replica**: the store
+is per-process, so N replicas each run their own capture loop (N grabs into
+every session) and answer /screenshot from their own store. See
+``portal.replicaCount`` in values.yaml; the loop warns at startup if it is >1.
+
+## This is monitoring — and it is not the only monitoring here
+
+Say it plainly: a periodic capture of a user's screen is surveillance, and
+``max_width`` is the only thing deciding which kind. At the 320px default a
+1920px desktop is downscaled 6x — window shapes, colours and layout survive,
+body text does not. That is an *activity overview*: you can see a session is
+being used, not what is being done in it. Raise it toward the native width and
+the same mechanism becomes readable monitoring. The setting is the policy, so
+it is documented as such rather than buried as a rendering detail. **The stored
+width is the boundary, not the CSS the dashboard displays it at** — anything
+this module holds is retrievable at full stored resolution from
+``/screenshot/<id>``.
+
+Nor is this the first such capability in the stack, only the first one whistler
+actually uses. Selkies is multi-client by design: one capture pipeline
+broadcast to every attached websocket (``_broadcast_to_clients``), with a
+``controller``/``viewer`` role split where ``viewer`` is read-only spectating
+of the live stream. The in-session server runs with no master token and
+``--enable-basic-auth=false``, so that role comes straight off the query string
+and anything able to reach ``:8082`` can attach. The only access control is the
+portal's proxy, which resolves sessions in the requesting user's namespace
+(``_resolve_desktop_base``). So the substrate can already put a second pair of
+eyes on a live desktop; what is missing is an admin surface for it, not a
+mechanism. Worth knowing before anyone concludes that turning screenshots off
+makes sessions unobservable.
 
 Only *desktop* sessions have an X display; ssh-mode instances are skipped.
 """
@@ -42,7 +71,10 @@ import zlib
 logger = logging.getLogger("whistler.portal")
 
 DEFAULT_INTERVAL_SECONDS = 300
-DEFAULT_MAX_WIDTH = 640
+# 320px is an activity overview, not a readable screen (see the module
+# docstring): it is the privacy posture, deliberately the default, and the
+# knob that turns this into real monitoring when raised.
+DEFAULT_MAX_WIDTH = 320
 DEFAULT_DISPLAY = ":0"
 # The streamer sidecar owns Xvfb in a desktop pod (see _build_pod_spec); the
 # workload container is "main" and is deliberately left without the grab tool.
@@ -408,6 +440,20 @@ def screenshot_ctx(app):
     async def _ctx(app):
         logger.info(f"Session screenshots: every {interval}s, "
                     f"max width {max_width}px, DISPLAY={display}")
+        # The store is per-process. With more than one replica each one grabs
+        # every session on its own schedule and answers /screenshot only for
+        # what it captured, so thumbnails appear and vanish as requests are
+        # balanced around — and every session gets grabbed N times.
+        try:
+            replicas = int(os.environ.get("PORTAL_REPLICAS", "1"))
+        except ValueError:
+            replicas = 1
+        if replicas > 1:
+            logger.warning(
+                f"Session screenshots are in-memory per portal process, but "
+                f"portal.replicaCount is {replicas}: each replica will grab "
+                f"every session and serve only its own captures. Run one "
+                f"portal replica, or disable screenshots.")
         task = asyncio.create_task(
             run_forever(app["cm"], STORE, interval=interval,
                         display=display, max_width=max_width))

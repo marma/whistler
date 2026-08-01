@@ -370,3 +370,47 @@ async def test_pass_prunes_sessions_that_are_gone_but_keeps_unready_ones(grabs):
     assert store.get("alice", "deleted") is None
     # Still listed, just not Ready — its last screenshot survives the pass.
     assert store.get("alice", "restarting")[1] == b"old"
+
+
+# --------------------------------------------------------------------------- #
+# Settings. The default width is a privacy posture, not a rendering detail:    #
+# whatever is stored is served at full stored resolution, so this test exists  #
+# to make raising it a deliberate act.                                         #
+# --------------------------------------------------------------------------- #
+
+def test_defaults_are_the_overview_posture(monkeypatch):
+    for var in ("WHISTLER_SCREENSHOT_INTERVAL", "WHISTLER_SCREENSHOT_WIDTH",
+                "WHISTLER_SCREENSHOT_DISPLAY"):
+        monkeypatch.delenv(var, raising=False)
+    interval, max_width, display = screenshots.settings()
+    assert interval == 300
+    assert max_width == 320, "raising the stored width turns overview into surveillance"
+    assert display == ":0"
+
+
+def test_settings_read_the_environment(monkeypatch):
+    monkeypatch.setenv("WHISTLER_SCREENSHOT_INTERVAL", "60")
+    monkeypatch.setenv("WHISTLER_SCREENSHOT_WIDTH", "1280")
+    monkeypatch.setenv("WHISTLER_SCREENSHOT_DISPLAY", ":3")
+    assert screenshots.settings() == (60, 1280, ":3")
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_non_positive_interval_disables_capture(monkeypatch, value):
+    monkeypatch.setenv("WHISTLER_SCREENSHOT_INTERVAL", value)
+    assert screenshots.settings()[0] <= 0
+
+
+def test_garbage_settings_fall_back_to_defaults(monkeypatch):
+    monkeypatch.setenv("WHISTLER_SCREENSHOT_INTERVAL", "soon")
+    monkeypatch.setenv("WHISTLER_SCREENSHOT_WIDTH", "big")
+    assert screenshots.settings()[:2] == (300, 320)
+
+
+def test_overview_width_does_not_preserve_readable_detail():
+    """A 1920-wide desktop at the default lands at 320: 6x down, which is the
+    difference between "a session is in use" and "here is what they typed"."""
+    blob = make_xwd(1920, 1080, solid(1920, 4, (0, 0, 0)) + solid(1920, 1076, (9, 9, 9)))
+    width, height, _ = screenshots.xwd_to_rgb(blob, screenshots.DEFAULT_MAX_WIDTH)
+    assert width == 320
+    assert height == 180
