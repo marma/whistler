@@ -14,6 +14,8 @@ Routes (all under a dev-only auth gate — see ``auth_middleware``):
   GET  /term-status/<id> JSON terminal-readiness poll
   GET  /ws-term/<id>     WebSocket <-> in-pod shell (kubectl exec) or VMI
                          serial console relay
+  GET  /screenshot/<id>  latest desktop thumbnail (PNG) — see
+                         whistler.portal.screenshots
   GET  /healthz          readiness probe
 
 Two display backends, chosen per session by ``status.viewer``:
@@ -43,7 +45,7 @@ import time
 import aiohttp
 from aiohttp import web
 
-from whistler.portal import kubevirt, proxy, terminal
+from whistler.portal import kubevirt, proxy, screenshots, terminal
 
 logger = logging.getLogger("whistler.portal")
 
@@ -643,6 +645,27 @@ async def ws_vnc(request):
     return downstream
 
 
+async def screenshot(request):
+    """The latest thumbnail for one of the requesting user's sessions.
+
+    No cluster round trip and no ownership check beyond the key: the store is
+    keyed by (user, session) and the middleware already resolved the user, so
+    another user's session simply isn't in this lookup. ``no-store`` because
+    the bytes at this URL change under the browser every pass."""
+    user, name = request["user"], request.match_info["id"]
+    shot = screenshots.STORE.get(user, name)
+    if shot is None:
+        return web.Response(status=404, text="no screenshot for this session yet")
+    captured_at, png = shot
+    return web.Response(
+        body=png, content_type="image/png",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Whistler-Captured-At": str(int(captured_at)),
+        },
+    )
+
+
 async def healthz(request):
     return web.Response(text="ok")
 
@@ -665,6 +688,7 @@ def build_app(config_manager):
     app["cm"] = config_manager
     app.cleanup_ctx.append(_proxy_client_ctx)
     app.cleanup_ctx.append(kubevirt.kube_ws_client_ctx)
+    app.cleanup_ctx.append(screenshots.screenshot_ctx)
     app.add_routes([
         web.get("/", index),
         web.post("/launch", launch),
@@ -677,6 +701,7 @@ def build_app(config_manager):
         web.get("/term/{id}", term),
         web.get("/term-status/{id}", term_status),
         web.get("/ws-term/{id}", ws_term),
+        web.get("/screenshot/{id}", screenshot),
         web.get("/healthz", healthz),
         # The vendored noVNC tree (ES modules with relative imports) is served
         # whole; aiohttp's static handler is traversal-safe. The flat whitelist

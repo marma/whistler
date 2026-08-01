@@ -191,7 +191,8 @@ rules:
 
   # Web terminal: the portal shells out to `kubectl exec` into the session pod
   # (whistler.portal.terminal), so it needs the pods/exec subresource — same
-  # grant the SSH server has for its interactive shells.
+  # grant the SSH server has for its interactive shells. The screenshot loop
+  # (whistler.portal.screenshots) execs into the streamer sidecar the same way.
   - apiGroups: [""]
     resources: [pods/exec]
     verbs: [create, get]

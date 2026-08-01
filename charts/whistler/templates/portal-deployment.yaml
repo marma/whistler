@@ -51,6 +51,12 @@ spec:
               value: {{ .Values.whistler.security.kataRuntimeClass | quote }}
             - name: WHISTLER_GPU_RUNTIME_CLASS
               value: {{ .Values.whistler.security.gpuRuntimeClass | quote }}
+            # Periodic desktop screenshots (whistler/portal/screenshots.py):
+            # newest-only, in memory, one per session. interval <= 0 disables.
+            - name: WHISTLER_SCREENSHOT_INTERVAL
+              value: {{ .Values.portal.screenshots.intervalSeconds | quote }}
+            - name: WHISTLER_SCREENSHOT_WIDTH
+              value: {{ .Values.portal.screenshots.maxWidth | quote }}
           ports:
             - containerPort: 8080
               name: http

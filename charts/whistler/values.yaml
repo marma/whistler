@@ -81,6 +81,16 @@ portal:
     allowAdmin: false
     # Comma-separated list of usernames with admin access in production.
     adminUsers: ""
+  # Periodic desktop screenshots: the portal grabs each running desktop
+  # session's X display (`xwd` via kubectl exec / SSH) and keeps ONE current
+  # thumbnail per session in memory — no history, nothing on disk, gone when
+  # the session or the portal goes away. Shown on the dashboard's session rows.
+  # This is monitoring: an admin holding a portal shell can see what a user has
+  # on screen. Set intervalSeconds to 0 to turn it off entirely.
+  screenshots:
+    intervalSeconds: 300
+    # Thumbnails are downscaled to at most this width before PNG encoding.
+    maxWidth: 640
   resources:
     limits:
       cpu: 1000m

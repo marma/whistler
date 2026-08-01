@@ -9,7 +9,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from whistler.portal import kubevirt
+from whistler.portal import kubevirt, screenshots
 from whistler.portal.app import build_app
 
 
@@ -118,6 +118,9 @@ async def backend():
 @pytest.fixture
 async def portal(backend, monkeypatch):
     monkeypatch.setenv("WHISTLER_AUTH_ALLOW_ANY", "true")
+    # The screenshot loop is a background task on the app; these tests exercise
+    # the routes, so keep it from grabbing at a FakeCM (0 = disabled).
+    monkeypatch.setenv("WHISTLER_SCREENSHOT_INTERVAL", "0")
     cm = FakeCM()
     cm.sessions["alice"] = [
         _session("d1", backend.port),
@@ -339,3 +342,37 @@ async def test_ws_term_vm_console_mode(portal, backend, monkeypatch):
     await ws.send_str("ls\n")
     assert (await ws.receive_bytes()) == b"echo:ls\n"
     await ws.close()
+
+
+# --------------------------------------------------------------------------- #
+# /screenshot/<id> — serves the newest thumbnail the capture loop stored.      #
+# The capture path itself is tested in test_screenshots.py.                    #
+# --------------------------------------------------------------------------- #
+
+async def test_screenshot_serves_the_stored_png(portal):
+    screenshots.STORE.put("alice", "d1", b"\x89PNG-fake")
+    try:
+        resp = await portal.get("/screenshot/d1?user=alice")
+        assert resp.status == 200
+        assert resp.content_type == "image/png"
+        assert resp.headers["Cache-Control"] == "no-store"
+        assert await resp.read() == b"\x89PNG-fake"
+    finally:
+        screenshots.STORE.keep_only([])
+
+
+async def test_screenshot_404s_before_the_first_capture(portal):
+    screenshots.STORE.keep_only([])
+    resp = await portal.get("/screenshot/d1?user=alice")
+    assert resp.status == 404
+
+
+async def test_screenshot_is_scoped_to_the_requesting_user(portal):
+    # The store is keyed by (user, session), so bob asking for alice's session
+    # name resolves to *his* key and misses — no cross-user read.
+    screenshots.STORE.put("alice", "d1", b"alice-png")
+    try:
+        resp = await portal.get("/screenshot/d1?user=bob")
+        assert resp.status == 404
+    finally:
+        screenshots.STORE.keep_only([])

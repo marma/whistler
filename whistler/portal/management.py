@@ -177,6 +177,14 @@ def _desktop_viewer_url(user: str, name: str) -> str:
     return f"{_DESKTOP_PORTAL_URL}/connect/{name}?user={user}"
 
 
+def _screenshot_url(user: str, name: str) -> str:
+    """Latest desktop thumbnail, served by the viewer app (same base URL as the
+    connect/terminal links). 404 until the first capture pass covers the
+    session, so the template hides the image on error rather than reserving
+    space for one that may never arrive."""
+    return f"{_DESKTOP_PORTAL_URL}/screenshot/{name}?user={user}"
+
+
 def _terminal_url(user: str, name: str) -> str:
     """Web-terminal (xterm.js) page, served by the same viewer app as the desktop
     relay — so it shares _DESKTOP_PORTAL_URL (empty = same-origin via the proxy)."""
@@ -195,6 +203,8 @@ def _merge_sessions(instances: list, desktop_sessions: list, user: str) -> list[
             "status": i.get("status"), "ready": i.get("ready", True),
             "mode": "ssh", "connect_url": None,
             "term_url": _terminal_url(user, i["name"]),
+            # ssh instances have no X display, so nothing to screenshot.
+            "screenshot_url": None,
         })
     for s in desktop_sessions:
         rows.append({
@@ -202,6 +212,7 @@ def _merge_sessions(instances: list, desktop_sessions: list, user: str) -> list[
             "status": s.get("phase"), "ready": True, "mode": "desktop",
             "connect_url": _desktop_viewer_url(user, s["name"]),
             "term_url": _terminal_url(user, s["name"]),
+            "screenshot_url": _screenshot_url(user, s["name"]),
         })
     rows.sort(key=lambda r: r["name"])
     return rows

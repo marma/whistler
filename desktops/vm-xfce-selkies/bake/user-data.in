@@ -37,9 +37,13 @@ write_files:
       # §4-5). Build-time-only packages (build-essential, python3-dev,
       # libxkbcommon-dev) are NOT needed: the selkies venv arrives prebuilt in
       # artifacts.tar.gz; libxkbcommon0 is its one runtime shared lib.
+      # x11-apps is here for `xwd` alone (it is NOT in x11-utils): the portal
+      # SSHes in periodically and grabs the display for the session thumbnail
+      # — see whistler/portal/screenshots.py.
       $APT install -y --no-install-recommends \
         xfce4 xfce4-terminal dbus-x11 \
         xvfb x11-xserver-utils xcvt x11-utils xclip xdotool \
+        x11-apps \
         pulseaudio pulseaudio-utils \
         python3 python3-venv libxkbcommon0 \
         ssl-cert ca-certificates curl \

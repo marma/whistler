@@ -2688,6 +2688,50 @@ class KubeConfigManager(ConfigManager):
                 logger.error(f"Failed to list desktop sessions: {e}")
         return sessions
 
+    def list_all_desktop_sessions(self) -> List[Dict[str, Any]]:
+        """Every desktop session in the cluster, in one API call, for the
+        portal's screenshot loop.
+
+        Deliberately *not* the per-user view: this reports ``status.phase`` as
+        the operator wrote it instead of deriving liveness from the live pod,
+        because a background pass over the whole cluster shouldn't cost a pod
+        list per namespace to shave ~10s off a phase that only gates a
+        screenshot. Not on the ConfigManager ABC — the portal always holds a
+        KubeConfigManager, and the ABC exists for the auth/routing surface the
+        unit tests fake."""
+        sessions: List[Dict[str, Any]] = []
+        try:
+            resp = self.api.list_cluster_custom_object(
+                self.group, self.version, SESSION_PLURAL,
+                label_selector="whistler.martinmalmsten.net/mode=desktop",
+            )
+        except ApiException as e:
+            logger.error(f"Failed to list desktop sessions cluster-wide: {e}")
+            return sessions
+
+        for item in resp.get("items", []):
+            meta = item.get("metadata", {})
+            status = item.get("status", {}) or {}
+            username = (item.get("spec", {}) or {}).get("user")
+            full_name = meta.get("name", "")
+            if not username or not full_name:
+                continue
+            display_name = full_name
+            if full_name.startswith(f"{username}-"):
+                display_name = full_name[len(username) + 1:]
+            sessions.append({
+                "user": username,
+                "name": display_name,
+                "namespace": meta.get("namespace"),
+                # A deleting session is never Ready, whatever the CR still says.
+                "phase": "Terminating" if meta.get("deletionTimestamp")
+                         else status.get("phase", "Unknown"),
+                "runtime": status.get("runtime"),
+                "podName": status.get("podName"),
+                "vmiName": status.get("vmiName"),
+            })
+        return sessions
+
     def add_desktop_session(self, username: str, template_name: str, session_name: str,
                             overrides: Optional[Dict[str, Any]] = None) -> bool:
         user_ns = self._ensure_user_namespace(username)

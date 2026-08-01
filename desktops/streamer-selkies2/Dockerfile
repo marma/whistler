@@ -100,6 +100,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       xcvt \
       # xdpyinfo for the entrypoint's X-ready wait loop.
       x11-utils \
+      # xwd (x11-apps, NOT x11-utils) backs the portal's periodic session
+      # screenshots: the portal `kubectl exec -c streamer`s a `xwd -root |
+      # gzip` here and does the decode/downscale/PNG itself. It is the only X
+      # grabber that needs no image encoder in the image — imagemagick or
+      # ffmpeg would each cost several times this package's footprint. See
+      # whistler/portal/screenshots.py.
+      x11-apps \
       # Clipboard sync: 2.x shells out to `xclip` on X11 — NOT 1.x's `xsel`.
       # Missing xclip is not graceful: the FileNotFoundError kills the
       # per-client WS message loop on connect, which presents as "video never
