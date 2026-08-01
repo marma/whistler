@@ -62,6 +62,20 @@ rescue path / default for unbaked VM images.
   (GNOME Settings → Keyboard → Input Sources, or `setxkbmap se`) — with the
   keysym present in the keymap, injection takes the direct XTEST path
   (measured: ~1s → 0 ms). The choice persists in dconf on the home volume.
+- **AltGr-style Mac chords** (`|`, `@`, `{`, … via Option — e.g. Option+7 for
+  `|` on a Swedish Mac layout): the client remaps the physical Option key to
+  the X11 keysym `Mode_switch`, which — unlike layout characters — is a
+  pre-XKB legacy keysym that **no modern keymap ever binds** (layouts use
+  `ISO_Level3_Shift` instead), so it hit the same 1s keymap-rewrite stall on
+  every guest regardless of layout, and adding a layout couldn't fix it. Selkies'
+  own fallback chain made it worse: its injector tries `pynput` first, which
+  throws when the keysym is unmapped, then falls back to `xdotool` wrapped in
+  a **hardcoded 1-second timeout** — a slow remap under a busy compositor can
+  graze that ceiling and abandon the temporary keycode mid-flight, which is
+  what produced the stray character on rapid repeats. Fixed for good in
+  `whistler-copy-agent`: it pre-binds `Mode_switch` (and, defensively,
+  `ISO_Level3_Shift`) to a spare keycode at startup, so every guest has both
+  present before any client ever needs them — no session-side action required.
 
 ## Conventions
 

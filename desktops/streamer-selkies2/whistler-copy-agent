@@ -9,6 +9,12 @@ CLIPBOARD — measured, so the classic Insert chords are out). The client cannot
 see which app has focus; this agent runs inside the display plane, where the
 answer is one property read away.
 
+It also pre-binds Mode_switch on startup (see PREBIND_KEYSYMS below) — not
+copy/paste, but it needs the same Display connection and the same
+XChangeKeyboardMapping helper, and shipping a second python-Xlib process just
+for one xmodmap-equivalent call would be the more complex option, not the
+simpler one.
+
 It grabs the XF86Copy/XF86Paste keycodes on the root window (XTEST-injected
 events hit X grabs like real ones) and re-injects the chord the focused window
 expects, picked by WM_CLASS. Modifier handling mirrors xdotool
@@ -43,6 +49,38 @@ KS_SHIFT_L = 0xFFE1
 KS_ALT_L = 0xFFE9
 KS_SUPER_L = 0xFFEB
 KS_C = 0x63
+
+# Mac clients remap their Option key client-side to one of these two X11
+# keysyms (Alt_L -> Mode_switch, Alt_R -> ISO_Level3_Shift — see
+# mac-cmd-chords.patch and upstream input.js) for AltGr-style chords (|, @, {,
+# on a Swedish layout, etc.). Mode_switch in particular is a pre-XKB legacy
+# keysym that NO modern xkb symbol file binds (layouts use ISO_Level3_Shift),
+# so on every guest it starts genuinely absent from the keymap.
+#
+# Selkies' own injector has no fast path for either: pynput's
+# KeyCode.from_vk() tries its own dynamic keycode remap and throws (observed:
+# X11Error / BadRRModeError — a python-xlib request-ordering artifact of
+# racing the remap against GNOME Shell's XKB reprocessing) whenever the
+# keysym isn't already mapped; the code then falls back to
+# `xdotool keydown/keyup <name>` wrapped in a HARDCODED 1-second
+# asyncio.wait_for. xdotool does its OWN dynamic remap in that fallback, and
+# under a busy compositor that remap can graze or blow through the 1s
+# ceiling — which is the "å/ä/ö take a second" and "pipe behaves like å/ä/ö
+# did, and repeating it drops a stray *" reports: the timeout can fire before
+# xdotool's temporary keycode is released, and the next chord's remap then
+# collides with that still-claimed keycode.
+#
+# The fix has nothing to do with layout choice (adding sv did not help,
+# unlike it did for å/ä/ö, because Mode_switch isn't a layout character —
+# it's the modifier itself, absent from EVERY layout including sv). Binding
+# it once, permanently, to a spare keycode at startup makes pynput's
+# from_vk() find an existing keycode and succeed immediately — verified live:
+# 5 rapid Option+7 cycles that previously round-tripped through the 1s
+# xdotool fallback (and could stray-corrupt) now complete in ~35ms each via
+# pynput alone, every time. ISO_Level3_Shift (Option-Right's target) is
+# already present on our layouts, but costs nothing to guarantee here too for
+# any guest image that might lack it.
+PREBIND_KEYSYMS = (0xFF7E, 0xFE03)  # Mode_switch, ISO_Level3_Shift
 KS_V = 0x76
 
 # WM_CLASS tokens (lowercased, exact match) that mean "Ctrl+C is not copy
@@ -134,6 +172,8 @@ def main():
 
     copy_kc = ensure_keycode(d, XF86_COPY)
     paste_kc = ensure_keycode(d, XF86_PASTE)
+    for ks in PREBIND_KEYSYMS:
+        ensure_keycode(d, ks)
     mod_kc = {ks: d.keysym_to_keycode(ks) for ks in MOD_KEYSYMS.values()}
     letter_kc = {"copy": d.keysym_to_keycode(KS_C),
                  "paste": d.keysym_to_keycode(KS_V)}

@@ -66,7 +66,12 @@ for i in $(seq 1 30); do xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1 && break
 # App-aware copy/paste for macOS clients: grabs the XF86Copy/XF86Paste taps
 # the Mac web client sends for plain Cmd-C/Cmd-V (see mac-cmd-chords.patch)
 # and re-injects Ctrl+C/V or Ctrl+Shift+C/V depending on the focused window.
-# Supervised loop: the agent is stateless, so a crash just restarts it.
+# Also pre-binds the Mode_switch/ISO_Level3_Shift keysyms Mac's Option-key
+# remap uses (Option+7 for "|" on sv, etc.) — otherwise absent from every
+# layout, forcing a slow dynamic keymap rewrite (and, past a hardcoded 1s
+# timeout in selkies' own xdotool fallback, an occasional stray character) on
+# every such chord. Supervised loop: the agent is stateless, so a crash just
+# restarts it.
 ( while true; do
     /usr/local/bin/whistler-copy-agent
     sleep 2
