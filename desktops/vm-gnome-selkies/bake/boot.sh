@@ -29,6 +29,8 @@ grep -q "WHISTLER-BAKE-OK" /build/console.log || {
   exit 1
 }
 
-qemu-img convert -O qcow2 -c /build/work.qcow2 /build/disk.qcow2
+# zstd + parallel coroutines: zlib -c pegged one core (the containerDisk layer
+# re-gzips on push anyway); zstd is much faster for equal/better ratio.
+qemu-img convert -O qcow2 -o compression_type=zstd -c -m 16 /build/work.qcow2 /build/disk.qcow2
 rm -f /build/work.qcow2
 qemu-img info /build/disk.qcow2
