@@ -71,10 +71,28 @@ def _probe(monkeypatch, objects):
 
 def test_probe_running_vmi_is_ready_with_address(monkeypatch):
     phase, name, address = _probe(monkeypatch, {
-        ("virtualmachineinstances", "alice-desk"): {"status": {"phase": "Running"}},
+        ("virtualmachineinstances", "alice-desk"): {"status": {
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True"}],
+        }},
     })
     assert (phase, name) == ("Ready", "alice-desk")
     assert address == "alice-desk.ns.svc.cluster.local"
+
+
+def test_probe_running_vmi_without_ready_condition_is_booting(monkeypatch):
+    # phase Running only means the domain booted. The readinessProbe on the VMI
+    # (see _build_vm_spec) is what says the guest actually serves the display /
+    # sshd, and it surfaces as the Ready condition — reporting Ready before it
+    # flips sends the portal's connect page at a port nothing is listening on.
+    phase, _, address = _probe(monkeypatch, {
+        ("virtualmachineinstances", "alice-desk"): {"status": {
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "False"}],
+        }},
+    })
+    assert phase == "Booting"
+    assert address is None
 
 
 def test_probe_failed_vmi_is_failed(monkeypatch):

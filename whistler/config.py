@@ -1796,6 +1796,11 @@ class KubeConfigManager(ConfigManager):
         # (template streamerEnv + displayPort). The vnc viewer needs no agent,
         # so its guests get the plain (ssh-style) document.
         desktop_stream = viewer == 'websockets'
+        # What "ready" means for this guest: the streamer port for a browser
+        # desktop, otherwise sshd — which is what the web terminal, the
+        # screenshot grabber and a plain `ssh` all land on. Either way it is a
+        # port cloud-init has to finish before it answers.
+        readiness_port = display_port if desktop_stream else 22
         user_data = build_user_data(
             username=username,
             uid=resolve_uid(user_details),
@@ -1857,10 +1862,33 @@ class KubeConfigManager(ConfigManager):
                     },
                 },
                 "spec": {
-                    # terminationGracePeriodSeconds stays at KubeVirt's 30s
-                    # default on purpose (unlike session pods): it is the ACPI
-                    # shutdown window, and a full guest OS needs the time to
-                    # stop cleanly before being forced off.
+                    # The ACPI shutdown window. Left unset this is NOT KubeVirt's
+                    # documented 30s: v1.8.4 renders the virt-launcher pod at 60s,
+                    # so a stop sat for a full minute after the guest was already
+                    # down. Systemd shuts these desktop guests down in ~2s (no
+                    # databases, no long drains — $HOME is a network mount the
+                    # gateway owns), so spend a few seconds on a clean ACPI
+                    # shutdown and force off after that rather than waiting on a
+                    # guest that has already gone.
+                    "terminationGracePeriodSeconds": 5,
+                    # Readiness = "the guest is actually serving", not "qemu
+                    # started". A VMI reaches phase Running the moment the domain
+                    # boots, ~20s before cloud-init has brought up the streamer
+                    # (or sshd), and _probe_vmi used to map Running -> Ready. The
+                    # connect page believed it, redirected to /desktop/<id>/, and
+                    # the proxy dialed a port nothing was listening on yet: a
+                    # guaranteed "desktop backend unreachable" on every cold
+                    # start. Probing from the launcher works because the interface
+                    # is masquerade (all ports forwarded to the guest).
+                    # failureThreshold is generous: this gates the *first* Ready,
+                    # and a guest that stops answering should read as broken
+                    # rather than flap the session out from under a live viewer.
+                    "readinessProbe": {
+                        "tcpSocket": {"port": readiness_port},
+                        "initialDelaySeconds": 5,
+                        "periodSeconds": 5,
+                        "failureThreshold": 30,
+                    },
                     "nodeSelector": node_selector,
                     "domain": domain,
                     "networks": [{"name": "default", "pod": {}}],

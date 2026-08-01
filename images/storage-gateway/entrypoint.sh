@@ -23,6 +23,15 @@ printf '%s\n%s\n' "$pass" "$pass" | smbpasswd -s -a "$SMB_USER"
 # populated home this is the ordinary "home dir owned by its user" no-op).
 chown "$SMB_UID:$SMB_UID" /shares/home
 
+# Provisioners hand out the volume root world-writable (k3s local-path gives
+# 0777), and now that the guest mounts with `posix` that real mode is what it
+# sees — so $HOME showed up as 0777 and sshd's StrictModes refused to read
+# ~/.ssh/authorized_keys out of it ("bad ownership or modes for directory").
+# Drop the group/other write bits rather than forcing 0755: that turns the
+# provisioner's 0777 into the intended 0755 while leaving a user who
+# deliberately tightened their own home (0700) alone.
+chmod go-w /shares/home
+
 sed "s/@USER@/$SMB_USER/g" /etc/samba/smb.conf.template > /etc/samba/smb.conf
 
 exec smbd --foreground --no-process-group --debug-stdout

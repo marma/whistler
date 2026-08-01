@@ -164,6 +164,28 @@ def test_pod_network_and_masquerade_interface():
     assert spec["domain"]["devices"]["interfaces"] == [{"name": "default", "masquerade": {}}]
 
 
+def test_readiness_probe_targets_display_port_for_browser_desktops():
+    # phase Running only means qemu booted; without this probe the operator
+    # called the session Ready ~20s before the in-guest streamer listened and
+    # the portal proxy returned "desktop backend unreachable".
+    spec = _build(viewer="websockets", display_port=8082)["spec"]["template"]["spec"]
+    assert spec["readinessProbe"]["tcpSocket"] == {"port": 8082}
+
+
+def test_readiness_probe_falls_back_to_sshd_without_a_streamer():
+    # vnc/ssh guests run no in-guest display server, so sshd — what the web
+    # terminal, screenshots and plain ssh all use — is the readiness signal.
+    spec = _build(viewer="vnc")["spec"]["template"]["spec"]
+    assert spec["readinessProbe"]["tcpSocket"] == {"port": 22}
+
+
+def test_termination_grace_period_is_short():
+    # Left unset KubeVirt 1.8 renders the launcher pod at 60s, so a stop sat
+    # for a minute after the guest was already down.
+    spec = _build()["spec"]["template"]["spec"]
+    assert spec["terminationGracePeriodSeconds"] == 5
+
+
 def test_instancetype_set_omits_inline_cpu_memory():
     vm = _build(instancetype="u1.medium",
                 template_spec={"image": "x", "resources": {"cpu": "4", "memory": "8Gi"}})

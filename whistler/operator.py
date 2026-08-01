@@ -104,6 +104,14 @@ def _probe_pod(namespace, name, logger):
     return (session_phase, name, address)
 
 
+def _vmi_condition(vmi, cond_type):
+    """The status of one VMI condition ("True"/"False"/None if absent)."""
+    for cond in (vmi.get("status") or {}).get("conditions") or []:
+        if cond.get("type") == cond_type:
+            return cond.get("status")
+    return None
+
+
 def _probe_vmi(namespace, name, logger):
     """Return (session_phase, vmiName, address) by reading the KubeVirt VMI.
 
@@ -128,7 +136,17 @@ def _probe_vmi(namespace, name, logger):
         return ("Terminating", name, None)
     phase = (vmi.get("status") or {}).get("phase")
     if phase == "Running":
-        return ("Ready", name, _session_address(name, namespace))
+        # Running means the domain booted, NOT that the guest serves anything —
+        # cloud-init still has ~20s of work before the streamer/sshd listens.
+        # Reporting Ready here sent the portal's connect page at a dead port and
+        # produced "desktop backend unreachable" on every cold start. The VMI's
+        # Ready condition carries the readinessProbe result (_build_vm_spec sets
+        # one), so gate on that instead. A VMI with no probe has Ready=True from
+        # the moment it runs, so this stays correct for VMs created before the
+        # probe existed — they just keep the old racy behaviour until restarted.
+        if _vmi_condition(vmi, "Ready") == "True":
+            return ("Ready", name, _session_address(name, namespace))
+        return ("Booting", name, None)
     if phase == "Failed":
         return ("Failed", name, None)
     if phase == "Succeeded":

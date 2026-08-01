@@ -108,8 +108,22 @@ def build_user_data(*, username: str, uid: int, ssh_keys: list,
     # coexists with `posix` (chmod still maps to the real mode). Trade-off: to a
     # pod mounting the PVC directly a VM-created symlink is a small regular file
     # with an XSym header, not a native symlink — acceptable, VMs own their home.
+    # `nobrl` is load-bearing for anything that keeps a SQLite database in
+    # $HOME — which on a GNOME desktop is nearly everything: nautilus's
+    # tags/starred store (~/.local/share/nautilus/tags/meta.db), tracker,
+    # dconf, and Chrome's whole profile. SQLite locks a byte range far past
+    # EOF (F_WRLCK at offset 0x40000002, len 510) and cifs forwards that to
+    # the server, which answers EACCES. SQLite reads EACCES as contention and
+    # spins its busy handler — measured on this gateway: 1010 retries x 100ms
+    # = a flat 100s stall, then failure ("database is locked"). Nautilus does
+    # this synchronously *before* it opens the display, so a Files/Trash click
+    # blew through dbus's 120s activation timeout and the icon simply never
+    # opened. Same share, same moment, with nobrl: 0.05s. nobrl keeps byte
+    # range locks client-local instead of sending them to the server; the
+    # coherence it trades away was never there anyway (a pod mounting this PVC
+    # directly never saw the VM's locks), and a home has one live session.
     base_opts = (
-        f"vers=3.1.1,seal,posix,mfsymlinks,uid={uid},gid={gid},"
+        f"vers=3.1.1,seal,posix,mfsymlinks,nobrl,uid={uid},gid={gid},"
         "nosuid,nodev,hard"
     )
     mount_opts = (
