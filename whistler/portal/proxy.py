@@ -37,6 +37,18 @@ _HOP_BY_HOP = frozenset({
 
 _WS_CLOSED_TYPES = (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR)
 
+# Selkies serves its web root with ETag/Last-Modified but NO Cache-Control, so
+# browsers fall back to heuristic freshness (~10% of the file's age — days for
+# a bundle whose mtime is the image build). The entry points are not
+# content-hashed (/index.html, /src/selkies-core.js) and the /desktop/<id>/ URL
+# is stable across image updates, so a Mac that loaded a session weeks ago can
+# keep running a weeks-stale viewer without ever revalidating. Stamp no-cache
+# (NOT no-store: revalidation is a cheap 304 thanks to the upstream ETag) on
+# the types the viewer boots from. Content-hashed assets get revalidated too —
+# a 304 apiece is a fair price for never wedging a browser on a stale client.
+# Upstream Cache-Control, if Selkies ever starts sending one, wins untouched.
+_REVALIDATE_TYPES = ("text/html", "javascript", "application/json")
+
 
 def _forward_headers(headers, *, drop_host=False):
     skip = _HOP_BY_HOP | ({"host"} if drop_host else set())
@@ -65,6 +77,10 @@ async def relay_http(request: web.Request, target_url: str,
             response = web.StreamResponse(status=upstream.status)
             for k, v in _forward_headers(upstream.headers):
                 response.headers.add(k, v)
+            if ("Cache-Control" not in response.headers
+                    and any(t in response.headers.get("Content-Type", "")
+                            for t in _REVALIDATE_TYPES)):
+                response.headers["Cache-Control"] = "no-cache"
             await response.prepare(request)
             async for chunk in upstream.content.iter_chunked(64 * 1024):
                 await response.write(chunk)

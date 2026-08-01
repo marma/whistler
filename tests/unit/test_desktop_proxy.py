@@ -24,6 +24,19 @@ def _fake_selkies_app():
     async def index(request):
         return web.Response(text="SELKIES INDEX", content_type="text/html")
 
+    async def core_js(request):
+        # Like the real web root: ETag/Last-Modified, no Cache-Control.
+        return web.Response(text="// core", content_type="text/javascript",
+                            headers={"Etag": '"abc"'})
+
+    async def png(request):
+        return web.Response(body=b"\x89PNG", content_type="image/png")
+
+    async def cached_js(request):
+        # Upstream that DOES set Cache-Control keeps its own policy.
+        return web.Response(text="// cached", content_type="text/javascript",
+                            headers={"Cache-Control": "max-age=3600"})
+
     async def status(request):
         return web.json_response({"current_mode": "websockets"})
 
@@ -56,6 +69,9 @@ def _fake_selkies_app():
     app = web.Application()
     app.add_routes([
         web.get("/", index),
+        web.get("/src/selkies-core.js", core_js),
+        web.get("/vite.svg", png),
+        web.get("/cached.js", cached_js),
         web.get("/status", status),
         web.post("/tokens", tokens),
         web.get("/websockets", websockets),
@@ -156,6 +172,24 @@ async def test_proxies_post_body(portal):
                              params={"user": "alice"})
     assert resp.status == 200
     assert await resp.text() == 'tokens:{"t":1}'
+
+
+async def test_viewer_entry_points_get_no_cache_stamped(portal):
+    # Selkies serves the (unhashed) entry points with no Cache-Control, and the
+    # stable /desktop/<id>/ URL makes heuristic caching serve weeks-stale
+    # viewer bundles. The proxy stamps no-cache so browsers revalidate (cheap:
+    # upstream sends an ETag).
+    for path in ("", "src/selkies-core.js", "status"):
+        resp = await portal.get(f"/desktop/d1/{path}", params={"user": "alice"})
+        assert resp.headers["Cache-Control"] == "no-cache", path
+
+
+async def test_non_boot_content_and_upstream_policy_pass_through(portal):
+    # Media keeps heuristic caching; an explicit upstream Cache-Control wins.
+    resp = await portal.get("/desktop/d1/vite.svg", params={"user": "alice"})
+    assert "Cache-Control" not in resp.headers
+    resp = await portal.get("/desktop/d1/cached.js", params={"user": "alice"})
+    assert resp.headers["Cache-Control"] == "max-age=3600"
 
 
 async def test_missing_slash_redirects_to_directory_url(portal):
