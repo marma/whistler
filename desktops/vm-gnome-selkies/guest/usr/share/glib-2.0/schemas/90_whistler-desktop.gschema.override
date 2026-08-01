@@ -1,0 +1,25 @@
+# System-wide desktop defaults, compiled into gschemas.compiled by the bake
+# (glib-compile-schemas --strict after artifacts.tar.gz lands). Both sections
+# exist because the session is plain user-mode gnome-shell with
+# XDG_CURRENT_DESKTOP=GNOME (whistler-desktop@.service): no session mode
+# enables Ubuntu Dock for us, and the dock package's own defaults
+# (10_ubuntu-dock.gschema.override) are all `:ubuntu`-qualified so they never
+# apply here — enable + look both have to be unqualified overrides. These are
+# defaults, not locks: per-user dconf (a user toggling things in Settings /
+# Extensions) still wins, and survives in the SMB home across sessions.
+
+[org.gnome.shell]
+enabled-extensions=['ubuntu-dock@ubuntu.com']
+favorite-apps=['google-chrome.desktop', 'firefox.desktop', 'org.gnome.Nautilus.desktop', 'org.gnome.Terminal.desktop', 'org.gnome.TextEditor.desktop']
+
+# The Ubuntu-look subset of Ubuntu's qualified defaults: dock on the left,
+# always visible, full height. disable-overview-on-startup matters more here
+# than on a real desktop: the Shell starts before the client has driven the
+# display to its real size, and the GNOME 46/X11 overview backdrop never grows
+# after a resize (see gnome-session-launch.sh) — landing on the desktop instead
+# of the overview sidesteps the ugliest first impression of that limitation.
+[org.gnome.shell.extensions.dash-to-dock]
+dock-position='LEFT'
+dock-fixed=true
+extend-height=true
+disable-overview-on-startup=true

@@ -52,6 +52,16 @@ write_files:
         > /etc/apt/sources.list.d/mozilla.list
       printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' \
         > /etc/apt/preferences.d/mozilla
+
+      # --- Google Chrome from Google's APT repo ----------------------------
+      # amd64-only, like the bake itself (build.sh). Seed the keyring + list
+      # ourselves so the install works at bake time; the .deb's postinst
+      # manages the repo entry from then on.
+      wget -qO /etc/apt/keyrings/google-chrome.asc \
+        https://dl.google.com/linux/linux_signing_key.pub
+      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.asc] https://dl.google.com/linux/chrome/deb/ stable main" \
+        > /etc/apt/sources.list.d/google-chrome.list
+
       $APT update
 
       # The runtime union of the retired desktops/gnome-selkies2 (the GNOME
@@ -65,10 +75,16 @@ write_files:
       # x11-apps is here for `xwd` alone (it is NOT in x11-utils): the portal
       # SSHes in periodically and grabs the display for the session thumbnail
       # — see whistler/portal/screenshots.py.
+      # gnome-shell-extension-ubuntu-dock is Ubuntu's dash-to-dock fork; it is
+      # enabled (and put on the left) by the guest schema override — see the
+      # glib-compile-schemas step below. libglib2.0-bin is what provides
+      # glib-compile-schemas for that step.
       $APT install -y --no-install-recommends \
         gnome-session gnome-shell gnome-settings-daemon \
+        gnome-shell-extension-ubuntu-dock \
         gnome-terminal nautilus gnome-text-editor gnome-control-center \
-        firefox \
+        firefox google-chrome-stable \
+        libglib2.0-bin \
         adwaita-icon-theme fonts-ubuntu fonts-dejavu-core \
         librsvg2-common \
         libgl1-mesa-dri libglx-mesa0 mesa-utils \
@@ -146,6 +162,16 @@ write_files:
       # fire here, and without it Adwaita's scalable icons render as blurry
       # blobs (text stays crisp — the tell is "text sharp, icons blurry").
       /usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache
+
+      # Compile the schema override that arrived in artifacts.tar.gz
+      # (guest/ 90_whistler-desktop.gschema.override: enable Ubuntu Dock on
+      # the left + favorites). The session runs plain user-mode gnome-shell
+      # with XDG_CURRENT_DESKTOP=GNOME, so the dock package's own
+      # `:ubuntu`-qualified defaults never apply — this override is the only
+      # thing that turns the dock on. --strict so a key that stops existing
+      # after a package bump fails the bake instead of silently shipping a
+      # dockless image.
+      glib-compile-schemas --strict /usr/share/glib-2.0/schemas
 
       # The streamer has no per-session inputs (its env file is optional), so
       # it is enabled at bake; the per-user whistler-desktop@<user> unit is

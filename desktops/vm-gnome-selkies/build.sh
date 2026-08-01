@@ -24,14 +24,17 @@
 #   3. Wrap the qcow2 as a containerDisk (Dockerfile.containerdisk).
 #
 # Knobs (env): IMAGE (default localhost:5000/whistler-vm-gnome-selkies),
-# TAG (dev), PUSH=1 to docker-push, DISK_SIZE (14G lean / 24G CUDA — GNOME is
+# TAG (latest), PUSH=1 to docker-push, DISK_SIZE (14G lean / 24G CUDA — GNOME is
 # heavier than XFCE), QEMU_MEM (4096), QEMU_SMP (min(8,nproc)), BASE_IMAGE_URL,
 # CACHE_DIR (~/.cache/whistler/vm-images), BAKE_TIMEOUT (2700s),
 # CUDA/NVIDIA_DRIVER_PACKAGE/CUDA_TOOLKIT_PACKAGE (see below).
 #
-# CUDA=1 bakes the NVIDIA open driver + the CUDA toolkit in and tags the result
-# :<TAG>-cuda; the default (CUDA=0) is a LEAN image with neither. Same split as
-# ../vm-xfce-selkies — only GPU templates pull the -cuda image. NOTE the guest
+# CUDA=1 bakes the NVIDIA open driver + the CUDA toolkit in and publishes the
+# result as <IMAGE>-cuda:<TAG>; the default (CUDA=0) is a LEAN image with
+# neither. Same split as ../vm-xfce-selkies — only GPU templates pull the -cuda
+# image, and the variant rides in the image NAME (not the tag) so the mutable
+# dev tag can stay exactly `:latest`, the only tag Kubernetes/KubeVirt default
+# to imagePullPolicy Always; see that script's header for the full why. NOTE the guest
 # here is 24.04, whose open-driver package name differs from 26.04's, so the
 # default driver is nvidia-driver-550-open (24.04's open-kernel branch) and the
 # toolkit is 24.04's archive nvidia-cuda-toolkit (CUDA 12.x); override
@@ -50,7 +53,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 IMAGE="${IMAGE:-localhost:5000/whistler-vm-gnome-selkies}"
-TAG="${TAG:-dev}"
+TAG="${TAG:-latest}"
 PUSH="${PUSH:-0}"
 CUDA="${CUDA:-0}"
 QEMU_MEM="${QEMU_MEM:-4096}"
@@ -72,7 +75,7 @@ if [ "$CUDA" = "1" ]; then
   # without it the GPU can only do CUDA + NVENC while all OpenGL stays on
   # llvmpipe (Xvfb's GLX is swrast). Empty it to skip.
   VIRTUALGL_VERSION="${VIRTUALGL_VERSION:-3.1.4}"
-  TAG="${TAG}-cuda"
+  IMAGE="${IMAGE}-cuda"
   DISK_SIZE="${DISK_SIZE:-24G}"
 else
   NVIDIA_DRIVER_PACKAGE=""

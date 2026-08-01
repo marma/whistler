@@ -51,7 +51,7 @@ worth remembering before reading a profile or a bug report:
   `x264enc`. GPU utilisation under a "software" encoder name is correct
   behaviour, not a misconfiguration. This needs the encode libraries present:
   pods get them from the nvidia runtime class (`resources.gpu`), VMs from the
-  `:dev-cuda` image's baked driver (`libnvidia-encode`) — so the CUDA variant of
+  `-cuda` image's baked driver (`libnvidia-encode`) — so the CUDA variant of
   a VM image is *not* display-neutral.
 - VA-API never applies to pods: `_build_pod_spec` exposes no `/dev/dri`.
 - `jpeg` and `x264enc-striped` force `use_cpu=true` server-side — always CPU.

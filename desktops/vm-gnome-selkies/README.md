@@ -96,10 +96,19 @@ Check `journalctl -u whistler-desktop@<user>` in the guest first.
   whistler-desktop@<user>` once the user exists.
 - The GNOME app set (Terminal, Files, Text Editor, Settings) plus **Firefox from
   Mozilla's APT repo** (24.04's `firefox` apt package is a snap shim, and snapd
-  is purged); llvmpipe software GL for mutter; `librsvg2-common` + a regenerated
-  gdk-pixbuf loader cache so Adwaita's SVG icons aren't blurry. The CUDA variant
-  adds **VirtualGL** and a `vgl` wrapper so GL apps can render on a passthrough
-  GPU — see [Three graphics tiers](#three-graphics-tiers).
+  is purged) and **Google Chrome** from Google's APT repo; llvmpipe software GL
+  for mutter; `librsvg2-common` + a regenerated gdk-pixbuf loader cache so
+  Adwaita's SVG icons aren't blurry. The CUDA variant adds **VirtualGL** and a
+  `vgl` wrapper so GL apps can render on a passthrough GPU — see
+  [Three graphics tiers](#three-graphics-tiers).
+- **Ubuntu Dock** (`gnome-shell-extension-ubuntu-dock`), fixed full-height on
+  the left with Chrome/Firefox/Files/Terminal/Text Editor favorites. The
+  session is plain user-mode `gnome-shell` (`XDG_CURRENT_DESKTOP=GNOME`), so
+  the package's own `:ubuntu`-qualified defaults never apply — the guest's
+  [`90_whistler-desktop.gschema.override`](guest/usr/share/glib-2.0/schemas/90_whistler-desktop.gschema.override)
+  both enables the extension and sets the look, compiled with
+  `glib-compile-schemas --strict` at bake. Defaults, not locks: per-user dconf
+  in the SMB home still wins.
 
 ## Streaming mode is required
 
@@ -124,7 +133,7 @@ set; with it false pixelflux tries **NVENC** (CUDA driver API) first, then
 **VA-API** (`/dev/dri` render node), and falls back to its bundled libx264 only
 if both fail.
 
-So a GPU-passthrough session on `:dev-cuda` encodes on the GPU while still
+So a GPU-passthrough session on the `-cuda` image encodes on the GPU while still
 displaying encoder `x264enc` — GPU utilisation with a "software" encoder name is
 expected, not a misconfiguration. The lean image and GPU-less sessions get
 software x264 from the identical config. `jpeg` and `x264enc-striped` force
@@ -149,9 +158,9 @@ A passthrough GPU is reachable three different ways, and they are independent:
 
 | Tier | What the GPU does | How you get it |
 |---|---|---|
-| software | nothing (or NVENC stream encode only) | `:dev` image, or `:dev-cuda` + GPU with no GL apps wrapped |
-| compute | CUDA (Cycles, ML) + NVENC encode; all drawing stays llvmpipe | `:dev-cuda` + GPU passthrough — the default behavior |
-| accelerated GL (per app) | the wrapped app's OpenGL renders on the GPU | `:dev-cuda` + GPU passthrough + `vgl <app>` |
+| software | nothing (or NVENC stream encode only) | lean image, or `-cuda` + GPU with no GL apps wrapped |
+| compute | CUDA (Cycles, ML) + NVENC encode; all drawing stays llvmpipe | `-cuda` image + GPU passthrough — the default behavior |
+| accelerated GL (per app) | the wrapped app's OpenGL renders on the GPU | `-cuda` image + GPU passthrough + `vgl <app>` |
 
 The reason drawing doesn't accelerate by itself: Xvfb's GLX is Mesa swrast, so
 *every* GL context — mutter's compositing, Blender's viewport, GTK4's
@@ -189,18 +198,21 @@ only full fix is a fixed resolution (no dynamic resize), which we decline. See
 ## Build
 
 ```bash
-make vm-gnome-desktop-image          # → localhost:5000/whistler-vm-gnome-selkies:dev  (lean, no GPU driver)
-make vm-gnome-desktop-image CUDA=1   # → …:dev-cuda  (bakes NVIDIA driver + CUDA toolkit for passthrough sessions)
+make vm-gnome-desktop-image          # → localhost:5000/whistler-vm-gnome-selkies:latest  (lean, no GPU driver)
+make vm-gnome-desktop-image CUDA=1   # → …-cuda:latest  (bakes NVIDIA driver + CUDA toolkit for passthrough sessions)
 make vm-gnome-desktop-image PUSH=1   # …and push to the dev registry
 ```
 
-Like [`../vm-xfce-selkies`](../vm-xfce-selkies/), the default `:dev` image
+Like [`../vm-xfce-selkies`](../vm-xfce-selkies/), the default lean image
 carries **no** NVIDIA driver; `CUDA=1` bakes the driver **and the CUDA toolkit**
 (`nvcc` + cuda runtime libs; several GB, so the CUDA build gets a bigger disk)
-in and tags `:dev-cuda`. GNOME still renders on llvmpipe in both variants (Xvfb
+in and publishes `whistler-vm-gnome-selkies-cuda`. (That suffix is on the image
+name, not the tag, so the mutable dev tag stays exactly `:latest` — the only tag
+KubeVirt defaults to `imagePullPolicy: Always`; see ../vm-xfce-selkies/README.md.)
+GNOME still renders on llvmpipe in both variants (Xvfb
 serves Mesa swrast GLX — a passthrough GPU can't change that by itself), but
 the two are **not** otherwise identical: the driver brings `libnvidia-encode`,
-so on a `:dev-cuda` passthrough session pixelflux encodes the stream on
+so on a `-cuda` passthrough session pixelflux encodes the stream on
 **NVENC** instead of software x264 (see [Streaming is H.264 — but not
 x264](#streaming-is-h264--but-not-x264)). CUDA on top of that is for
 GPU-compute workloads in the guest, and **VirtualGL** (`VIRTUALGL_VERSION`,

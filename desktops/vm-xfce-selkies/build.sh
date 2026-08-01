@@ -17,16 +17,26 @@
 #   3. Wrap the qcow2 as a containerDisk (Dockerfile.containerdisk).
 #
 # Knobs (env): IMAGE (default localhost:5000/whistler-vm-xfce-selkies),
-# TAG (dev), PUSH=1 to docker-push, DISK_SIZE (12G lean / 22G CUDA),
+# TAG (latest), PUSH=1 to docker-push, DISK_SIZE (12G lean / 22G CUDA),
 # QEMU_MEM (4096), QEMU_SMP (min(8,nproc)), BASE_IMAGE_URL, CACHE_DIR
 # (~/.cache/whistler/vm-images), BAKE_TIMEOUT (2700s),
 # CUDA/NVIDIA_DRIVER_PACKAGE/CUDA_TOOLKIT_PACKAGE (see below).
 #
-# CUDA=1 bakes the NVIDIA open driver + the CUDA toolkit in and tags the result
-# :<TAG>-cuda; the default (CUDA=0) is a LEAN image with neither. Two variants,
-# not one: the driver+toolkit are dead weight (and the driver a first-boot
-# install over the egress-locked guest net) on the vast majority of sessions
-# that have no passthrough GPU, so only GPU templates pull the -cuda image.
+# CUDA=1 bakes the NVIDIA open driver + the CUDA toolkit in and publishes the
+# result as <IMAGE>-cuda:<TAG>; the default (CUDA=0) is a LEAN image with
+# neither. Two variants, not one: the driver+toolkit are dead weight (and the
+# driver a first-boot install over the egress-locked guest net) on the vast
+# majority of sessions that have no passthrough GPU, so only GPU templates pull
+# the -cuda image.
+#
+# The variant rides in the IMAGE NAME, never the tag, and the dev tag is
+# `latest` — both to keep Kubernetes' tag-based imagePullPolicy defaulting
+# working. Kubelet (and KubeVirt for containerDisks) defaults ONLY the exact
+# tag `:latest` to Always and everything else to IfNotPresent, so a mutable
+# dev tag must literally be `:latest` or nodes silently keep booting a stale
+# cached qcow2 after a rebuild. A `:latest-cuda` would NOT match, which is
+# exactly why the suffix moved to the name. Production uses immutable
+# versioned tags, which correctly default to IfNotPresent.
 # They're baked (not session-time installed) precisely because the default zone
 # blocks package mirrors — so a GPU session boots ready. NVIDIA_DRIVER_PACKAGE /
 # CUDA_TOOLKIT_PACKAGE override which packages (the guest is 26.04; defaults are
@@ -41,7 +51,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 IMAGE="${IMAGE:-localhost:5000/whistler-vm-xfce-selkies}"
-TAG="${TAG:-dev}"
+TAG="${TAG:-latest}"
 PUSH="${PUSH:-0}"
 CUDA="${CUDA:-0}"
 QEMU_MEM="${QEMU_MEM:-4096}"
@@ -49,15 +59,16 @@ QEMU_SMP="${QEMU_SMP:-$(( $(nproc) < 8 ? $(nproc) : 8 ))}"
 BASE_IMAGE_URL="${BASE_IMAGE_URL:-https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img}"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/whistler/vm-images}"
 BAKE_TIMEOUT="${BAKE_TIMEOUT:-2700}"
-# CUDA=1 → bake the NVIDIA driver + CUDA toolkit and suffix the tag; else a
-# lean image with neither. CUDA_TOOLKIT_PACKAGE defaults to 26.04's archive
-# nvidia-cuda-toolkit (nvcc + cuda runtime libs); empty it for driver-only, or
-# point it at a cuda-toolkit-XX-Y package from NVIDIA's CUDA apt repo for a
-# specific release. The toolkit adds several GB, so CUDA builds get a bigger disk.
+# CUDA=1 → bake the NVIDIA driver + CUDA toolkit and suffix the IMAGE NAME
+# (not the tag — see the header); else a lean image with neither.
+# CUDA_TOOLKIT_PACKAGE defaults to 26.04's archive nvidia-cuda-toolkit (nvcc +
+# cuda runtime libs); empty it for driver-only, or point it at a
+# cuda-toolkit-XX-Y package from NVIDIA's CUDA apt repo for a specific release.
+# The toolkit adds several GB, so CUDA builds get a bigger disk.
 if [ "$CUDA" = "1" ]; then
   NVIDIA_DRIVER_PACKAGE="${NVIDIA_DRIVER_PACKAGE:-nvidia-driver-595-open}"
   CUDA_TOOLKIT_PACKAGE="${CUDA_TOOLKIT_PACKAGE:-nvidia-cuda-toolkit}"
-  TAG="${TAG}-cuda"
+  IMAGE="${IMAGE}-cuda"
   DISK_SIZE="${DISK_SIZE:-22G}"
 else
   NVIDIA_DRIVER_PACKAGE=""

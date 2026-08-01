@@ -50,23 +50,33 @@ home mount, streamer env, session-unit start — see
 ## Build
 
 ```bash
-make vm-desktop-image          # → localhost:5000/whistler-vm-xfce-selkies:dev  (lean, no GPU driver)
-make vm-desktop-image CUDA=1   # → …:dev-cuda  (bakes NVIDIA driver + CUDA toolkit for passthrough sessions)
+make vm-desktop-image          # → localhost:5000/whistler-vm-xfce-selkies:latest  (lean, no GPU driver)
+make vm-desktop-image CUDA=1   # → …-cuda:latest  (bakes NVIDIA driver + CUDA toolkit for passthrough sessions)
 make vm-desktop-image PUSH=1   # …and push to the dev registry
 ```
 
-The default `:dev` image carries **no** NVIDIA driver — most sessions have no
+**Why `:latest`, and why the variant is in the image name.** These dev images
+are mutable — a rebuild overwrites the tag in place — and `:latest` is the only
+tag Kubernetes and KubeVirt default to `imagePullPolicy: Always`. Anything else
+defaults to `IfNotPresent`, so nodes silently keep booting the stale cached
+qcow2 after a rebuild (a fixed image still showing the old bug, fixable only
+with `crictl rmi` on the node). `:latest-cuda` would *not* match that rule,
+which is why `CUDA=1` suffixes the image NAME instead. `_build_vm_spec` sets no
+`imagePullPolicy` at all, so this defaulting is what's in force; production
+should use immutable versioned tags, which correctly stay `IfNotPresent`.
+
+The default image carries **no** NVIDIA driver — most sessions have no
 passthrough GPU, and the driver is dead weight (plus a first-boot install over
 the egress-locked guest net) on them. `CUDA=1` bakes the open driver **and the
 CUDA toolkit** (`nvcc` + cuda runtime libs; several GB, so the CUDA build gets a
-bigger disk) in and tags the result `:dev-cuda`; only GPU templates (e.g.
-`ubuntu-vm-selkies-cuda` in
-[values-dev-vm.yaml](../../charts/whistler/values-dev-vm.yaml)) pull that tag.
+bigger disk) in and publishes it as `whistler-vm-xfce-selkies-cuda`; only GPU
+templates (e.g. `ubuntu-vm-selkies-cuda` in
+[values-dev-vm.yaml](../../charts/whistler/values-dev-vm.yaml)) pull that image.
 `CUDA_TOOLKIT_PACKAGE` overrides which toolkit (default: the archive
 `nvidia-cuda-toolkit`; empty for driver-only).
 
 The driver is **not** display-neutral: it brings `libnvidia-encode`, and
-Selkies' `--use-cpu` defaults to false, so on a `:dev-cuda` passthrough session
+Selkies' `--use-cpu` defaults to false, so on a `-cuda` passthrough session
 pixelflux encodes the stream on **NVENC** rather than software x264 — even
 though `--encoder=x264enc` (an output-mode label, not an implementation) is
 unchanged. XFCE's rendering is llvmpipe either way; only the encode stage moves.

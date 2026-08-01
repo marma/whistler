@@ -12,13 +12,18 @@ whistler:
       - https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
       # Baked desktop VMs (in-guest Selkies) — build & push with
       # `make vm-desktop-image PUSH=1` / `make vm-gnome-desktop-image PUSH=1`
-      # (+ CUDA=1 for the -cuda tag); not skaffold artifacts because the qcow2
+      # (+ CUDA=1 for the -cuda image); not skaffold artifacts because the qcow2
       # bake needs qemu/KVM. Every tag a template references must be listed here
       # or ensure_session fails closed with a PolicyError.
-      - localhost:5000/whistler-vm-xfce-selkies:dev
-      - localhost:5000/whistler-vm-xfce-selkies:dev-cuda
-      - localhost:5000/whistler-vm-gnome-selkies:dev
-      - localhost:5000/whistler-vm-gnome-selkies:dev-cuda
+      # `:latest` is deliberate for these mutable dev images: it is the only tag
+      # KubeVirt defaults to imagePullPolicy Always, so a rebuild is actually
+      # re-pulled instead of booting the node's stale cached qcow2. The CUDA
+      # variant is a separate image NAME for the same reason (`:latest-cuda`
+      # would not match). See desktops/vm-xfce-selkies/build.sh.
+      - localhost:5000/whistler-vm-xfce-selkies:latest
+      - localhost:5000/whistler-vm-xfce-selkies-cuda:latest
+      - localhost:5000/whistler-vm-gnome-selkies:latest
+      - localhost:5000/whistler-vm-gnome-selkies-cuda:latest
 
 templates:
   # containerDisk boot: the qcow2 ships inside an OCI image. Fast pull-and-boot,
@@ -60,9 +65,9 @@ templates:
   # as a rescue path (shows the text console, not the desktop).
   #
   # Four VM-desktop templates below, two DEs x {lean, CUDA}. The `-cuda`
-  # variants use the :dev-cuda image (built with CUDA=1 — bakes the NVIDIA open
-  # driver) and request the RTX 4090 via nodeSelector + resources.gpu; the lean
-  # ones use the driver-free :dev image and run anywhere. Build all four with:
+  # variants use the separate -cuda image (built with CUDA=1 — bakes the NVIDIA
+  # open driver) and request the RTX 4090 via nodeSelector + resources.gpu; the
+  # lean ones use the driver-free image and run anywhere. Build all four with:
   #   make vm-desktop-image        make vm-desktop-image CUDA=1
   #   make vm-gnome-desktop-image  make vm-gnome-desktop-image CUDA=1
 
@@ -71,7 +76,7 @@ templates:
     description: "Ubuntu 26.04 VM + XFCE (containerDisk, Selkies)"
     mode: desktop
     runtime: vm
-    image: "localhost:5000/whistler-vm-xfce-selkies:dev"
+    image: "localhost:5000/whistler-vm-xfce-selkies:latest"
     viewer: websockets
     persistence: ephemeral
     displayPort: 8082
@@ -84,7 +89,7 @@ templates:
     description: "Ubuntu 26.04 VM + XFCE + RTX 4090 (containerDisk, Selkies)"
     mode: desktop
     runtime: vm
-    image: "localhost:5000/whistler-vm-xfce-selkies:dev-cuda"
+    image: "localhost:5000/whistler-vm-xfce-selkies-cuda:latest"
     viewer: websockets
     persistence: ephemeral
     displayPort: 8082
@@ -107,7 +112,7 @@ templates:
     description: "Ubuntu 24.04 VM + GNOME Shell (containerDisk, Selkies)"
     mode: desktop
     runtime: vm
-    image: "localhost:5000/whistler-vm-gnome-selkies:dev"
+    image: "localhost:5000/whistler-vm-gnome-selkies:latest"
     viewer: websockets
     persistence: ephemeral
     displayPort: 8082
@@ -122,7 +127,7 @@ templates:
     description: "Ubuntu 24.04 VM + GNOME Shell + RTX 4090 (containerDisk, Selkies)"
     mode: desktop
     runtime: vm
-    image: "localhost:5000/whistler-vm-gnome-selkies:dev-cuda"
+    image: "localhost:5000/whistler-vm-gnome-selkies-cuda:latest"
     viewer: websockets
     persistence: ephemeral
     displayPort: 8082

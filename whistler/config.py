@@ -1813,17 +1813,17 @@ class KubeConfigManager(ConfigManager):
             root_volume = {"name": "rootdisk",
                            "dataVolume": {"name": f"{session_name}-root"}}
         else:
-            # imagePullPolicy: Always — our dev containerDisk tags (e.g.
-            # localhost:5000/whistler-vm-*-selkies:dev) are MUTABLE: a rebuild
-            # overwrites :dev in place. KubeVirt defaults non-:latest tags to
-            # IfNotPresent, so without this the node keeps booting the stale
-            # cached qcow2 after a rebuild (symptom: a fixed image still shows
-            # the old bug, and the only other fix is `crictl rmi` on the node).
-            # Always re-checks the registry; unchanged digests reuse cached
-            # layers, so the cost on immutable tags is just a manifest lookup.
+            # No imagePullPolicy on purpose: let KubeVirt's tag-based
+            # defaulting decide (`:latest` → Always, anything else →
+            # IfNotPresent), which is why the dev images are built as
+            # `<name>[-cuda]:latest` rather than `:dev`/`:dev-cuda` (see
+            # desktops/vm-*-selkies/build.sh). Mutable dev tags then re-pull on
+            # every VMI start instead of silently booting a stale cached qcow2,
+            # while production's immutable versioned tags keep IfNotPresent and
+            # don't make the registry a hard dependency of every VM boot.
+            # Pinning Always here would take that choice away from both.
             root_volume = {"name": "rootdisk",
-                           "containerDisk": {"image": image or 'ubuntu:latest',
-                                             "imagePullPolicy": "Always"}}
+                           "containerDisk": {"image": image or 'ubuntu:latest'}}
 
         # The userData travels via a per-session Secret (userDataSecretRef),
         # not inline: KubeVirt's admission webhook caps inline userData at
