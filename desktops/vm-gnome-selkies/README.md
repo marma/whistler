@@ -102,13 +102,18 @@ Check `journalctl -u whistler-desktop@<user>` in the guest first.
   `vgl` wrapper so GL apps can render on a passthrough GPU — see
   [Three graphics tiers](#three-graphics-tiers).
 - **Ubuntu Dock** (`gnome-shell-extension-ubuntu-dock`), fixed full-height on
-  the left with Chrome/Firefox/Files/Terminal/Text Editor favorites. The
-  session is plain user-mode `gnome-shell` (`XDG_CURRENT_DESKTOP=GNOME`), so
-  the package's own `:ubuntu`-qualified defaults never apply — the guest's
+  the left with Chrome/Firefox/Files/Terminal/Text Editor favorites, and
+  **Ubuntu's default wallpaper** (`ubuntu-wallpapers`). The session is plain
+  user-mode `gnome-shell` (`XDG_CURRENT_DESKTOP=GNOME`), so the `:ubuntu`-qualified
+  defaults those packages ship — the dock's own, and `ubuntu-settings`' background
+  stanzas — never apply; the guest's
   [`90_whistler-desktop.gschema.override`](guest/usr/share/glib-2.0/schemas/90_whistler-desktop.gschema.override)
-  both enables the extension and sets the look, compiled with
-  `glib-compile-schemas --strict` at bake. Defaults, not locks: per-user dconf
-  in the SMB home still wins.
+  enables the extension, sets the look and sets the background, compiled with
+  `glib-compile-schemas --strict` at bake. `--strict` catches a key that stops
+  existing after a package bump but not a `picture-uri` aimed at a file that
+  moved (whose only symptom is a black desktop), so the bake `test -f`s the two
+  wallpapers as well. Defaults, not locks: per-user dconf in the SMB home still
+  wins.
 
 ## Streaming mode is required
 

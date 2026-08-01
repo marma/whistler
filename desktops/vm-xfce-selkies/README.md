@@ -41,6 +41,16 @@ home mount, streamer env, session-unit start — see
   (both Ubuntu 26.04). The bake also installs `cifs-utils` (so the home mount
   uses mount.cifs instead of the raw-kernel fallback) and purges snapd
   (snapd.seeded otherwise delays every session boot ~30 s).
+- **Ubuntu's default wallpaper** (`ubuntu-wallpapers`, which nothing in `xfce4`
+  pulls in) instead of the stock Xfce mouse, via the guest's
+  [`xfce4-desktop.xml`](guest/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml)
+  — xfconf reads channel XML under `XDG_CONFIG_DIRS` as read-only defaults that
+  `~/.config/xfce4/xfconf/…` shadows, so a user's own wallpaper still wins and
+  persists in the SMB home. The backdrop property path embeds the RandR output
+  name, which for Xvfb is always `screen`; keep it in sync with the pod copy in
+  [`../xfce-plain/xfce4-desktop.xml`](../xfce-plain/xfce4-desktop.xml). A
+  backdrop path that no longer exists is silent (xfdesktop just keeps its
+  built-in one), so the bake `test -f`s the wallpaper.
 - Unlike the pod images there is **no bwrap divert**: the VM has a full
   kernel and Ubuntu ships an AppArmor profile permitting bwrap's user
   namespace, so glycin's image-decode sandbox actually works here. If icons

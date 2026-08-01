@@ -70,6 +70,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       gnome-text-editor \
       gnome-control-center \
       firefox \
+      # Ubuntu's wallpaper set, including the release-independent default
+      # aliases the schema override below points at. Nothing in gnome-shell
+      # pulls this in — without it the desktop is stock Adwaita.
+      ubuntu-wallpapers \
+      # glib-compile-schemas, for that override. Not in the base image, and
+      # not guaranteed by anything above.
+      libglib2.0-bin \
       # Adwaita icon/cursor theme + sane default fonts so the Shell isn't a
       # sea of missing-icon boxes.
       adwaita-icon-theme \
@@ -110,6 +117,16 @@ ENV DISPLAY=:0 \
     PUID=1000 \
     PGID=1000 \
     DESKTOP_SUDO=false
+
+# System-wide desktop defaults (Ubuntu's wallpaper — see the file's header for
+# why an unqualified override is the only thing that applies to this session).
+# --strict so a key that stops existing after a package bump fails the build;
+# the test -f guards the half --strict cannot see, a URI aimed at a path that
+# no longer exists, whose only symptom is a black desktop at runtime.
+COPY 90_whistler-desktop.gschema.override /usr/share/glib-2.0/schemas/
+RUN test -f /usr/share/backgrounds/warty-final-ubuntu.png \
+ && test -f /usr/share/backgrounds/ubuntu-wallpaper-d.png \
+ && glib-compile-schemas --strict /usr/share/glib-2.0/schemas
 
 # The session launcher (gnome-shell + curated settings daemons, not plain
 # gnome-session — see the script header for why).

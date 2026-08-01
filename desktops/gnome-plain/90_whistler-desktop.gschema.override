@@ -1,0 +1,35 @@
+# System-wide desktop defaults, compiled into gschemas.compiled by the
+# Dockerfile (glib-compile-schemas --strict).
+#
+# The session here is plain user-mode `gnome-shell --x11` with
+# XDG_CURRENT_DESKTOP=GNOME (entrypoint.sh), not Ubuntu's `ubuntu` session
+# mode. Ubuntu ships its wallpaper defaults in 10_ubuntu-settings.gschema.
+# override, but every stanza there is `:ubuntu`-qualified and so never applies
+# to us — the background has to be set as an unqualified override, or the
+# Shell draws GNOME's upstream Adwaita default. (ubuntu-settings itself is not
+# installed; only ubuntu-wallpapers, for the picture files.)
+#
+# The VM sibling is
+# ../vm-gnome-selkies/guest/usr/share/glib-2.0/schemas/90_whistler-desktop.gschema.override
+# — same filename, same background stanzas, and it additionally enables Ubuntu
+# Dock, which this image does not install. Not a synced pair: keep the
+# background in step, ignore the rest.
+#
+# Defaults, not locks: per-user dconf (a user changing the wallpaper in
+# Settings) still wins and persists in the mounted home.
+
+# File names are the release-independent aliases ubuntu-wallpapers has shipped
+# for years, so a base-image bump moves the picture without touching this file.
+# Both light and dark are set because which one applies follows
+# org.gnome.desktop.interface color-scheme, and a user flipping that must not
+# land back on Adwaita. The Dockerfile asserts both files exist: an override
+# pointing at a missing path renders a *black* desktop, and
+# glib-compile-schemas --strict validates key names only, never URI targets.
+[org.gnome.desktop.background]
+picture-uri='file:///usr/share/backgrounds/warty-final-ubuntu.png'
+picture-uri-dark='file:///usr/share/backgrounds/ubuntu-wallpaper-d.png'
+
+# Lock screen, same picture (Ubuntu sets this one light-only — the screensaver
+# schema has no picture-uri-dark).
+[org.gnome.desktop.screensaver]
+picture-uri='file:///usr/share/backgrounds/warty-final-ubuntu.png'

@@ -40,8 +40,13 @@ write_files:
       # x11-apps is here for `xwd` alone (it is NOT in x11-utils): the portal
       # SSHes in periodically and grabs the display for the session thumbnail
       # — see whistler/portal/screenshots.py.
+      # ubuntu-wallpapers ships the release's wallpaper set *and* the
+      # release-independent default aliases the xfconf backdrop default points
+      # at (guest/ etc/xdg/.../xfce4-desktop.xml). Nothing in xfce4 pulls it
+      # in — without it the desktop is the stock Xfce mouse.
       $APT install -y --no-install-recommends \
         xfce4 xfce4-terminal dbus-x11 \
+        ubuntu-wallpapers \
         xvfb x11-xserver-utils xcvt x11-utils xclip xdotool \
         x11-apps \
         pulseaudio pulseaudio-utils \
@@ -82,6 +87,12 @@ write_files:
       chmod 0755 /usr/local/bin/whistler-streamer \
                  /usr/local/bin/whistler-desktop-session \
                  /usr/local/bin/wtype
+
+      # The xfconf backdrop default that just landed points at a wallpaper by
+      # path, and nothing validates that at session start: a missing file just
+      # leaves xfdesktop on its built-in Xfce backdrop, silently. Assert it
+      # here so a renamed wallpaper fails the bake instead.
+      test -f /usr/share/backgrounds/warty-final-ubuntu.png
 
       # The streamer has no per-session inputs (its env file is optional), so
       # it is enabled at bake; the per-user whistler-desktop@<user> unit is

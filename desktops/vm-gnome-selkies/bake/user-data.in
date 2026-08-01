@@ -79,11 +79,16 @@ write_files:
       # enabled (and put on the left) by the guest schema override — see the
       # glib-compile-schemas step below. libglib2.0-bin is what provides
       # glib-compile-schemas for that step.
+      # ubuntu-wallpapers ships the release's wallpaper set *and* the
+      # release-independent default aliases the schema override points at
+      # (warty-final-ubuntu.png / ubuntu-wallpaper-d.png). It is not pulled in
+      # by gnome-shell — the desktop background is stock Adwaita without it.
       $APT install -y --no-install-recommends \
         gnome-session gnome-shell gnome-settings-daemon \
         gnome-shell-extension-ubuntu-dock \
         gnome-terminal nautilus gnome-text-editor gnome-control-center \
         firefox google-chrome-stable \
+        ubuntu-wallpapers \
         libglib2.0-bin \
         adwaita-icon-theme fonts-ubuntu fonts-dejavu-core \
         librsvg2-common \
@@ -164,13 +169,20 @@ write_files:
       /usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache
 
       # Compile the schema override that arrived in artifacts.tar.gz
-      # (guest/ 90_whistler-desktop.gschema.override: enable Ubuntu Dock on
-      # the left + favorites). The session runs plain user-mode gnome-shell
-      # with XDG_CURRENT_DESKTOP=GNOME, so the dock package's own
-      # `:ubuntu`-qualified defaults never apply — this override is the only
-      # thing that turns the dock on. --strict so a key that stops existing
-      # after a package bump fails the bake instead of silently shipping a
-      # dockless image.
+      # (guest/ 90_whistler-desktop.gschema.override: Ubuntu Dock on the left,
+      # favorites, Ubuntu's default wallpaper). The session runs plain
+      # user-mode gnome-shell with XDG_CURRENT_DESKTOP=GNOME, so the dock and
+      # ubuntu-settings `:ubuntu`-qualified defaults never apply — this
+      # override is the only thing that turns the dock on and sets the
+      # background. --strict so a key that stops existing after a package bump
+      # fails the bake instead of silently shipping a dockless image.
+      #
+      # --strict validates key *names*, not the files a URI points at: a
+      # picture-uri aimed at a missing path just renders a black desktop, in
+      # the running session, long after the bake said OK. Assert them here so
+      # a renamed wallpaper fails the build instead.
+      test -f /usr/share/backgrounds/warty-final-ubuntu.png
+      test -f /usr/share/backgrounds/ubuntu-wallpaper-d.png
       glib-compile-schemas --strict /usr/share/glib-2.0/schemas
 
       # The streamer has no per-session inputs (its env file is optional), so

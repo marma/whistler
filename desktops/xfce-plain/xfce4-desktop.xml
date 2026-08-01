@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  System-wide xfdesktop defaults: Ubuntu's wallpaper instead of the stock Xfce
+  mouse. Installed to /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/ — xfconf reads
+  every channel XML found under XDG_CONFIG_DIRS as read-only defaults and lets
+  ~/.config/xfce4/xfconf/... shadow them, so this is a default, not a lock: a
+  user picking another wallpaper still wins, and it persists in the home mount.
+
+  MONITOR NAME: the backdrop property path embeds the RandR output name, and
+  Xvfb's single output is always literally `screen` — hence `monitorscreen`.
+  Verified against xfdesktop's own user XML: given this file it registers
+  exactly /backdrop/screen0/monitorscreen/workspace0/last-image and takes the
+  value from here. On a display with differently named outputs (a real X
+  server) the path would not match and xfdesktop falls back to its built-in
+  /usr/share/backgrounds/xfce backdrop — cosmetic, never fatal.
+
+  single-workspace-mode keeps one backdrop across all four XFCE workspaces, so
+  workspace0 is the only stanza needed. image-style 5 = Zoomed.
+
+  The picture is the release-independent alias ubuntu-wallpapers has shipped
+  for years (warty-final-ubuntu.png is the *current* release's light default,
+  not the 2004 warty artwork), so a base-image bump moves the picture without
+  touching this file. There is no dark variant here: xfdesktop has no
+  light/dark switching, unlike the GNOME images' picture-uri-dark.
+
+  The VM sibling is
+  ../vm-xfce-selkies/guest/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml
+  — keep the two in sync (same convention as the selkies web patch).
+-->
+<channel name="xfce4-desktop" version="1.0">
+  <property name="backdrop" type="empty">
+    <property name="single-workspace-mode" type="bool" value="true"/>
+    <property name="single-workspace-number" type="int" value="0"/>
+    <property name="screen0" type="empty">
+      <property name="monitorscreen" type="empty">
+        <property name="workspace0" type="empty">
+          <property name="image-style" type="int" value="5"/>
+          <property name="last-image" type="string" value="/usr/share/backgrounds/warty-final-ubuntu.png"/>
+        </property>
+      </property>
+    </property>
+  </property>
+</channel>

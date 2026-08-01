@@ -1,12 +1,14 @@
 # System-wide desktop defaults, compiled into gschemas.compiled by the bake
-# (glib-compile-schemas --strict after artifacts.tar.gz lands). Both sections
-# exist because the session is plain user-mode gnome-shell with
+# (glib-compile-schemas --strict after artifacts.tar.gz lands). Every section
+# exists because the session is plain user-mode gnome-shell with
 # XDG_CURRENT_DESKTOP=GNOME (whistler-desktop@.service): no session mode
 # enables Ubuntu Dock for us, and the dock package's own defaults
-# (10_ubuntu-dock.gschema.override) are all `:ubuntu`-qualified so they never
-# apply here — enable + look both have to be unqualified overrides. These are
-# defaults, not locks: per-user dconf (a user toggling things in Settings /
-# Extensions) still wins, and survives in the SMB home across sessions.
+# (10_ubuntu-dock.gschema.override) — like Ubuntu's wallpaper defaults in
+# 10_ubuntu-settings.gschema.override — are all `:ubuntu`-qualified so they
+# never apply here; look, dock and background all have to be unqualified
+# overrides. These are defaults, not locks: per-user dconf (a user toggling
+# things in Settings / Extensions) still wins, and survives in the SMB home
+# across sessions.
 
 [org.gnome.shell]
 enabled-extensions=['ubuntu-dock@ubuntu.com']
@@ -23,3 +25,22 @@ dock-position='LEFT'
 dock-fixed=true
 extend-height=true
 disable-overview-on-startup=true
+
+# Ubuntu's default wallpaper, copied verbatim from the `:ubuntu`-qualified
+# stanza in 10_ubuntu-settings.gschema.override (ubuntu-settings is not even
+# installed here — the file names are, deliberately, the release-independent
+# aliases `ubuntu-wallpapers` has shipped for years, so a base-image bump moves
+# the picture without touching this file). Both light and dark are set because
+# which one applies follows org.gnome.desktop.interface color-scheme, and a
+# user flipping that in Settings must not land on the stock Adwaita default.
+# Without the override the session shows GNOME's upstream Adwaita background —
+# the bake asserts both files exist, since an override pointing at a missing
+# file yields a *black* desktop and glib-compile-schemas cannot catch that.
+[org.gnome.desktop.background]
+picture-uri='file:///usr/share/backgrounds/warty-final-ubuntu.png'
+picture-uri-dark='file:///usr/share/backgrounds/ubuntu-wallpaper-d.png'
+
+# Lock screen, same picture (Ubuntu sets this one light-only — the screensaver
+# schema has no picture-uri-dark).
+[org.gnome.desktop.screensaver]
+picture-uri='file:///usr/share/backgrounds/warty-final-ubuntu.png'

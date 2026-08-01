@@ -27,6 +27,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       x11-utils \
       # pactl/paplay: client tools to verify the shared PulseAudio path.
       pulseaudio-utils \
+      # Ubuntu's wallpaper set, including the release-independent default
+      # alias the xfconf backdrop default below points at. Nothing in xfce4
+      # pulls it in — without it the desktop is the stock Xfce mouse.
+      ubuntu-wallpapers \
       ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
@@ -57,6 +61,13 @@ RUN useradd -m -s /bin/bash "${DESKTOP_USER}"
 
 ENV DESKTOP_USER=abc \
     DISPLAY=:0
+
+# System-wide xfdesktop defaults (Ubuntu's wallpaper — see the file's header
+# for the monitor-name and precedence details). The test -f is the only check
+# there is: xfdesktop treats a backdrop path that does not exist as "use my
+# built-in one" and says nothing, so a renamed wallpaper would ship silently.
+COPY xfce4-desktop.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml
+RUN test -f /usr/share/backgrounds/warty-final-ubuntu.png
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

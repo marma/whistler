@@ -16,5 +16,14 @@ sidecar's startupProbe already gates this container) and then execs
 foreground, so the container tracks the session and a crashed DE restarts
 against the still-running display.
 
+The desktop shows **Ubuntu's default wallpaper** rather than the stock Xfce
+mouse: `ubuntu-wallpapers` (nothing in `xfce4` pulls it in) plus
+[`xfce4-desktop.xml`](xfce4-desktop.xml) installed to `/etc/xdg/xfce4/xfconf/`,
+which xfconf reads as a read-only default that `~/.config/xfce4/xfconf/…`
+shadows — so a user's own choice wins and persists in the mounted home. The
+backdrop property path embeds the RandR output name, always `screen` on the
+streamer's Xvfb. Keep it in sync with the VM copy in
+[`../vm-xfce-selkies/guest/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml`](../vm-xfce-selkies/guest/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml).
+
 For running the pair without a cluster, see
 [`../streamer-selkies2/README.md`](../streamer-selkies2/README.md).
