@@ -25,27 +25,31 @@
 #
 # Knobs (env): IMAGE (default localhost:5000/whistler-vm-gnome-selkies),
 # TAG (latest), PUSH=1 to docker-push, DISK_SIZE (14G lean / 24G CUDA — GNOME is
-# heavier than XFCE), QEMU_MEM (4096), QEMU_SMP (min(8,nproc)), BASE_IMAGE_URL,
+# heavier than XFCE, and the CUDA figure keeps headroom for an opt-in
+# CUDA_TOOLKIT_PACKAGE build), QEMU_MEM (4096), QEMU_SMP (min(8,nproc)), BASE_IMAGE_URL,
 # CACHE_DIR (~/.cache/whistler/vm-images), BAKE_TIMEOUT (2700s),
 # CUDA/NVIDIA_DRIVER_PACKAGE/CUDA_TOOLKIT_PACKAGE (see below).
 #
-# CUDA=1 bakes the NVIDIA open driver + the CUDA toolkit in and publishes the
-# result as <IMAGE>-cuda:<TAG>; the default (CUDA=0) is a LEAN image with
-# neither. Same split as ../vm-xfce-selkies — only GPU templates pull the -cuda
-# image, and the variant rides in the image NAME (not the tag) so the mutable
-# dev tag can stay exactly `:latest`, the only tag Kubernetes/KubeVirt default
-# to imagePullPolicy Always; see that script's header for the full why. NOTE the guest
-# here is 24.04, whose open-driver package name differs from 26.04's, so the
-# default driver is nvidia-driver-550-open (24.04's open-kernel branch) and the
-# toolkit is 24.04's archive nvidia-cuda-toolkit (CUDA 12.x); override
-# NVIDIA_DRIVER_PACKAGE / CUDA_TOOLKIT_PACKAGE for different ones (a wrong name
-# fails the bake). GNOME renders on llvmpipe in both variants (Xvfb's GLX is
-# Mesa swrast), but the driver is not desktop-neutral: it brings
-# libnvidia-encode, so a -cuda passthrough session encodes the Selkies stream on
-# NVENC rather than software x264 (see guest/usr/local/bin/whistler-streamer).
-# The CUDA toolkit on top of that is for GPU-compute workloads in-guest, and
-# VirtualGL (VIRTUALGL_VERSION, CUDA variant only) lets individual GL apps
-# render on the GPU via `vgl <app>` — see README "Three graphics tiers".
+# CUDA=1 bakes the NVIDIA open driver in and publishes the result as
+# <IMAGE>-cuda:<TAG>; the default (CUDA=0) is a LEAN, driver-free image. Same
+# split as ../vm-xfce-selkies — only GPU templates pull the -cuda image, and the
+# variant rides in the image NAME (not the tag) so the mutable dev tag can stay
+# exactly `:latest`, the only tag Kubernetes/KubeVirt default to
+# imagePullPolicy Always; see that script's header for the full why. NOTE the
+# guest here is 24.04, whose open-driver package name differs from 26.04's, so
+# the default driver is nvidia-driver-550-open (24.04's open-kernel branch —
+# which the archive has since turned into a transitional shim for
+# nvidia-driver-580-open, so that is what actually lands); override
+# NVIDIA_DRIVER_PACKAGE for a different one (a wrong name fails the bake).
+# GNOME renders on llvmpipe in both variants (Xvfb's GLX is Mesa swrast), but
+# the driver is not desktop-neutral: it brings libnvidia-encode, so a -cuda
+# passthrough session encodes the Selkies stream on NVENC rather than software
+# x264 (see guest/usr/local/bin/whistler-streamer). The driver also carries the
+# entire GPU runtime — libcuda, the PTX JIT, OptiX — which is what compute
+# (PyTorch) and rendering (Blender) actually load; the CUDA *SDK* is opt-in and
+# off by default (CUDA_TOOLKIT_PACKAGE, below). VirtualGL (VIRTUALGL_VERSION,
+# CUDA variant only) lets individual GL apps render on the GPU via `vgl <app>`
+# — see README "Three graphics tiers".
 #
 # amd64-only: the bake runs the target-arch guest under KVM; producing arm64
 # needs an arm64 host (or an emulated ~hour-long TCG bake nobody wants).
@@ -61,15 +65,18 @@ QEMU_SMP="${QEMU_SMP:-$(( $(nproc) < 8 ? $(nproc) : 8 ))}"
 BASE_IMAGE_URL="${BASE_IMAGE_URL:-https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img}"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/whistler/vm-images}"
 BAKE_TIMEOUT="${BAKE_TIMEOUT:-2700}"
-# CUDA=1 → bake the NVIDIA driver + CUDA toolkit and suffix the tag; else a
-# lean, driver-free image. CUDA_TOOLKIT_PACKAGE defaults to 24.04's archive
-# `nvidia-cuda-toolkit` (nvcc + cuda runtime libs, CUDA 12.x — enough for the
-# RTX 4090 / sm_89); point it at a cuda-toolkit-XX-Y package if you've added
-# NVIDIA's CUDA apt repo and need a newer release. Empty it to bake the driver
-# only. The toolkit adds several GB, so the CUDA build also gets a bigger disk.
+# CUDA=1 → bake the NVIDIA driver (+ VirtualGL) and suffix the image name; else
+# a lean, driver-free image. The driver is the whole GPU *runtime*: libcuda,
+# the PTX JIT, OptiX and NVENC — enough for PyTorch (its wheels bring their own
+# cudart/cuBLAS/cuDNN) and Blender. CUDA_TOOLKIT_PACKAGE is EMPTY by default:
+# nvcc and its ~2.8GB of headers/static libs/host compiler are build-time SDK
+# nothing in a GPU *session* loads, so they belong in a dev/data-science desktop
+# or in the user's $HOME (pixi/conda-forge install cuda-nvcc without root). Set
+# it to `nvidia-cuda-toolkit` (24.04's archive CUDA 12.x) or a cuda-toolkit-XX-Y
+# from NVIDIA's apt repo to bake one in; that build needs a bigger DISK_SIZE.
 if [ "$CUDA" = "1" ]; then
   NVIDIA_DRIVER_PACKAGE="${NVIDIA_DRIVER_PACKAGE:-nvidia-driver-550-open}"
-  CUDA_TOOLKIT_PACKAGE="${CUDA_TOOLKIT_PACKAGE:-nvidia-cuda-toolkit}"
+  CUDA_TOOLKIT_PACKAGE="${CUDA_TOOLKIT_PACKAGE:-}"
   # VirtualGL (pinned upstream .deb) rides along with the driver so GL apps can
   # opt in to *drawing* on the passthrough GPU via `vgl <app>` (EGL backend) —
   # without it the GPU can only do CUDA + NVENC while all OpenGL stays on

@@ -129,15 +129,24 @@ write_files:
         rm -f /run/virtualgl.deb
       fi
 
-      # CUDA toolkit (nvcc + cuda runtime libs) for GPU-compute workloads in the
-      # guest. Only in the CUDA variant (build.sh CUDA=1 sets
-      # CUDA_TOOLKIT_PACKAGE, default 24.04's archive nvidia-cuda-toolkit; the
-      # lean default leaves it empty and skips this). Not --no-install-recommends
-      # here: the toolkit's recommends (gcc host compiler, headers) are what make
-      # nvcc actually usable. Several GB — build.sh gives the CUDA build a bigger
-      # disk to fit it.
+      # CUDA SDK — OFF by default, and deliberately so. The image ships the
+      # *runtime* only: the driver above already provides libcuda.so.1, the PTX
+      # JIT, libnvoptix + rtcore (Blender's OptiX backend) and libnvidia-encode,
+      # which is everything GPU workloads actually load. PyTorch wheels carry
+      # their own cudart/cuBLAS/cuDNN/nvrtc; Blender ships precompiled Cycles
+      # kernels. nvidia-cuda-toolkit adds ~2.8GB of *build*-time SDK on top of
+      # that — 2.4GB of it nvidia-cuda-dev headers and static libs, plus g++ as
+      # nvcc's mandatory host compiler — which only matters when someone
+      # compiles CUDA C++ in-guest (flash-attn, DeepSpeed JIT ops,
+      # torch.utils.cpp_extension). That belongs in a dev/data-science desktop,
+      # or in the user's $HOME via a user-space package manager (pixi/conda-forge
+      # ship cuda-nvcc and compilers without root) — not in every GPU session.
+      # Set CUDA_TOOLKIT_PACKAGE=nvidia-cuda-toolkit to bake it in anyway;
+      # --no-install-recommends then still excludes the ~1.6GB of nsight /
+      # visual-profiler tooling (the profiler is what used to drag in
+      # openjdk-8-jre + GTK2).
       if [ -n "@CUDA_TOOLKIT_PACKAGE@" ]; then
-        $APT install -y "@CUDA_TOOLKIT_PACKAGE@"
+        $APT install -y --no-install-recommends "@CUDA_TOOLKIT_PACKAGE@"
       fi
 
       # Selkies venv + web client + vendored libva 2.22 (all built on 24.04 by

@@ -204,14 +204,13 @@ only full fix is a fixed resolution (no dynamic resize), which we decline. See
 
 ```bash
 make vm-gnome-desktop-image          # → localhost:5000/whistler-vm-gnome-selkies:latest  (lean, no GPU driver)
-make vm-gnome-desktop-image CUDA=1   # → …-cuda:latest  (bakes NVIDIA driver + CUDA toolkit for passthrough sessions)
+make vm-gnome-desktop-image CUDA=1   # → …-cuda:latest  (bakes the NVIDIA driver for passthrough sessions)
 make vm-gnome-desktop-image PUSH=1   # …and push to the dev registry
 ```
 
 Like [`../vm-xfce-selkies`](../vm-xfce-selkies/), the default lean image
-carries **no** NVIDIA driver; `CUDA=1` bakes the driver **and the CUDA toolkit**
-(`nvcc` + cuda runtime libs; several GB, so the CUDA build gets a bigger disk)
-in and publishes `whistler-vm-gnome-selkies-cuda`. (That suffix is on the image
+carries **no** NVIDIA driver; `CUDA=1` bakes the driver in and
+publishes `whistler-vm-gnome-selkies-cuda`. (That suffix is on the image
 name, not the tag, so the mutable dev tag stays exactly `:latest` — the only tag
 KubeVirt defaults to `imagePullPolicy: Always`; see ../vm-xfce-selkies/README.md.)
 GNOME still renders on llvmpipe in both variants (Xvfb
@@ -219,13 +218,32 @@ serves Mesa swrast GLX — a passthrough GPU can't change that by itself), but
 the two are **not** otherwise identical: the driver brings `libnvidia-encode`,
 so on a `-cuda` passthrough session pixelflux encodes the stream on
 **NVENC** instead of software x264 (see [Streaming is H.264 — but not
-x264](#streaming-is-h264--but-not-x264)). CUDA on top of that is for
-GPU-compute workloads in the guest, and **VirtualGL** (`VIRTUALGL_VERSION`,
+x264](#streaming-is-h264--but-not-x264)). The driver also carries the whole GPU
+compute runtime, and **VirtualGL** (`VIRTUALGL_VERSION`,
 default 3.1.4) lets individual GL apps draw on the GPU via `vgl <app>` — see
 [Three graphics tiers](#three-graphics-tiers). NOTE the 24.04
-packages differ from 26.04's: default driver `nvidia-driver-550-open`, default
-toolkit the archive `nvidia-cuda-toolkit` (CUDA 12.x); override via
-`NVIDIA_DRIVER_PACKAGE` / `CUDA_TOOLKIT_PACKAGE` (a wrong name fails the bake).
+packages differ from 26.04's: default driver `nvidia-driver-550-open`, override
+via `NVIDIA_DRIVER_PACKAGE` (a wrong name fails the bake). Heads-up: in current
+noble that package is a **transitional shim** whose only dependency is
+`nvidia-driver-580-open`, so the bake really installs 580.x — the "550" in the
+default is no longer pinning anything.
+
+**The `-cuda` image ships the GPU runtime, not the CUDA SDK.** What GPU
+workloads actually load comes from the driver: `libcuda.so.1`, the PTX JIT,
+`libnvoptix` + rtcore (Blender's OptiX backend), `libnvidia-encode` and
+`nvidia-smi`. PyTorch's wheels bundle their own cudart/cuBLAS/cuDNN/nvrtc and
+only dlopen `libcuda`; Blender ships precompiled Cycles kernels. So
+`CUDA_TOOLKIT_PACKAGE` is **empty by default** — `nvcc` exists to *compile*
+CUDA C++, needs `g++` as its host compiler and pulls ~2.8 GB (2.4 GB of that
+`nvidia-cuda-dev` headers and static libs), none of which a running session
+touches. Set `CUDA_TOOLKIT_PACKAGE=nvidia-cuda-toolkit` (CUDA 12.x from the
+24.04 archive, or a `cuda-toolkit-XX-Y` from NVIDIA's apt repo) to bake it into
+a dev/data-science image; it installs `--no-install-recommends`, which still
+excludes the ~1.6 GB of `nsight-systems` / `nsight-compute` /
+`nvidia-visual-profiler` (that last one being what used to pull `openjdk-8-jre`
+into every GPU desktop). Users who need `nvcc` or compilers ad hoc can install
+them into `$HOME` with a user-space package manager such as pixi/conda-forge —
+no root, no image rebuild — provided their zone permits the package hosts.
 
 Needs docker, `qemu-system-x86_64` and `/dev/kvm` — no libguestfs (the bake
 boots the 24.04 cloud image once under qemu with a NoCloud-over-HTTP seed, runs

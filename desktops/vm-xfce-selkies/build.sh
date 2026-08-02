@@ -22,12 +22,11 @@
 # (~/.cache/whistler/vm-images), BAKE_TIMEOUT (2700s),
 # CUDA/NVIDIA_DRIVER_PACKAGE/CUDA_TOOLKIT_PACKAGE (see below).
 #
-# CUDA=1 bakes the NVIDIA open driver + the CUDA toolkit in and publishes the
-# result as <IMAGE>-cuda:<TAG>; the default (CUDA=0) is a LEAN image with
-# neither. Two variants, not one: the driver+toolkit are dead weight (and the
-# driver a first-boot install over the egress-locked guest net) on the vast
-# majority of sessions that have no passthrough GPU, so only GPU templates pull
-# the -cuda image.
+# CUDA=1 bakes the NVIDIA open driver in and publishes the result as
+# <IMAGE>-cuda:<TAG>; the default (CUDA=0) is a LEAN, driver-free image. Two
+# variants, not one: the driver is dead weight (and a first-boot install over
+# the egress-locked guest net) on the vast majority of sessions that have no
+# passthrough GPU, so only GPU templates pull the -cuda image.
 #
 # The variant rides in the IMAGE NAME, never the tag, and the dev tag is
 # `latest` — both to keep Kubernetes' tag-based imagePullPolicy defaulting
@@ -37,10 +36,10 @@
 # cached qcow2 after a rebuild. A `:latest-cuda` would NOT match, which is
 # exactly why the suffix moved to the name. Production uses immutable
 # versioned tags, which correctly default to IfNotPresent.
-# They're baked (not session-time installed) precisely because the default zone
-# blocks package mirrors — so a GPU session boots ready. NVIDIA_DRIVER_PACKAGE /
-# CUDA_TOOLKIT_PACKAGE override which packages (the guest is 26.04; defaults are
-# nvidia-driver-595-open and the archive nvidia-cuda-toolkit). Note the driver
+# It's baked (not session-time installed) precisely because the default zone
+# blocks package mirrors — so a GPU session boots ready. NVIDIA_DRIVER_PACKAGE
+# overrides which driver (the guest is 26.04; default nvidia-driver-595-open),
+# and CUDA_TOOLKIT_PACKAGE (empty by default) can add the CUDA SDK. Note the driver
 # also changes the DISPLAY path: libnvidia-encode makes pixelflux encode the
 # Selkies stream on NVENC instead of software x264 (see
 # guest/usr/local/bin/whistler-streamer).
@@ -59,15 +58,19 @@ QEMU_SMP="${QEMU_SMP:-$(( $(nproc) < 8 ? $(nproc) : 8 ))}"
 BASE_IMAGE_URL="${BASE_IMAGE_URL:-https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img}"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/whistler/vm-images}"
 BAKE_TIMEOUT="${BAKE_TIMEOUT:-2700}"
-# CUDA=1 → bake the NVIDIA driver + CUDA toolkit and suffix the IMAGE NAME
-# (not the tag — see the header); else a lean image with neither.
-# CUDA_TOOLKIT_PACKAGE defaults to 26.04's archive nvidia-cuda-toolkit (nvcc +
-# cuda runtime libs); empty it for driver-only, or point it at a
-# cuda-toolkit-XX-Y package from NVIDIA's CUDA apt repo for a specific release.
-# The toolkit adds several GB, so CUDA builds get a bigger disk.
+# CUDA=1 → bake the NVIDIA driver and suffix the IMAGE NAME (not the tag — see
+# the header); else a lean, driver-free image. The driver is the whole GPU
+# *runtime*: libcuda, the PTX JIT, OptiX and NVENC — enough for PyTorch (its
+# wheels bring their own cudart/cuBLAS/cuDNN) and Blender. CUDA_TOOLKIT_PACKAGE
+# is EMPTY by default: nvcc and its GBs of headers/static libs/host compiler are
+# build-time SDK nothing in a GPU *session* loads, so they belong in a
+# dev/data-science desktop or in the user's $HOME (pixi/conda-forge install
+# cuda-nvcc without root). Set it to `nvidia-cuda-toolkit` (26.04's archive) or
+# a cuda-toolkit-XX-Y from NVIDIA's CUDA apt repo to bake one in; that build
+# needs a bigger DISK_SIZE.
 if [ "$CUDA" = "1" ]; then
   NVIDIA_DRIVER_PACKAGE="${NVIDIA_DRIVER_PACKAGE:-nvidia-driver-595-open}"
-  CUDA_TOOLKIT_PACKAGE="${CUDA_TOOLKIT_PACKAGE:-nvidia-cuda-toolkit}"
+  CUDA_TOOLKIT_PACKAGE="${CUDA_TOOLKIT_PACKAGE:-}"
   IMAGE="${IMAGE}-cuda"
   DISK_SIZE="${DISK_SIZE:-22G}"
 else

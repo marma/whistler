@@ -77,13 +77,26 @@ should use immutable versioned tags, which correctly stay `IfNotPresent`.
 
 The default image carries **no** NVIDIA driver — most sessions have no
 passthrough GPU, and the driver is dead weight (plus a first-boot install over
-the egress-locked guest net) on them. `CUDA=1` bakes the open driver **and the
-CUDA toolkit** (`nvcc` + cuda runtime libs; several GB, so the CUDA build gets a
-bigger disk) in and publishes it as `whistler-vm-xfce-selkies-cuda`; only GPU
-templates (e.g. `ubuntu-vm-selkies-cuda` in
+the egress-locked guest net) on them. `CUDA=1` bakes the open driver in and
+publishes it as `whistler-vm-xfce-selkies-cuda`; only GPU templates (e.g.
+`ubuntu-vm-selkies-cuda` in
 [values-dev-vm.yaml](../../charts/whistler/values-dev-vm.yaml)) pull that image.
-`CUDA_TOOLKIT_PACKAGE` overrides which toolkit (default: the archive
-`nvidia-cuda-toolkit`; empty for driver-only).
+
+**The `-cuda` image ships the GPU runtime, not the CUDA SDK.** The driver is
+already everything a GPU workload loads: `libcuda.so.1`, the PTX JIT,
+`libnvoptix` + rtcore (Blender's OptiX backend), `libnvidia-encode` (NVENC) and
+`nvidia-smi`. PyTorch's wheels carry their own cudart/cuBLAS/cuDNN/nvrtc and
+only dlopen `libcuda`; Blender ships precompiled Cycles kernels. So
+`CUDA_TOOLKIT_PACKAGE` is **empty by default** — `nvcc` exists to *compile*
+CUDA C++, drags in a host compiler and GBs of headers and static libs, and
+nothing in a running session touches it. Set
+`CUDA_TOOLKIT_PACKAGE=nvidia-cuda-toolkit` to bake it in for a dev/data-science
+image (it installs `--no-install-recommends`, which still excludes the ~1.6 GB
+of `nsight-systems` / `nsight-compute` / `nvidia-visual-profiler` — that last
+one being what used to pull `openjdk-8-jre` into every GPU desktop). Users who
+need `nvcc` or compilers ad hoc can also install them into `$HOME` with a
+user-space package manager such as pixi/conda-forge, no root and no image
+rebuild — as long as their zone permits the package hosts.
 
 The driver is **not** display-neutral: it brings `libnvidia-encode`, and
 Selkies' `--use-cpu` defaults to false, so on a `-cuda` passthrough session
