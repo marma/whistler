@@ -121,10 +121,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       # headers, the xkbcommon cffi binding against libxkbcommon headers.
       python3-dev build-essential libxkbcommon-dev \
       ca-certificates \
+      # Applies keymap-injection.patch to the selkies source below.
+      patch \
  && rm -rf /var/lib/apt/lists/*
 ADD https://github.com/selkies-project/selkies/archive/${SELKIES_COMMIT}.tar.gz /tmp/selkies.tar.gz
+# Multi-group X11 keymap character injection fixes — see the patch header and
+# design/keyboards.md. Copy of ../../streamer-selkies2/keymap-injection.patch
+# (this context can't reach it — same story as mac-cmd-chords.patch and the
+# wtype shim); keep the two in sync. `patch` exits non-zero, failing the
+# build, if a pin bump makes it stale.
+COPY keymap-injection.patch /tmp/
 RUN mkdir /tmp/selkies-src \
  && tar -xzf /tmp/selkies.tar.gz -C /tmp/selkies-src --strip-components=1 \
+ && patch -p1 -d /tmp/selkies-src < /tmp/keymap-injection.patch \
  && python3 -m venv /opt/venv \
  # Pin pcmflux/pixelflux on the command line so they win over selkies' unpinned
  # deps (see the ARG header — 2.0.0 breaks this commit). setuptools is required

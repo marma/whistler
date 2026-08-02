@@ -1,0 +1,508 @@
+# Multi-group X11 keymap character injection fixes (apply to SELKIES_COMMIT
+# 5686f6c4d20ed63a27e253bac00fb89ef99828c8; re-derive when bumping the pin).
+#
+# A session offering more than one GNOME input source (e.g. Swedish + US)
+# gets a live XKB keymap with multiple *groups* on the same physical keys.
+# input_handler.py's three keysym-injection paths (the printable-non-alpha
+# branch of send_x11_keypress, the co,end handler, and the pynput branch for
+# alphabetic characters including å/ä/ö) all delegated to xdotool/pynput's own
+# keycode/modifier resolution, which has no concept of which group is
+# currently active and no reliable way to target it. Symptoms: plain
+# punctuation and å/ä/ö intermittently rendering as the wrong character,
+# self-correcting on rapid repeat (":" -> "Ö", ">" -> ":", "<" -> "Z" or "|"
+# depending on which input source was active) — plus, independently, AltGr-
+# level characters ("|", "^") rendering as unrelated symbols ("×", "√") even
+# with exactly the right modifier state genuinely held.
+#
+# All three call sites now route through two shared helpers instead:
+#
+# _whistler_resolve_keycode(keysym) — finds (keycode, level 0-3) via a LIVE
+# get_keyboard_mapping() query (NOT self.xdisplay's cached
+# keycode_to_keysym/keysym_to_keycode — that cache does not track GNOME's
+# live keymap reconciliation, confirmed directly: a fresh connection found
+# colon at keycode 60/level 1 while the cached one only found a level-3
+# binding elsewhere, reproducing ":" -> "Ö" through supposedly-fixed code).
+# Strictly prefers a match at index<4 (group 0, the group-independent quad)
+# over index>=4 (a later XKB group, flattened into the same wide per-keycode
+# list by this server — index%4 is only a valid "level" within group 0;
+# treating a group-1 index the same way is what sent ">" through the
+# physical Z key instead of the dedicated one).
+#
+# _whistler_xtest_inject(keysym, down) — for level 0/1 (no AltGr needed),
+# injects directly via Xlib.ext.xtest.fake_input, explicitly synthesizing
+# Shift only if the target level needs it and it isn't already genuinely
+# held (checked against self.active_modifiers, not xdotool's own
+# bookkeeping — xdotool's --clearmodifiers cleanup reproducibly left AltGr
+# stuck held after a single ">", corrupting the next keystroke). Tracks
+# exactly what each keydown synthesized so the matching keyup releases
+# precisely that.
+#
+# For level>=2 (AltGr-involving) keysyms, delegates to
+# _whistler_remap_inject(keysym, down) instead of trying to synthesize
+# Shift+AltGr: GetKeyboardMapping's flat index does not reliably mean
+# "index 2 = AltGr, index 3 = Shift+AltGr" (confirmed live — a receiver
+# window showed exactly-correct Shift+AltGr state on the injected event,
+# genuinely held per XQueryKeymap, and GNOME still delivered the wrong
+# character). That mapping is actually governed by each key's XKB "type"
+# definition, invisible through the core-protocol GetKeyboardMapping call —
+# there is no reliable way to reverse-engineer it from there. Instead,
+# _whistler_remap_inject sidesteps the ambiguity entirely: temporarily remap
+# an unused ("scratch") keycode directly to the target keysym via
+# XChangeKeyboardMapping, press that keycode bare with no modifiers at all
+# (only "index 0" is ever read, unambiguous under every XKB type), then
+# restore it to NoSymbol on release. Scoped to level>=2 only — level 0/1 was
+# already reliable, and remapping broadcasts an X MappingNotify to every
+# client on the display (each recomputes its keymap cache), worth avoiding
+# for the common case.
+#
+# WHISTLER-DEBUG instrumentation throughout (grep that string) is kept at
+# DEBUG level, not INFO — proven valuable multiple times during this
+# investigation to correlate which of the three injection paths a given
+# keystroke took, but too noisy for default INFO-level logs since it fires
+# on every keystroke through these paths.
+#
+# Verified against a live session with an actual Mac keyboard driving both
+# `sv` and `en` GNOME input sources: `:`, `<`, `>`, å/ä/ö, `|`, `^` all
+# confirmed correct; XQueryKeymap confirmed no modifiers left stuck
+# afterward. Full investigation narrative: design/keyboards.md.
+--- a/src/selkies/input_handler.py
++++ b/src/selkies/input_handler.py
+@@ -1249,6 +1249,178 @@
+                 if self.uinput_mouse_socket_path: self.__mouse_emit(btn_uinput_or_pynput, 0)
+                 elif self.mouse: self.mouse.release(btn_uinput_or_pynput)
+ 
++    def _whistler_resolve_keycode(self, keysym):
++        """Find (keycode, level 0-3) for keysym via a LIVE protocol query
++        (get_keyboard_mapping, not the cached keycode_to_keysym/
++        keysym_to_keycode convenience methods - self.xdisplay is a
++        long-lived connection whose cache does NOT track GNOME's live
++        keymap reconciliation; confirmed directly, a fresh connection found
++        colon at keycode 60/level 1 while self.xdisplay's cache didn't).
++        Prefers the lowest level (0=base,1=shift,2=altgr,3=shift+altgr -
++        the X11 core-protocol convention; this server flattens multiple
++        XKB groups into one wide per-keycode list, so level = index % 4).
++        """
++        if not self.xdisplay:
++            return None, 0
++        try:
++            min_kc = self.xdisplay.display.info.min_keycode
++            max_kc = self.xdisplay.display.info.max_keycode
++            raw = self.xdisplay.get_keyboard_mapping(min_kc, max_kc - min_kc + 1)
++        except Exception:
++            return None, 0
++        # WHISTLER-DEBUG fix, take 6: idx % 4 is only a valid "level" when idx
++        # is actually IN group 0 (idx < 4) - this server flattens multiple XKB
++        # groups into one wide per-keycode list, and idx >= 4 belongs to a
++        # DIFFERENT group entirely, not "the same level in group 0". Confirmed
++        # directly: keycode 53 is "x X x X guillemetright greater x X" -
++        # "greater" sits at idx=5 (group 1), and idx=5 % 4 == 1 was wrongly
++        # treated as "just needs Shift", so pressing keycode 53 + Shift
++        # delivered group 0's REAL level 1 there ('X') instead - reproducing
++        # the exact ">" corruption. "less"/"greater" are ALSO natively in
++        # group 0 (keycode 94), so strictly preferring idx < 4 matches finds
++        # that instead; idx >= 4 is only used as a last-resort fallback (still
++        # group-ambiguous, but better than never matching at all).
++        best = None       # best idx<4 (group-0-safe) match: (keycode, level)
++        fallback = None   # best idx>=4 match, only used if no idx<4 exists
++        for offset, syms in enumerate(raw):
++            kc = min_kc + offset
++            for idx, ks in enumerate(syms):
++                if not ks or ks != keysym:
++                    continue
++                level = idx % 4
++                if idx < 4:
++                    if best is None or level < best[1]:
++                        best = (kc, level)
++                    if level == 0:
++                        return kc, 0
++                elif fallback is None:
++                    fallback = (kc, level)
++        if best is not None:
++            return best
++        if fallback is not None:
++            return fallback
++        return None, 0
++
++    def _whistler_alloc_scratch_keycode(self):
++        """Find (and cache) an unused keycode to remap on demand. Discovered
++        once per xdisplay connection via a live keymap query (NoSymbol on
++        every group/level), not hardcoded - the exact free keycodes are
++        keymap-layout-dependent."""
++        if not hasattr(self, '_whistler_scratch_pool'):
++            pool = []
++            try:
++                min_kc = self.xdisplay.display.info.min_keycode
++                max_kc = self.xdisplay.display.info.max_keycode
++                raw = self.xdisplay.get_keyboard_mapping(min_kc, max_kc - min_kc + 1)
++                for offset, syms in enumerate(raw):
++                    if not any(syms):
++                        pool.append(min_kc + offset)
++            except Exception:
++                pool = []
++            self._whistler_scratch_pool = pool
++            self._whistler_scratch_inuse = {}
++        return self._whistler_scratch_pool
++
++    async def _whistler_remap_inject(self, keysym, down):
++        """Inject one keysym by temporarily remapping an unused ("scratch")
++        keycode to it and pressing that keycode bare, with no modifiers at
++        all - then restoring the keycode to NoSymbol on release.
++
++        WHISTLER-DEBUG fix, take 7: level>=2 (AltGr-involving) characters
++        kept misrendering even with exactly-correct Shift+AltGr state
++        synthesized (confirmed via a receiver: keycode 15 pressed with
++        state=0x81 - genuinely Shift+Mod5/AltGr held, verified via
++        XQueryKeymap - still delivered "radical" instead of "asciicircum",
++        and keycode 51 delivered "multiply" instead of "bar"). Root cause:
++        GetKeyboardMapping's flat per-keycode index does not reliably mean
++        "index 2 = AltGr, index 3 = Shift+AltGr" - that mapping is actually
++        governed by the key's XKB "type" definition, which for two-groups
++        Swedish/US mixed layouts is not always the textbook FOUR_LEVEL type
++        the index%4 arithmetic assumes. There is no way to reverse-engineer
++        that from GetKeyboardMapping alone (it is a core-protocol
++        compatibility flattening, not the real XKB type table). Remapping a
++        scratch keycode sidesteps the whole problem: with no modifiers
++        involved, only "index 0" (unambiguous across every key type) is
++        ever used. Confirmed directly - same repro that previously produced
++        "√|" instead of "^|" now produces exactly the right bytes.
++
++        Scoped to level>=2 (AltGr) cases only, where this ambiguity has
++        actually been observed - level 0/1 injection via the plain
++        Shift-synthesis path in _whistler_xtest_inject is unaffected (types
++        for the no-AltGr levels have always resolved correctly here) and
++        remapping on every keystroke would add an X MappingNotify broadcast
++        (all clients recompute their keymap cache) that's better avoided
++        for the common case.
++        """
++        if not (self.xdisplay and xtest):
++            return False
++        if not hasattr(self, '_whistler_remap_lock'):
++            self._whistler_remap_lock = asyncio.Lock()
++        if down:
++            pool = self._whistler_alloc_scratch_keycode()
++            kc = next((c for c in pool if c not in self._whistler_scratch_inuse.values()), None)
++            if kc is None:
++                return False
++            async with self._whistler_remap_lock:
++                self.xdisplay.change_keyboard_mapping(kc, [(keysym, keysym, keysym, keysym)])
++                self.xdisplay.sync()
++                xtest.fake_input(self.xdisplay, X.KeyPress, kc)
++                self.xdisplay.sync()
++            self._whistler_scratch_inuse[keysym] = kc
++        else:
++            kc = self._whistler_scratch_inuse.pop(keysym, None)
++            if kc is None:
++                return False
++            xtest.fake_input(self.xdisplay, X.KeyRelease, kc)
++            self.xdisplay.sync()
++            async with self._whistler_remap_lock:
++                self.xdisplay.change_keyboard_mapping(kc, [(0, 0, 0, 0)])
++                self.xdisplay.sync()
++        logger_webrtc_input.debug(
++            f"WHISTLER-DEBUG remap-inject keysym={keysym:#x} down={down} scratch_kc={kc}"
++        )
++        return True
++
++    async def _whistler_xtest_inject(self, keysym, down):
++        """Inject one keysym via direct XTEST, bypassing xdotool's own
++        keycode/modifier resolution AND its own modifier bookkeeping
++        entirely (which reproducibly left AltGr stuck held - confirmed via
++        XQueryKeymap after a single ">" corrupted the next keystroke).
++        For level>=2 (AltGr-involving) keysyms, delegates to
++        _whistler_remap_inject instead of trying to synthesize Shift/AltGr -
++        see that method's docstring for why. For level 0/1, explicitly
++        synthesizes Shift only if needed and isn't already genuinely held,
++        tracked per-keysym so the matching keyup releases exactly what this
++        keydown pressed - keydown and keyup arrive as separate calls, so
++        state has to survive between them (unlike the co,end path, which
++        calls both back-to-back)."""
++        if not (self.xdisplay and xtest):
++            return False
++        kc, level = self._whistler_resolve_keycode(keysym)
++        if not kc or level >= 2:
++            return await self._whistler_remap_inject(keysym, down)
++        if not hasattr(self, '_whistler_synth_mods'):
++            self._whistler_synth_mods = {}
++        if down:
++            synthesized = []
++            if level & 1 and not ({65505, 65506} & self.active_modifiers):
++                shift_kc, _ = self._whistler_resolve_keycode(0xffe1)  # Shift_L
++                if shift_kc:
++                    xtest.fake_input(self.xdisplay, X.KeyPress, shift_kc)
++                    synthesized.append(shift_kc)
++            self._whistler_synth_mods[keysym] = synthesized
++            xtest.fake_input(self.xdisplay, X.KeyPress, kc)
++        else:
++            xtest.fake_input(self.xdisplay, X.KeyRelease, kc)
++            for mod_kc in reversed(self._whistler_synth_mods.pop(keysym, [])):
++                xtest.fake_input(self.xdisplay, X.KeyRelease, mod_kc)
++        self.xdisplay.sync()
++        logger_webrtc_input.debug(
++            f"WHISTLER-DEBUG XTEST-direct keysym={keysym:#x} down={down} "
++            f"keycode={kc} level={level}"
++        )
++        return True
++
+     async def send_x11_keypress(self, keysym, down=True):
+         if down:
+             if (self.active_modifiers & self.ACTION_MODIFIER_KEYSYMS) and keysym in CYRILLIC_TO_QWERTY_KEYSYM:
+@@ -1301,6 +1473,13 @@
+         action = "keydown" if down else "keyup"
+         command = None
+         use_pynput_for_printable = False
++        # WHISTLER-DEBUG: temporary instrumentation for a stochastic wrong-char /
++        # 1s-delay bug reported on plain punctuation (: < > |) that could not be
++        # reproduced on demand. Logs every branch this function can take, with
++        # timing, so a live repro can be correlated after the fact. Remove once
++        # root-caused — see design/keyboard_debug_logging.md if present.
++        _t0 = time.monotonic()
++        _char_repr = None
+         if is_printable:
+             unicode_codepoint = keysym & 0x00FFFFFF if (keysym & 0xFF000000) == 0x01000000 else keysym
+             try:
+@@ -1308,11 +1487,28 @@
+                 if char.isalpha():
+                     use_pynput_for_printable = True
+                 else:
++                    # WHISTLER-DEBUG fix, take 3: xdotool's "U0000" argument
++                    # (both bare and under --clearmodifiers) resolves via
++                    # xdotool's OWN internal keycode/modifier computation,
++                    # which for some characters on this multi-group keymap
++                    # goes through AltGr (ISO_Level3_Shift) - and its cleanup
++                    # doesn't always release that bit afterward. Confirmed
++                    # live: after typing ">", XQueryKeymap showed keycode 92
++                    # (AltGr) stuck held, corrupting the NEXT keypress
++                    # (reported: "<" became "|", exactly AltGr+less on this
++                    # keymap). Bypass xdotool for this path too - resolve the
++                    # keycode via this process's own X connection and inject
++                    # directly via XTEST, respecting whatever's genuinely
++                    # held (e.g. a real physical Shift) without any of
++                    # xdotool's own modifier bookkeeping to leak state from.
++                    if await self._whistler_xtest_inject(unicode_codepoint, down):
++                        return
+                     xdotool_arg = f"U{unicode_codepoint:04X}"
+                     if not self.active_shortcut_modifiers:
+                         command = ["xdotool", action, "--clearmodifiers", xdotool_arg]
+                     else:
+                         command = ["xdotool", action, xdotool_arg]
++                _char_repr = char
+             except ValueError:
+                 use_pynput_for_printable = True
+ 
+@@ -1328,29 +1524,68 @@
+                         else:
+                             self.active_shortcut_modifiers.discard(xdotool_arg)
+ 
++        logger_webrtc_input.debug(
++            f"WHISTLER-DEBUG entry keysym={keysym:#x} char={_char_repr!r} {action} "
++            f"is_printable={is_printable} use_pynput={use_pynput_for_printable} "
++            f"command={command} active_shortcut_mods={self.active_shortcut_modifiers} "
++            f"active_modifiers={self.active_modifiers}"
++        )
++
+         if command:
+             try:
+                 process = await subprocess.create_subprocess_exec(
+                     *command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                 )
+-                await asyncio.wait_for(process.communicate(), timeout=0.5)
++                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=0.5)
++                _elapsed_ms = (time.monotonic() - _t0) * 1000
+                 if process.returncode == 0:
++                    logger_webrtc_input.debug(
++                        f"WHISTLER-DEBUG xdotool-cmd OK keysym={keysym:#x} char={_char_repr!r} "
++                        f"{action} elapsed_ms={_elapsed_ms:.0f} cmd={command}"
++                    )
+                     return
+-            except Exception:
+-                pass
++                else:
++                    logger_webrtc_input.debug(
++                        f"WHISTLER-DEBUG xdotool-cmd NONZERO keysym={keysym:#x} char={_char_repr!r} "
++                        f"{action} elapsed_ms={_elapsed_ms:.0f} returncode={process.returncode} "
++                        f"stdout={stdout!r} stderr={stderr!r} cmd={command}"
++                    )
++            except Exception as e:
++                _elapsed_ms = (time.monotonic() - _t0) * 1000
++                logger_webrtc_input.debug(
++                    f"WHISTLER-DEBUG xdotool-cmd EXCEPTION keysym={keysym:#x} char={_char_repr!r} "
++                    f"{action} elapsed_ms={_elapsed_ms:.0f} exc={e!r} cmd={command}"
++                )
+ 
+         if use_pynput_for_printable or not command:
+             try:
++                if use_pynput_for_printable and await self._whistler_xtest_inject(keysym, down):
++                    return
++
+                 if not self.keyboard:
++                    logger_webrtc_input.debug(
++                        f"WHISTLER-DEBUG no-keyboard-controller keysym={keysym:#x} char={_char_repr!r} "
++                        f"{action} -> falling back to _xdotool_fallback"
++                    )
+                     await self._xdotool_fallback(keysym, down)
+                     return
+-                
++
+                 pynput_key = pynput.keyboard.KeyCode.from_vk(keysym)
+                 if down:
+                     self.keyboard.press(pynput_key)
+                 else:
+                     self.keyboard.release(pynput_key)
+-            except Exception:
++                _elapsed_ms = (time.monotonic() - _t0) * 1000
++                logger_webrtc_input.debug(
++                    f"WHISTLER-DEBUG pynput OK keysym={keysym:#x} char={_char_repr!r} "
++                    f"{action} elapsed_ms={_elapsed_ms:.0f}"
++                )
++            except Exception as e:
++                _elapsed_ms = (time.monotonic() - _t0) * 1000
++                logger_webrtc_input.debug(
++                    f"WHISTLER-DEBUG pynput EXCEPTION keysym={keysym:#x} char={_char_repr!r} "
++                    f"{action} elapsed_ms={_elapsed_ms:.0f} exc={e!r} -> falling back to _xdotool_fallback"
++                )
+                 await self._xdotool_fallback(keysym, down)
+ 
+     async def _xdotool_fallback(self, keysym_number, down=True):
+@@ -1419,6 +1654,14 @@
+         if not self.xdisplay:
+             return
+ 
++        # WHISTLER-DEBUG: see send_x11_keypress for context. Reaching this
++        # function at all means the fast path (xdotool-U-arg or pynput)
++        # already failed or threw — this IS the up-to-1s-per-attempt slow path.
++        _t0_fb = time.monotonic()
++        logger_webrtc_input.debug(
++            f"WHISTLER-DEBUG _xdotool_fallback ENTRY keysym={keysym_number:#x} down={down}"
++        )
++
+         xdotool_key_arg = None
+         char_for_type_cmd_fallback = None
+ 
+@@ -1474,13 +1717,23 @@
+                 stderr=subprocess.PIPE
+             )
+             stdout_key, stderr_key = await asyncio.wait_for(process_key.communicate(), timeout=1.0)
++            _elapsed_fb1 = (time.monotonic() - _t0_fb) * 1000
+             if process_key.returncode == 0 and not (stderr_key and (b"No such key name" in stderr_key or b"Error:" in stderr_key.lower())):
+                 fallback_succeeded = True
++                logger_webrtc_input.debug(
++                    f"WHISTLER-DEBUG _xdotool_fallback xdotool-key OK keysym={keysym_number:#x} "
++                    f"arg={xdotool_key_arg} elapsed_ms={_elapsed_fb1:.0f}"
++                )
+             else:
++                logger_webrtc_input.debug(
++                    f"WHISTLER-DEBUG _xdotool_fallback xdotool-key FAILED keysym={keysym_number:#x} "
++                    f"arg={xdotool_key_arg} elapsed_ms={_elapsed_fb1:.0f} "
++                    f"returncode={process_key.returncode} stderr={stderr_key!r} -> trying xdotool type"
++                )
+                 char_to_type = char_for_type_cmd_fallback
+                 if not char_to_type and 'keysym_name_from_xlib' in locals() and keysym_name_from_xlib and len(keysym_name_from_xlib) == 1:
+                     char_to_type = keysym_name_from_xlib
+-                
++
+                 if down and char_to_type and (0x20 <= ord(char_to_type) <= 0x7E or ord(char_to_type) >= 0xA0) and char_to_type.isprintable():
+                     command_type = ["xdotool", "type", "--clearmodifiers", char_to_type]
+                     try:
+@@ -1490,12 +1743,33 @@
+                             stderr=subprocess.PIPE
+                         )
+                         await asyncio.wait_for(process_type.communicate(), timeout=1.0)
++                        _elapsed_fb2 = (time.monotonic() - _t0_fb) * 1000
+                         if process_type.returncode == 0:
+                             fallback_succeeded = True
+-                    except (asyncio.TimeoutError, FileNotFoundError, Exception):
+-                        pass
+-        except (FileNotFoundError, asyncio.TimeoutError, Exception):
+-            pass
++                        logger_webrtc_input.debug(
++                            f"WHISTLER-DEBUG _xdotool_fallback xdotool-type "
++                            f"{'OK' if process_type.returncode == 0 else 'FAILED'} "
++                            f"keysym={keysym_number:#x} char={char_to_type!r} "
++                            f"total_elapsed_ms={_elapsed_fb2:.0f} returncode={process_type.returncode}"
++                        )
++                    except (asyncio.TimeoutError, FileNotFoundError, Exception) as e:
++                        _elapsed_fb2 = (time.monotonic() - _t0_fb) * 1000
++                        logger_webrtc_input.debug(
++                            f"WHISTLER-DEBUG _xdotool_fallback xdotool-type EXCEPTION "
++                            f"keysym={keysym_number:#x} char={char_to_type!r} "
++                            f"total_elapsed_ms={_elapsed_fb2:.0f} exc={e!r}"
++                        )
++                else:
++                    logger_webrtc_input.debug(
++                        f"WHISTLER-DEBUG _xdotool_fallback no-type-fallback-attempted "
++                        f"keysym={keysym_number:#x} char_to_type={char_to_type!r} down={down}"
++                    )
++        except (FileNotFoundError, asyncio.TimeoutError, Exception) as e:
++            _elapsed_fb1 = (time.monotonic() - _t0_fb) * 1000
++            logger_webrtc_input.debug(
++                f"WHISTLER-DEBUG _xdotool_fallback xdotool-key EXCEPTION keysym={keysym_number:#x} "
++                f"arg={xdotool_key_arg} elapsed_ms={_elapsed_fb1:.0f} exc={e!r}"
++            )
+ 
+     async def _inject_unicode_via_clipboard(self, text_to_type):
+         async with self.clipboard_injection_lock:
+@@ -2225,6 +2499,7 @@
+             self.on_ping_response(float("%.3f" % ((time.time() - self.ping_start) / 2 * 1000)))
+         elif msg_type == "kd":
+             keysym = int(toks[1])
++            logger_webrtc_input.debug(f"WHISTLER-DEBUG RAW-KD keysym={keysym:#x} active_modifiers={self.active_modifiers}")
+             if self.is_wayland:
+                 self.keyboard_queue.put_nowait(("kd", keysym))
+             else:
+@@ -2487,14 +2762,48 @@
+                 if self.is_wayland:
+                     self.keyboard_queue.put_nowait(("co_end", text_to_type))
+                 else:
+-                    cmd = ["xdotool", "type", text_to_type]
+-                    process = await subprocess.create_subprocess_exec(
+-                        *cmd,
+-                        stdout=subprocess.PIPE,
+-                        stderr=subprocess.PIPE
+-                    )
+-                    await asyncio.wait_for(process.communicate(), timeout=0.5)
+-            except Exception as e: logger_webrtc_input.warning(f"Error with co,end type: {e}")
++                    # WHISTLER-DEBUG fix, take 2: xdotool's OWN keysym resolution
++                    # (both "type" and "key <name>") can pick a GROUP-SPECIFIC
++                    # keycode+modifier combo instead of the simple, group-
++                    # independent one - reproduced directly: for "less" on a
++                    # multi-group (se,us,us) keymap, `xdotool key -- less`
++                    # injects keycode 52 (the PHYSICAL Z KEY) + Shift + AltGr,
++                    # which only means "<" under the "se" group's definition;
++                    # under "en" the receiving app sees just Shift+Z. Bypass
++                    # xdotool's resolution entirely: ask THIS process's own X
++                    # connection for the keycode directly (matching what
++                    # whistler-copy-agent already does for XF86Copy/Paste) and
++                    # inject via XTEST. Falls back to xdotool type for any
++                    # character with no direct keycode (real remap needed).
++                    _t0 = time.monotonic()
++                    _handled = bool(text_to_type)
++                    for c in (text_to_type or ""):
++                        ok_down = await self._whistler_xtest_inject(ord(c), True)
++                        ok_up = await self._whistler_xtest_inject(ord(c), False)
++                        if not (ok_down and ok_up):
++                            _handled = False
++                            break
++                    if _handled:
++                        logger_webrtc_input.debug(
++                            f"WHISTLER-DEBUG co-end XTEST text={text_to_type!r} "
++                            f"elapsed_ms={(time.monotonic()-_t0)*1000:.0f}"
++                        )
++                    if not _handled:
++                        cmd = ["xdotool", "type", text_to_type]
++                        process = await subprocess.create_subprocess_exec(
++                            *cmd,
++                            stdout=subprocess.PIPE,
++                            stderr=subprocess.PIPE
++                        )
++                        _stdout, _stderr = await asyncio.wait_for(process.communicate(), timeout=0.5)
++                        logger_webrtc_input.debug(
++                            f"WHISTLER-DEBUG co-end xdotool-type-fallback cmd={cmd!r} "
++                            f"elapsed_ms={(time.monotonic()-_t0)*1000:.0f} "
++                            f"returncode={process.returncode} stdout={_stdout!r} stderr={_stderr!r}"
++                        )
++            except Exception as e:
++                logger_webrtc_input.warning(f"Error with co,end type: {e}")
++                logger_webrtc_input.debug(f"WHISTLER-DEBUG co-end EXCEPTION text={text_to_type!r} exc={e!r}")
+         elif msg_type == "_ebc":
+             try:
+                 enable = toks[1].lower() == "true"

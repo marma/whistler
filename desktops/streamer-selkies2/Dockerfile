@@ -145,6 +145,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
       libxkbcommon-dev \
       ca-certificates \
+      # Applies keymap-injection.patch to the selkies source below.
+      patch \
  && rm -rf /var/lib/apt/lists/*
 
 # Selkies server from the pinned commit, in its own venv. Pulls
@@ -156,8 +158,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # required at runtime: GPUtil does `from distutils import spawn`, and distutils
 # left the stdlib in Python 3.12 — setuptools' shim puts it back.
 ADD https://github.com/selkies-project/selkies/archive/${SELKIES_COMMIT}.tar.gz /tmp/selkies.tar.gz
+# Multi-group X11 keymap character injection fixes (Mac + non-Mac clients
+# alike, on any session offering more than one GNOME input source) — see the
+# patch header and design/keyboards.md for the full investigation. Same file
+# as ../vm-gnome-selkies/bake/keymap-injection.patch — keep in sync. `patch`
+# exits non-zero, failing the build, if a pin bump makes it stale.
+COPY keymap-injection.patch /tmp/
 RUN mkdir /tmp/selkies-src \
  && tar -xzf /tmp/selkies.tar.gz -C /tmp/selkies-src --strip-components=1 \
+ && patch -p1 -d /tmp/selkies-src < /tmp/keymap-injection.patch \
  && python3 -m venv /opt/venv \
  && /opt/venv/bin/pip install --no-cache-dir \
       "pcmflux==${PCMFLUX_VERSION}" "pixelflux==${PIXELFLUX_VERSION}" \
