@@ -11,9 +11,9 @@
 #
 # The VM sibling is
 # ../vm-gnome-selkies/guest/usr/share/glib-2.0/schemas/90_whistler-desktop.gschema.override
-# — same filename, same background stanzas, and it additionally enables Ubuntu
-# Dock, which this image does not install. Not a synced pair: keep the
-# background in step, ignore the rest.
+# — same filename, same background and icon-theme stanzas, and it additionally
+# enables Ubuntu Dock, which this image does not install. Not a synced pair:
+# keep the background and icon theme in step, ignore the rest.
 #
 # Defaults, not locks: per-user dconf (a user changing the wallpaper in
 # Settings) still wins and persists in the mounted home.
@@ -33,3 +33,15 @@ picture-uri-dark='file:///usr/share/backgrounds/ubuntu-wallpaper-d.png'
 # schema has no picture-uri-dark).
 [org.gnome.desktop.screensaver]
 picture-uri='file:///usr/share/backgrounds/warty-final-ubuntu.png'
+
+# Ubuntu's icon set (yaru-theme-icon). Same reason as the background: Ubuntu
+# declares it in a `:ubuntu`-qualified stanza that never applies here, so
+# without this the session draws upstream Adwaita icons. The value is a theme
+# *directory name* under /usr/share/icons and nothing validates it — a
+# misspelling or an uninstalled theme silently falls back to Adwaita, so the
+# Dockerfile test -d's it next to the wallpapers.
+#
+# Not set: cursor-theme. Yaru's cursors ship in the same package, but Adwaita's
+# are what this session has always drawn; switching them is a separate call.
+[org.gnome.desktop.interface]
+icon-theme='Yaru'

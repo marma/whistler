@@ -77,18 +77,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       # glib-compile-schemas, for that override. Not in the base image, and
       # not guaranteed by anything above.
       libglib2.0-bin \
-      # Adwaita icon/cursor theme + sane default fonts so the Shell isn't a
-      # sea of missing-icon boxes.
+      # Yaru is Ubuntu's icon set, selected by the schema override below.
+      # adwaita-icon-theme stays: it is what Yaru falls back to for the icons
+      # it doesn't define. Yaru's own index.theme says `Inherits=Humanity,
+      # hicolor` (Humanity is a Suggests we don't install), but GTK appends
+      # Adwaita to every lookup chain regardless — verified: every
+      # Adwaita-only icon name still resolves under Yaru with Humanity absent.
+      # Drop adwaita-icon-theme and that safety net goes with it.
+      yaru-theme-icon \
       adwaita-icon-theme \
       fonts-ubuntu \
       fonts-dejavu-core \
-      # librsvg2-common provides the gdk-pixbuf *SVG loader*. Adwaita's icons
-      # are scalable SVGs; without it every icon renders as a tiny bitmap
-      # scaled to a blurry blob. Normally pulled via Recommends, which
-      # --no-install-recommends drops, so it MUST be explicit — and the loader
-      # cache is regenerated below because the dpkg trigger is unreliable in a
-      # docker build layer (loader present on disk but not in loaders.cache =
-      # still blurry).
+      # librsvg2-common provides the gdk-pixbuf *SVG loader*. Yaru's and
+      # Adwaita's icons are scalable SVGs; without it every icon renders as a
+      # tiny bitmap scaled to a blurry blob. Normally pulled via Recommends,
+      # which --no-install-recommends drops, so it MUST be explicit — and the
+      # loader cache is regenerated below because the dpkg trigger is
+      # unreliable in a docker build layer (loader present on disk but not in
+      # loaders.cache = still blurry).
       librsvg2-common \
       # Software OpenGL: mutter hard-requires GL; llvmpipe renders client-side
       # here and presents via the *streamer's* Xvfb GLX (started with
@@ -118,14 +124,17 @@ ENV DISPLAY=:0 \
     PGID=1000 \
     DESKTOP_SUDO=false
 
-# System-wide desktop defaults (Ubuntu's wallpaper — see the file's header for
-# why an unqualified override is the only thing that applies to this session).
-# --strict so a key that stops existing after a package bump fails the build;
-# the test -f guards the half --strict cannot see, a URI aimed at a path that
-# no longer exists, whose only symptom is a black desktop at runtime.
+# System-wide desktop defaults (Ubuntu's wallpaper and Yaru icons — see the
+# file's header for why an unqualified override is the only thing that applies
+# to this session). --strict so a key that stops existing after a package bump
+# fails the build; the test -f/-d guard the half --strict cannot see, a *value*
+# naming something that isn't installed — a URI aimed at a missing path (black
+# desktop) or an icon-theme name with no theme dir (silent fall back to
+# Adwaita). Neither shows up until the session is running.
 COPY 90_whistler-desktop.gschema.override /usr/share/glib-2.0/schemas/
 RUN test -f /usr/share/backgrounds/warty-final-ubuntu.png \
  && test -f /usr/share/backgrounds/ubuntu-wallpaper-d.png \
+ && test -d /usr/share/icons/Yaru \
  && glib-compile-schemas --strict /usr/share/glib-2.0/schemas
 
 # The session launcher (gnome-shell + curated settings daemons, not plain

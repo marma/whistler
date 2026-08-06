@@ -44,9 +44,18 @@ write_files:
       # release-independent default aliases the xfconf backdrop default points
       # at (guest/ etc/xdg/.../xfce4-desktop.xml). Nothing in xfce4 pulls it
       # in — without it the desktop is the stock Xfce mouse.
+      # yaru-theme-icon is Ubuntu's icon set, selected by the xsettings default
+      # next to it (guest/ etc/xdg/.../xsettings.xml) and equally not pulled in
+      # by anything. That override *replaces* a conffile xfce4-settings ships
+      # here — hence the artifacts.tar.gz extraction below must stay after this
+      # install, or dpkg's own file (IconThemeName=elementary-xfce-dark, a
+      # theme no Recommends brings in) is what the session reads.
+      # xfce4 depends on adwaita-icon-theme, which stays as the
+      # fallback for icons Yaru doesn't define (Yaru inherits Humanity/hicolor,
+      # never Adwaita — but GTK appends Adwaita to every lookup chain anyway).
       $APT install -y --no-install-recommends \
         xfce4 xfce4-terminal dbus-x11 \
-        ubuntu-wallpapers \
+        ubuntu-wallpapers yaru-theme-icon \
         xvfb x11-xserver-utils xcvt x11-utils xclip xdotool \
         x11-apps \
         pulseaudio pulseaudio-utils \
@@ -97,11 +106,14 @@ write_files:
                  /usr/local/bin/whistler-desktop-session \
                  /usr/local/bin/wtype
 
-      # The xfconf backdrop default that just landed points at a wallpaper by
-      # path, and nothing validates that at session start: a missing file just
-      # leaves xfdesktop on its built-in Xfce backdrop, silently. Assert it
-      # here so a renamed wallpaper fails the bake instead.
+      # The xfconf defaults that just landed name a wallpaper by path and an
+      # icon theme by name, and nothing validates either at session start: a
+      # missing picture just leaves xfdesktop on its built-in Xfce backdrop, an
+      # icon theme that isn't installed just leaves GTK on Adwaita — both
+      # silently. Assert them here so a renamed wallpaper or a dropped theme
+      # package fails the bake instead.
       test -f /usr/share/backgrounds/warty-final-ubuntu.png
+      test -d /usr/share/icons/Yaru
 
       # The streamer has no per-session inputs (its env file is optional), so
       # it is enabled at bake; the per-user whistler-desktop@<user> unit is

@@ -42,15 +42,21 @@ home mount, streamer env, session-unit start — see
   uses mount.cifs instead of the raw-kernel fallback) and purges snapd
   (snapd.seeded otherwise delays every session boot ~30 s).
 - **Ubuntu's default wallpaper** (`ubuntu-wallpapers`, which nothing in `xfce4`
-  pulls in) instead of the stock Xfce mouse, via the guest's
+  pulls in) instead of the stock Xfce mouse, and **Ubuntu's Yaru icons**
+  (`yaru-theme-icon`, likewise) instead of Adwaita, via the guest's
   [`xfce4-desktop.xml`](guest/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml)
+  and [`xsettings.xml`](guest/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml)
   — xfconf reads channel XML under `XDG_CONFIG_DIRS` as read-only defaults that
-  `~/.config/xfce4/xfconf/…` shadows, so a user's own wallpaper still wins and
-  persists in the SMB home. The backdrop property path embeds the RandR output
-  name, which for Xvfb is always `screen`; keep it in sync with the pod copy in
-  [`../xfce-plain/xfce4-desktop.xml`](../xfce-plain/xfce4-desktop.xml). A
-  backdrop path that no longer exists is silent (xfdesktop just keeps its
-  built-in one), so the bake `test -f`s the wallpaper.
+  `~/.config/xfce4/xfconf/…` shadows, so a user's own wallpaper or theme still
+  wins and persists in the SMB home. The backdrop property path embeds the
+  RandR output name, which for Xvfb is always `screen`; the icon theme reaches
+  the whole session via xfsettingsd's XSETTINGS. Keep both in sync with the pod
+  copies in [`../xfce-plain/`](../xfce-plain/). Icons only — the GTK widget
+  theme stays Xfce's default, with `adwaita-icon-theme` (an `xfce4` dependency)
+  underneath as the fallback for what Yaru doesn't define. A backdrop path that
+  no longer exists is silent (xfdesktop just keeps its built-in one), as is an
+  icon theme that isn't installed (GTK just uses Adwaita), so the bake `test`s
+  for both.
 - Unlike the pod images there is **no bwrap divert**: the VM has a full
   kernel and Ubuntu ships an AppArmor profile permitting bwrap's user
   namespace, so glycin's image-decode sandbox actually works here. If icons

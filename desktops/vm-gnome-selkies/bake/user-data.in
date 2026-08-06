@@ -83,6 +83,13 @@ write_files:
       # release-independent default aliases the schema override points at
       # (warty-final-ubuntu.png / ubuntu-wallpaper-d.png). It is not pulled in
       # by gnome-shell — the desktop background is stock Adwaita without it.
+      # yaru-theme-icon is Ubuntu's icon set, likewise not pulled in by
+      # anything and likewise selected by that override. adwaita-icon-theme
+      # stays alongside it: Yaru's index.theme inherits Humanity (a Suggests we
+      # don't install) and hicolor, never Adwaita, but GTK appends Adwaita to
+      # every lookup chain anyway — that is what covers the icons Yaru doesn't
+      # define. (yaru-theme-icon Breaks gnome-shell-extension-ubuntu-dock
+      # << 90~; noble ships 90ubuntu1+, so the dock above is fine.)
       $APT install -y --no-install-recommends \
         gnome-session gnome-shell gnome-settings-daemon \
         gnome-shell-extension-ubuntu-dock \
@@ -90,7 +97,7 @@ write_files:
         firefox google-chrome-stable \
         ubuntu-wallpapers \
         libglib2.0-bin \
-        adwaita-icon-theme fonts-ubuntu fonts-dejavu-core \
+        yaru-theme-icon adwaita-icon-theme fonts-ubuntu fonts-dejavu-core \
         librsvg2-common \
         libgl1-mesa-dri libglx-mesa0 mesa-utils \
         dbus dbus-x11 gnome-keyring \
@@ -173,25 +180,28 @@ write_files:
 
       # Regenerate the gdk-pixbuf loader cache so the SVG loader from
       # librsvg2-common is registered — the packaging trigger doesn't reliably
-      # fire here, and without it Adwaita's scalable icons render as blurry
-      # blobs (text stays crisp — the tell is "text sharp, icons blurry").
+      # fire here, and without it Yaru's and Adwaita's scalable icons render as
+      # blurry blobs (text stays crisp — the tell is "text sharp, icons blurry").
       /usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache
 
       # Compile the schema override that arrived in artifacts.tar.gz
       # (guest/ 90_whistler-desktop.gschema.override: Ubuntu Dock on the left,
-      # favorites, Ubuntu's default wallpaper). The session runs plain
-      # user-mode gnome-shell with XDG_CURRENT_DESKTOP=GNOME, so the dock and
-      # ubuntu-settings `:ubuntu`-qualified defaults never apply — this
-      # override is the only thing that turns the dock on and sets the
-      # background. --strict so a key that stops existing after a package bump
-      # fails the bake instead of silently shipping a dockless image.
+      # favorites, Ubuntu's default wallpaper, Yaru icons). The session runs
+      # plain user-mode gnome-shell with XDG_CURRENT_DESKTOP=GNOME, so the dock
+      # and ubuntu-settings `:ubuntu`-qualified defaults never apply — this
+      # override is the only thing that turns the dock on, sets the background
+      # and picks the icon theme. --strict so a key that stops existing after a
+      # package bump fails the bake instead of silently shipping a dockless
+      # image.
       #
-      # --strict validates key *names*, not the files a URI points at: a
-      # picture-uri aimed at a missing path just renders a black desktop, in
-      # the running session, long after the bake said OK. Assert them here so
-      # a renamed wallpaper fails the build instead.
+      # --strict validates key *names*, never what a value names: a picture-uri
+      # aimed at a missing path renders a black desktop, an icon-theme naming a
+      # theme that isn't installed quietly falls back to Adwaita — both in the
+      # running session, long after the bake said OK. Assert them here so a
+      # renamed wallpaper or a dropped theme package fails the build instead.
       test -f /usr/share/backgrounds/warty-final-ubuntu.png
       test -f /usr/share/backgrounds/ubuntu-wallpaper-d.png
+      test -d /usr/share/icons/Yaru
       glib-compile-schemas --strict /usr/share/glib-2.0/schemas
 
       # The streamer has no per-session inputs (its env file is optional), so

@@ -24,17 +24,21 @@ streamer's Xvfb GLX (the streamer starts Xvfb with `+extension GLX` for
 exactly this). MIT-SHM between the containers needs a shared IPC namespace —
 free inside a pod, explicit `ipc:` wiring in compose.
 
-The desktop shows **Ubuntu's default wallpaper** rather than upstream Adwaita:
-`ubuntu-wallpapers` plus
+The desktop shows **Ubuntu's default wallpaper and Yaru icons** rather than
+upstream Adwaita: `ubuntu-wallpapers` + `yaru-theme-icon` plus
 [`90_whistler-desktop.gschema.override`](90_whistler-desktop.gschema.override).
-Ubuntu ships its own background defaults in `ubuntu-settings`, but every stanza
+Ubuntu ships its own defaults for both in `ubuntu-settings`, but every stanza
 there is `:ubuntu`-qualified and this session is plain `gnome-shell --x11` with
-`XDG_CURRENT_DESKTOP=GNOME`, so only an unqualified override applies. It is a
-default, not a lock — a user changing the wallpaper in Settings wins and
-persists in the mounted home. The VM sibling
+`XDG_CURRENT_DESKTOP=GNOME`, so only an unqualified override applies. They are
+defaults, not locks — a user changing either in Settings wins and persists in
+the mounted home. `adwaita-icon-theme` stays installed underneath: Yaru
+inherits `Humanity,hicolor`, never Adwaita, but GTK appends Adwaita to every
+lookup chain, and that is what covers the icons Yaru doesn't define. Cursors
+stay Adwaita (Yaru's ship in the same package, but nothing selects them). The
+VM sibling
 [`../vm-gnome-selkies/guest/usr/share/glib-2.0/schemas/90_whistler-desktop.gschema.override`](../vm-gnome-selkies/guest/usr/share/glib-2.0/schemas/90_whistler-desktop.gschema.override)
-carries the same background stanzas plus Ubuntu Dock, which this image does not
-install.
+carries the same background and icon stanzas plus Ubuntu Dock, which this image
+does not install.
 
 Identity is runtime-configurable
 (`DESKTOP_USER`/`PUID`/`PGID`/`DESKTOP_SUDO`); the known GNOME-46 HiDPI

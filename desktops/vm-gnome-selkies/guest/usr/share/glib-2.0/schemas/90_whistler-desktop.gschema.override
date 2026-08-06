@@ -44,3 +44,17 @@ picture-uri-dark='file:///usr/share/backgrounds/ubuntu-wallpaper-d.png'
 # schema has no picture-uri-dark).
 [org.gnome.desktop.screensaver]
 picture-uri='file:///usr/share/backgrounds/warty-final-ubuntu.png'
+
+# Ubuntu's icon set (yaru-theme-icon), for the same reason as everything above:
+# Ubuntu's own default is `:ubuntu`-qualified, so without this stanza the
+# session — dock included — draws upstream Adwaita icons. The value is a theme
+# *directory name* under /usr/share/icons and nothing validates it: a
+# misspelling or an uninstalled theme just falls back to Adwaita, silently, so
+# the bake test -d's it alongside the wallpapers.
+#
+# Not set: cursor-theme. Yaru's cursors ride along in the same package, but
+# Adwaita's are what this session has always drawn; switching them is a
+# separate call. Kept in step with the pod sibling
+# desktops/gnome-plain/90_whistler-desktop.gschema.override.
+[org.gnome.desktop.interface]
+icon-theme='Yaru'

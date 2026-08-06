@@ -31,6 +31,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       # alias the xfconf backdrop default below points at. Nothing in xfce4
       # pulls it in — without it the desktop is the stock Xfce mouse.
       ubuntu-wallpapers \
+      # Ubuntu's icon set, selected by the xsettings default below. Also not
+      # pulled in by xfce4, which depends on adwaita-icon-theme instead — that
+      # stays as Yaru's fallback for icons it doesn't define.
+      yaru-theme-icon \
       ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
@@ -62,12 +66,19 @@ RUN useradd -m -s /bin/bash "${DESKTOP_USER}"
 ENV DESKTOP_USER=abc \
     DISPLAY=:0
 
-# System-wide xfdesktop defaults (Ubuntu's wallpaper — see the file's header
-# for the monitor-name and precedence details). The test -f is the only check
-# there is: xfdesktop treats a backdrop path that does not exist as "use my
-# built-in one" and says nothing, so a renamed wallpaper would ship silently.
-COPY xfce4-desktop.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml
-RUN test -f /usr/share/backgrounds/warty-final-ubuntu.png
+# System-wide xfconf defaults: Ubuntu's wallpaper (xfce4-desktop) and Yaru
+# icons (xsettings) — see each file's header for the monitor-name and
+# precedence details. xsettings.xml *replaces a conffile* xfce4-settings ships
+# (its stock IconThemeName is elementary-xfce-dark, a theme that arrives only
+# via a dropped Recommends), so this COPY must stay after the apt layer above.
+# The tests are the only checks there are: both settings
+# name something by string, and both fail *silently* if it isn't installed —
+# xfdesktop treats a missing backdrop path as "use my built-in one", GTK treats
+# an unknown icon theme as "use Adwaita". A renamed wallpaper or a dropped
+# theme package would otherwise ship green and only show up in a live session.
+COPY xfce4-desktop.xml xsettings.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/
+RUN test -f /usr/share/backgrounds/warty-final-ubuntu.png \
+ && test -d /usr/share/icons/Yaru
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

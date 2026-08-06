@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  System-wide xsettings defaults: Ubuntu's Yaru icon set.
+
+  This file OVERWRITES a dpkg conffile — xfce4-settings ships its own
+  /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml, and its
+  IconThemeName is `elementary-xfce-dark`, a theme that only arrives with
+  elementary-xfce-icon-theme — a Recommends, which these no-install-recommends
+  builds drop. So the stock default has always named a theme that isn't
+  installed and GTK has always silently fallen back to Adwaita. Replacing the file is
+  therefore the whole fix; adding one next to it would do nothing. The COPY
+  must stay *after* the apt layer that installs xfce4, or dpkg wins.
+
+  Same read path as the sibling xfce4-desktop.xml: xfconf reads every channel
+  XML under XDG_CONFIG_DIRS as read-only defaults that
+  ~/.config/xfce4/xfconf/... shadows, so this is a default, not a lock
+  (Settings → Appearance still wins, and the choice persists in the home
+  mount). The corollary bites on a *pre-existing* home: xfconfd rewrites the
+  entire channel to the user file the first time anything in it changes, so a
+  home first used under an image that lacked this override has the old value
+  frozen in and will never see Yaru. `xfconf-query -c xsettings -p
+  /Net/IconThemeName` in a live session is the only way to tell.
+
+  xfsettingsd is what turns this into the XSETTINGS property GTK apps read, so
+  it reaches the whole session — panel, xfdesktop, Thunar, GTK dialogs — and
+  nothing else needs to be told.
+
+  Yaru's index.theme says `Inherits=Humanity,hicolor` and Humanity is not
+  installed, but that costs nothing: GTK appends Adwaita to every lookup chain
+  regardless, and adwaita-icon-theme arrives as a hard dependency of xfce4.
+  Icons Yaru doesn't define still resolve.
+
+  Net/ThemeName (the GTK *widget* theme) is deliberately absent — this is the
+  icon set only; the widgets stay on the Xfce default.
+
+  Nothing validates the name: an icon theme that isn't installed makes GTK fall
+  straight back to Adwaita, silently and identically to having no override at
+  all — hence the `test -d /usr/share/icons/Yaru` next to the COPY.
+
+  The VM sibling is
+  ../vm-xfce-selkies/guest/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml
+  — keep the two in sync (same convention as xfce4-desktop.xml).
+-->
+<channel name="xsettings" version="1.0">
+  <property name="Net" type="empty">
+    <property name="IconThemeName" type="string" value="Yaru"/>
+  </property>
+</channel>
