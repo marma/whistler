@@ -15,7 +15,7 @@ guest `:8082`.
 (unix sockets don't cross it), so VMs run an in-guest streamer. Same reasoning,
 same in-guest `whistler-streamer.service` + `whistler-desktop@<user>.service`
 split as `vm-xfce-selkies`; cloud-init stays the per-session control plane
-(user/uid/keys, SMB home mount, streamer env, session-unit start — see
+(user/uid/keys, NFS home mount, streamer env, session-unit start — see
 [whistler/cloudinit.py](../../whistler/cloudinit.py)).
 
 ## The crux: Ubuntu 24.04 / GNOME 46 (not 26.04)
@@ -86,7 +86,7 @@ Check `journalctl -u whistler-desktop@<user>` in the guest first.
   knobs from `/etc/whistler/streamer.env` (cloud-init writes it from the
   template's `streamerEnv` + `displayPort`).
 - **`whistler-desktop@<user>.service`** (template unit, `User=%i`): waits for
-  the streamer's X and the SMB home mount, then runs `gnome-shell --x11` under
+  the streamer's X and the NFS home mount, then runs `gnome-shell --x11` under
   `dbus-run-session` via
   [`gnome-session-launch.sh`](guest/usr/local/bin/gnome-session-launch.sh) —
   which launches the Shell + a **curated** set of gsd plugins directly, NOT
@@ -117,7 +117,7 @@ Check `journalctl -u whistler-desktop@<user>` in the guest first.
   bake `test`s the two wallpapers and the theme directory as well.
   `adwaita-icon-theme` stays installed as Yaru's fallback (Yaru inherits
   `Humanity,hicolor`, but GTK appends Adwaita to every lookup chain); cursors
-  stay Adwaita. Defaults, not locks: per-user dconf in the SMB home still wins.
+  stay Adwaita. Defaults, not locks: per-user dconf in the NFS home still wins.
 
 ## Streaming mode is required
 
@@ -272,7 +272,7 @@ desktops/vm-gnome-selkies/test.sh   # boots the baked disk with a session-like
 
 It generates the seed with the real `whistler.cloudinit.build_user_data`
 (desktop mode, H264 streaming mode on), boots the disk with `hostfwd`, waits for
-Selkies to serve HTTP, then over SSH fakes the SMB share landing (tmpfs on the
+Selkies to serve HTTP, then over SSH fakes the NFS export landing (tmpfs on the
 home mountpoint — no gateway outside the cluster) and asserts `gnome-shell` comes
 up *and stays up* with windows in the streamer's X, and that a fresh SSH
 connection still authenticates once the mount shadows `~/.ssh/authorized_keys`.

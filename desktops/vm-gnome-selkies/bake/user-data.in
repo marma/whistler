@@ -106,7 +106,7 @@ write_files:
         pulseaudio pulseaudio-utils \
         python3 python3-venv libxkbcommon0 \
         ssl-cert ca-certificates curl \
-        cifs-utils
+        nfs-common
 
       # NVIDIA driver for KubeVirt GPU-passthrough sessions. Only present in
       # the CUDA variant (build.sh CUDA=1 sets NVIDIA_DRIVER_PACKAGE — a valid

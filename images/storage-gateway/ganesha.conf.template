@@ -1,0 +1,88 @@
+# Rendered by entrypoint.sh (@USER@/@UID@/@GID@ -> the Whistler user).
+#
+# Strict single-user home profile: server-side identity only. AUTH_SYS lets a
+# client assert any uid — and the guest is root, so it can — therefore the
+# export trusts none of it: `Squash = All_Squash` maps EVERY request to the
+# user's real uid/gid, the direct analog of Samba's `force user`. Files land
+# on the PVC owned by that uid, consistent with pod sessions mounting the
+# same PVC directly, and a guest chown to another uid fails EPERM.
+#
+# What this does NOT do is authenticate: there is no per-share credential the
+# way SMB had one. Reaching the export is the whole permission, so the
+# boundary is the fencing NetworkPolicy (_build_gateway_network_policy) plus
+# the per-user namespace. sec=krb5 would restore per-principal auth if that
+# is ever needed — see design/security.md.
+
+NFS_CORE_PARAM {
+	NFS_Port = 2049;
+	# NFSv4 only. Locking and open state ride the same TCP connection, so
+	# there is no rpcbind, no NLM, no statd, and exactly one port to fence.
+	NFS_Protocols = 4;
+	Enable_NLM = false;
+	Enable_RQUOTA = false;
+	Enable_UDP = false;
+}
+
+NFSV4 {
+	# 4.1+ only. NFSv4.0 puts callbacks (delegations, lock recalls) on a
+	# connection the SERVER opens back to the client, which the gateway's
+	# ingress-only fencing can never allow; 4.1 sessions carry the
+	# backchannel over the client's own connection instead.
+	Minor_Versions = 1, 2;
+	# Ship uids/gids as numbers rather than user@domain strings. The guest
+	# is created with the same real uid as the PVC's files (cloud-init), so
+	# the numbers already agree and neither side needs an idmapd domain to
+	# match — which they would not, the guest hostname being per-session.
+	Only_Numeric_Owners = true;
+	# No delegations: a home has one live session, so there is nothing to
+	# win, and a recall would need the 4.1 backchannel to stay healthy
+	# across a NetworkPolicy that only permits guest-initiated traffic.
+	Delegations = false;
+	# Lock-recovery window after a gateway restart. The default 90s is 90s
+	# of stalled I/O in every `hard`-mounted guest on every roll of the
+	# Deployment (routine in the dev loop). Recovery state lives on the
+	# container filesystem and is therefore empty after a restart, so
+	# nothing is actually waiting to reclaim; keep a short window rather
+	# than Graceless so a client that IS holding locks gets a chance.
+	# Measured with these values: a `docker restart` of the gateway cost a
+	# live client a 9s write stall and no errors.
+	Lease_Lifetime = 10;
+	Grace_Period = 20;
+}
+
+# No Kerberos: SecType is sys everywhere below. Saying so explicitly keeps
+# ganesha from trying to initialise GSSAPI against a keytab that isn't there.
+NFS_KRB5 {
+	Active_krb5 = false;
+}
+
+EXPORT {
+	Export_Id = 1;
+	Path = /shares/home;
+	# What the guest mounts: <gateway>:/home.
+	Pseudo = /home;
+	Access_Type = RW;
+	Protocols = 4;
+	Transports = TCP;
+	SecType = sys;
+	# The identity boundary. Anonymous_Uid/Gid are the user's REAL ids, so
+	# squashing is not a downgrade to `nobody` — it is a pin to the one
+	# identity this export is allowed to act as.
+	Squash = All_Squash;
+	Anonymous_Uid = @UID@;
+	Anonymous_Gid = @GID@;
+	# The PVC carries plain POSIX modes and nothing sets NFSv4 ACLs on it;
+	# leaving ACL support on would have the client fetch and merge an ACL
+	# view of every mode it already knows how to read.
+	Disable_ACL = true;
+	Filesystem_Id = 1.1;
+	FSAL {
+		Name = VFS;
+	}
+}
+
+# Where the log GOES is the entrypoint's `-L STDOUT` (ganesha takes the token,
+# not a path — /dev/stdout is rejected outright); this only sets how much.
+LOG {
+	Default_Log_Level = EVENT;
+}

@@ -109,7 +109,7 @@ cp -a guest/. "$STAGE_DIR/"
 # --mode go-w: the staging dir inherits the repo's group-writable modes, and
 # extracting ./etc ./usr with g+w onto the guest made sshd's StrictModes
 # refuse the whole /etc/ssh/authorized_keys.d path ("bad ownership or modes
-# for directory /etc") — which surfaces only once the SMB home shadows
+# for directory /etc") — which surfaces only once the NFS home shadows
 # ~/.ssh/authorized_keys, i.e. exactly when the root-disk path must work.
 tar --owner=0 --group=0 --mode=go-w -czf "$SEED_DIR/artifacts.tar.gz" -C "$STAGE_DIR" .
 

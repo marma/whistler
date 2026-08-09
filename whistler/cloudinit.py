@@ -3,29 +3,30 @@
 Pure (no Kubernetes imports) so it is unit-testable without a cluster, like
 `KubeConfigManager._build_pod_spec`. The generated ``#cloud-config`` document
 creates the Whistler user with their real username/uid inside the guest and
-mounts their home from the per-user SMB storage gateway
-(``whistler-storage-<user>``, see images/storage-gateway/) over cifs.
+mounts their home from the per-user NFS storage gateway
+(``whistler-storage-<user>``, see images/storage-gateway/) over NFSv4.2.
 
-Why SMB and not virtiofs: KubeVirt (<= 1.8) runs virtiofsd unprivileged
+Why a gateway and not virtiofs: KubeVirt (<= 1.8) runs virtiofsd unprivileged
 (hardcoded uid 107, --sandbox=none, caps dropped — upstream kubevirt#13028),
 which makes a virtiofs-shared home read-only for the guest user. The gateway
 gives server-side identity instead: client uids are never trusted, and its
-``force user`` lands every write on the PVC as the user's real uid.
+``Squash = All_Squash`` to the user's real uid/gid lands every write on the
+PVC as that uid (the successor to Samba's ``force user``).
 
 Mount mechanics: a systemd oneshot (whistler-home.service, written by
 write_files, kicked off by runcmd and enabled for later boots) retries the
-mount. It prefers mount.cifs (the fstab entry with ``credentials=``) when
-the image ships cifs-utils, and otherwise does a raw kernel-cifs mount:
-it resolves the gateway itself (getent; DNS egress is open — the kernel
-can't resolve) and passes username=/password= from the credentials file
-(``credentials=`` is parsed by mount.cifs only, never by the kernel).
-Deliberately NO ``packages: [cifs-utils]``: the default user-namespace
-egress is DNS + gateway-SMB only, so apt just burns ~50s timing out on
+mount. It prefers mount.nfs4 (the fstab entry) when the image ships
+nfs-common, and otherwise does a raw kernel mount: the kernel's NFSv4 text
+mount interface cannot resolve DNS, so the script resolves the gateway
+itself (getent; DNS egress is open) and passes the result as ``addr=``.
+Both paths verified against the real gateway image.
+Deliberately NO ``packages: [nfs-common]``: the default user-namespace
+egress is DNS + gateway-NFS only, so apt just burns ~50s timing out on
 unreachable mirrors — and the packages module runs *before* runcmd, which
 delayed the mount by that much past the login prompt (measured live). The
-raw kernel path needs no userspace helper and is the verified primary. A
-unit rather than a bare runcmd mount so persistent-root (CDI) guests
-remount on every boot — runcmd is once-per-instance.
+raw kernel path needs no userspace helper. A unit rather than a bare runcmd
+mount so persistent-root (CDI) guests remount on every boot — runcmd is
+once-per-instance.
 
 Mount latency: runcmd alone is too late a trigger — cloud-final waits for
 multi-user.target, which snapd.seeded holds up for ~30s on stock Ubuntu
@@ -40,8 +41,8 @@ honest "home not ready" signal; anything written there would be shadowed
 by the mount. The mount script respawns the autologin getty once the share
 lands so a console shell opened early doesn't keep the shadowed directory
 as its cwd. ``useradd -m`` neither chowns nor skels the existing mountpoint
-— harmless; in-guest ownership after the mount comes from the uid=/gid=
-mount options.
+— harmless; ownership after the mount is whatever the PVC says, which the
+gateway's entrypoint has already claimed for the user.
 
 Console access is via serial-getty autologin rather than a generated
 password: the portal's auth + RBAC already gate who can reach the console
@@ -53,20 +54,22 @@ additional isolation.)
 
 import yaml
 
-SMB_CREDENTIALS_PATH = "/etc/whistler/smb-credentials"
 STREAMER_ENV_PATH = "/etc/whistler/streamer.env"
+# The gateway's Ganesha pseudo-path (images/storage-gateway/ganesha.conf.template).
+NFS_EXPORT = "/home"
 
 
 def build_user_data(*, username: str, uid: int, ssh_keys: list,
-                    hostname: str, smb_host: str, smb_password: str,
+                    hostname: str, nfs_host: str,
                     gid: int = None,
                     autologin: bool = True, desktop: bool = False,
                     streamer_env: dict = None,
                     display_port: int = None) -> str:
     """Return a ``#cloud-config`` userData document for cloudInitNoCloud.
 
-    ``smb_host`` is the storage gateway Service DNS name;
-    ``smb_password`` the user's password from Secret whistler-smb-<user>.
+    ``nfs_host`` is the storage gateway Service DNS name. There is no
+    credential to pass: NFS AUTH_SYS has none, and reaching the export is the
+    whole permission (fenced by NetworkPolicy — see design/security.md).
 
     ``desktop=True`` targets a Whistler desktop-VM image (viewer:
     websockets — e.g. desktops/vm-xfce-selkies): the image ships the
@@ -84,76 +87,71 @@ def build_user_data(*, username: str, uid: int, ssh_keys: list,
     home = f"/home/{username}"
     keys = list(ssh_keys or [])
     gid = uid if gid is None else gid
-    # Mount options: server-side identity means the client-side uid=/gid= only
-    # shape the in-guest VIEW (what lands on the PVC is decided by the gateway's
-    # force user). vers=3.1.1 + seal to match the gateway's `server min
-    # protocol` / `server smb encrypt = required`; hard (not soft) so a gateway
-    # blip blocks I/O instead of corrupting it; nofail + _netdev so boot
-    # survives the gateway being unreachable.
+    # Mount options. Unlike cifs there is no client-side uid=/gid= remapping:
+    # NFSv4 with AUTH_SYS and numeric owners (the gateway sets
+    # Only_Numeric_Owners) passes the PVC's real ids straight through, and the
+    # guest user is created with exactly those ids below — so the view in the
+    # guest and the ownership on disk are the same thing, not two things kept
+    # in sync. What lands on the PVC is still decided server-side by the
+    # export's Squash = All_Squash, whatever uid the (root) guest asserts.
     #
-    # `posix` is load-bearing: it makes the cifs client actually USE the SMB3.1.1
-    # POSIX extensions the gateway advertises (smb3 unix extensions = yes), so
-    # per-file chmod / the executable bit round-trips to the real on-disk mode —
-    # durable and consistent with pod sessions on the same PVC. WITHOUT `posix`
-    # the client negotiates the dialect but ignores POSIX mode semantics: it
-    # drops chmod silently and pins a fixed file_mode. Deliberately NO
-    # file_mode/dir_mode here — those would override the real POSIX modes.
+    # Nothing here corresponds to the old `posix` / `mfsymlinks` / `nobrl`
+    # trio: NFS carries per-file modes, real symlinks and byte-range locks
+    # natively. The last of those is why this is NFS at all — cifs answered
+    # SQLite's past-EOF F_WRLCK with EACCES, costing a flat 100s stall and
+    # then "database is locked" for nautilus, dconf, gnome-keyring and
+    # Chrome's profile; the same lock over NFSv4 is granted immediately.
     #
-    # `mfsymlinks` is required alongside `posix`: cifs's native SMB3.1.1 POSIX
-    # symlinks can't take utimensat(AT_SYMLINK_NOFOLLOW) — lutimes on a symlink
-    # returns EOPNOTSUPP (os error 95) and some tools even hit ELOOP on the
-    # link. That breaks anything that stamps symlink times, e.g. pixi/conda
-    # linking a versioned .so (libz.so.1 -> libz.so.1.3.2). mfsymlinks stores
-    # symlinks as Minshall+French regular files, where time-setting works, and
-    # coexists with `posix` (chmod still maps to the real mode). Trade-off: to a
-    # pod mounting the PVC directly a VM-created symlink is a small regular file
-    # with an XSym header, not a native symlink — acceptable, VMs own their home.
-    # `nobrl` is load-bearing for anything that keeps a SQLite database in
-    # $HOME — which on a GNOME desktop is nearly everything: nautilus's
-    # tags/starred store (~/.local/share/nautilus/tags/meta.db), tracker,
-    # dconf, and Chrome's whole profile. SQLite locks a byte range far past
-    # EOF (F_WRLCK at offset 0x40000002, len 510) and cifs forwards that to
-    # the server, which answers EACCES. SQLite reads EACCES as contention and
-    # spins its busy handler — measured on this gateway: 1010 retries x 100ms
-    # = a flat 100s stall, then failure ("database is locked"). Nautilus does
-    # this synchronously *before* it opens the display, so a Files/Trash click
-    # blew through dbus's 120s activation timeout and the icon simply never
-    # opened. Same share, same moment, with nobrl: 0.05s. nobrl keeps byte
-    # range locks client-local instead of sending them to the server; the
-    # coherence it trades away was never there anyway (a pod mounting this PVC
-    # directly never saw the VM's locks), and a home has one live session.
-    base_opts = (
-        f"vers=3.1.1,seal,posix,mfsymlinks,nobrl,uid={uid},gid={gid},"
-        "nosuid,nodev,hard"
-    )
-    mount_opts = (
-        f"credentials={SMB_CREDENTIALS_PATH},{base_opts},nofail,_netdev"
-    )
-    # Fallback mounter (see module docstring): raw kernel-cifs mount for
-    # guests without cifs-utils. The credentials file's username=/password=
-    # lines are deliberately valid shell, so the same file both feeds
-    # mount.cifs (credentials=) and is sourced here. After a successful
-    # mount the autologin getty is respawned: a console shell spawned in
-    # the pre-mount window keeps the now-shadowed directory as its cwd.
+    # vers=4.2 pins the dialect (the gateway allows 4.1+ only: NFSv4.0 puts
+    # callbacks on a server->client connection its ingress fencing can never
+    # permit). hard (not soft) so a gateway blip blocks I/O instead of
+    # corrupting it; nofail + _netdev so boot survives an absent gateway.
+    #
+    # `noauto` is load-bearing for boot latency. cloud-init's `mounts` module
+    # runs `mount -a` synchronously in the init stage, and a gateway that
+    # silently drops packets (rather than refusing the connection) costs one
+    # TCP connect budget there — measured at 181s against a black hole, well
+    # past the login prompt. noauto keeps `mount -a` and systemd's fstab
+    # generator off this entry entirely, leaving whistler-home.service as the
+    # only mounter; it runs detached, so a slow attempt delays the home and
+    # nothing else. The entry still exists because the script mounts by
+    # mountpoint (`mount $HOME_DIR`) and reads its options from here.
+    #
+    # retry=0 then bounds each of those attempts to a single try instead of
+    # mount.nfs retrying internally for two minutes on top. It is a mount.nfs
+    # option, so it is deliberately absent from the raw kernel options below,
+    # which the kernel would reject.
+    base_opts = "vers=4.2,hard,nosuid,nodev"
+    mount_opts = f"{base_opts},retry=0,noauto,nofail,_netdev"
+    # Fallback mounter (see module docstring): raw kernel mount for guests
+    # without nfs-common. The kernel's NFSv4 text mount interface cannot
+    # resolve DNS, so the script resolves the gateway and passes addr=.
+    # After a successful mount the autologin getty is respawned: a console
+    # shell spawned in the pre-mount window keeps the now-shadowed directory
+    # as its cwd.
     getty_respawn = (
         "systemctl try-restart serial-getty@ttyS0.service\n" if autologin
         else "")
     mount_script = f"""#!/bin/sh
 # Written by Whistler cloud-init; run by whistler-home.service.
 set -u
-HOST={smb_host}
+HOST={nfs_host}
 HOME_DIR={home}
 mountpoint -q "$HOME_DIR" && exit 0
+# Own the mountpoint rather than waiting for cloud-init's mounts module to
+# make it: bootcmd kicks this script off well before that module runs. Left
+# root-owned on purpose — see the module docstring, it is the "home not
+# ready" signal.
+mkdir -p "$HOME_DIR"
 mount_once() {{
-    if command -v mount.cifs >/dev/null 2>&1; then
+    if command -v mount.nfs4 >/dev/null 2>&1; then
         mount "$HOME_DIR"
     else
-        modprobe cifs 2>/dev/null || true
+        modprobe nfsv4 2>/dev/null || true
         ip="$(getent hosts "$HOST" | cut -d' ' -f1)"
         [ -n "$ip" ] || return 1
-        . {SMB_CREDENTIALS_PATH}
-        mount -t cifs "//$HOST/home" "$HOME_DIR" \\
-            -o "ip=$ip,username=$username,password=$password,{base_opts}"
+        mount -t nfs4 "$HOST:{NFS_EXPORT}" "$HOME_DIR" \\
+            -o "addr=$ip,{base_opts}"
     fi
 }}
 i=0
@@ -186,13 +184,6 @@ exit 1
                 "/etc/ssh/authorized_keys.d/%u\n"
             ),
         },
-        # Root-only cifs credentials; referenced from the fstab entry so the
-        # password never appears in the mount table or process lists.
-        {
-            "path": SMB_CREDENTIALS_PATH,
-            "permissions": "0600",
-            "content": f"username={username}\npassword={smb_password}\n",
-        },
         {
             "path": "/usr/local/sbin/whistler-mount-home",
             "permissions": "0755",
@@ -224,6 +215,15 @@ exit 1
         # never blocked. Waiting for runcmd instead would sit behind
         # snapd.seeded/multi-user, ~30s past the login prompt.
         "bootcmd": [
+            # The guest's primary group must really BE the PVC's gid: NFS
+            # passes numeric owners through untranslated, so unlike the old
+            # cifs gid= there is nothing remapping the view. useradd would
+            # otherwise invent a user-private group at whatever gid happens
+            # to be free. bootcmd runs before cloud-init's users-groups
+            # module (and on every boot, so it is idempotent by construction),
+            # which is what lets `primary_group` below reference this gid.
+            f"getent group {gid} >/dev/null || groupadd -g {gid} {username}"
+            " || true",
             "setsid sh -c 'i=0; while [ ! -x /usr/local/sbin/whistler-mount-home ]"
             " && [ $i -lt 120 ]; do i=$((i+1)); sleep 1; done;"
             " exec /usr/local/sbin/whistler-mount-home'"
@@ -231,7 +231,7 @@ exit 1
         ],
         # [fs_spec, fs_file, fs_vfstype, fs_mntops, fs_freq, fs_passno].
         "mounts": [
-            [f"//{smb_host}/home", home, "cifs", mount_opts, "0", "0"],
+            [f"{nfs_host}:{NFS_EXPORT}", home, "nfs4", mount_opts, "0", "0"],
         ],
         # No `default` entry: this suppresses the image's built-in user
         # (uid 1000 in containerdisks images), freeing that uid for ours.
@@ -239,6 +239,9 @@ exit 1
             {
                 "name": username,
                 "uid": str(uid),
+                # Numeric: useradd --gid takes a gid, and bootcmd has just
+                # guaranteed a group holds it.
+                "primary_group": str(gid),
                 "shell": "/bin/bash",
                 "sudo": "ALL=(ALL) NOPASSWD:ALL",
                 "groups": ["sudo"],
@@ -307,9 +310,11 @@ def resolve_uid(user_details) -> int:
 
 
 def resolve_gid(user_details) -> int:
-    """POSIX gid for the guest's SMB mount view: explicit ``gid`` field, else
-    the pod securityContext's runAsGroup, else the resolved uid (single-user-
-    group convention, matching the guest's own user-private group)."""
+    """POSIX gid the home is owned by: explicit ``gid`` field, else the pod
+    securityContext's runAsGroup, else the resolved uid (single-user-group
+    convention, matching the guest's own user-private group). It is both the
+    export's Anonymous_Gid and the guest user's primary group — with numeric
+    NFSv4 owners those are the same number by construction."""
     user_details = user_details or {}
     gid = user_details.get("gid")
     if gid is None:

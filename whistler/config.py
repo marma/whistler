@@ -427,7 +427,7 @@ class KubeConfigManager(ConfigManager):
             "WHISTLER_STREAMER_IMAGE",
             "ghcr.io/marma/whistler-streamer-selkies2:latest",
         )
-        # Per-user SMB storage gateway (VM homes): image plus values-level
+        # Per-user NFS storage gateway (VM homes): image plus values-level
         # placement/limits, passed by the chart as JSON envs (nodeSelector
         # and resources are maps, which a plain env var can't carry).
         self.storage_gateway_image = os.environ.get(
@@ -1336,13 +1336,14 @@ class KubeConfigManager(ConfigManager):
         return [
             # Session pods (including VM virt-launcher pods, whose guest
             # traffic is masqueraded through them) may reach the user's own
-            # storage gateway on SMB. Same-namespace podSelector; the
+            # storage gateway on NFS. Same-namespace podSelector; the
             # gateway's dedicated policy (_build_gateway_network_policy)
-            # narrows the ingress side.
+            # narrows the ingress side. One port is the whole rule because
+            # the export is NFSv4-only — no rpcbind, no NLM, no statd.
             {
                 "to": [{"podSelector": {
                     "matchLabels": {"app": "whistler-storage-gateway"}}}],
-                "ports": [{"port": 445, "protocol": "TCP"}],
+                "ports": [{"port": 2049, "protocol": "TCP"}],
             },
         ]
 
@@ -1733,7 +1734,7 @@ class KubeConfigManager(ConfigManager):
 
     def _build_vm_spec(self, *, session_name, hostname, username, uid,
                        template_spec, display_port, instancetype,
-                       preemptible, smb_host, smb_password,
+                       preemptible, nfs_host,
                        user_details=None, run_strategy="Halted",
                        portal_public_key=None, viewer=None):
         """Build a KubeVirt VirtualMachine manifest from resolved inputs.
@@ -1745,8 +1746,8 @@ class KubeConfigManager(ConfigManager):
         root), `imageURL` an HTTP qcow2/raw imported by CDI into a per-session
         root PVC via dataVolumeTemplates. The user's home PVC is NOT attached
         to the VM: it is mounted by the per-user storage gateway
-        (ensure_storage_gateway) and reaches the guest as a cifs mount of
-        ``//smb_host/home`` set up by cloud-init — KubeVirt's unprivileged
+        (ensure_storage_gateway) and reaches the guest as an NFSv4.2 mount of
+        ``nfs_host:/home`` set up by cloud-init — KubeVirt's unprivileged
         virtiofsd made a directly-shared home read-only for the guest user
         (kubevirt#13028), and keeping the PVC off the VM also sidesteps RWO
         contention with the gateway. cloud-init creates the real user
@@ -1807,8 +1808,7 @@ class KubeConfigManager(ConfigManager):
             gid=resolve_gid(user_details),
             ssh_keys=ssh_keys,
             hostname=hostname,
-            smb_host=smb_host,
-            smb_password=smb_password,
+            nfs_host=nfs_host,
             desktop=desktop_stream,
             streamer_env=template_spec.get('streamerEnv') if desktop_stream else None,
             display_port=display_port if desktop_stream else None,
@@ -1832,9 +1832,9 @@ class KubeConfigManager(ConfigManager):
 
         # The userData travels via a per-session Secret (userDataSecretRef),
         # not inline: KubeVirt's admission webhook caps inline userData at
-        # 2048 bytes (ours exceeds it), and this keeps the SMB password out
-        # of the VM object. KubeVirt expects the document under the key
-        # `userdata`. Owner-referenced to the Session like the VM itself.
+        # 2048 bytes and ours exceeds it. KubeVirt expects the document under
+        # the key `userdata`. Owner-referenced to the Session like the VM
+        # itself.
         cloudinit_secret = {
             "apiVersion": "v1",
             "kind": "Secret",
@@ -2107,21 +2107,18 @@ class KubeConfigManager(ConfigManager):
             cr['metadata'].get('annotations') or {})
 
         if effective_runtime == 'vm':
-            # The home reaches the guest through the per-user SMB storage
-            # gateway, not virtiofs (see _build_vm_spec). It must be ensured
-            # BEFORE the VM: the SMB password is baked into the VM's
-            # cloud-init userData at creation, so a missing gateway is a
-            # transient failure (operator retries), not a degraded boot.
-            smb_password = self.ensure_storage_gateway(
-                username, user_ns, pvc_name)
-            if not smb_password:
+            # The home reaches the guest through the per-user NFS storage
+            # gateway, not virtiofs (see _build_vm_spec). Ensured BEFORE the
+            # VM: a guest that boots with no export to mount comes up with a
+            # root-owned empty home, so a missing gateway is a transient
+            # failure (operator retries), not a degraded boot.
+            if not self.ensure_storage_gateway(username, user_ns, pvc_name):
                 return result
             ok = self._create_vm(
                 user_ns, full_name, session_name, username, uid,
                 template_spec, display_port,
                 template_spec.get('instancetype'), preemptible,
-                smb_host=self._gateway_host(username, user_ns),
-                smb_password=smb_password,
+                nfs_host=self._gateway_host(username, user_ns),
                 start=wants_start,
                 viewer=result.get("viewer"),
                 user_details=user_details,
@@ -2261,13 +2258,17 @@ class KubeConfigManager(ConfigManager):
             return None
 
     # ------------------------------------------------------------------ #
-    # Per-user SMB storage gateway (VM homes). KubeVirt's unprivileged     #
+    # Per-user NFS storage gateway (VM homes). KubeVirt's unprivileged     #
     # virtiofsd (kubevirt#13028) made a directly-shared home read-only for #
     # the guest user, so the home PVC is instead mounted by a per-user     #
-    # Samba pod (images/storage-gateway/) and exported as SMB3; the guest  #
-    # cifs-mounts it from cloud-init. Server-side identity: client uids    #
-    # are never trusted, `force user` lands every write on the PVC as the  #
-    # user's real uid — consistent with pod sessions sharing the PVC.      #
+    # NFS-Ganesha pod (images/storage-gateway/) and exported as NFSv4.2;   #
+    # the guest mounts it from cloud-init. Server-side identity: client    #
+    # uids are never trusted, the export's Squash = All_Squash lands every #
+    # write on the PVC as the user's real uid — consistent with pod        #
+    # sessions sharing the PVC. NFS AUTH_SYS has no per-share credential,  #
+    # so reaching the export IS the permission: the fencing NetworkPolicy  #
+    # below plus the per-user namespace are the whole boundary (see        #
+    # design/security.md).                                                 #
     # ------------------------------------------------------------------ #
 
     def _gateway_name(self, username: str) -> str:
@@ -2276,48 +2277,7 @@ class KubeConfigManager(ConfigManager):
     def _gateway_host(self, username: str, user_ns: str) -> str:
         return f"{self._gateway_name(username)}.{user_ns}.svc.cluster.local"
 
-    def _smb_secret_name(self, username: str) -> str:
-        return f"whistler-smb-{username}"
-
-    def _ensure_smb_secret(self, username: str, user_ns: str) -> Optional[str]:
-        """Random per-user SMB password, generated once into Secret
-        whistler-smb-<user> (same pattern as _ensure_vm_access_key). The
-        gateway pod feeds it to smbpasswd at startup; every VM's cloud-init
-        writes it into the guest's root-only credentials file. Returns the
-        password, or None if the Secret could not be ensured."""
-        secret_name = self._smb_secret_name(username)
-        core_api = client.CoreV1Api()
-        try:
-            sec = core_api.read_namespaced_secret(secret_name, user_ns)
-            import base64
-            return base64.b64decode(sec.data["password"]).decode()
-        except ApiException as e:
-            if e.status != 404:
-                logger.error(f"Failed to read SMB secret for {username}: {e}")
-                return None
-
-        import secrets as _secrets
-        password = _secrets.token_urlsafe(24)
-        body = {
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {
-                "name": secret_name,
-                "labels": {"app": "whistler", "user": username},
-            },
-            "stringData": {"password": password},
-        }
-        try:
-            core_api.create_namespaced_secret(user_ns, body)
-            logger.info(f"Created SMB secret for {username}")
-            return password
-        except ApiException as e:
-            if e.status == 409:  # lost a race; use the winner's password
-                return self._ensure_smb_secret(username, user_ns)
-            logger.error(f"Failed to create SMB secret for {username}: {e}")
-            return None
-
-    def _build_gateway_manifests(self, *, username, uid, pvc_name, image,
+    def _build_gateway_manifests(self, *, username, uid, gid, pvc_name, image,
                                  node_selector=None, resources=None):
         """Deployment + Service manifests for the per-user storage gateway
         (pure, unit-testable like _build_pod_spec). No ownerReferences: the
@@ -2341,36 +2301,61 @@ class KubeConfigManager(ConfigManager):
                         # Values-level pinning to fast/storage nodes — the
                         # gateway is deliberately NOT co-scheduled with VMs.
                         "nodeSelector": node_selector or {},
-                        # smbd exits promptly on SIGTERM, and with the
+                        # ganesha.nfsd exits promptly on SIGTERM, and with the
                         # Recreate strategy on an RWO PVC the new pod cannot
                         # start until the old one is fully gone.
                         "terminationGracePeriodSeconds": 5,
                         "containers": [{
-                            "name": "samba",
+                            "name": "ganesha",
                             "image": image,
                             "env": [
-                                {"name": "SMB_USER", "value": username},
-                                {"name": "SMB_UID", "value": str(uid)},
+                                {"name": "SHARE_USER", "value": username},
+                                {"name": "SHARE_UID", "value": str(uid)},
+                                {"name": "SHARE_GID", "value": str(gid)},
                             ],
-                            "ports": [{"containerPort": 445, "name": "smb"}],
+                            "ports": [{"containerPort": 2049, "name": "nfs"}],
+                            # Two capabilities, not privileged: ganesha's VFS
+                            # FSAL addresses files by handle
+                            # (open_by_handle_at, hence DAC_READ_SEARCH) and
+                            # raises its own fd limit (SYS_RESOURCE). The
+                            # kernel nfsd would have needed the whole pod
+                            # privileged and is a kernel-global singleton
+                            # besides — unusable one-per-user.
+                            "securityContext": {
+                                "capabilities": {
+                                    "add": ["DAC_READ_SEARCH", "SYS_RESOURCE"],
+                                },
+                            },
+                            # NOT a tcpSocket probe. ganesha binds 2049 and
+                            # logs "NFS SERVER INITIALIZED" even when every
+                            # export failed to build, so a port check calls a
+                            # gateway that serves nothing healthy while guest
+                            # mounts get ENOENT — which is exactly how the
+                            # SMB->NFS move shipped broken. gateway-ready
+                            # asks ganesha over DBus which exports it has.
                             "readinessProbe": {
-                                "tcpSocket": {"port": 445},
-                                "initialDelaySeconds": 2,
-                                "periodSeconds": 5,
+                                "exec": {"command": ["/usr/local/bin/gateway-ready"]},
+                                "periodSeconds": 10,
+                                "failureThreshold": 3,
+                            },
+                            # A gateway that never manages to export is broken,
+                            # not slow: restart it so the failure is a visible
+                            # CrashLoop rather than a pod sitting NotReady
+                            # forever. 30 x 2s is far longer than ganesha's
+                            # ~1s startup.
+                            "startupProbe": {
+                                "exec": {"command": ["/usr/local/bin/gateway-ready"]},
+                                "periodSeconds": 2,
+                                "failureThreshold": 30,
                             },
                             "volumeMounts": [
                                 {"name": "home", "mountPath": "/shares/home"},
-                                {"name": "smb-secret",
-                                 "mountPath": "/etc/whistler-smb",
-                                 "readOnly": True},
                             ],
                             "resources": resources or {},
                         }],
                         "volumes": [
                             {"name": "home",
                              "persistentVolumeClaim": {"claimName": pvc_name}},
-                            {"name": "smb-secret",
-                             "secret": {"secretName": self._smb_secret_name(username)}},
                         ],
                     },
                 },
@@ -2383,17 +2368,21 @@ class KubeConfigManager(ConfigManager):
             "spec": {
                 "type": "ClusterIP",
                 "selector": labels,
-                "ports": [{"name": "smb", "port": 445, "targetPort": 445}],
+                "ports": [{"name": "nfs", "port": 2049, "targetPort": 2049}],
             },
         }
         return deployment, service
 
     def _build_gateway_network_policy(self, username: str) -> Dict[str, Any]:
         """Fencing (pure): only this user's session pods may reach the
-        gateway, and only on SMB. virt-launcher pods inherit the
+        gateway, and only on NFS. virt-launcher pods inherit the
         app: whistler-desktop label from the VM template metadata. Additive
         with isolate-user-pods, whose portal carve-out also selects the
-        gateway pod (harmless — the portal never speaks SMB)."""
+        gateway pod (harmless — the portal never speaks NFS).
+
+        Under SMB this narrowed an already-authenticated share; under NFS
+        AUTH_SYS it IS the authentication, since the export trusts whoever
+        can open a connection to it."""
         labels = {"app": "whistler-storage-gateway", "user": username}
         return {
             "apiVersion": "networking.k8s.io/v1",
@@ -2406,66 +2395,98 @@ class KubeConfigManager(ConfigManager):
                 "ingress": [{
                     "from": [{"podSelector": {
                         "matchLabels": {"app": "whistler-desktop"}}}],
-                    "ports": [{"port": 445, "protocol": "TCP"}],
+                    "ports": [{"port": 2049, "protocol": "TCP"}],
                 }],
             },
         }
 
-    def ensure_storage_gateway(self, username: str, user_ns: str,
-                               pvc_name: str) -> Optional[str]:
-        """Ensure the per-user storage gateway exists (Secret + Deployment +
-        Service + fencing NetworkPolicy), lazily with the first runtime:vm
-        session. Idempotent; an existing Deployment is patched so values
-        changes (image bumps in the dev loop) roll through. Returns the SMB
-        password on success (the caller bakes it into cloud-init), None on
-        failure — callers must treat that as transient and retry."""
-        password = self._ensure_smb_secret(username, user_ns)
-        if not password:
-            return None
+    @staticmethod
+    def _preserve_cluster_ip(live, body: Dict[str, Any]) -> None:
+        """Carry the API-server-assigned clusterIP onto a replacement Service
+        body. It is immutable, and a replace that omits it is rejected."""
+        cluster_ip = getattr(live.spec, "cluster_ip", None) if live.spec else None
+        if cluster_ip:
+            body.setdefault("spec", {})["clusterIP"] = cluster_ip
 
+    def _ensure_object(self, name: str, user_ns: str, body: Dict[str, Any], *,
+                       create, read, replace, preserve=None) -> bool:
+        """Create ``body``, or make an existing object match it. True on
+        success; the caller treats False as transient and retries.
+
+        **Replace, not patch.** A strategic-merge patch merges list entries by
+        their key, so renaming a container adds the new one *beside* the old
+        rather than superseding it, and a removed volume or a renamed port
+        simply stays. That is not hypothetical: the SMB->NFS move left live
+        gateways running a ganesha container and a samba container at once,
+        with a Service still publishing 445 and a NetworkPolicy still fencing
+        445, so the guest could not mount its home at all. Replace makes the
+        manifest authoritative, which is what "ensure" is supposed to mean.
+        """
+        kind = body.get("kind", "object")
+        try:
+            create(user_ns, body)
+            logger.info(f"Created {kind} {name} in {user_ns}")
+            return True
+        except ApiException as e:
+            if e.status != 409:
+                logger.error(f"Failed to create {kind} {name}: {e}")
+                return False
+
+        try:
+            if preserve:
+                preserve(read(name, user_ns), body)
+            replace(name, user_ns, body)
+            return True
+        except ApiException as e:
+            logger.error(f"Failed to reconcile {kind} {name}: {e}")
+            return False
+
+    def ensure_storage_gateway(self, username: str, user_ns: str,
+                               pvc_name: str) -> bool:
+        """Ensure the per-user storage gateway matches its manifests
+        (Deployment + Service + fencing NetworkPolicy), lazily with the first
+        runtime:vm session. Self-healing: every call reconciles all three, so
+        a values change, an image bump in the dev loop, or a change to the
+        manifests themselves reaches an already-running gateway. False on
+        failure — callers must treat that as transient and retry."""
+        user_details = self.get_user(username)
         deployment, service = self._build_gateway_manifests(
             username=username,
-            uid=resolve_uid(self.get_user(username)),
+            uid=resolve_uid(user_details),
+            gid=resolve_gid(user_details),
             pvc_name=pvc_name,
             image=self.storage_gateway_image,
             node_selector=self.storage_gateway_node_selector,
             resources=self.storage_gateway_resources,
         )
+        policy = self._build_gateway_network_policy(username)
         name = deployment["metadata"]["name"]
 
         apps_api = client.AppsV1Api()
-        try:
-            apps_api.create_namespaced_deployment(user_ns, deployment)
-            logger.info(f"Storage gateway {name} created for {username}")
-        except ApiException as e:
-            if e.status != 409:
-                logger.error(f"Failed to create storage gateway {name}: {e}")
-                return None
-            try:
-                apps_api.patch_namespaced_deployment(name, user_ns, deployment)
-            except ApiException as pe:
-                logger.warning(f"Could not update storage gateway {name}: {pe}")
-
         core_api = client.CoreV1Api()
-        try:
-            core_api.create_namespaced_service(user_ns, service)
-        except ApiException as e:
-            if e.status != 409:
-                logger.error(
-                    f"Failed to create storage gateway service {name}: {e}")
-                return None
-
         net_api = NetworkingV1Api()
-        try:
-            net_api.create_namespaced_network_policy(
-                user_ns, self._build_gateway_network_policy(username))
-        except ApiException as e:
-            if e.status != 409:
-                logger.error(
-                    f"Failed to create storage gateway NetworkPolicy: {e}")
-                return None
 
-        return password
+        # A tuple, not a generator: all three must be attempted even if an
+        # earlier one fails, so one transient error doesn't leave the other
+        # two stale. The False return makes the operator retry regardless.
+        return all((
+            self._ensure_object(
+                name, user_ns, deployment,
+                create=apps_api.create_namespaced_deployment,
+                read=apps_api.read_namespaced_deployment,
+                replace=apps_api.replace_namespaced_deployment),
+            self._ensure_object(
+                name, user_ns, service,
+                create=core_api.create_namespaced_service,
+                read=core_api.read_namespaced_service,
+                replace=core_api.replace_namespaced_service,
+                preserve=self._preserve_cluster_ip),
+            self._ensure_object(
+                policy["metadata"]["name"], user_ns, policy,
+                create=net_api.create_namespaced_network_policy,
+                read=net_api.read_namespaced_network_policy,
+                replace=net_api.replace_namespaced_network_policy),
+        ))
 
     def get_vmi_address(self, username: str, session_name: str) -> Optional[str]:
         """The running VMI's pod-network IP (masquerade forwards all ports,
@@ -2487,7 +2508,7 @@ class KubeConfigManager(ConfigManager):
 
     def _create_vm(self, user_ns, full_name, session_name, username, uid,
                    template_spec, display_port, instancetype,
-                   preemptible, smb_host, smb_password, start=False,
+                   preemptible, nfs_host, start=False,
                    viewer=None, user_details=None) -> bool:
         vm_body, cloudinit_secret = self._build_vm_spec(
             session_name=full_name,
@@ -2496,8 +2517,7 @@ class KubeConfigManager(ConfigManager):
             uid=uid,
             template_spec=template_spec,
             display_port=display_port,
-            smb_host=smb_host,
-            smb_password=smb_password,
+            nfs_host=nfs_host,
             instancetype=instancetype,
             preemptible=preemptible,
             user_details=user_details if user_details is not None else self.get_user(username),

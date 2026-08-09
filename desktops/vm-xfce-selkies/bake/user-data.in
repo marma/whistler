@@ -61,7 +61,7 @@ write_files:
         pulseaudio pulseaudio-utils \
         python3 python3-venv libxkbcommon0 \
         ssl-cert ca-certificates curl \
-        cifs-utils
+        nfs-common
 
       # NVIDIA driver for KubeVirt GPU-passthrough sessions (vfio-pci hands
       # the guest a raw PCI device — same as bare metal, there is no

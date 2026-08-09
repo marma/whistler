@@ -239,11 +239,16 @@ whistler:
   streamer:
     image: ghcr.io/marma/whistler-streamer-selkies2:latest
 
-  # Per-user SMB storage gateway (built from images/storage-gateway). Created
+  # Per-user NFS storage gateway (built from images/storage-gateway). Created
   # lazily by the operator with a user's first runtime:vm session: it mounts
-  # the user's home PVC via normal CSI and exports it as SMB3; the VM guest
-  # cifs-mounts it from cloud-init. Replaces virtiofs, which KubeVirt runs
+  # the user's home PVC via normal CSI and exports it as NFSv4.2; the VM guest
+  # mounts it from cloud-init. Replaces virtiofs, which KubeVirt runs
   # unprivileged (kubevirt#13028) making a shared home read-only in the guest.
+  #
+  # NFS AUTH_SYS has no per-share credential — the export trusts whoever can
+  # open a connection to it — so the fencing NetworkPolicy (this user's own
+  # session pods, in this user's own namespace, on 2049) is the whole
+  # boundary, and the traffic is not encrypted. See design/security.md.
   storageGateway:
     image: ghcr.io/marma/whistler-storage-gateway:latest
     # Pin gateways to fast/storage nodes ({} = anywhere). Deliberately NOT
@@ -343,7 +348,7 @@ templates:
       memory: 8Gi
   # KubeVirt VM template (needs KubeVirt installed — scripts/install_kubevirt.sh).
   # The guest is a stock cloud image: cloud-init creates the real user
-  # (username/uid/SSH keys), cifs-mounts the home from the user's storage
+  # (username/uid/SSH keys), NFS-mounts the home from the user's storage
   # gateway (whistler.storageGateway above), and
   # enables serial-console autologin (the web terminal). viewer: vnc serves the
   # portal's noVNC client over the KubeVirt VNC subresource — no agent in the

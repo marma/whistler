@@ -31,7 +31,7 @@ if ! xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1; then
   exit 1
 fi
 
-# Wait for the network home (the SMB mount cloud-init sets up) before starting
+# Wait for the network home (the NFS mount cloud-init sets up) before starting
 # the session: GNOME writes per-user state ($HOME/.config, dconf, keyring)
 # immediately, and anything written to the pre-mount root-owned mountpoint would
 # be shadowed the moment the share lands (same reasoning as the getty respawn in

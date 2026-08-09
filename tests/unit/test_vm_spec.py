@@ -25,8 +25,7 @@ def _build_both(**overrides):
         display_port=5900,
         instancetype=None,
         preemptible=False,
-        smb_host="whistler-storage-alice.whistler-user-alice.svc.cluster.local",
-        smb_password="s3cret",
+        nfs_host="whistler-storage-alice.whistler-user-alice.svc.cluster.local",
         user_details={"name": "alice", "uid": 1001,
                       "publicKeys": ["ssh-ed25519 AAA alice"]},
     )
@@ -79,8 +78,8 @@ def test_root_container_disk_and_no_home_attachment():
     root = next(v for v in volumes if v["name"] == "rootdisk")
     assert root["containerDisk"]["image"] == "quay.io/example/desktop:latest"
     # The home PVC is NOT attached to the VM (no virtiofs, no disk): it is
-    # mounted by the per-user storage gateway and reaches the guest as a
-    # cifs mount set up by cloud-init (kubevirt#13028 made virtiofs homes
+    # mounted by the per-user storage gateway and reaches the guest as an
+    # NFS mount set up by cloud-init (kubevirt#13028 made virtiofs homes
     # read-only for the guest user).
     assert not any(v["name"] == "home" for v in volumes)
     devices = spec["domain"]["devices"]
@@ -91,16 +90,15 @@ def test_root_container_disk_and_no_home_attachment():
 
 def test_cloud_init_mounts_home_from_gateway():
     user_data = _cloud_init()
-    assert "//whistler-storage-alice.whistler-user-alice.svc.cluster.local/home" in user_data
-    assert "cifs" in user_data
-    assert "s3cret" in user_data
+    assert "whistler-storage-alice.whistler-user-alice.svc.cluster.local:/home" \
+        in user_data
+    assert "nfs4" in user_data
 
 
 def test_cloud_init_travels_via_session_secret():
     # KubeVirt caps inline cloudInitNoCloud userData at 2048 bytes and ours
     # exceeds it, so the document lives in a per-session Secret referenced
-    # from the volume — which also keeps the SMB password out of the VM
-    # object. KubeVirt reads the `userdata` key.
+    # from the volume. KubeVirt reads the `userdata` key.
     vm, secret = _build_both()
     spec = vm["spec"]["template"]["spec"]
     disk_names = [d["name"] for d in spec["domain"]["devices"]["disks"]]

@@ -14,7 +14,7 @@ boundary), so VMs need an in-guest streamer. Installing it at boot is out:
 containerDisk roots are ephemeral (every session boot would pay the full
 install), the user-namespace egress policy blocks package mirrors by design,
 and Selkies 2.x is an unreleased pinned-commit source build. So the bytes are
-baked; cloud-init stays the per-session control plane (user/uid/keys, SMB
+baked; cloud-init stays the per-session control plane (user/uid/keys, NFS
 home mount, streamer env, session-unit start — see
 [whistler/cloudinit.py](../../whistler/cloudinit.py)).
 
@@ -30,7 +30,7 @@ home mount, streamer env, session-unit start — see
   console and stays available as the agentless rescue path (`viewer: vnc`
   semantics) even on this image.
 - **`whistler-desktop@<user>.service`** (template unit, `User=%i`): waits for
-  the streamer's X and the SMB home mount, then runs XFCE in the foreground —
+  the streamer's X and the NFS home mount, then runs XFCE in the foreground —
   the in-guest analog of [`xfce-plain/entrypoint.sh`](../xfce-plain/entrypoint.sh).
   Only cloud-init knows the username, so the session's userData does
   `systemctl enable --now whistler-desktop@<user>` (enable so CDI
@@ -38,8 +38,8 @@ home mount, streamer env, session-unit start — see
 - The Selkies venv + web client are **extracted from the
   [`streamer-selkies2`](../streamer-selkies2/) docker build** at bake time:
   one `SELKIES_COMMIT`, client/server lock preserved, binary-compatible
-  (both Ubuntu 26.04). The bake also installs `cifs-utils` (so the home mount
-  uses mount.cifs instead of the raw-kernel fallback) and purges snapd
+  (both Ubuntu 26.04). The bake also installs `nfs-common` (so the home mount
+  uses mount.nfs4 instead of the raw-kernel fallback) and purges snapd
   (snapd.seeded otherwise delays every session boot ~30 s).
 - **Ubuntu's default wallpaper** (`ubuntu-wallpapers`, which nothing in `xfce4`
   pulls in) instead of the stock Xfce mouse, and **Ubuntu's Yaru icons**
@@ -48,7 +48,7 @@ home mount, streamer env, session-unit start — see
   and [`xsettings.xml`](guest/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml)
   — xfconf reads channel XML under `XDG_CONFIG_DIRS` as read-only defaults that
   `~/.config/xfce4/xfconf/…` shadows, so a user's own wallpaper or theme still
-  wins and persists in the SMB home. The backdrop property path embeds the
+  wins and persists in the NFS home. The backdrop property path embeds the
   RandR output name, which for Xvfb is always `screen`; the icon theme reaches
   the whole session via xfsettingsd's XSETTINGS. Keep both in sync with the pod
   copies in [`../xfce-plain/`](../xfce-plain/). Icons only — the GTK widget
@@ -135,7 +135,7 @@ desktops/vm-xfce-selkies/test.sh   # boots the baked disk with a session-like
 
 It generates the seed with the real `whistler.cloudinit.build_user_data`
 (desktop mode), boots the disk with `hostfwd`, waits for the in-guest Selkies
-to serve HTTP, then (over SSH, with a throwaway key) fakes the SMB share
+to serve HTTP, then (over SSH, with a throwaway key) fakes the NFS export
 landing with a tmpfs on the home mountpoint — no gateway exists outside the
 cluster — and asserts that the XFCE session comes up *and stays up* and that
 a fresh SSH connection still authenticates once the mount shadows

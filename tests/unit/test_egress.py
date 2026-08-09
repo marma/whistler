@@ -28,9 +28,10 @@ def _dns_anywhere_rule(rule):
     return rule.get("to") is None and ports == {(53, "UDP"), (53, "TCP")}
 
 
+# One port: the gateway exports NFSv4 only, so no rpcbind/NLM/statd.
 GATEWAY_RULE = {
     "to": [{"podSelector": {"matchLabels": {"app": "whistler-storage-gateway"}}}],
-    "ports": [{"port": 445, "protocol": "TCP"}],
+    "ports": [{"port": 2049, "protocol": "TCP"}],
 }
 
 

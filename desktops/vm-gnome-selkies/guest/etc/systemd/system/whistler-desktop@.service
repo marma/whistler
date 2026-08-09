@@ -12,7 +12,7 @@
 [Unit]
 Description=Whistler GNOME desktop session for %i
 Wants=whistler-streamer.service
-# Deliberately NOT ordered After=whistler-home.service (the SMB home mount,
+# Deliberately NOT ordered After=whistler-home.service (the NFS home mount,
 # written by cloud-init at runtime): it is a oneshot whose retry loop runs up
 # to 150s when the gateway is unreachable, and After= would keep this unit's
 # start job QUEUED (inactive, no logs, nothing to debug) that whole time.

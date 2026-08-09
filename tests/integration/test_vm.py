@@ -47,28 +47,31 @@ def _apis():
 
 
 def _assert_storage_gateway(custom, core):
-    """The per-user SMB gateway (home PVC export — replaces virtiofs) must be
-    provisioned lazily with the first vm session: Secret + Deployment +
-    Service + fencing NetworkPolicy, and the VM's cloud-init must mount the
-    share from it. (The actual write path — guest write lands uid-correct on
-    the PVC — is covered by live verification; it needs a booted guest.)"""
+    """The per-user NFS gateway (home PVC export — replaces virtiofs) must be
+    provisioned lazily with the first vm session: Deployment + Service +
+    fencing NetworkPolicy, and the VM's cloud-init must mount the export from
+    it. (The actual write path — guest write lands uid-correct on the PVC —
+    is covered by live verification; it needs a booted guest.)"""
     from kubernetes import client
 
     gateway = f"whistler-storage-{USER}"
-    sec = core.read_namespaced_secret(f"whistler-smb-{USER}", USER_NS)
-    assert sec.data.get("password")
-
     apps = client.AppsV1Api()
     deploy = apps.read_namespaced_deployment(gateway, USER_NS)
     assert deploy.spec.strategy.type == "Recreate"
+    # No Secret and no mounted credential: AUTH_SYS has nothing to
+    # authenticate with, which is why the NetworkPolicy below is the boundary.
+    (volume,) = deploy.spec.template.spec.volumes
+    assert volume.persistent_volume_claim.claim_name == f"whistler-data-{USER}"
+
     svc = core.read_namespaced_service(gateway, USER_NS)
-    assert svc.spec.ports[0].port == 445
+    assert svc.spec.ports[0].port == 2049
 
     net = client.NetworkingV1Api()
     policy = net.read_namespaced_network_policy(
         "whistler-storage-gateway", USER_NS)
     assert policy.spec.pod_selector.match_labels == {
         "app": "whistler-storage-gateway"}
+    assert policy.spec.ingress[0].ports[0].port == 2049
 
 
 def _require_crd(ext_api, name, why):
@@ -161,10 +164,9 @@ def _run_vm_session(template_spec, template_name, session_short, observe=None):
 
         _assert_storage_gateway(custom, core)
 
-        # The home is a cifs mount of the gateway share, not a VM-attached
+        # The home is an NFS mount of the gateway export, not a VM-attached
         # PVC (virtiofs is gone — kubevirt#13028). The cloud-init document
-        # travels via a per-session Secret (KubeVirt's 2048-byte inline cap;
-        # keeps the SMB password out of the VM object).
+        # travels via a per-session Secret (KubeVirt's 2048-byte inline cap).
         vm = custom.get_namespaced_custom_object(
             "kubevirt.io", "v1", USER_NS, "virtualmachines", session)
         vm_spec = vm["spec"]["template"]["spec"]
@@ -177,7 +179,8 @@ def _run_vm_session(template_spec, template_name, session_short, observe=None):
         import base64
         ci_secret = core.read_namespaced_secret(f"{session}-cloudinit", USER_NS)
         user_data = base64.b64decode(ci_secret.data["userdata"]).decode()
-        assert f"//whistler-storage-{USER}.{USER_NS}.svc.cluster.local/home" in user_data
+        assert f"whistler-storage-{USER}.{USER_NS}.svc.cluster.local:/home" \
+            in user_data
     finally:
         for delete in (
             lambda: custom.delete_namespaced_custom_object(

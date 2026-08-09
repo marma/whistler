@@ -7,7 +7,7 @@
 # 10_ubuntu-settings.gschema.override — are all `:ubuntu`-qualified so they
 # never apply here; look, dock and background all have to be unqualified
 # overrides. These are defaults, not locks: per-user dconf (a user toggling
-# things in Settings / Extensions) still wins, and survives in the SMB home
+# things in Settings / Extensions) still wins, and survives in the NFS home
 # across sessions.
 
 [org.gnome.shell]

@@ -2,16 +2,16 @@
 import yaml
 
 from whistler.cloudinit import (
-    build_user_data, resolve_uid, resolve_gid, SMB_CREDENTIALS_PATH,
+    build_user_data, resolve_uid, resolve_gid, NFS_EXPORT,
 )
 
-SMB_HOST = "whistler-storage-alice.whistler-user-alice.svc.cluster.local"
+NFS_HOST = "whistler-storage-alice.whistler-user-alice.svc.cluster.local"
 
 
 def _doc(**overrides):
     args = dict(username="alice", uid=1001,
                 ssh_keys=["ssh-ed25519 AAA alice"], hostname="desk",
-                smb_host=SMB_HOST, smb_password="s3cret")
+                nfs_host=NFS_HOST)
     args.update(overrides)
     text = build_user_data(**args)
     assert text.startswith("#cloud-config\n")
@@ -34,45 +34,45 @@ def test_no_default_user_entry():
     assert "default" not in doc["users"]
 
 
-def test_home_mounted_via_cifs_from_gateway():
+def test_home_mounted_via_nfs_from_gateway():
     (mount,) = _doc()["mounts"]
     fs_spec, fs_file, fs_vfstype, fs_mntops, freq, passno = mount
-    assert fs_spec == f"//{SMB_HOST}/home"
+    assert fs_spec == f"{NFS_HOST}:{NFS_EXPORT}"
     assert fs_file == "/home/alice"
-    assert fs_vfstype == "cifs"
+    assert fs_vfstype == "nfs4"
     assert (freq, passno) == ("0", "0")
     opts = fs_mntops.split(",")
-    # Server-side identity: uid=/gid=/*_mode shape the in-guest view only.
-    assert f"credentials={SMB_CREDENTIALS_PATH}" in opts
-    assert "vers=3.1.1" in opts
-    assert "seal" in opts
-    assert "uid=1001" in opts and "gid=1001" in opts
-    # `posix` makes the client use the gateway's SMB3.1.1 POSIX extensions, so
-    # per-file chmod round-trips to the real on-disk mode. No file_mode/dir_mode
-    # — those would override the real POSIX modes with a fixed blanket bit.
-    assert "posix" in opts
-    assert "file_mode" not in fs_mntops and "dir_mode" not in fs_mntops
-    # mfsymlinks: native POSIX symlinks can't take lutimes (EOPNOTSUPP) which
-    # breaks pixi/conda linking versioned .so symlinks; M+F symlinks can.
-    assert "mfsymlinks" in opts
+    # 4.2 pinned: the gateway refuses 4.0, whose callbacks would need a
+    # server->client connection its ingress fencing can't allow.
+    assert "vers=4.2" in opts
     assert "nosuid" in opts and "nodev" in opts
     # hard (not soft): a gateway blip blocks I/O instead of corrupting it;
-    # nofail + _netdev keep first boot alive while cifs-utils installs.
+    # nofail + _netdev keep first boot alive when the gateway is absent.
     assert "hard" in opts
     assert "nofail" in opts and "_netdev" in opts
+    # noauto: cloud-init's mounts module runs `mount -a` synchronously in the
+    # init stage, where one TCP connect budget against a black-holed gateway
+    # measured 181s — past the login prompt. Mounting is whistler-home's job,
+    # off the boot path; this entry exists only to hold the options.
+    assert "noauto" in opts
+    # retry=0 then bounds each of those attempts to one try.
+    assert "retry=0" in opts
+    # No client-side identity remapping and no cifs workarounds: NFS carries
+    # real owners, modes, symlinks and byte-range locks.
+    for gone in ("uid=", "gid=", "posix", "mfsymlinks", "nobrl", "seal",
+                 "credentials="):
+        assert gone not in fs_mntops
 
 
-def test_smb_credentials_root_only_on_root_disk():
+def test_no_credentials_file_written():
+    # AUTH_SYS has no per-share secret to leak into the guest; the boundary
+    # is the gateway's fencing NetworkPolicy.
     doc = _doc()
-    creds = next(f for f in doc["write_files"]
-                 if f["path"] == SMB_CREDENTIALS_PATH)
-    assert creds["permissions"] == "0600"
-    assert "username=alice" in creds["content"]
-    assert "password=s3cret" in creds["content"]
+    assert not any("credential" in f["path"] for f in doc["write_files"])
 
 
 def test_no_package_install_and_mount_unit_armed():
-    # NO packages: [cifs-utils] — with the default locked-down egress apt
+    # NO packages: [nfs-common] — with the default locked-down egress apt
     # burns ~50s timing out on unreachable mirrors, and the packages module
     # runs before runcmd, delaying the mount that long past the login
     # prompt. The raw kernel mount needs no helper. The unit is started
@@ -90,7 +90,7 @@ def test_bootcmd_kicks_mount_before_runcmd_stage():
     # stock Ubuntu, well past the login prompt), so a detached bootcmd
     # poller runs the mount script as soon as write_files lands it. It must
     # detach (setsid, backgrounded) — bootcmd must never block boot.
-    (kick,) = _doc()["bootcmd"]
+    _, kick = _doc()["bootcmd"]
     assert "/usr/local/sbin/whistler-mount-home" in kick
     assert kick.startswith("setsid ")
     assert kick.endswith("&")
@@ -123,19 +123,23 @@ def test_mount_unit_and_fallback_script_written():
                   if f["path"] == "/usr/local/sbin/whistler-mount-home")
     assert script["permissions"] == "0755"
     body = script["content"]
-    # Prefers the fstab/mount.cifs path...
-    assert "command -v mount.cifs" in body
-    # ...and falls back to a raw kernel mount when cifs-utils is absent
-    # (locked-down egress: no package mirrors). The kernel can't resolve
-    # DNS or parse credentials=, so the script does both.
-    assert f"HOST={SMB_HOST}" in body
+    # Prefers the fstab/mount.nfs4 path...
+    assert "command -v mount.nfs4" in body
+    # ...and falls back to a raw kernel mount when nfs-common is absent
+    # (locked-down egress: no package mirrors). The kernel's NFSv4 text mount
+    # interface can't resolve DNS, so the script resolves and passes addr=.
+    assert f"HOST={NFS_HOST}" in body
     assert "getent hosts" in body
-    assert f". {SMB_CREDENTIALS_PATH}" in body
-    assert "ip=$ip,username=$username,password=$password" in body
-    assert "vers=3.1.1,seal" in body
-    # The fallback options must not carry the fstab-isms.
+    assert f'mount -t nfs4 "$HOST:{NFS_EXPORT}"' in body
+    assert "-o \"addr=$ip,vers=4.2,hard,nosuid,nodev\"" in body
+    # The fallback options must not carry mount.nfs-only or fstab-only ones:
+    # the kernel rejects options it doesn't know.
+    assert "retry=0" not in body
     assert "nofail" not in body and "_netdev" not in body and \
-        "credentials=" not in body.replace(f". {SMB_CREDENTIALS_PATH}", "")
+        "noauto" not in body
+    # bootcmd kicks this off before cloud-init's mounts module exists to make
+    # the mountpoint, so the script makes it itself.
+    assert 'mkdir -p "$HOME_DIR"' in body
 
 
 def test_hostname_set():
@@ -246,15 +250,25 @@ def test_resolve_gid_falls_back_to_resolved_uid():
     assert resolve_gid(None) == 1000
 
 
-# --- gid threaded into the SMB mount view --------------------------------- #
+# --- gid becomes the guest's real primary group --------------------------- #
+# NFS passes numeric owners through untranslated (the export sets
+# Only_Numeric_Owners), so there is no client-side gid= remapping left to
+# paper over a mismatch: the guest group must genuinely hold the PVC's gid.
 
-def test_mount_uses_explicit_gid_when_given():
-    (mount,) = _doc(uid=1001, gid=2001)["mounts"]
-    opts = mount[3].split(",")
-    assert "uid=1001" in opts and "gid=2001" in opts
+def test_primary_group_created_before_the_user():
+    # cloud-init's bootcmd runs before its users-groups module, which is what
+    # lets `primary_group` reference a gid useradd would otherwise invent.
+    doc = _doc(uid=1001, gid=2001)
+    groupadd, _kick = doc["bootcmd"]
+    assert "getent group 2001" in groupadd
+    assert "groupadd -g 2001 alice" in groupadd
+    (user,) = doc["users"]
+    assert user["uid"] == "1001"
+    assert user["primary_group"] == "2001"
 
 
-def test_mount_gid_defaults_to_uid_when_omitted():
-    (mount,) = _doc(uid=1001)["mounts"]
-    opts = mount[3].split(",")
-    assert "uid=1001" in opts and "gid=1001" in opts
+def test_primary_group_defaults_to_uid_when_gid_omitted():
+    doc = _doc(uid=1001)
+    (user,) = doc["users"]
+    assert user["primary_group"] == "1001"
+    assert "groupadd -g 1001 alice" in doc["bootcmd"][0]
