@@ -19,7 +19,19 @@ def test_clusterip_port_and_selector():
     svc = _build(display_port=5900)
     assert svc["spec"]["type"] == "ClusterIP"
     assert svc["spec"]["selector"] == {"session": "alice-desk"}
-    assert svc["spec"]["ports"] == [{"name": "display", "port": 5900, "targetPort": 5900}]
+    assert svc["spec"]["ports"] == [
+        {"name": "display", "port": 5900, "targetPort": 5900},
+        {"name": "ssh", "port": 22, "targetPort": 22},
+    ]
+
+
+def test_exposes_ssh_for_jump_routing():
+    """The gateway splices ProxyJump channels to this Service's DNS name, so
+    22 must be published even for a desktop session whose display port is
+    something else entirely (design/proxyjump.md)."""
+    ports = {p["name"]: p["port"] for p in _build(display_port=8082)["spec"]["ports"]}
+    assert ports["ssh"] == 22
+    assert ports["display"] == 8082
 
 
 def test_owner_reference_to_session():

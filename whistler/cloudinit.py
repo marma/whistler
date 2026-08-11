@@ -54,6 +54,8 @@ additional isolation.)
 
 import yaml
 
+from .hostca import GUEST_HOST_CERT_PATH, GUEST_HOST_KEY_PATH
+
 STREAMER_ENV_PATH = "/etc/whistler/streamer.env"
 # The gateway's Ganesha pseudo-path (images/storage-gateway/ganesha.conf.template).
 NFS_EXPORT = "/home"
@@ -64,12 +66,19 @@ def build_user_data(*, username: str, uid: int, ssh_keys: list,
                     gid: int = None,
                     autologin: bool = True, desktop: bool = False,
                     streamer_env: dict = None,
-                    display_port: int = None) -> str:
+                    display_port: int = None,
+                    host_key: bytes = None, host_cert: str = None) -> str:
     """Return a ``#cloud-config`` userData document for cloudInitNoCloud.
 
     ``nfs_host`` is the storage gateway Service DNS name. There is no
     credential to pass: NFS AUTH_SYS has none, and reaching the export is the
     whole permission (fenced by NetworkPolicy — see design/security.md).
+
+    ``host_key``/``host_cert`` install a Whistler-CA-signed host certificate
+    (see hostca.py) so clients verify the guest against one
+    ``@cert-authority`` line instead of a per-instance TOFU prompt. Both or
+    neither; the image's own host key is left in place either way, so a
+    client that has not adopted the CA still connects as before.
 
     ``desktop=True`` targets a Whistler desktop-VM image (viewer:
     websockets — e.g. desktops/vm-xfce-selkies): the image ships the
@@ -171,6 +180,20 @@ exit 1
     # whole of first boot (see module docstring), and a root-owned path on
     # the root disk is StrictModes-clean and not writable through the share.
     # The drop-in keeps ~/.ssh/authorized_keys as a secondary source.
+    sshd_conf = (
+        "AuthorizedKeysFile .ssh/authorized_keys "
+        "/etc/ssh/authorized_keys.d/%u\n"
+    )
+    if host_key and host_cert:
+        # Additive: HostKey lines accumulate, so the image's own keys keep
+        # working for clients that don't know the CA. sshd offers the
+        # certificate to clients that advertise support and falls back to the
+        # plain key otherwise.
+        sshd_conf += (
+            f"HostKey {GUEST_HOST_KEY_PATH}\n"
+            f"HostCertificate {GUEST_HOST_CERT_PATH}\n"
+        )
+
     write_files = [
         {
             "path": f"/etc/ssh/authorized_keys.d/{username}",
@@ -179,10 +202,7 @@ exit 1
         },
         {
             "path": "/etc/ssh/sshd_config.d/60-whistler.conf",
-            "content": (
-                "AuthorizedKeysFile .ssh/authorized_keys "
-                "/etc/ssh/authorized_keys.d/%u\n"
-            ),
+            "content": sshd_conf,
         },
         {
             "path": "/usr/local/sbin/whistler-mount-home",
@@ -207,6 +227,22 @@ exit 1
             ),
         },
     ]
+    if host_key and host_cert:
+        key_pem = host_key.decode() if isinstance(host_key, bytes) else host_key
+        write_files.extend([
+            {
+                "path": GUEST_HOST_KEY_PATH,
+                "permissions": "0600",
+                "owner": "root:root",
+                "content": key_pem if key_pem.endswith("\n") else key_pem + "\n",
+            },
+            {
+                "path": GUEST_HOST_CERT_PATH,
+                "permissions": "0644",
+                "owner": "root:root",
+                "content": host_cert.strip() + "\n",
+            },
+        ])
     doc = {
         "hostname": hostname,
         # Early mount kick (see module docstring): bootcmd runs in the init
@@ -259,6 +295,16 @@ exit 1
             "systemctl start --no-block whistler-home.service",
         ],
     }
+    if host_key and host_cert:
+        # Normally redundant — write_files lands in the init stage, well
+        # before sshd starts — but a guest whose sshd came up first would
+        # otherwise serve its uncertified key until the next boot.
+        # try-reload-or-restart: SIGHUP where the unit supports it (existing
+        # connections survive sshd re-exec'ing), no-op when sshd isn't
+        # running, and the name differs across distros.
+        doc["runcmd"].append(
+            "systemctl try-reload-or-restart ssh 2>/dev/null"
+            " || systemctl try-reload-or-restart sshd || true")
     if desktop:
         env_lines = [f"{k}={v}" for k, v in (streamer_env or {}).items()]
         if display_port:

@@ -51,6 +51,13 @@ spec:
               value: {{ .Values.whistler.security.kataRuntimeClass | quote }}
             - name: WHISTLER_GPU_RUNTIME_CLASS
               value: {{ .Values.whistler.security.gpuRuntimeClass | quote }}
+            # SSH addressing (design/proxyjump.md): the portal shows users the
+            # `ssh <name>.w` one-liner and the @cert-authority line for their
+            # known_hosts, so it needs the same suffix and CA the gateway uses.
+            - name: WHISTLER_SSH_CA_SECRET_NAME
+              value: "{{ .Release.Name }}-ssh-ca"
+            - name: WHISTLER_SSH_DOMAIN_SUFFIX
+              value: {{ .Values.whistler.ssh.domainSuffix | quote }}
             # Periodic desktop screenshots (whistler/portal/screenshots.py):
             # newest-only, in memory, one per session. interval <= 0 disables.
             - name: WHISTLER_SCREENSHOT_INTERVAL

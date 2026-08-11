@@ -8,6 +8,7 @@ from kubernetes import client, config as k8s_config
 from kubernetes.client import CoreV1Api, NetworkingV1Api
 from kubernetes.client.rest import ApiException
 from kubernetes.utils import parse_quantity
+import base64
 import copy
 import hashlib
 import ipaddress
@@ -16,8 +17,30 @@ import os
 import yaml
 
 from whistler.cloudinit import build_user_data, resolve_uid, resolve_gid
+from whistler import hostca
 
 logger = logging.getLogger(__name__)
+
+# The port a session's own sshd listens on. Jump routing splices to exactly
+# this and nothing else, so the gateway can never become a generic TCP relay
+# (design/proxyjump.md).
+SESSION_SSH_PORT = 22
+
+# How a zone treats interactive SSH. An inbound session is an egress channel
+# the zone's (egress-only) NetworkPolicies never see, so the posture is the
+# only place that can constrain it — see design/proxyjump.md, "SSH is an
+# egress channel the zone fence cannot see". Only `none` is a boundary;
+# `relay` is friction, and must never be documented as more than that.
+SSH_POSTURE_DIRECT = "direct"   # ProxyJump splice: full end-to-end SSH
+SSH_POSTURE_RELAY = "relay"     # gateway-mediated PTY only
+SSH_POSTURE_NONE = "none"       # no SSH at all
+SSH_POSTURES = (SSH_POSTURE_DIRECT, SSH_POSTURE_RELAY, SSH_POSTURE_NONE)
+
+# Marks a Session the gateway created on demand (`ssh <template>.w`) and may
+# therefore reap once nothing is connected to it. On the CR rather than in the
+# gateway's memory so a gateway restart doesn't orphan it — though reaping
+# itself is still gateway-driven; see design/proxyjump.md.
+EPHEMERAL_ANNOTATION = "whistler/ephemeral"
 
 # Config file locations. Defaults match the in-cluster mount paths used by the
 # Helm chart; override via env so the server/operator can run as host processes
@@ -250,6 +273,32 @@ class ConfigManager(ABC):
     def save_server_host_key(self, secret_name: str, key_data: bytes) -> bool:
         pass
 
+    @abstractmethod
+    def resolve_ssh_target(self, username: str,
+                           name: str) -> Optional[Dict[str, Any]]:
+        """Where an SSH jump for ``<name>`` should land, or None when this user
+        has no session by that name (design/proxyjump.md)."""
+        pass
+
+    @abstractmethod
+    def get_ssh_known_hosts_line(self) -> Optional[str]:
+        """The ``@cert-authority`` line users add once to trust every
+        instance."""
+        pass
+
+
+    @abstractmethod
+    def get_ssh_ca_public_key(self) -> Optional[str]:
+        """The host CA's public half, for verifying a session's host
+        certificate (whistler/relay.py)."""
+        pass
+
+    @abstractmethod
+    def get_vm_access_private_key(self, username: str) -> Optional[str]:
+        """The per-user access key Whistler authenticates as when it relays
+        into a session on that user's behalf."""
+        pass
+
     # ------------------------------------------------------------------ #
     # Admin / management operations                                        #
     # ------------------------------------------------------------------ #
@@ -421,6 +470,19 @@ class KubeConfigManager(ConfigManager):
         # permittedHostDevices.resourceName for the same PCI device.
         self.gpu_vm_resource_name = os.environ.get(
             "WHISTLER_GPU_VM_RESOURCE_NAME", "nvidia.com/gpu")
+        # SSH host CA: the Secret the operator signs session host keys with
+        # and whose public half the gateway hands users for their
+        # `@cert-authority` line (see hostca.py). Lives in the system
+        # namespace, like the gateway's own host key.
+        self.ssh_ca_secret_name = os.environ.get(
+            "WHISTLER_SSH_CA_SECRET_NAME", "whistler-ssh-ca")
+        # Client-side domain suffix for jump addressing (`Host *.w` in
+        # ~/.ssh/config). Nothing resolves it — it exists so one ssh_config
+        # stanza can match every instance — but the gateway strips it and the
+        # host certificates carry it as a principal, so the operator and the
+        # gateway must agree on the string.
+        self.ssh_domain_suffix = os.environ.get(
+            "WHISTLER_SSH_DOMAIN_SUFFIX", ".w")
         # Default image for the streamer sidecar every desktop pod gets;
         # a template's streamerImage overrides it.
         self.streamer_image = os.environ.get(
@@ -720,7 +782,8 @@ class KubeConfigManager(ConfigManager):
 
     def add_instance(self, username: str, template_name: str, instance_name: str,
                      preemptible: bool = False,
-                     overrides: Optional[Dict[str, Any]] = None) -> bool:
+                     overrides: Optional[Dict[str, Any]] = None,
+                     ephemeral: bool = False) -> bool:
         user_ns = self._ensure_user_namespace(username)
 
         spec = {
@@ -731,16 +794,19 @@ class KubeConfigManager(ConfigManager):
         if overrides:
             spec["overrides"] = overrides
 
+        metadata = {
+            "name": f"{username}-{instance_name}",
+            "namespace": user_ns,
+            # Denormalize access mode onto the CR so listing can filter
+            # ssh vs desktop sessions cheaply (without resolving templates).
+            "labels": {"whistler.martinmalmsten.net/mode": "ssh"},
+        }
+        if ephemeral:
+            metadata["annotations"] = {EPHEMERAL_ANNOTATION: "true"}
         body = {
             "apiVersion": f"{self.group}/{self.version}",
             "kind": "Session",
-            "metadata": {
-                "name": f"{username}-{instance_name}",
-                "namespace": user_ns,
-                # Denormalize access mode onto the CR so listing can filter
-                # ssh vs desktop sessions cheaply (without resolving templates).
-                "labels": {"whistler.martinmalmsten.net/mode": "ssh"},
-            },
+            "metadata": metadata,
             "spec": spec,
         }
         try:
@@ -1311,22 +1377,47 @@ class KubeConfigManager(ConfigManager):
                              f"{ns.metadata.name}: {e}")
 
     def _build_ingress_rules(self) -> list:
-        """Ingress for a user namespace: deny everything except the trusted portal
-        reaching desktop pods. Without this carve-out the round-1 deny-all-ingress
-        policy would block it and the desktop would never render.
+        """Ingress for a user namespace: deny everything except the two trusted
+        brokers. Without these carve-outs the round-1 deny-all-ingress policy
+        would block them and the desktop would never render.
 
         The portal (websockets viewer) reverse-proxies the browser to the in-pod
         Selkies HTTP/WebSocket server on the pod's display port. It is pinned by
         namespace + pod label; no port is pinned because the display port varies
-        per template and the portal only ever dials that one port anyway."""
+        per template and the portal only ever dials that one port anyway.
+
+        The SSH gateway reaches session sshd for jump routing and the relay
+        (design/proxyjump.md), and unlike the portal it *is* port-pinned: 22 is
+        the only thing it ever dials, and a rule that permitted more would make
+        the gateway a route to every port in the namespace.
+
+        Both are separate rules, not one rule with two peers, because a
+        NetworkPolicy rule's `from` and `ports` are ANDed — folding them
+        together would either drop the gateway's port pin or impose it on the
+        portal.
+
+        Note this is the baseline policy, which zones can never narrow
+        (NetworkPolicy allows are union'd). A zone's `none` SSH posture is
+        therefore enforced in the gateway, which is legitimate — the gateway is
+        the only route in — but it is enforcement by a trusted component rather
+        than by the network. See design/proxyjump.md."""
         broker_ns = os.environ.get("PORTAL_NAMESPACE", self.namespace)
         ns_selector = {"matchLabels": {"kubernetes.io/metadata.name": broker_ns}}
-        return [{
-            "from": [
-                {"namespaceSelector": ns_selector,
-                 "podSelector": {"matchLabels": {"app": "whistler-portal"}}},
-            ]
-        }]
+        return [
+            {
+                "from": [
+                    {"namespaceSelector": ns_selector,
+                     "podSelector": {"matchLabels": {"app": "whistler-portal"}}},
+                ]
+            },
+            {
+                "from": [
+                    {"namespaceSelector": ns_selector,
+                     "podSelector": {"matchLabels": {"app": "whistler-server"}}},
+                ],
+                "ports": [{"port": SESSION_SSH_PORT, "protocol": "TCP"}],
+            },
+        ]
 
     def _build_baseline_egress_rules(self) -> list:
         """Egress every pod in a user namespace gets, regardless of zone.
@@ -1736,7 +1827,8 @@ class KubeConfigManager(ConfigManager):
                        template_spec, display_port, instancetype,
                        preemptible, nfs_host,
                        user_details=None, run_strategy="Halted",
-                       portal_public_key=None, viewer=None):
+                       portal_public_key=None, viewer=None,
+                       host_key=None, host_cert=None):
         """Build a KubeVirt VirtualMachine manifest from resolved inputs.
 
         Pure (no API calls). The VMI launcher pod inherits the template labels
@@ -1812,6 +1904,8 @@ class KubeConfigManager(ConfigManager):
             desktop=desktop_stream,
             streamer_env=template_spec.get('streamerEnv') if desktop_stream else None,
             display_port=display_port if desktop_stream else None,
+            host_key=host_key,
+            host_cert=host_cert,
         )
 
         if image_url:
@@ -1964,7 +2058,13 @@ class KubeConfigManager(ConfigManager):
     def _build_session_service(self, *, session_name, username, uid, display_port):
         """Build the per-session ClusterIP Service manifest (pure). It selects
         the desktop pod / VMI launcher pod by the ``session`` label and exposes
-        the display port — the portal's websockets viewer reaches a desktop here."""
+        the display port — the portal's websockets viewer reaches a desktop here.
+
+        It also exposes 22, which is what makes jump routing addressable: the
+        gateway splices to this Service's cluster DNS name rather than to a
+        pod/VMI IP, so an instance keeps one address across reboots. Harmless
+        where nothing listens (a desktop pod with no sshd yet): the connection
+        is simply refused."""
         return {
             "apiVersion": "v1",
             "kind": "Service",
@@ -1980,11 +2080,18 @@ class KubeConfigManager(ConfigManager):
             "spec": {
                 "type": "ClusterIP",
                 "selector": {"session": session_name},
-                "ports": [{
-                    "name": "display",
-                    "port": display_port,
-                    "targetPort": display_port,
-                }],
+                "ports": [
+                    {
+                        "name": "display",
+                        "port": display_port,
+                        "targetPort": display_port,
+                    },
+                    {
+                        "name": "ssh",
+                        "port": SESSION_SSH_PORT,
+                        "targetPort": SESSION_SSH_PORT,
+                    },
+                ],
             },
         }
 
@@ -2510,6 +2617,12 @@ class KubeConfigManager(ConfigManager):
                    template_spec, display_port, instancetype,
                    preemptible, nfs_host, start=False,
                    viewer=None, user_details=None) -> bool:
+        # Issued (or renewed) before the cloud-init Secret is written, since
+        # that document carries it into the guest. Best-effort: a cluster with
+        # no CA yet just boots an uncertified guest.
+        host_key, host_cert = self.ensure_session_host_cert(
+            user_ns, full_name, uid,
+            self.session_ssh_principals(username, session_name))
         vm_body, cloudinit_secret = self._build_vm_spec(
             session_name=full_name,
             hostname=session_name,
@@ -2524,6 +2637,8 @@ class KubeConfigManager(ConfigManager):
             run_strategy="Always" if start else "Halted",
             portal_public_key=self._ensure_vm_access_key(username, user_ns),
             viewer=viewer,
+            host_key=host_key,
+            host_cert=host_cert,
         )
         # The userData Secret must exist before the VM starts; replace on
         # conflict so key/template changes reach the guest on its next boot.
@@ -2781,7 +2896,8 @@ class KubeConfigManager(ConfigManager):
         return sessions
 
     def add_desktop_session(self, username: str, template_name: str, session_name: str,
-                            overrides: Optional[Dict[str, Any]] = None) -> bool:
+                            overrides: Optional[Dict[str, Any]] = None,
+                            ephemeral: bool = False) -> bool:
         user_ns = self._ensure_user_namespace(username)
         spec = {
             "templateRef": template_name,
@@ -2789,14 +2905,17 @@ class KubeConfigManager(ConfigManager):
         }
         if overrides:
             spec["overrides"] = overrides
+        metadata = {
+            "name": f"{username}-{session_name}",
+            "namespace": user_ns,
+            "labels": {"whistler.martinmalmsten.net/mode": "desktop"},
+        }
+        if ephemeral:
+            metadata["annotations"] = {EPHEMERAL_ANNOTATION: "true"}
         body = {
             "apiVersion": f"{self.group}/{self.version}",
             "kind": "Session",
-            "metadata": {
-                "name": f"{username}-{session_name}",
-                "namespace": user_ns,
-                "labels": {"whistler.martinmalmsten.net/mode": "desktop"},
-            },
+            "metadata": metadata,
             "spec": spec,
         }
         try:
@@ -2877,6 +2996,263 @@ class KubeConfigManager(ConfigManager):
         except ApiException as e:
              logger.error(f"Failed to save host key secret: {e}")
              return False
+
+    # ------------------------------------------------------------------ #
+    # SSH host CA (design/proxyjump.md, hostca.py)                          #
+    # ------------------------------------------------------------------ #
+
+    def ensure_ssh_ca(self) -> Optional[bytes]:
+        """The CA private key, generating and persisting one on first use.
+
+        Create-if-absent and 409-tolerant: the operator and the gateway race
+        on startup, and losing that race must mean "read theirs", never
+        "overwrite with mine" — a replaced CA silently invalidates every
+        certificate already delivered to a guest.
+
+        Cached in memory once read: this is on the VM reconcile path, and the
+        CA never changes during a process's life (a rotation is a restart).
+        """
+        cached = getattr(self, "_ssh_ca_key", None)
+        if cached:
+            return cached
+
+        api = CoreV1Api()
+        existing = self._read_ssh_ca_secret(api)
+        if existing:
+            self._ssh_ca_key = existing
+            return existing
+
+        key_data = hostca.generate_ca_key()
+        body = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": self.ssh_ca_secret_name,
+                         "namespace": self.namespace},
+            "type": "Opaque",
+            "data": {
+                "ca_key": base64.b64encode(key_data).decode(),
+                "ca_pub": base64.b64encode(
+                    hostca.ca_public_key(key_data).encode()).decode(),
+            },
+        }
+        try:
+            api.create_namespaced_secret(self.namespace, body)
+            logger.info(f"Generated SSH host CA in secret {self.ssh_ca_secret_name}")
+            self._ssh_ca_key = key_data
+            return key_data
+        except ApiException as e:
+            if e.status == 409:
+                # Someone else created it between our read and our write.
+                self._ssh_ca_key = self._read_ssh_ca_secret(api)
+                return self._ssh_ca_key
+            logger.error(f"Failed to create SSH CA secret: {e}")
+            return None
+
+    def _read_ssh_ca_secret(self, api=None) -> Optional[bytes]:
+        api = api or CoreV1Api()
+        try:
+            secret = api.read_namespaced_secret(
+                self.ssh_ca_secret_name, self.namespace)
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to read SSH CA secret: {e}")
+            return None
+        data = secret.data or {}
+        if "ca_key" in data:
+            return base64.b64decode(data["ca_key"])
+        return None
+
+    def get_ssh_ca_public_key(self) -> Optional[str]:
+        """The CA's public half, for the user's ``@cert-authority`` line.
+        Read-only: a component that only verifies never creates the CA."""
+        try:
+            secret = CoreV1Api().read_namespaced_secret(
+                self.ssh_ca_secret_name, self.namespace)
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to read SSH CA secret: {e}")
+            return None
+        data = secret.data or {}
+        if "ca_pub" in data:
+            return base64.b64decode(data["ca_pub"]).decode().strip()
+        if "ca_key" in data:
+            return hostca.ca_public_key(base64.b64decode(data["ca_key"]))
+        return None
+
+    def get_ssh_known_hosts_line(self) -> Optional[str]:
+        """The one line a user adds to ~/.ssh/known_hosts to trust every
+        instance, present and future."""
+        ca_pub = self.get_ssh_ca_public_key()
+        if not ca_pub:
+            return None
+        return hostca.known_hosts_line(ca_pub, f"*{self.ssh_domain_suffix}")
+
+    def session_ssh_principals(self, username: str, session_name: str) -> List[str]:
+        """Host principals a session's certificate must carry: the names a
+        client can dial it by. The suffixed form is the one clients actually
+        verify; the internal ``<user>-<session>`` name is what Whistler's own
+        components (the relay, the screenshot grabber) reach it as."""
+        return hostca.session_principals(
+            session_name, self.ssh_domain_suffix,
+            extra=[f"{username}-{session_name}"])
+
+    def _host_cert_secret_name(self, full_name: str) -> str:
+        return f"{full_name}-hostcert"
+
+    def ensure_session_host_cert(self, user_ns: str, full_name: str, uid: str,
+                                 principals: List[str]):
+        """Return ``(host_key_pem, cert_line)`` for a session, issuing on first
+        call and re-issuing when the names or the expiry demand it.
+
+        Persisted in a per-session Secret rather than regenerated per build:
+        the cloud-init Secret is *replaced* on every reconcile, so a freshly
+        generated key each time would change the guest's identity on every
+        reboot — precisely the churn the CA exists to end. The key survives
+        re-issue; only the certificate over it is replaced.
+
+        Owner-referenced to the Session, so it is garbage-collected with it.
+        Returns ``(None, None)`` when no CA is available, which callers treat
+        as "no certificate this time" rather than a failure — an uncertified
+        guest is the pre-CA status quo, not a broken one.
+        """
+        ca_key = self.ensure_ssh_ca()
+        if not ca_key:
+            return (None, None)
+
+        api = CoreV1Api()
+        secret_name = self._host_cert_secret_name(full_name)
+        host_key = cert_line = None
+        valid_before = 0
+        try:
+            secret = api.read_namespaced_secret(secret_name, user_ns)
+            data = secret.data or {}
+            if "host_key" in data:
+                host_key = base64.b64decode(data["host_key"])
+            if "host_cert" in data:
+                cert_line = base64.b64decode(data["host_cert"]).decode()
+            valid_before = int(
+                (secret.metadata.annotations or {}).get(
+                    "whistler/cert-valid-before", 0) or 0)
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to read host cert secret {secret_name}: {e}")
+                return (None, None)
+
+        if host_key and not hostca.needs_reissue(cert_line, principals, valid_before):
+            return (host_key, cert_line)
+
+        try:
+            host_key, cert_line, valid_before = hostca.issue_host_cert(
+                ca_private_key=ca_key,
+                principals=principals,
+                key_id=full_name,
+                host_private_key=host_key,
+            )
+        except Exception as e:
+            logger.error(f"Failed to issue host certificate for {full_name}: {e}")
+            return (None, None)
+
+        body = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": secret_name,
+                "annotations": {"whistler/cert-valid-before": str(valid_before)},
+                "ownerReferences": [self._session_owner_reference(full_name, uid)],
+            },
+            "type": "Opaque",
+            "data": {
+                "host_key": base64.b64encode(host_key).decode(),
+                "host_cert": base64.b64encode(cert_line.encode()).decode(),
+            },
+        }
+        try:
+            api.create_namespaced_secret(user_ns, body)
+        except ApiException as e:
+            if e.status != 409:
+                logger.error(f"Failed to store host cert {secret_name}: {e}")
+                return (None, None)
+            try:
+                api.replace_namespaced_secret(secret_name, user_ns, body)
+            except ApiException as pe:
+                logger.error(f"Failed to update host cert {secret_name}: {pe}")
+                return (None, None)
+        logger.info(f"Issued SSH host certificate for {full_name} "
+                    f"(principals: {', '.join(principals)})")
+        return (host_key, cert_line)
+
+    def zone_ssh_posture(self, zone: str) -> str:
+        """How a zone treats interactive SSH (SSH_POSTURES). Unknown values
+        fail closed to `none`, matching how an unknown zone already does —
+        a typo in a restricted zone's posture must not silently open it."""
+        posture = (self.zones.get(zone) or {}).get("ssh")
+        if posture is None:
+            return SSH_POSTURE_DIRECT
+        posture = str(posture).strip().lower()
+        if posture not in SSH_POSTURES:
+            logger.warning(
+                f"Zone {zone} has unknown ssh posture {posture!r}; denying SSH")
+            return SSH_POSTURE_NONE
+        return posture
+
+    def resolve_ssh_target(self, username: str, name: str) -> Optional[Dict[str, Any]]:
+        """Where an SSH jump for ``<name>`` should land, or None when this user
+        has no session by that name.
+
+        The single lookup point for jump routing, so the membership rule lives
+        in one place when project instances arrive (design/proxyjump.md,
+        "Membership, not ownership"). Today "sessions the user may reach" is
+        exactly "sessions in their own namespace" — ssh-mode and desktop alike,
+        which is what makes `ssh mydesktop.w` reach a VM the portal created.
+
+        The address is the per-session Service's cluster DNS name rather than a
+        live pod/VMI IP: it is stable across reboots, so nothing here has to be
+        re-resolved when a guest restarts, and dialling it while the workload is
+        down simply fails — which the caller is retrying through anyway.
+        """
+        user_ns = self._get_user_namespace(username)
+        full_name = f"{username}-{name}"
+        try:
+            cr = self.api.get_namespaced_custom_object(
+                self.group, self.version, user_ns, SESSION_PLURAL, full_name)
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to read session {full_name}: {e}")
+            return None
+
+        spec = cr.get("spec") or {}
+        status = cr.get("status") or {}
+        # Freshly loaded, not the catalog cached at startup: an admin who sets
+        # a zone's ssh posture to `none` in the portal must close it now, not
+        # at the gateway's next restart. Cheap — a jump connect is rare, and
+        # this call is already reading two other objects.
+        self._load_zones()
+        template = self._resolve_template(user_ns, spec.get("templateRef")) or {}
+        template_spec = template.get("spec", {})
+        zone = ((spec.get("overrides") or {}).get("zone")
+                or template_spec.get("zone") or DEFAULT_ZONE)
+        return {
+            "name": name,
+            "fullName": full_name,
+            "namespace": user_ns,
+            "runtime": status.get("runtime") or template_spec.get("runtime", "container"),
+            "mode": status.get("mode") or template_spec.get("mode", "ssh"),
+            "host": f"{full_name}.{user_ns}.svc.cluster.local",
+            "port": SESSION_SSH_PORT,
+            "zone": zone,
+            "sshPosture": self.zone_ssh_posture(zone),
+            "phase": status.get("phase"),
+            # Created on demand by the gateway and reapable once nothing is
+            # connected (design/proxyjump.md).
+            "ephemeral": (cr["metadata"].get("annotations") or {}).get(
+                EPHEMERAL_ANNOTATION) == "true",
+            # The operator records a hard policy refusal here; without it a
+            # refused start is indistinguishable from a slow boot and the user
+            # gets a mystery timeout instead of the reason.
+            "policyFailed": bool(status.get("policyFailed")),
+            "statusMessage": status.get("statusMessage"),
+        }
+
 
     # ------------------------------------------------------------------ #
     # Admin / management operations                                        #

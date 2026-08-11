@@ -176,6 +176,68 @@ def test_authorized_keys_on_root_disk():
     assert "/etc/ssh/authorized_keys.d/%u" in sshd_conf["content"]
 
 
+# --- host certificate (design/proxyjump.md, whistler/hostca.py) ----------- #
+
+HOST_KEY = b"-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+HOST_CERT = "ssh-ed25519-cert-v01@openssh.com AAAAcert alice-box"
+
+
+def _certified(**overrides):
+    return _doc(host_key=HOST_KEY, host_cert=HOST_CERT, **overrides)
+
+
+def _file(doc, path):
+    return next(f for f in doc["write_files"] if f["path"] == path)
+
+
+def test_host_key_and_cert_written_with_sane_modes():
+    doc = _certified()
+    key = _file(doc, "/etc/ssh/ssh_host_whistler_ed25519_key")
+    cert = _file(doc, "/etc/ssh/ssh_host_whistler_ed25519_key-cert.pub")
+    assert key["content"] == HOST_KEY.decode()
+    assert key["permissions"] == "0600"   # sshd refuses a world-readable key
+    assert cert["content"] == HOST_CERT + "\n"
+    assert cert["permissions"] == "0644"
+
+
+def test_sshd_configured_to_offer_the_certificate():
+    conf = _file(_certified(), "/etc/ssh/sshd_config.d/60-whistler.conf")["content"]
+    assert "HostKey /etc/ssh/ssh_host_whistler_ed25519_key\n" in conf
+    assert ("HostCertificate /etc/ssh/ssh_host_whistler_ed25519_key-cert.pub\n"
+            in conf)
+    # Additive: the image's own keys keep working for clients that don't know
+    # the CA, and the authorized_keys directive is untouched.
+    assert "/etc/ssh/authorized_keys.d/%u" in conf
+
+
+def test_sshd_reloaded_in_case_it_started_first():
+    # Normally redundant (write_files lands in the init stage), but a guest
+    # whose sshd raced ahead would otherwise serve its uncertified key until
+    # the next boot. Reload, not restart: established connections survive.
+    runcmd = " ".join(_certified()["runcmd"])
+    assert "try-reload-or-restart ssh" in runcmd
+
+
+def test_no_certificate_bits_without_one():
+    """A cluster with no CA yet boots exactly as before — an uncertified guest
+    is the pre-CA status quo, not a broken one."""
+    doc = _doc()
+    paths = [f["path"] for f in doc["write_files"]]
+    assert not any("whistler_ed25519" in p for p in paths)
+    conf = _file(doc, "/etc/ssh/sshd_config.d/60-whistler.conf")["content"]
+    assert "HostCertificate" not in conf
+    assert "try-reload-or-restart" not in " ".join(doc["runcmd"])
+
+
+def test_half_a_certificate_is_ignored():
+    # Both or neither: a HostCertificate line pointing at a file that was
+    # never written stops sshd from starting at all.
+    for kwargs in ({"host_key": HOST_KEY}, {"host_cert": HOST_CERT}):
+        conf = _file(_doc(**kwargs),
+                     "/etc/ssh/sshd_config.d/60-whistler.conf")["content"]
+        assert "HostCertificate" not in conf
+
+
 # --- desktop mode (viewer=websockets VM images, e.g. vm-xfce-selkies) ----- #
 
 STREAMER_ENV = "/etc/whistler/streamer.env"

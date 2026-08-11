@@ -51,7 +51,11 @@ def test_malformed_authorized_key_is_skipped_not_fatal(make_config):
     assert srv.validate_public_key("alice", key) is True
 
 
-def test_resolve_target_template_vs_instance(make_config):
+def test_resolve_target_is_tui_or_an_existing_instance(make_config):
+    """The legacy suffix now only ever names an existing instance. It used to
+    also accept a *template* name, meaning "make me one and connect" — dropped
+    with the jump's equivalent, because creating belongs in an interface that
+    can show progress."""
     cm = make_config(
         users={"alice": {"name": "alice", "publicKeys": []}},
         templates={"alice": [{"name": "small"}]},
@@ -61,8 +65,9 @@ def test_resolve_target_template_vs_instance(make_config):
     srv._resolve_target("alice", ["alice"])
     assert srv.target_type == "tui"
 
+    # A template name is not special any more: it is just a name to look up.
     srv._resolve_target("alice", ["alice", "small"])
-    assert srv.target_type == "template"
+    assert srv.target_type == "instance"
     assert srv.target_name == "small"
 
     srv._resolve_target("alice", ["alice", "123"])
@@ -78,3 +83,54 @@ def test_resolve_target_rejoins_dashed_suffix(make_config):
     srv._resolve_target("alice", ["alice", "my", "box"])
     assert srv.target_type == "instance"
     assert srv.target_name == "my-box"
+
+
+# --- username routing: the whole name wins over the legacy split ---------- #
+
+def test_username_with_a_dash_authenticates_as_itself(make_config):
+    """The bug the old unconditional split had: `alice-smith` could never log
+    in, because it was read as user `alice` wanting instance `smith`."""
+    key, line = _keypair()
+    cm = make_config(users={"alice-smith": {"name": "alice-smith",
+                                            "publicKeys": [line]}})
+    srv = SSHServer(config_manager=cm)
+
+    assert srv.validate_public_key("alice-smith", key) is True
+    assert srv.username == "alice-smith"
+    assert srv.target_type == "tui"
+
+
+def test_dashed_user_wins_over_a_same_named_instance(make_config):
+    """Both readings are possible for `alice-box`; the real user wins."""
+    key, line = _keypair()
+    cm = make_config(users={
+        "alice-box": {"name": "alice-box", "publicKeys": [line]},
+        "alice": {"name": "alice", "publicKeys": [line]},
+    })
+    srv = SSHServer(config_manager=cm)
+
+    assert srv.validate_public_key("alice-box", key) is True
+    assert srv.username == "alice-box"
+    assert srv.target_type == "tui"
+
+
+def test_legacy_routing_still_works_for_non_users(make_config):
+    key, line = _keypair()
+    cm = make_config(users={"alice": {"name": "alice", "publicKeys": [line]}})
+    srv = SSHServer(config_manager=cm)
+
+    assert srv.validate_public_key("alice-box", key) is True
+    assert srv.username == "alice"
+    assert srv.target_type == "instance"
+    assert srv.target_name == "box"
+
+
+def test_legacy_routing_can_be_switched_off(monkeypatch, make_config):
+    monkeypatch.setattr("whistler.server.LEGACY_USERNAME_ROUTING", False)
+    key, line = _keypair()
+    cm = make_config(users={"alice": {"name": "alice", "publicKeys": [line]}})
+    srv = SSHServer(config_manager=cm)
+
+    # With the convention gone, `alice-box` is simply an unknown user — the
+    # instance is reached by `ssh box.w` through the jump instead.
+    assert srv.validate_public_key("alice-box", key) is False

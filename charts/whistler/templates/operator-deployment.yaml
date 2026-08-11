@@ -44,6 +44,14 @@ spec:
               value: {{ .Values.whistler.security.gpuRuntimeClass | quote }}
             - name: WHISTLER_GPU_VM_RESOURCE_NAME
               value: {{ .Values.whistler.security.gpuVmResourceName | quote }}
+            # SSH host CA + jump addressing (design/proxyjump.md). The
+            # operator signs session host keys with the CA; the suffix goes
+            # into the certificates as a principal, so it MUST match the
+            # server's or clients fail to verify the name they dialled.
+            - name: WHISTLER_SSH_CA_SECRET_NAME
+              value: "{{ .Release.Name }}-ssh-ca"
+            - name: WHISTLER_SSH_DOMAIN_SUFFIX
+              value: {{ .Values.whistler.ssh.domainSuffix | quote }}
             - name: WHISTLER_STREAMER_IMAGE
               value: {{ .Values.whistler.streamer.image | quote }}
             - name: WHISTLER_STORAGE_GATEWAY_IMAGE

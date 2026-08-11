@@ -40,6 +40,15 @@ spec:
               value: "{{ .Values.server.logLevel }}"
             - name: WHISTLER_HOST_KEY_SECRET_NAME
               value: "{{ .Release.Name }}-server-host-key"
+            # SSH host CA + jump addressing (design/proxyjump.md). The gateway
+            # strips this suffix off the dialled name; the operator bakes it
+            # into host certificates. The two must agree.
+            - name: WHISTLER_SSH_CA_SECRET_NAME
+              value: "{{ .Release.Name }}-ssh-ca"
+            - name: WHISTLER_SSH_DOMAIN_SUFFIX
+              value: {{ .Values.whistler.ssh.domainSuffix | quote }}
+            - name: WHISTLER_LEGACY_USERNAME_ROUTING
+              value: {{ .Values.whistler.ssh.legacyUsernameRouting | quote }}
             - name: WHISTLER_FORCE_KATA_FOR_PRIVILEGED
               value: {{ .Values.whistler.security.forceKataForPrivileged | quote }}
             - name: WHISTLER_KATA_RUNTIME_CLASS

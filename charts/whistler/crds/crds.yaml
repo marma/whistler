@@ -392,6 +392,25 @@ spec:
               properties:
                 description:
                   type: string
+                ssh:
+                  type: string
+                  enum: ["direct", "relay", "none"]
+                  description: >-
+                    How this zone treats interactive SSH (default: direct).
+                    An inbound session is an egress channel the zone's
+                    egress-only NetworkPolicies never see — a user with a
+                    shell can scp anything out — so the gateway is the only
+                    place that can constrain it. direct: full end-to-end SSH
+                    (ProxyJump), scp/sftp/port-forwarding included. relay:
+                    gateway-mediated PTY only — FRICTION, NOT A BOUNDARY,
+                    since data can still be typed out through the terminal.
+                    none: no SSH at all. NOTE that `none` closes SSH, not the
+                    border: the session still has a desktop, a bidirectional
+                    clipboard, the portal web terminal and screenshots, none
+                    of which this field governs. Containment is the
+                    conjunction of the data, the channels, the user's trust
+                    and the endpoint they sit at — see design/security.md,
+                    "The border has four axes".
                 egress:
                   type: object
                   properties:

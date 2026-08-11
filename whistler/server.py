@@ -3,73 +3,94 @@ import asyncssh
 import sys
 import os
 import logging
+import re
 import threading
 from kubernetes import client
 from kubernetes import watch as k8s_watch
-from asyncssh.process import SSHCompletedProcess
-import pty
-import fcntl
-import termios
-import struct
 import traceback
 from textual.driver import Driver
 from textual.app import App
 from textual.geometry import Size
 from textual.events import Resize
 from textual._xterm_parser import XTermParser
-import stat
 import time
 from whistler.tui import WhistlerApp, LoadingScreen
-from whistler.sftp_support import WhistlerSFTPServer
-from whistler.globals import CONN_SERVER_MAP as _CONN_SERVER_MAP
+from whistler import relay
 
 import argparse
 from functools import partial
-from whistler.config import ConfigManager, KubeConfigManager
+from whistler.config import (ConfigManager, KubeConfigManager,
+                             SESSION_SSH_PORT, SSH_POSTURE_DIRECT,
+                             SSH_POSTURE_NONE)
 from asyncio import Event
-from textual.worker import Worker, WorkerState
 
 logger = logging.getLogger("whistler.server")
 
-class SubprocessTunnelProtocol(asyncssh.SSHServerSession):
-    """Protocol to bridge an SSH channel to a subprocess (e.g. kubectl exec)."""
-    def __init__(self, process):
-        self.process = process
-        self.transport = None
-        self._stdout_task = None
+# How long a jump connection waits for the target's sshd to answer, and how
+# often it retries in the meantime. Generous because the wait covers a cold
+# VM boot (cloud-init, the NFS home mount) and the client sees it as nothing
+# worse than a slow connect — `ssh box.w` on a stopped instance is supposed
+# to start it and wait.
+JUMP_CONNECT_TIMEOUT = float(os.environ.get("WHISTLER_JUMP_TIMEOUT", "180"))
+JUMP_RETRY_INTERVAL = 3.0
 
-    def connection_made(self, transport):
-        self.transport = transport
-        self._stdout_task = asyncio.create_task(self._pipe_stdout())
-    
-    def session_started(self):
-        pass
+# How long an on-demand instance survives its last closed connection. A grace
+# window rather than an immediate reap because the common shapes — `scp` then
+# `ssh`, a `git push` followed by a build — are several short connections
+# seconds apart, and reaping between them would make every one of them pay for
+# a cold boot.
+JUMP_EPHEMERAL_GRACE = float(os.environ.get("WHISTLER_JUMP_EPHEMERAL_GRACE", "60"))
 
-    async def _pipe_stdout(self):
-        try:
-            while True:
-                data = await self.process.stdout.read(4096)
-                if not data:
-                    break
-                self.transport.write(data)
-        except Exception as e:
-            logger.error(f"Tunnel pipe error: {e}")
-        finally:
-            if self.transport:
-                self.transport.close()
+# Live jump splices per (user, instance). The reap signal is this reaching
+# zero: an SSH connection has no "session end" a gateway can see, since the
+# client may open several channels and close them independently, so the
+# gateway counts them. Process-local, which is the known limitation — a
+# gateway restart forgets the counts and leaves an on-demand instance running
+# until someone connects and disconnects again (see design/proxyjump.md).
+_JUMP_SPLICES = {}
 
-    def data_received(self, data, datatype):
-        if self.process.stdin and not self.process.stdin.is_closing():
-            self.process.stdin.write(data)
+
+class _TrackedForwarder(asyncssh.forward.SSHForwarder):
+    """A spliced connection that tells the gateway when it closes, so
+    on-demand instances can be reaped once nothing is attached."""
+
+    def __init__(self, peer, on_close):
+        super().__init__(peer)
+        self._on_close = on_close
 
     def connection_lost(self, exc):
-        if self._stdout_task:
-            self._stdout_task.cancel()
-        if self.process.returncode is None:
-            try:
-                self.process.terminate()
-            except ProcessLookupError:
-                pass
+        super().connection_lost(exc)
+        on_close, self._on_close = self._on_close, None
+        if on_close:
+            on_close()
+
+# A session CR is named `<user>-<name>`, so an instance name is a DNS-1123
+# label minus the leading-digit allowance we don't need to police here.
+INSTANCE_NAME_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
+
+# Honour the pre-ProxyJump `user-<instance>` username convention. Deprecated:
+# instances are addressed by name through the jump mechanism now, and the
+# convention costs a real bug (a username containing a dash). Kept for one
+# release so muscle memory and existing scripts don't break; set false to
+# turn it off, and it goes away entirely after that.
+LEGACY_USERNAME_ROUTING = os.environ.get(
+    "WHISTLER_LEGACY_USERNAME_ROUTING", "true").strip().lower() in (
+        "1", "true", "yes")
+
+
+def strip_ssh_suffix(dest_host: str, suffix: str) -> str:
+    """The instance name inside a dialled hostname.
+
+    The suffix (``.w``) is a client-side convention that exists so one
+    ``Host *.w`` stanza matches every instance; nothing resolves it, and the
+    gateway is the only thing that ever parses it. Names are accepted with or
+    without it, so `ssh box.w` and a bare `ssh -J gw box` both work.
+    """
+    host = (dest_host or "").strip().rstrip(".")
+    if suffix and host.lower().endswith(suffix.lower()):
+        host = host[:-len(suffix)]
+    return host
+
 class WhistlerDriver(Driver):
     def __init__(self, next_driver: Driver | None = None, *, debug: bool = False, size: tuple[int, int] | None = None, **kwargs):
         super().__init__(next_driver, debug=debug, size=size)
@@ -217,7 +238,20 @@ async def start_server():
     logger.info(f"Starting in Kubernetes mode ({mode}) with log level {log_level}")
     
     config_manager = KubeConfigManager(kubeconfig=args.kubeconfig)
-    
+
+    # The SSH host CA (design/proxyjump.md). Ensured here rather than left to
+    # the operator's first VM so the `@cert-authority` line Whistler hands
+    # users exists from the moment the gateway is up. Idempotent and
+    # race-tolerant: whoever loses simply reads the other's key.
+    try:
+        if config_manager.ensure_ssh_ca():
+            logger.info("SSH host CA ready: %s",
+                        config_manager.get_ssh_known_hosts_line())
+    except Exception as e:
+        # Not fatal: without a CA, guests fall back to per-instance TOFU,
+        # which is exactly the pre-CA status quo.
+        logger.warning(f"Could not ensure the SSH host CA: {e}")
+
     # Create a partial to pass config_manager to SSHServer
     server_factory = partial(SSHServer, config_manager=config_manager)
 
@@ -273,7 +307,6 @@ class SSHServer(asyncssh.SSHServer):
 
     def connection_made(self, conn):
         logger.info('SSH connection received from %s.' % conn.get_extra_info('peername')[0])
-        _CONN_SERVER_MAP[conn] = self
         self._conn = conn
 
     def connection_lost(self, exc):
@@ -281,12 +314,9 @@ class SSHServer(asyncssh.SSHServer):
             logger.error('SSH connection error: ' + str(exc))
         else:
             logger.info('SSH connection closed.')
-        # Cleanup global map
-        if hasattr(self, '_conn') and self._conn in _CONN_SERVER_MAP:
-            del _CONN_SERVER_MAP[self._conn]
 
     def subsystem_requested(self, subsystem):
-        # SFTP is handled at the session level in WhistlerSession.subsystem_requested
+        # Subsystems are handled per-session (WhistlerSession).
         return False
 
     def begin_auth(self, username):
@@ -306,23 +336,8 @@ class SSHServer(asyncssh.SSHServer):
             return False
             
         logger.warning(f"Dev mode: allowing {username} via password auth")
-        
-        parts = username.split('-')
-        real_user = parts[0]
-        self.username = real_user
-        
-        # Determine target (same logic as before)
-        if len(parts) == 1:
-            self.target_type = "tui"
-        elif len(parts) >= 2:
-            suffix = "-".join(parts[1:])
-            templates = self.config_manager.get_user_templates(real_user)
-            if any(t['name'] == suffix for t in templates):
-                self.target_type = "template"
-                self.target_name = suffix
-            else:
-                self.target_type = "instance"
-                self.target_name = suffix
+        real_user, parts = self._split_username(username)
+        self._resolve_target(real_user, parts)
         return True
 
     def public_key_auth_supported(self):
@@ -330,28 +345,55 @@ class SSHServer(asyncssh.SSHServer):
         
 
     def _resolve_target(self, real_user, parts):
-        """Set username/target_type/target_name from the SSH username segments.
+        """Set username/target_type/target_name from the SSH username.
 
-        username conventions: `user` -> TUI, `user-<template>` -> ephemeral
-        instance from template, `user-<instance>` -> existing instance.
+        The username is just the username: `ssh alice@gateway` lands in the
+        TUI, and instances are addressed by name through the jump mechanism
+        (`ssh alice@box.w`), which is what `parts` used to be smuggling.
+
+        The legacy convention — `alice-<template>` / `alice-<instance>` — is
+        still honoured when WHISTLER_LEGACY_USERNAME_ROUTING is on (the
+        default, for one release), but only as a *fallback*: a username that
+        names a real user is taken whole first. That ordering alone fixes the
+        long-standing bug where a user whose name contains a dash could never
+        log in, since `alice-smith` now resolves to the user before it is
+        considered as user `alice` wanting instance `smith`.
         """
         self.username = real_user
-        if len(parts) == 1:
-            self.target_type = "tui"
-        else:
-            suffix = "-".join(parts[1:])
-            templates = self.config_manager.get_user_templates(real_user)
-            if any(t['name'] == suffix for t in templates):
-                self.target_type = "template"
-                self.target_name = suffix
-            else:
-                self.target_type = "instance"
-                self.target_name = suffix
-                self.active_instance_name = suffix
+        self.target_type = "tui"
+        if len(parts) == 1 or not LEGACY_USERNAME_ROUTING:
+            return
+
+        # Only an existing instance. The old convention also let a *template*
+        # name here mean "make me one and connect" — dropped along with the
+        # jump's equivalent: creating from a template belongs in an interface
+        # that can show progress, not behind a connection that either blocks
+        # or times out (design/proxyjump.md).
+        suffix = "-".join(parts[1:])
+        logger.warning(
+            f"Deprecated username routing: '{real_user}-{suffix}'. Use "
+            f"`ssh {suffix}{getattr(self.config_manager, 'ssh_domain_suffix', '.w')}` "
+            f"with a ProxyJump stanza instead (design/proxyjump.md).")
+        self.target_type = "instance"
+        self.target_name = suffix
+        self.active_instance_name = suffix
+
+    def _split_username(self, username):
+        """(real_user, parts) for an SSH username.
+
+        The whole string is preferred when it names a real user, so a user
+        called `alice-smith` authenticates as themselves rather than being
+        read as `alice` asking for instance `smith` — the bug the old
+        unconditional split had. Only a username that is *not* a user falls
+        back to the legacy convention.
+        """
+        if not LEGACY_USERNAME_ROUTING or self.config_manager.user_exists(username):
+            return username, [username]
+        parts = username.split('-')
+        return parts[0], parts
 
     def validate_public_key(self, username, key):
-        parts = username.split('-')
-        real_user = parts[0]
+        real_user, parts = self._split_username(username)
 
         # Check for dev mode bypass
         if os.environ.get("WHISTLER_AUTH_ALLOW_ANY") == "true":
@@ -408,162 +450,175 @@ class SSHServer(asyncssh.SSHServer):
         )
     
     async def connection_requested(self, dest_host, dest_port, orig_host, orig_port):
+        """A `direct-tcpip` channel open — the one place SSH carries a
+        destination *name* to a server we control, and therefore how Whistler
+        addresses instances without encoding them in the username
+        (design/proxyjump.md).
+
+        Two callers land here, told apart by the destination:
+
+        - ``localhost``/``127.0.0.1``: a `-L` port forward from a session this
+          gateway is already bridging via ``kubectl exec``. Legacy; it goes
+          away with the exec bridge.
+        - anything else: a ProxyJump (`ssh -J gw box.w`). The name is resolved
+          against this user's own sessions and the channel is spliced to that
+          instance's sshd — the gateway moves bytes and never sees plaintext.
+        """
         logger.info(f"Connection requested: {dest_host}:{dest_port} from {orig_host}:{orig_port}")
-        
-        # Only allow forwarding to localhost (which maps to the container)
-        if dest_host not in ("localhost", "127.0.0.1"):
-            logger.warning(f"Forwarding denied: destination {dest_host} not allowed (only localhost)")
+        return await self._jump_to_instance(dest_host, dest_port)
+
+    async def _jump_to_instance(self, dest_host, dest_port):
+        """Route a ProxyJump channel to the named instance's sshd.
+
+        Fail-closed at every step: an unparseable name, a name this user has no
+        session for, a port other than sshd, or a zone whose posture forbids
+        direct SSH all refuse the channel rather than falling through to
+        something permissive. The gateway must never become a generic TCP
+        relay — the set of instances it will splice to is the access-control
+        decision for the whole SSH plane.
+        """
+        loop = asyncio.get_running_loop()
+        cm = self.config_manager
+        suffix = getattr(cm, "ssh_domain_suffix", ".w")
+        name = strip_ssh_suffix(dest_host, suffix)
+
+        # Validated before it reaches an API call or a log line. A session CR
+        # is named `<user>-<name>`, so anything that isn't a DNS-1123 label
+        # cannot name one — rejecting it here keeps unresolvable junk out of
+        # the Kubernetes client and out of the logs.
+        if not INSTANCE_NAME_RE.match(name):
             raise asyncssh.ChannelOpenError(
                 asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED,
-                "Forwarding is only allowed to localhost (the container)"
-            )
-            
-        instance_name = getattr(self, "active_instance_name", None)
-        if not instance_name:
-             logger.warning("Forwarding denied: no active instance")
-             raise asyncssh.ChannelOpenError(
+                f"Not a valid Whistler instance name: {dest_host!r}")
+
+        # Port-pinned before anything is resolved: this mechanism reaches sshd
+        # and nothing else. A user's own `-L`/`-R` forwards ride the
+        # end-to-end connection and are the instance sshd's business, so they
+        # never arrive here.
+        if dest_port != SESSION_SSH_PORT:
+            raise asyncssh.ChannelOpenError(
                 asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED,
-                "No active container instance found for forwarding"
-            )
-            
-        # Resolve instance
-        instances = self.config_manager.get_user_instances(self.username)
-        instance = next((i for i in instances if i["name"] == instance_name), None)
-        
-        if instance and instance.get("podName") and instance.get("status") == "Running":
-            logger.info(f"Tunneling {dest_host}:{dest_port} -> Pod {instance['podName']}:127.0.0.1:{dest_port}")
-            return await self._create_pod_tunnel(instance['podName'], instance.get('namespace'), dest_port)
-        else:
-            logger.error(f"Forwarding failed: instance {instance_name} not running or not found")
+                f"Only port {SESSION_SSH_PORT} is reachable through this "
+                f"gateway (asked for {dest_port})")
+
+        target = await loop.run_in_executor(
+            None, cm.resolve_ssh_target, self.username, name)
+        if not target:
+            # Deliberately not "create it from the template of that name".
+            # That reads well in a demo and behaves badly: a channel open is
+            # the wrong place to wait on a cold boot, because the client has
+            # nothing to show and no way to report why it is taking minutes —
+            # or that it will never finish. Creating from a template belongs
+            # in the launcher, which can track and explain the wait.
             raise asyncssh.ChannelOpenError(
                 asyncssh.OPEN_CONNECT_FAILED,
-                f"Container {instance_name} is not reachable"
-            )
+                f"{self.username} has no instance named '{name}'")
 
-    async def _create_pod_tunnel(self, pod_name, namespace, port):
-        # Determine bridge command
-        cmd_str = f"socat - TCP4:127.0.0.1:{port}"
-        
-        # Check for socat
-        if not await self._is_command_available(pod_name, namespace, "socat"):
-             # Try fallback to nc?
-             if await self._is_command_available(pod_name, namespace, "nc"):
-                  cmd_str = f"nc 127.0.0.1 {port}"
-                  logger.warning(f"socat not found, falling back to nc for {pod_name}:{port}")
-             else:
-                  # Inject socat
-                  socat_bin = "/tmp/socat-static"
-                  if not await self._is_file_present(pod_name, namespace, socat_bin):
-                       logger.info(f"Injecting static socat for tunnel {pod_name}:{port}...")
-                       try:
-                           await self._inject_static_socat(pod_name, namespace, socat_bin)
-                       except Exception as e:
-                           logger.error(f"Injection failed: {e}")
-                           raise asyncssh.ChannelOpenError(
-                             asyncssh.OPEN_CONNECT_FAILED,
-                             f"Failed to inject socat: {e}"
-                           )
-                  cmd_str = f"{socat_bin} - TCP4:127.0.0.1:{port}"
-        
-        cmd = [
-            "kubectl", "exec", "-i", pod_name, "-n", namespace,
-            "--", "sh", "-c", cmd_str
-        ]
-        
-        try:
-            logger.info(f"Starting tunnel process: {cmd}")
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            # Helper to log stderr without blocking
-            async def log_stderr():
-                try:
-                    while True:
-                        line = await process.stderr.readline()
-                        if not line: break
-                        msg = line.decode().strip()
-                        if msg:
-                            logger.info(f"Tunnel {pod_name}:{port} stderr: {msg}")
-                except Exception:
-                    pass
-
-            asyncio.create_task(log_stderr())
-            
-            # Return protocol instance directly
-            return SubprocessTunnelProtocol(process)
-        except Exception as e:
-            logger.error(f"Failed to create tunnel: {e}")
+        posture = target.get("sshPosture", SSH_POSTURE_DIRECT)
+        if posture != SSH_POSTURE_DIRECT:
+            logger.warning(f"Jump to {name} denied: zone {target.get('zone')} "
+                           f"has ssh posture {posture}")
             raise asyncssh.ChannelOpenError(
-                asyncssh.OPEN_CONNECT_FAILED,
-                f"Tunnel creation failed: {e}"
-            )
+                asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED,
+                f"Zone '{target.get('zone')}' does not allow direct SSH to "
+                f"'{name}' (posture: {posture})")
 
-    async def _is_command_available(self, pod_name, namespace, cmd):
-        check_cmd = ["kubectl", "exec", pod_name, "-n", namespace, "--", "command", "-v", cmd]
-        process = await asyncio.create_subprocess_exec(
-            *check_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-        )
-        return await process.wait() == 0
+        # Declare intent and let the operator do the work, exactly as the TUI
+        # path does: bumping last-connect fires reconcile, which starts a
+        # halted VM. Harmless when it is already running.
+        await loop.run_in_executor(
+            None, cm.trigger_instance_start, self.username, name)
 
-    async def _is_file_present(self, pod_name, namespace, path):
-        check_cmd = ["kubectl", "exec", pod_name, "-n", namespace, "--", "test", "-f", path]
-        process = await asyncio.create_subprocess_exec(
-            *check_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-        )
-        return await process.wait() == 0
+        logger.info(f"Jump: {self.username}@{dest_host} -> {target['fullName']} "
+                    f"({target['host']}:{target['port']})")
+        return await self._wait_and_splice(target)
 
-    async def _inject_static_socat(self, pod_name, namespace, target_path):
-        # Use bundled binary
-        local_binary = "/app/bin/socat_x64"
-        
-        # Fallback for local development (outside container)
-        if not os.path.exists(local_binary):
-            # Try path relative to current directory
-            local_binary = os.path.join(os.getcwd(), "bin", "socat_x64")
-            
-        if not os.path.exists(local_binary):
-             raise Exception(f"Bundled socat binary not found at {local_binary}")
-        
-        # Inject into pod
-        logger.info(f"Injecting static socat from {local_binary} to {pod_name}:{target_path}...")
-        # Use cat < local | kubectl exec ... "cat > target && chmod +x target"
-        inject_cmd = [
-            "kubectl", "exec", "-i", pod_name, "-n", namespace, "--",
-            "sh", "-c", f"cat > {target_path} && chmod +x {target_path}"
-        ]
-        
+
+    def _splice_closed(self, target):
+        """Last one out reaps the instance — if the gateway made it."""
+        key = (self.username, target["name"])
+        remaining = _JUMP_SPLICES.get(key, 1) - 1
+        if remaining > 0:
+            _JUMP_SPLICES[key] = remaining
+            return
+        _JUMP_SPLICES.pop(key, None)
+        if target.get("ephemeral"):
+            asyncio.create_task(self._reap_ephemeral(target))
+
+    async def _reap_ephemeral(self, target):
+        name = target["name"]
+        await asyncio.sleep(JUMP_EPHEMERAL_GRACE)
+        # Someone reconnected inside the grace window: it is in use again, and
+        # whoever closes *that* connection gets the decision instead.
+        if _JUMP_SPLICES.get((self.username, name)):
+            return
+        logger.info(f"Jump: reaping on-demand instance '{name}' for {self.username}")
         try:
-            process = await asyncio.create_subprocess_exec(
-                *inject_cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-
-            # Manual write to stdin to ensure data is sent correctly
-            with open(local_binary, "rb") as f:
-                while True:
-                    chunk = f.read(4096)
-                    if not chunk:
-                        break
-                    process.stdin.write(chunk)
-                    await process.stdin.drain()
-            
-            process.stdin.close()
-            await process.stdin.wait_closed()
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                 raise Exception(f"Failed to inject socat: {stderr.decode()}")
-
+            await asyncio.get_running_loop().run_in_executor(
+                None, self.config_manager.delete_instance, self.username, name)
         except Exception as e:
-            logger.error(f"Injection failed: {e}")
-            raise
+            logger.warning(f"Could not reap on-demand instance '{name}': {e}")
+
+    async def _splice(self, target):
+        """Connect to the target's sshd and hand asyncssh a forwarder for it.
+
+        Deliberately not `conn.forward_connection`: that returns a plain
+        SSHForwarder with no close hook, and the reap signal is exactly "this
+        splice closed". Same two steps it performs, plus the bookkeeping.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            _, peer = await loop.create_connection(
+                asyncssh.forward.SSHForwarder, target["host"], target["port"])
+        except OSError as exc:
+            raise asyncssh.ChannelOpenError(
+                asyncssh.OPEN_CONNECT_FAILED, str(exc)) from None
+
+        key = (self.username, target["name"])
+        _JUMP_SPLICES[key] = _JUMP_SPLICES.get(key, 0) + 1
+        return _TrackedForwarder(peer, partial(self._splice_closed, target))
+
+    async def _wait_and_splice(self, target):
+        """Retry the splice until the target's sshd answers.
+
+        The client sees a slow connect, which is the right shape for "start my
+        instance and let me in". Three outcomes, not two: a hard policy
+        refusal has to be told apart from a slow boot, or a session the
+        operator refused to start reads to the user as an unexplained timeout.
+        """
+        loop = asyncio.get_running_loop()
+        cm = self.config_manager
+        deadline = time.monotonic() + JUMP_CONNECT_TIMEOUT
+        last_error = None
+
+        while True:
+            try:
+                return await self._splice(target)
+            except asyncssh.ChannelOpenError as e:
+                last_error = e
+
+            fresh = await loop.run_in_executor(
+                None, cm.resolve_ssh_target, self.username, target["name"])
+            if fresh and fresh.get("policyFailed"):
+                raise asyncssh.ChannelOpenError(
+                    asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED,
+                    fresh.get("statusMessage")
+                    or f"Policy refused to start '{target['name']}'")
+            if fresh is None:
+                raise asyncssh.ChannelOpenError(
+                    asyncssh.OPEN_CONNECT_FAILED,
+                    f"Instance '{target['name']}' disappeared while starting")
+
+            if time.monotonic() >= deadline:
+                raise asyncssh.ChannelOpenError(
+                    asyncssh.OPEN_CONNECT_FAILED,
+                    f"Timed out waiting for sshd on '{target['name']}' "
+                    f"(phase: {fresh.get('phase')}): {last_error}")
+            await asyncio.sleep(JUMP_RETRY_INTERVAL)
+
+
+
+
 
 
 
@@ -576,7 +631,6 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self._app_task = None
         self._chan = None
         self._shell_task = None
-        self._master_fd = None
         self.config_manager = config_manager
         self.username = username
         self.target_type = target_type
@@ -585,17 +639,19 @@ class WhistlerSession(asyncssh.SSHServerSession):
         self._resize_timer = None
         self._pending_size = None
         self._last_processed_size = None
-        self._agent_task = None
-        self.local_agent_path = None
-        self.pod_socket_path = None
         self.term_type = None
-        self._process_stdin = None
         self.is_ephemeral = is_ephemeral
         self.template_name = template_name
         self.exec_command = None
-        self._stdin_queue = asyncio.Queue()
         self._cleanup_done = False
         self._cleanup_lock = asyncio.Lock()
+        # Set while a gateway-mediated SSH relay is bridging this channel to a
+        # session's own sshd (whistler/relay.py). Mutually exclusive with the
+        # TUI app and with the legacy exec bridge's PTY.
+        self._relay = None
+        # True while a handover launched from the launcher is running: the
+        # channel outlives the remote shell because the TUI comes back.
+        self._return_to_tui = False
         logger.debug(f"WhistlerSession initialized: user={username}, type={target_type}, target={target_name}, ephemeral={is_ephemeral}")
 
     async def _cleanup_ephemeral(self):
@@ -636,52 +692,16 @@ class WhistlerSession(asyncssh.SSHServerSession):
              asyncio.create_task(self._cleanup_ephemeral())
 
     def subsystem_requested(self, subsystem):
+        """No subsystems on the gateway session.
+
+        SFTP used to be served here by shelling out to `kubectl exec`. It is
+        now native and end-to-end: `sftp box.w` through the ProxyJump stanza
+        talks to the instance's own sshd, so the gateway has nothing to
+        reimplement (design/proxyjump.md)."""
         if subsystem == "sftp":
-            logger.debug("WhistlerSession starting SFTP subsystem")
-            try:
-                from asyncssh.sftp import SFTPServerHandler
-
-                # Store session info on the channel so WhistlerSFTPServer can access it
-                self._chan._whistler_session = self
-                # Mark that SFTP is active so session_started doesn't start a shell
-                self._sftp_active = True
-
-                # Create reader for SFTP protocol
-                self._sftp_reader = asyncio.StreamReader()
-                conn = self._chan.get_connection()
-                self._sftp_reader.logger = conn.logger
-                def get_extra_info(name, default=None):
-                    return conn.get_extra_info(name, default)
-                self._sftp_reader.get_extra_info = get_extra_info
-
-                # Create WhistlerSFTPServer instance
-                logger.debug(f"Creating WhistlerSFTPServer instance")
-                sftp_server = WhistlerSFTPServer(self._chan)
-                logger.debug(f"WhistlerSFTPServer instance created")
-
-                # Create and start handler
-                self.sftp_handler = SFTPServerHandler(sftp_server, self._sftp_reader, self._chan, 3)
-                logger.debug("Starting SFTP handler")
-                self._sftp_task = asyncio.create_task(self.sftp_handler.run())
-
-                def notify_done(future):
-                    try:
-                        future.result()
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as e:
-                        logger.error(f"SFTP handler failed: {e}")
-                        traceback.print_exc(file=sys.stderr)
-
-                self._sftp_task.add_done_callback(notify_done)
-                logger.debug("SFTP handler running")
-
-                return True
-            except Exception as e:
-                logger.error(f"Failed to start SFTP: {e}")
-                import traceback
-                traceback.print_exc(file=sys.stderr)
-                return False
+            logger.info("SFTP against the gateway is no longer served; use "
+                        "the jump (sftp <instance>.w) to reach the instance "
+                        "directly.")
         return False
 
     def pty_requested(self, term_type, term_size, term_modes):
@@ -695,13 +715,8 @@ class WhistlerSession(asyncssh.SSHServerSession):
         return True
 
     def data_received(self, data, datatype):
-        if getattr(self, 'sftp_handler', None):
-            #print(f"SFTP data proxy: {len(data)} bytes", file=sys.stderr, flush=True)
-            self._sftp_reader.feed_data(data)
-            return
-
-        # Debugging input data
-        # print(f"DEBUG: WhistlerSession.data_received: len={len(data)} val={repr(data)}", file=sys.stderr, flush=True)
+        """User input goes to whichever of the two things owns the screen: the
+        launcher, or a relayed remote session."""
         if self._app:
              # Check for Ctrl-C explicitly to handle race conditions where driver is not ready or fails to route
              is_ctrl_c = False
@@ -709,7 +724,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                  is_ctrl_c = True
              elif isinstance(data, str) and '\x03' in data:
                  is_ctrl_c = True
-             
+
              if is_ctrl_c:
                  if hasattr(self._app, 'exit'):
                      self._app.exit("cancelled")
@@ -717,28 +732,15 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
              if hasattr(self._app, 'driver') and self._app.driver:
                 self._app.driver.feed_data(data)
-        elif self._master_fd is not None:
-             # Forward to PTY master
-             try:
-                 os.write(self._master_fd, data.encode('utf-8') if isinstance(data, str) else data)
-             except OSError:
-                 pass
-        elif hasattr(self, '_stdin_queue'):
-             # Forward to queue for non-PTY process stdin
-             try:
-                 self._stdin_queue.put_nowait(data.encode('utf-8') if isinstance(data, str) else data)
-             except Exception as e:
-                 logger.debug(f"Error queuing input data: {e}")
-        elif self._process_stdin is not None:
-             # Forward to process stdin (non-PTY)
-             try:
-                 self._process_stdin.write(data.encode('utf-8') if isinstance(data, str) else data)
-                 # self._process_stdin.drain() # Not async here, need to check if we can await or if it's buffered
-             except Exception:
-                 pass
+        elif self._relay:
+             self._relay.write(data.encode('utf-8') if isinstance(data, str) else data)
 
     def signal_received(self, signal):
         # print(f"DEBUG: WhistlerSession.signal_received: {signal}", file=sys.stderr, flush=True)
+        if self._relay:
+            # Pass it on rather than interpreting it: the remote shell's job.
+            self._relay.send_signal(signal)
+            return
         if signal == 'INT' or signal == 'TERM':
              if self._app and hasattr(self._app, 'action_cancel'):
                  asyncio.create_task(self._app.action_cancel())
@@ -747,6 +749,9 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
     def break_received(self, msec):
         logger.info(f"WhistlerSession.break_received: {msec}")
+        if self._relay:
+            self._relay.send_break(msec)
+            return
         # Treat break as Ctrl-C
         if self._app and hasattr(self._app, 'action_cancel'):
              asyncio.create_task(self._app.action_cancel())
@@ -759,20 +764,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
         return True
     
     def session_started(self):
-        # If SFTP is active, don't start a shell
-        if getattr(self, '_sftp_active', False):
-             logger.debug("Session started in SFTP mode, bypassing shell startup")
-             return
-
         logger.debug("WhistlerSession.session_started")
-        
-        # Check for agent forwarding
-        self.local_agent_path = self._chan.get_agent_path()
-        if self.local_agent_path:
-            import secrets
-            # Generate a unique path for the pod socket
-            self.pod_socket_path = f"/tmp/agent-{secrets.token_hex(4)}.sock"
-            logger.info(f"Agent forwarding requested. Local: {self.local_agent_path}, Pod: {self.pod_socket_path}")
 
         # Temporarily set TERM/COLORTERM based on client request so Textual/Rich picks it up
         old_term = os.environ.get('TERM')
@@ -799,8 +791,6 @@ class WhistlerSession(asyncssh.SSHServerSession):
             elif self.target_type == "instance":
                 # Find the instance
                 self._shell_task = asyncio.create_task(self._connect_to_instance(command=self.exec_command))
-            elif self.target_type == "template":
-                 self._shell_task = asyncio.create_task(self._create_and_connect_ephemeral(command=self.exec_command))
             else:
                 logger.warning(f"Target type {self.target_type} unknown, falling back to TUI")
                 self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
@@ -815,10 +805,38 @@ class WhistlerSession(asyncssh.SSHServerSession):
             else: os.environ.pop('COLORTERM', None)
 
     async def _run_app(self):
+        """Run the launcher, and keep running it around any handovers.
+
+        Choosing "connect" exits the app with the instance name rather than
+        connecting in place: a Textual app cannot hand its own channel to a
+        remote shell. The session does the relay, and when the remote shell
+        ends we come back with a fresh app — so the TUI behaves like a place
+        you return to rather than a thing you leave.
+        """
         logger.debug("WhistlerSession._run_app starting")
         try:
-            # Run the app with our custom driver
-            await self._app.run_async()
+            while True:
+                await self._app.run_async()
+                choice = getattr(self._app, "return_value", None)
+                self._app = None
+                if not (isinstance(choice, tuple) and choice[:1] == ("connect",)):
+                    break
+
+                self.target_name = choice[1]
+                self.active_instance_name = choice[1]
+                if self.server:
+                    self.server.active_instance_name = choice[1]
+                self._return_to_tui = True
+                try:
+                    await self._connect_to_instance()
+                finally:
+                    self._return_to_tui = False
+
+                self._app = WhistlerApp(
+                    driver_class=WhistlerDriver,
+                    config_manager=self.config_manager,
+                    username=self.username, session=self)
+                self._app.ssh_channel = self._chan
         except Exception as e:
             logger.error(f"App error: {e}")
             traceback.print_exc(file=sys.stderr)
@@ -826,616 +844,150 @@ class WhistlerSession(asyncssh.SSHServerSession):
             logger.debug("WhistlerSession._run_app finished")
             self._chan.exit(0)
 
-    async def _create_and_connect_ephemeral(self, command=None):
-         # Create ephemeral instance
-         # self.is_ephemeral already set in __init__
-         instance_name = self.target_name
-         template_name = self.template_name or self.target_name
-         
-         # Resolve full template name
-         templates = self.config_manager.get_user_templates(self.username)
-         template_obj = next((t for t in templates if t["name"] == template_name), None)
-         template_ref = template_obj["fullName"] if template_obj else template_name
-         
-         if self.term_type:
-             # Use loading screen for PTY mode
-             loading_app = LoadingApp(self._chan, self.initial_term_size, f"Creating ephemeral instance {instance_name}...")
-             loading_app.ssh_channel = self._chan
-             
-             async def create_task():
-                 # Create instance
-                 loop = asyncio.get_running_loop()
-                 success = await loop.run_in_executor(
-                     None, 
-                     lambda: self.config_manager.add_instance(self.username, template_ref, instance_name, preemptible=True)
-                 )
-                 
-                 if success:
-                     loading_app.update_status(f"Waiting for instance {instance_name} to be ready...")
-                     self.target_name = instance_name
-                     return await self._connect_to_instance_with_app(loading_app)
-                 else:
-                     loading_app.request_exit()
-                     self._chan.write(f"Failed to create ephemeral instance.\r\n".encode('utf-8'))
-                     self._chan.exit(1)
-                     return None
-             
-             # Run the loading app with the create task
-             task = asyncio.create_task(create_task())
-             # Set app so input is routed to it
-             self._app = loading_app
-             try:
-                 result = await loading_app.run_async()
-                 if result == "cancelled":
-                     logger.info(f"User cancelled creation of {instance_name}")
-                     task.cancel()
-                     try:
-                         await task
-                     except asyncio.CancelledError:
-                         pass
-                     return
 
-                 # Wait for task to complete
-                 pod_name = await task
-                 
-                 if pod_name:
-                     self._app = None # Clear app reference SOONER
-                     
-                     # Force restore terminal state
-                     try:
-                          # Show cursor, exit alt screen
-                          self._chan.write(b"\x1b[?25h\x1b[?1049l")
-                          await asyncio.sleep(0.1)
-                     except Exception:
-                          pass
 
-                     await self._run_pod_shell(pod_name, command=command)
-             except asyncio.CancelledError:
-                 logger.info("Task cancelled in _create_and_connect_ephemeral")
-                 task.cancel()
-                 raise
-             finally:
-                 # Cleanup
-                 logger.info(f"Entering finally block for {instance_name}")
-                 if self.term_type:
-                     try:
-                         self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
-                     except Exception:
-                         pass
-                 
-                 await self._cleanup_ephemeral()
-                 
-                 try:
-                     # Restore terminal state explicitly: Show Cursor, Disable Alt Screen
-                     self._chan.write(b"\x1b[?25h\x1b[?1049l")
-                     # Give a moment for the buffer to flush before exit
-                     await asyncio.sleep(0.1)
-                     self._chan.exit(0)
-                 except Exception:
-                     pass
-                 self._app = None
-         else:
-             # Non-PTY mode: use simple text output
-             if self.term_type and not command:
-                 try:
-                    self._chan.write(f"Creating ephemeral instance {instance_name} (full name: {self.username}-{instance_name}) from template {self.target_name}...\r\n".encode('utf-8'))
-                 except Exception:
-                    pass
-             
-             if self.config_manager.add_instance(self.username, template_ref, instance_name):
-                 try:
-                     self.target_name = instance_name
-                     await self._connect_to_instance(command=command)
-                 except Exception as e:
-                     logger.error(f"Error in _create_and_connect_ephemeral: {e}")
-                     try:
-                         self._chan.write(f"Error connecting to instance: {e}\r\n".encode('utf-8'))
-                     except Exception:
-                         pass
-                 except asyncio.CancelledError:
-                     logger.info("Task cancelled in _create_and_connect_ephemeral")
-                     raise
-                 finally:
-                     logger.info(f"Entering finally block for {instance_name}")
-                     if self.term_type and not command:
-                         try:
-                             self._chan.write(f"\r\nCleaning up ephemeral instance {instance_name}...\r\n".encode('utf-8'))
-                         except Exception:
-                             pass
-                     
-                     await self._cleanup_ephemeral()
- 
-                     try:
-                         # Force close channel to prompt cleanup
-                         self._chan.close()
-                         self._chan.exit(0)
-                     except Exception:
-                         pass
-             else:
-                 try:
-                    self._chan.write(f"Failed to create ephemeral instance.\r\n".encode('utf-8'))
-                    self._chan.exit(1)
-                 except Exception:
-                    pass
+    def _fail(self, message):
+        """Report why a connection didn't happen, and end the session unless
+        the launcher is waiting to take the screen back."""
+        try:
+            self._chan.write(f"\r\n{message}\r\n".encode('utf-8'))
+            if not self._return_to_tui:
+                self._chan.exit(1)
+        except Exception:
+            pass
 
-    async def _connect_to_instance_with_app(self, loading_app):
-        """Connect to instance using the provided loading app."""
-        loop = asyncio.get_running_loop()
-        instances = await loop.run_in_executor(None, self.config_manager.get_user_instances, self.username)
-        instance = next((i for i in instances if i["name"] == self.target_name), None)
-        
-        if not instance:
-            loading_app.request_exit()
-            self._chan.write(f"Instance {self.target_name} not found.\r\n".encode('utf-8'))
-            self._chan.exit(1)
-            return
-            
-        pod_name = instance.get("podName")
-        
-        # If terminating, wait for it to finish first
-        if instance.get("status") == "Terminating":
-            loading_app.update_status("Waiting for existing pod to terminate...")
-            while instance and instance.get("status") == "Terminating":
-                await asyncio.sleep(0.5)
-                instances = await loop.run_in_executor(None, self.config_manager.get_user_instances, self.username)
-                instance = next((i for i in instances if i["name"] == self.target_name), None)
-            
-            if instance:
-                pod_name = instance.get("podName")
-        
-        if not pod_name or (instance and instance.get("status") != "Running"):
-            loading_app.update_status(f"Ensuring instance {self.target_name} is running...")
-
-            # Pod creation is owned by the operator. Bump the CR so its reconcile
-            # handler fires and (re)creates the pod, then wait for it to come up.
-            ns = instance.get("namespace") if instance else self.config_manager._get_user_namespace(self.username)
-            await loop.run_in_executor(
-                None, self._trigger_reconcile, f"{self.username}-{self.target_name}", ns
-            )
-
-            loading_app.update_status(f"Starting instance {self.target_name}...")
-            pod_name = await self._wait_for_pod_with_app(self.target_name, loading_app)
-        
-        # Exit the loading app
-        loading_app.request_exit()
-        
-        if pod_name:
-            # Update server context for forwarding
-            if self.server:
-                self.server.active_instance_name = self.target_name
-                logger.info(f"Updated server active_instance_name to {self.target_name}")
-
-            # Start agent bridge if needed
-            if self.local_agent_path and self.pod_socket_path:
-                ns = instance.get("namespace", self.config_manager.namespace)
-                self._agent_task = asyncio.create_task(self._bridge_agent(pod_name, ns))
-                await asyncio.sleep(0.5)
-
-            return pod_name
-        else:
-            self._chan.write(f"Failed to start instance {self.target_name}.\r\n".encode('utf-8'))
-            self._chan.exit(1)
-            return None
+    async def _sshd_ready(self, target):
+        """Whether the instance is answering on its SSH port yet."""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(target["host"], target["port"]), 5)
+        except (OSError, asyncio.TimeoutError):
+            return False
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+        return True
 
     async def _connect_to_instance(self, loading_screen=None, command=None):
-        """Connect to instance (for non-PTY mode)."""
-        instances = self.config_manager.get_user_instances(self.username)
-        instance = next((i for i in instances if i["name"] == self.target_name), None)
-        
-        if self.term_type and not loading_screen and not command:
-            # PTY mode (interactive): use loading app
-            # If command is present, we might be in PTY mode but executing a single command (ssh -t cmd)
-            # In that case, we should maybe still use loading screen? Or just text?
-            # For now, let's treat command execution as "just do it" without LoadingApp unless it takes too long?
-            # Actually, reusing the LoadingApp logic for connection is robust.
-            pass
-            
-        if self.term_type and not loading_screen:
-            # Check if already running to skip loading screen (avoid blackout)
-            pod_name_ready = None
-            if instance and instance.get("status") == "Running":
-                 pod_name_ready = instance.get("podName")
-                 # Verify? No, trust CR status for speed. If it fails, user can retry or we can fallback?
-                 # Assuming "Running" means ready.
-            
-            if pod_name_ready:
-                 logger.warning(f"Instance {self.target_name} already running, skipping loading screen.")
-                 await self._run_pod_shell(pod_name_ready, command=command)
-                 return
+        """Connect this channel to an instance over the SSH relay.
 
-            # PTY mode: use loading app
-            loading_app = LoadingApp(self._chan, self.initial_term_size, f"Connecting to instance {self.target_name}...")
-            loading_app.ssh_channel = self._chan
-            
-            task = asyncio.create_task(self._connect_to_instance_with_app(loading_app))
-            # Set app so input is routed to it
-            self._app = loading_app
-            try:
-                result = await loading_app.run_async()
-                if result == "cancelled":
-                    logger.info(f"User cancelled connection to {self.target_name}")
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                    return
-
-                pod_name = await task
-                if pod_name:
-                    self._app = None # Clear app reference SOONER so input goes to shell
-                    
-                    # Force restore terminal state
-                    try:
-                         # Show cursor, exit alt screen
-                         self._chan.write(b"\x1b[?25h\x1b[?1049l")
-                         await asyncio.sleep(0.1) # Brief pause to let client process
-                    except Exception:
-                         pass
-
-                    await self._run_pod_shell(pod_name, command=command)
-            except asyncio.CancelledError:
-                task.cancel()
-                raise
-            finally:
-                self._app = None
-                try:
-                    # Restore terminal state explicitly: Show Cursor, Disable Alt Screen
-                    # We do this again in finally block just in case
-                    self._chan.write(b"\x1b[?25h\x1b[?1049l")
-                except:
-                    pass
-            return
-        
-        # Non-PTY mode or already have loading screen
-        if not instance:
-            try:
-                self._chan.write(f"Instance {self.target_name} not found.\r\n".encode('utf-8'))
-                self._chan.exit(1)
-            except Exception:
-                pass
-            return
-            
-        pod_name = instance.get("podName")
-        
-        # If terminating, wait for it to finish first
-        if instance.get("status") == "Terminating":
-            try:
-                if self.term_type and not command:
-                    self._chan.write(b"Waiting for existing pod to terminate ")
-            except Exception:
-                pass
-            while instance and instance.get("status") == "Terminating":
-                await asyncio.sleep(0.5)
-                try:
-                    if self.term_type and not command:
-                        self._chan.write(b".")
-                except Exception:
-                    pass
-                instances = self.config_manager.get_user_instances(self.username)
-                instance = next((i for i in instances if i["name"] == self.target_name), None)
-            
-            try:
-                if self.term_type and not command:
-                    self._chan.write(b"\r\n")
-            except Exception:
-                pass
-            
-            if instance:
-                pod_name = instance.get("podName")
-        
-        if not pod_name or (instance and instance.get("status") != "Running"):
-            # Pod creation is owned by the operator; trigger its reconcile.
-            ns = instance.get("namespace", self.config_manager.namespace) if instance else self.config_manager._get_user_namespace(self.username)
-            await asyncio.get_running_loop().run_in_executor(
-                None, self._trigger_reconcile, f"{self.username}-{self.target_name}", ns
-            )
-            pod_name = await self._wait_for_pod(self.target_name)
-        
-        if pod_name:
-            # Update server context for forwarding
-            if self.server:
-                self.server.active_instance_name = self.target_name
-                logger.info(f"Updated server active_instance_name to {self.target_name}")
-
-            # Start agent bridge if needed
-            if self.local_agent_path and self.pod_socket_path:
-                ns = instance.get("namespace", self.config_manager.namespace)
-                self._agent_task = asyncio.create_task(self._bridge_agent(pod_name, ns))
-                await asyncio.sleep(0.5)
-
-            await self._run_pod_shell(pod_name, command=command)
-        else:
-            self._chan.write(f"Failed to start instance {self.target_name}.\r\n".encode('utf-8'))
-            self._chan.exit(1)
-
-    def _generate_motd(self, instance, template, all_volumes):
-        message = []
-        
-        # Welcome message
-        banner = """
-    ********************************************************************
-    *  ██╗    ██╗██╗  ██╗██╗███████╗████████╗██╗     ███████╗██████╗   *
-    *  ██║    ██║██║  ██║██║██╔════╝╚══██╔══╝██║     ██╔════╝██╔══██╗  *
-    *  ██║ █╗ ██║███████║██║███████╗   ██║   ██║     █████╗  ██████╔╝  *
-    *  ██║███╗██║██╔══██║██║╚════██║   ██║   ██║     ██╔══╝  ██╔══██╗  *
-    *  ╚███╔███╔╝██║  ██║██║███████║   ██║   ███████╗███████╗██║  ██║  *
-    *   ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝╚══════╝   ╚═╝   ╚══════╝╚══════╝╚═╝  ╚═╝  *
-    ********************************************************************
+        Same three-outcome wait as the jump path — ready, still booting, or
+        refused by policy — because a session the operator declined to start
+        must say so rather than time out silently. The difference is that
+        here there is a terminal to explain the wait in.
         """
-        message.append(f"\033[32m{banner}\033[0m")
-        message.append(f"Welcome to Whistler. You are connected to {instance['name']}")
-        
-        # Personal mount check
-        personal_mount = template.get("personalMountPath")
-        if not personal_mount:
-             personal_mount = "/userdata"
+        loop = asyncio.get_running_loop()
+        cm = self.config_manager
+        name = self.target_name
 
-        if personal_mount:
-            message.append(f"and your user directory is mounted under {personal_mount}")
-            
-        # Volumes list
-        visible_volumes = []
-        
-        # Use actual mounts from pod if available (source of truth)
-        real_mounts = instance.get("mounts")
-        if visible_volumes:
-            message.append("\nMounted volumes are")
-            message.extend(visible_volumes)
-            message.append("")
-            
-        # Ephemeral warning
-        if self.is_ephemeral:
-            message.append("This instance is ephemeral and will be terminated once you close the connection.\nMake sure to save any work to mounted persistant volumes before exiting.")
-            message.append("")
-            
-        # Preemptible warning
-        if instance.get("preemptible"):
-            message.append("This instance is preemptible, it can terminate without warning at any time.\nPlan accordingly.")
-            message.append("")
-            
-        return "\n".join(message) + "\n"
+        target = await loop.run_in_executor(
+            None, cm.resolve_ssh_target, self.username, name)
+        if not target:
+            self._fail(f"No instance named '{name}'.")
+            return
 
-    async def _run_pod_shell(self, pod_name, command=None):
-        logger.info(f"Starting shell for pod {pod_name}. Command: {command}")
-        
-        # Get instance and template info for MOTD (Only if not running a command and interactive)
-        motd = ""
-        if not command and self.term_type:
-            instances = self.config_manager.get_user_instances(self.username)
-            instance = next((i for i in instances if i["name"] == self.target_name), None)
-            
-            if instance:
-                templates = self.config_manager.get_user_templates(self.username)
-                # TemplateRef in instance might be full name "user-template", but get_user_templates returns list with "name" (short) and "fullName"
-                # Instance template ref is likely just the name if created via TUI? 
-                # In config.py add_instance: "templateRef": template_name
-                # Let's match by fullName or name
-                template_ref = instance.get("template")
-                template = next((t for t in templates if t["fullName"] == template_ref or t["name"] == template_ref), {})
-                
-                all_volumes = self.config_manager.get_volumes() # Global volume definitions if needed
-                motd = self._generate_motd(instance, template, all_volumes)
-                logger.info(f"Generated MOTD for {self.username}: {len(motd)} chars")
-            else:
-                 logger.warning(f"MOTD: Instance {self.target_name} not found in {len(instances)} instances")
-                 motd = f"Connecting to {self.target_name}...\r\n(Instance details not found for MOTD)\r\n"
-            
-        if motd:
-            # We need to write CRLF for raw PTY/SSH output to look right
-            formatted_motd = motd.replace("\n", "\r\n")
-            
-            # Clear screen? Maybe not, just header.
-            # self._chan.write(b"\x1b[2J\x1b[H") 
-            
-            self._chan.write(formatted_motd.encode('utf-8'))
-            logger.info("MOTD sent to channel")
-            
-            # Ensure the MOTD is sent before we hook up the PTY
-            # asyncssh doesn't have drain on channel. buffer is managed.
-            # We keep the sleep to ensure render.
-            await asyncio.sleep(0.5)
+        # `relay` permits exactly this path and forbids the end-to-end jump;
+        # only `none` closes both.
+        if target.get("sshPosture") == SSH_POSTURE_NONE:
+            self._fail(f"Zone '{target.get('zone')}' does not allow SSH to "
+                       f"'{name}'.")
+            return
 
-        
-        process = None
-        use_pty = self.term_type is not None
-        
+        # Declare intent; the operator starts a stopped instance.
+        await loop.run_in_executor(
+            None, cm.trigger_instance_start, self.username, name)
+
+        interactive = bool(self.term_type) and not command
+        deadline = time.monotonic() + JUMP_CONNECT_TIMEOUT
+        announced = False
+        while not await self._sshd_ready(target):
+            fresh = await loop.run_in_executor(
+                None, cm.resolve_ssh_target, self.username, name)
+            if fresh is None:
+                self._fail(f"Instance '{name}' disappeared while starting.")
+                return
+            if fresh.get("policyFailed"):
+                self._fail(fresh.get("statusMessage")
+                           or f"Policy refused to start '{name}'.")
+                return
+            if time.monotonic() >= deadline:
+                self._fail(f"Timed out waiting for '{name}' to accept SSH "
+                           f"(phase: {fresh.get('phase')}).")
+                return
+            if interactive:
+                if not announced:
+                    self._chan.write(
+                        f"Waiting for {name} ".encode('utf-8'))
+                    announced = True
+                self._chan.write(b".")
+            await asyncio.sleep(JUMP_RETRY_INTERVAL)
+
+        if interactive and announced:
+            self._chan.write(b"\r\n")
+
+        if not await self._run_relay_shell(target, command=command):
+            self._fail(f"Could not open a session on '{name}'. If this is a "
+                       f"pod, it may not run an sshd yet.")
+
+
+    async def _run_relay_shell(self, target, command=None):
+        """Bridge this channel to the instance's own sshd (whistler/relay.py).
+
+        The successor to `_run_pod_shell`: one SSH client connection instead of
+        a PTY, a `kubectl exec` subprocess, fd readers and a hand-rolled agent
+        bridge — and identical for pods and VMs, since both are just sshd.
+
+        Returns True if the relay ran; False if it could not be established,
+        which leaves the caller free to fall back to the exec bridge for a
+        workload that has no sshd yet.
+        """
+        loop = asyncio.get_running_loop()
+        cm = self.config_manager
+        private_key, ca_pub = await asyncio.gather(
+            loop.run_in_executor(None, cm.get_vm_access_private_key, self.username),
+            loop.run_in_executor(None, cm.get_ssh_ca_public_key),
+        )
+
+        term_size = None
+        if self.term_type:
+            cols, rows = self._pending_size or self.initial_term_size or (80, 24)
+            term_size = (cols, rows)
+
         try:
-            instances = self.config_manager.get_user_instances(self.username)
-            instance = next((i for i in instances if i["name"] == self.target_name), None)
-            ns = instance.get("namespace", self.config_manager.namespace) if instance else self.config_manager.namespace
-            
-            cmd = ["kubectl", "exec", "-n", ns]
-            
-            if use_pty:
-                cmd.append("-it")
-            else:
-                cmd.append("-i")
-                
-            cmd.append(pod_name)
-            cmd.append("--")
-            
-            if self.pod_socket_path:
-                cmd.extend(["env", f"SSH_AUTH_SOCK={self.pod_socket_path}"])
-                
-            if command:
-                # Use base64 encoding to avoid argument parsing issues with kubectl/sh
-                import base64
-                import secrets
-                
-                b64_cmd = base64.b64encode(command.encode('utf-8')).decode('utf-8')
-                script_path = f"/tmp/whistler-exec-{secrets.token_hex(4)}.sh"
-                
-                # Write decoded command to temp file, execute with sh -l (login shell), then cleanup
-                # We use '&&' to ensure execution only happens if write succeeds
-                # Using ';' for cleanup to ensure it runs even if command fails
-                # Note: sh -l <file> generally preserves stdin for the commands in the file
-                wrapped_cmd = f"echo {b64_cmd} | base64 -d > {script_path} && sh -l {script_path}; rm -f {script_path}"
-                
-                cmd.extend(["bash", "-c", wrapped_cmd])
-            else:
-                # Interactive shell
-                cmd.append("/bin/bash")
-            
-            logger.info(f"Executing subprocess: {cmd}")
-            
-            if use_pty:
-                # PTY Mode
-                master, slave = pty.openpty()
-                self._master_fd = master
-                
-                # Set initial size logic:
-                # 1) If we have a pending size from a recent resize event (while app was closing?), use it.
-                # 2) Else use initial_term_size from pty_request.
-                cols, rows = 80, 24
-                if self.initial_term_size:
-                    cols, rows = self.initial_term_size
-                
-                if self._pending_size:
-                     cols, rows = self._pending_size
-                     
-                try:
-                    winsize = struct.pack("HHHH", rows, cols, 0, 0)
-                    fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
-                    logger.info(f"Set initial PTY size to {cols}x{rows}")
-                except Exception as e:
-                    logger.error(f"Failed to set initial PTY size: {e}")
+            self._relay = await relay.open_relay(
+                chan=self._chan,
+                host=target["host"], port=target["port"],
+                username=self.username,
+                private_key=private_key,
+                ca_public_key=ca_pub,
+                term_type=self.term_type,
+                term_size=term_size,
+                command=command,
+                # The user's own forwarded agent, passed straight through, so
+                # a relayed shell can still reach their keys.
+                agent_path=self._chan.get_connection().get_agent_path(),
+            )
+        except relay.RelayError as e:
+            logger.warning(f"Relay to {target['name']} failed: {e}")
+            self._relay = None
+            return False
 
-                # Ensure non-blocking
-                os.set_blocking(master, False)
-
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=slave, stdout=slave, stderr=slave,
-                    preexec_fn=os.setsid
-                )
-                os.close(slave) # Close slave in parent
-                
-                loop = asyncio.get_running_loop()
-                pty_closed = loop.create_future()
-                
-                def read_pty():
-                    try:
-                        data = os.read(master, 1024)
-                        if not data:
-                            if not pty_closed.done():
-                                pty_closed.set_result(True)
-                        else:
-                            # print(f"PTY read {len(data)} bytes", file=sys.stderr)
-                            self._chan.write(data)
-                    except BlockingIOError:
-                        pass
-                    except (OSError, Exception) as e:
-                        # print(f"PTY read error: {e}", file=sys.stderr)
-                        if not pty_closed.done():
-                            pty_closed.set_result(True)
-
-                loop.add_reader(master, read_pty)
-                
-                # Wait for either process exit or PTY close
-                wait_task = asyncio.create_task(process.wait())
-                
-                try:
-                    done, pending = await asyncio.wait(
-                        [wait_task, pty_closed], 
-                        return_when=asyncio.FIRST_COMPLETED
-                    )
-                except asyncio.CancelledError:
-                    logger.info("Shell task cancelled, cleaning up...")
-                    raise
-                finally:
-                    # Clean up reader immediately 
-                    loop.remove_reader(master)
-
-            else:
-                # Non-PTY Mode (Pipes)
-                # Queue is already initialized in __init__ to buffer early input
-                
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                self._process_stdin = process.stdin
-                
-                # Task to consume queue and write to stdin
-                async def consume_stdin(writer, queue):
-                    try:
-                        while True:
-                            item = await queue.get()
-                            if item is None: # EOF sentinel
-                                if writer.can_write_eof():
-                                    writer.write_eof()
-                                else:
-                                    writer.close()
-                                break
-                            
-                            writer.write(item)
-                            await writer.drain()
-                    except Exception as e:
-                        logger.error(f"Stdin consumer error: {e}")
-
-                stdin_task = asyncio.create_task(consume_stdin(self._process_stdin, self._stdin_queue))
-                
-                async def forward_output(reader, channel_write_func):
-                    try:
-                        while True:
-                            data = await reader.read(1024)
-                            if not data:
-                                break
-                            channel_write_func(data)
-                    except Exception as e:
-                        logger.error(f"Output forwarder error: {e}")
-
-                # Forward stdout -> channel stdout
-                stdout_task = asyncio.create_task(forward_output(process.stdout, self._chan.write))
-                
-                # Forward stderr -> channel stderr
-                stderr_task = asyncio.create_task(forward_output(process.stderr, partial(self._chan.write, datatype=asyncssh.EXTENDED_DATA_STDERR)))
-                
-                try:
-                    await process.wait()
-                    # Wait for output forwarding to finish (drain pipes)
-                    await asyncio.gather(stdout_task, stderr_task)
-                except asyncio.CancelledError:
-                    logger.info("Shell task cancelled, cleaning up...")
-                    stdout_task.cancel()
-                    stderr_task.cancel()
-                    stdin_task.cancel()
-                    raise
-                finally:
-                    stdin_task.cancel() # Ensure consumer stops
-                    try:
-                         await stdin_task
-                    except asyncio.CancelledError:
-                         pass
-
-        except Exception as e:
-            logger.error(f"Shell error: {e}")
+        try:
+            status = await self._relay.wait_closed()
         finally:
-            logger.info("Shell finished, cleaning up resources...")
-            loop = asyncio.get_running_loop()
-            if self._master_fd:
-                # Ensure reader is removed if not already
-                try:
-                    loop.remove_reader(self._master_fd)
-                except Exception:
-                    pass
-                os.close(self._master_fd)
-                self._master_fd = None
-            
-            if process and process.returncode is None:
-                logger.info("Terminating kubectl process...")
-                try:
-                    process.terminate()
-                except ProcessLookupError:
-                    pass
-            
+            self._relay = None
+
+        # A handover launched from the TUI returns to it, so the channel has to
+        # stay open; a direct connection is the whole session and ends with it.
+        if not self._return_to_tui:
             try:
-                self._chan.exit(0)
-            except Exception as e:
+                self._chan.exit(status if status is not None else 0)
+            except OSError:
                 pass
+        return True
+
 
     def _trigger_reconcile(self, instance_full_name, namespace):
         """Bump an annotation on the Session so the operator's update handler
@@ -1532,15 +1084,6 @@ class WhistlerSession(asyncssh.SSHServerSession):
         finally:
             stop.set()
 
-    async def _wait_for_pod_with_app(self, instance_name, loading_app, timeout=None):
-        """Wait for pod to be ready (PTY mode), updating the loading app."""
-        ns = self.config_manager._get_user_namespace(self.username)
-        full_name = f"{self.username}-{instance_name}"
-        return await self._watch_pod_ready(
-            ns, full_name,
-            status_cb=lambda phase: loading_app.update_status(f"Instance status: {phase}"),
-            timeout=timeout,
-        )
 
     async def _wait_for_pod(self, instance_name, timeout=None):
         """Wait for pod to be ready (non-PTY mode), writing status to the channel."""
@@ -1559,30 +1102,8 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
     def eof_received(self):
         logger.debug("WhistlerSession.eof_received")
-        if getattr(self, 'sftp_handler', None):
-            self._sftp_reader.feed_eof()
-            return
-
-        if self._master_fd:
-            try:
-                # Send EOT (Ctrl-D) to PTY
-                os.write(self._master_fd, b'\x04')
-            except Exception as e:
-                 logger.debug(f"Error sending EOT to PTY: {e}")
-        elif hasattr(self, '_stdin_queue'):
-            # Signal EOF to queue consumer
-            try:
-                self._stdin_queue.put_nowait(None)
-            except Exception as e:
-                logger.debug(f"Error queuing EOF: {e}")
-        elif self._process_stdin:
-            try:
-                if self._process_stdin.can_write_eof():
-                     self._process_stdin.write_eof()
-                else:
-                     self._process_stdin.close()
-            except Exception as e:
-                 logger.debug(f"Error closing stdin on EOF: {e}")
+        if self._relay:
+            self._relay.write_eof()
         return True # Return True to keep channel open/manual EOF handling
 
     def terminal_size_changed(self, width, height, pixwidth, pixheight):
@@ -1597,14 +1118,11 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 loop = asyncio.get_running_loop()
                 self._resize_timer = loop.call_later(0.1, self._resize_cooldown_expired)
             
-        if self._master_fd:
-             # If shell is active, apply immediately (kernel handles coalescence/buffering usually fine)
-             try:
-                 winsize = struct.pack("HHHH", height, width, 0, 0)
-                 fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ, winsize)
-                 logger.info(f"Updated PTY size to {width}x{height}")
-             except Exception as e:
-                 logger.error(f"Failed to update PTY size: {e}")
+        if self._relay:
+             # A window-change request on the remote session: the guest's own
+             # sshd delivers SIGWINCH, so this is one message instead of the
+             # exec bridge's ioctl on a local PTY master.
+             self._relay.change_terminal_size(width, height)
 
     def _process_resize(self):
         if self._app and self._pending_size:
@@ -1624,71 +1142,6 @@ class WhistlerSession(asyncssh.SSHServerSession):
 
 
 
-    async def _bridge_agent(self, pod_name, namespace):
-        logger.info(f"Starting agent bridge: {self.local_agent_path} -> pod {pod_name}:{self.pod_socket_path}")
-        try:
-            # Ensure socat is available in the pod
-            socat_bin = "socat"
-            if not await self.server._is_command_available(pod_name, namespace, "socat"):
-                logger.warning(f"socat not found in pod {pod_name}, attempting to inject static binary...")
-                socat_bin = "/tmp/socat-static"
-                if not await self.server._is_file_present(pod_name, namespace, socat_bin):
-                     await self.server._inject_static_socat(pod_name, namespace, socat_bin)
-            
-            # Connect to local agent socket
-            local_reader, local_writer = await asyncio.open_unix_connection(self.local_agent_path)
-            
-            # Start socat in pod using the determined binary path
-            # Using fork again to allow multiple sequential connections (ssh behavior)
-            cmd = [
-                "kubectl", "exec", "-i", pod_name, "-n", namespace, "--",
-                socat_bin, f"UNIX-LISTEN:{self.pod_socket_path},fork,mode=600", "STDIO"
-            ]
-            
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            async def forward(reader, writer, name):
-                try:
-                    while True:
-                        data = await reader.read(4096)
-                        if not data:
-                            logger.info(f"Bridge {name} closed (EOF)")
-                            break
-                        writer.write(data)
-                        await writer.drain()
-                except Exception as e:
-                    logger.error(f"Bridge {name} error: {e}")
-                finally:
-                    try:
-                        writer.close()
-                    except:
-                        pass
-            
-            # Helper to read stderr
-            async def log_stderr(reader):
-                while True:
-                    line = await reader.readline()
-                    if not line: break
-                    logger.info(f"Agent bridge stderr: {line.decode().strip()}")
-
-            # local -> remote (process.stdin)
-            t1 = asyncio.create_task(forward(local_reader, process.stdin, "local->remote"))
-            # remote (process.stdout) -> local
-            t2 = asyncio.create_task(forward(process.stdout, local_writer, "remote->local"))
-            # stderr logger
-            t3 = asyncio.create_task(log_stderr(process.stderr))
-            
-            await asyncio.gather(t1, t2)
-            
-        except Exception as e:
-             logger.error(f"Agent bridge failed: {e}")
-        finally:
-             logger.info("Agent bridge finished")
 
 
 

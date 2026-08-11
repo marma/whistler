@@ -130,6 +130,36 @@ whistler:
     name: ""
     publicKeys: []
 
+  # SSH addressing (design/proxyjump.md). Users reach an instance by name
+  # through the gateway acting as a jump host:
+  #
+  #   # ~/.ssh/config
+  #   Host *.w
+  #       ProxyJump <user>@<gateway>
+  #
+  #   ssh box.w      # and scp/rsync/sftp/-L/-R, all natively
+  #
+  # domainSuffix is a client-side convention only — nothing resolves it, and
+  # no DNS records are needed. It exists so one `Host *` stanza matches every
+  # instance. The gateway strips it from the dialled name and the operator
+  # bakes it into each session's host certificate as a principal, so changing
+  # it invalidates the certificates of already-booted guests (they recover on
+  # their next boot). Set it to a domain you own (".vm.example.com") if you
+  # prefer; instances are still addressable without any suffix at all.
+  ssh:
+    domainSuffix: ".w"
+
+    # The pre-ProxyJump username convention: `ssh user-myinstance@gateway`
+    # meaning "connect user to myinstance". DEPRECATED — instances are
+    # addressed by name now — and kept for one release so muscle memory and
+    # existing scripts keep working. Each use logs a warning naming the
+    # replacement.
+    #
+    # Even with this on, a username that names a real user is taken whole
+    # first, so a user called `anna-lisa` logs in as themselves. That was
+    # impossible before and is the bug this convention cost.
+    legacyUsernameRouting: true
+
 
   # Network zones: named egress postures a session runs under, selected by the
   # template's `zone` field (or a per-session override, if the user holds the

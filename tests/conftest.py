@@ -21,8 +21,17 @@ class FakeConfigManager(ConfigManager):
 
     def __init__(self, users=None, templates=None, instances=None,
                  desktop_templates=None, desktop_sessions=None, gpu_types=None,
-                 zones=None):
+                 zones=None, ssh_targets=None, ssh_domain_suffix=".w",
+                 ssh_ca_public_key=None, vm_access_keys=None):
         self.users: Dict[str, Dict[str, Any]] = users or {}
+        # {username: {name: {...resolve_ssh_target dict...}}} for jump routing.
+        self._ssh_targets: Dict[str, Dict[str, Any]] = ssh_targets or {}
+        self.ssh_domain_suffix = ssh_domain_suffix
+        self.started: List[tuple] = []
+        self.created: List[tuple] = []
+        self.deleted: List[tuple] = []
+        self.ssh_ca_public_key = ssh_ca_public_key
+        self.vm_access_keys: Dict[str, str] = vm_access_keys or {}
         self._templates: Dict[str, List[Dict[str, Any]]] = templates or {}
         self._instances: Dict[str, List[Dict[str, Any]]] = instances or {}
         self._desktop_templates: Dict[str, List[Dict[str, Any]]] = desktop_templates or {}
@@ -46,7 +55,7 @@ class FakeConfigManager(ConfigManager):
         return list(self._instances.get(username, []))
 
     def add_instance(self, username, template_name, instance_name, preemptible=False,
-                     overrides=None):
+                     overrides=None, ephemeral=False):
         self._instances.setdefault(username, []).append({
             "name": instance_name,
             "template": template_name,
@@ -54,7 +63,9 @@ class FakeConfigManager(ConfigManager):
             "podName": None,
             "preemptible": preemptible,
             "overrides": overrides,
+            "ephemeral": ephemeral,
         })
+        self.created.append((username, template_name, instance_name, ephemeral))
         return True
 
     def get_instance_config(self, username, instance_name):
@@ -80,6 +91,10 @@ class FakeConfigManager(ConfigManager):
         return True
 
     def delete_instance(self, username, instance_name):
+        self.deleted.append((username, instance_name))
+        self._instances[username] = [
+            i for i in self._instances.get(username, [])
+            if i["name"] != instance_name]
         return True
 
     def delete_template(self, username, template_name):
@@ -91,7 +106,8 @@ class FakeConfigManager(ConfigManager):
     def get_user_desktop_sessions(self, username):
         return list(self._desktop_sessions.get(username, []))
 
-    def add_desktop_session(self, username, template_name, session_name, overrides=None):
+    def add_desktop_session(self, username, template_name, session_name, overrides=None,
+                            ephemeral=False):
         self._desktop_sessions.setdefault(username, []).append({
             "name": session_name,
             "template": template_name,
@@ -100,7 +116,9 @@ class FakeConfigManager(ConfigManager):
             "backend": None,
             "podName": None,
             "overrides": overrides,
+            "ephemeral": ephemeral,
         })
+        self.created.append((username, template_name, session_name, ephemeral))
         return True
 
     def delete_desktop_session(self, username, session_name):
@@ -143,6 +161,20 @@ class FakeConfigManager(ConfigManager):
 
     def save_server_host_key(self, secret_name, key_data):
         return True
+
+    def resolve_ssh_target(self, username, name):
+        target = (self._ssh_targets.get(username) or {}).get(name)
+        return dict(target) if target else None
+
+    def get_ssh_known_hosts_line(self):
+        return "@cert-authority *.w ssh-ed25519 AAAAFAKE"
+
+    def get_ssh_ca_public_key(self):
+        return self.ssh_ca_public_key
+
+    def get_vm_access_private_key(self, username):
+        return self.vm_access_keys.get(username)
+
 
     def list_all_users(self):
         return list(self.users.values())
@@ -225,6 +257,7 @@ class FakeConfigManager(ConfigManager):
         return True
 
     def trigger_instance_start(self, username, instance_name):
+        self.started.append((username, instance_name))
         return True
 
 
