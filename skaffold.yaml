@@ -8,18 +8,11 @@ build:
       context: .
       docker:
         dockerfile: Dockerfile
-    - image: whistler-desktop-xfce-plain
-      context: desktops/xfce-plain
-      docker:
-        dockerfile: Dockerfile
-    - image: whistler-desktop-gnome-plain
-      context: desktops/gnome-plain
-      docker:
-        dockerfile: Dockerfile
-    - image: whistler-streamer-selkies2
-      context: desktops/streamer-selkies2
-      docker:
-        dockerfile: Dockerfile
+    # The container-desktop trio (xfce-plain / gnome-plain / streamer-selkies2)
+    # is not built here any more: desktops are VM-only and container sessions
+    # are web-terminal only. The images and their Makefile targets still work
+    # if you want to run the sidecar mechanism by hand — see
+    # design/container_workloads.md.
     - image: whistler-storage-gateway
       context: images/storage-gateway
       docker:
@@ -85,11 +78,6 @@ deploy:
           # tag@digest: the git-dirty tag alone doesn't change between edits,
           # so without the digest a rebuild would not roll the deployments.
           image.tag: "{{.IMAGE_TAG_whistler}}@{{.IMAGE_DIGEST_whistler}}"
-          # Use the locally-built workload images for the sample templates.
-          templates.xfce-desktop.image: "{{.IMAGE_REPO_whistler_desktop_xfce_plain}}:{{.IMAGE_TAG_whistler_desktop_xfce_plain}}"
-          templates.gnome-desktop.image: "{{.IMAGE_REPO_whistler_desktop_gnome_plain}}:{{.IMAGE_TAG_whistler_desktop_gnome_plain}}"
-          # The streamer sidecar image the operator injects into every desktop pod.
-          whistler.streamer.image: "{{.IMAGE_REPO_whistler_streamer_selkies2}}:{{.IMAGE_TAG_whistler_streamer_selkies2}}"
           # The per-user NFS storage gateway (VM homes). tag@digest like the
           # main image: the git-dirty tag doesn't change between edits, so
           # without the digest a gateway rebuild wouldn't roll the operator-
@@ -97,11 +85,6 @@ deploy:
           # (e.g. one whose export still squashes to the wrong uid, or an old
           # Samba build, so the home mounts wrong or not at all).
           whistler.storageGateway.image: "{{.IMAGE_REPO_whistler_storage_gateway}}:{{.IMAGE_TAG_whistler_storage_gateway}}@{{.IMAGE_DIGEST_whistler_storage_gateway}}"
-          # Use the locally-built desktop images as the enforced desktop allow-list,
-          # so the operator accepts them and the management UI picker shows the
-          # actual build outputs (replaces the production defaults in values.yaml).
-          whistler.images.desktop[0]: "{{.IMAGE_REPO_whistler_desktop_xfce_plain}}:{{.IMAGE_TAG_whistler_desktop_xfce_plain}}"
-          whistler.images.desktop[1]: "{{.IMAGE_REPO_whistler_desktop_gnome_plain}}:{{.IMAGE_TAG_whistler_desktop_gnome_plain}}"
 # Forward the front doors to localhost on `skaffold dev` (NodePorts aren't
 # auto-published on kind the way they are on docker-desktop). The portal now goes
 # through the chart's bundled Traefik proxy (whistler-portal-proxy :80): both

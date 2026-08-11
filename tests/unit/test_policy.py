@@ -26,11 +26,30 @@ def test_ssh_container_allows_any_image():
     assert cm._apply_policy({"image": "whatever:latest"}, "ssh", "kata") == "kata"
 
 
-def test_desktop_image_must_be_in_list():
+@pytest.mark.parametrize("runtime", ["container", "kata"])
+def test_desktop_mode_needs_a_vm(runtime):
+    """Container sessions are web-terminal only: the streamed desktop-in-a-pod
+    is retired (design/container_workloads.md), so asking for one is a policy
+    error naming the way forward rather than a pod that quietly has no
+    display."""
     cm = _manager(images={"ssh": [], "desktop": ["good:1"], "vm": []})
-    assert cm._apply_policy({"image": "good:1"}, "desktop", "container") == "container"
-    with pytest.raises(PolicyError):
+    with pytest.raises(PolicyError) as e:
+        cm._apply_policy({"image": "good:1"}, "desktop", runtime)
+    assert "runtime 'vm'" in str(e.value)
+
+
+def test_desktop_refusal_precedes_the_image_check():
+    """Fail on the shape, not the image — otherwise a container desktop with
+    an unlisted image reports the wrong reason."""
+    cm = _manager(images={"ssh": [], "desktop": ["good:1"], "vm": []})
+    with pytest.raises(PolicyError) as e:
         cm._apply_policy({"image": "bad:1"}, "desktop", "container")
+    assert "runtime 'vm'" in str(e.value)
+
+
+def test_ssh_container_is_unaffected():
+    cm = _manager(images={"ssh": [], "desktop": ["good:1"], "vm": []})
+    assert cm._apply_policy({"image": "anything:1"}, "ssh", "container") == "container"
 
 
 def test_vm_image_must_be_in_vm_list():
@@ -86,12 +105,14 @@ def test_privileged_vm_unchanged():
     assert cm._apply_policy({"image": "v:1", "privileged": True}, "desktop", "vm") == "vm"
 
 
-def test_coercion_to_kata_keeps_desktop_image_check():
-    # Coercion happens first; the desktop allow-list still applies to the image.
+def test_coercion_to_kata_does_not_rescue_a_container_desktop():
+    """Kata is still not a VM as far as displays go: coercion happens after
+    the desktop check, so a privileged container desktop is refused for being
+    a container desktop, not silently promoted into one that works."""
     cm = _manager(force_kata=True, images={"ssh": [], "desktop": ["good:1"], "vm": []})
-    assert cm._apply_policy({"image": "good:1", "privileged": True}, "desktop", "container") == "kata"
-    with pytest.raises(PolicyError):
-        cm._apply_policy({"image": "bad:1", "privileged": True}, "desktop", "container")
+    with pytest.raises(PolicyError) as e:
+        cm._apply_policy({"image": "good:1", "privileged": True}, "desktop", "container")
+    assert "runtime 'vm'" in str(e.value)
 
 
 # --- GPU type allow-list -------------------------------------------------- #

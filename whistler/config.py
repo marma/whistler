@@ -1065,6 +1065,17 @@ class KubeConfigManager(ConfigManager):
             absent zone (implicit default) skips both checks so a
             misconfigured allow-list can't brick plain templates."""
         effective_runtime = runtime
+        # Desktops are a VM feature. A container session is a throwaway
+        # workspace reached through the portal's web terminal; the streamed
+        # desktop-in-a-pod worked and is deliberately retired rather than
+        # maintained alongside the VM one (design/container_workloads.md).
+        if mode == "desktop" and runtime != "vm":
+            raise PolicyError(
+                f"desktop mode needs runtime 'vm' (template asks for "
+                f"{runtime!r}). Container sessions are web-terminal only — "
+                f"see design/container_workloads.md"
+            )
+
         wants_privileged = bool(template_spec.get("privileged") or template_spec.get("fuse"))
         if self.force_kata_for_privileged and wants_privileged and effective_runtime == "container":
             logger.warning(
@@ -1638,19 +1649,22 @@ class KubeConfigManager(ConfigManager):
 
         Pure function of its arguments (no Kubernetes API calls) so it is
         unit-tested without a cluster; ``ensure_session`` does the API work.
-        Handles both access modes (ssh / desktop) and the container/kata runtimes
-        (runtime=vm is built by ``_build_vm_spec`` instead):
-          - ssh overrides the entrypoint with ``sleep`` (the image must stay
-            alive for the exec bridge); desktop does not (the workload image's
-            entrypoint starts the DE/app session).
-          - desktop pods get a native streamer sidecar (Xvfb + PulseAudio +
-            Selkies, see desktops/streamer-selkies2) sharing the X/Pulse
-            sockets with the workload container over emptyDirs; the workload
-            image needs no display server at all and its entire display
-            contract is the injected DISPLAY/PULSE_SERVER env.
-          - both ``instance`` and ``session`` labels are emitted so the SSH
-            server's pod-watch and the desktop Service selector both resolve.
+        Builds the container and kata runtimes (runtime=vm is built by
+        ``_build_vm_spec`` instead):
+          - the entrypoint is overridden with ``sleep``: a session pod's job
+            is to sit there until someone execs into it.
+          - both ``instance`` and ``session`` labels are emitted so pod
+            watches and Service selectors both resolve.
           - runtime=kata pins the configured Kata RuntimeClass.
+
+        Container sessions are **web terminal only**. The streamed
+        desktop-in-a-pod (a Selkies sidecar owning Xvfb/PulseAudio, sharing
+        sockets with the workload over emptyDirs) was built, worked, and is
+        deliberately retired — the mechanism is written up in full in
+        design/container_workloads.md, which is also where the case for
+        bringing it back for *single-app* containers lives. ``_apply_policy``
+        refuses desktop mode for non-VM runtimes, so display_port never
+        reaches here.
         """
         image = template_spec.get('image', 'ubuntu:latest')
         resources = template_spec.get('resources', {})
@@ -1672,58 +1686,10 @@ class KubeConfigManager(ConfigManager):
             "resources": resource_reqs,
             "volumeMounts": volume_mounts,
         }
-        streamer_sidecar = None
-        if mode == "ssh":
-            # SSH images are bridged via `kubectl exec`; keep the pod alive.
-            container["command"] = ["sleep", "3600"]
-        elif display_port is not None:
-            # Every desktop pod gets the streamer sidecar: the workload image
-            # knows nothing about displays — a native sidecar (initContainer
-            # with restartPolicy=Always) owns Xvfb + PulseAudio + Selkies and
-            # shares the X/Pulse sockets over emptyDirs. The startupProbe on
-            # the Selkies port gates the workload container: its entrypoint (a
-            # DE session or app) can assume DISPLAY is live without a wait
-            # loop. The display port therefore lives on the sidecar, not
-            # "main".
-            # Pod containers share the IPC namespace by default, which is what
-            # lets the workload's X clients use MIT-SHM against the sidecar's
-            # Xvfb (compose needs explicit ipc: wiring for the same effect).
-            # streamerEnv carries workload-dependent streaming knobs the sidecar
-            # cannot infer (e.g. SELKIES_H264_STREAMING_MODE for GL compositors).
-            sidecar_env = [{"name": "SELKIES_PORT", "value": str(display_port)}]
-            for k, v in (template_spec.get('streamerEnv') or {}).items():
-                sidecar_env.append({"name": str(k), "value": str(v)})
-            streamer_sidecar = {
-                "name": "streamer",
-                "image": template_spec.get('streamerImage') or self.streamer_image,
-                "restartPolicy": "Always",
-                "env": sidecar_env,
-                "ports": [{"containerPort": display_port, "name": "display"}],
-                "volumeMounts": [
-                    {"name": "x11", "mountPath": "/tmp/.X11-unix"},
-                    {"name": "pulse", "mountPath": "/tmp/pulse"},
-                ],
-                "startupProbe": {
-                    "tcpSocket": {"port": display_port},
-                    "periodSeconds": 2,
-                    "failureThreshold": 60,
-                },
-                # Requests only (scheduling hint); encode bursts get whatever
-                # CPU the node has free.
-                "resources": {"requests": {"cpu": "250m", "memory": "256Mi"}},
-            }
-            container["env"] = [
-                {"name": "DISPLAY", "value": ":0"},
-                {"name": "PULSE_SERVER", "value": "unix:/tmp/pulse/native"},
-            ]
-            container["volumeMounts"] = volume_mounts + [
-                {"name": "x11", "mountPath": "/tmp/.X11-unix"},
-                {"name": "pulse", "mountPath": "/tmp/pulse"},
-            ]
-        # (mode == desktop with display_port None builds a plain pod — it can't
-        # be reached by the portal, but the resolver always supplies the
-        # template's displayPort default so this is a defensive dead end, not a
-        # supported shape.)
+        # Keep the pod alive: a session image's job is to sit there until
+        # someone execs into it, and most have an entrypoint that would exit
+        # immediately.
+        container["command"] = ["sleep", "3600"]
 
         app_label = "whistler-instance" if mode == "ssh" else "whistler-desktop"
         zone = template_spec.get('zone') or DEFAULT_ZONE
@@ -1762,13 +1728,6 @@ class KubeConfigManager(ConfigManager):
             },
         }
         self._apply_zone_dns(pod_body["spec"], zone)
-
-        if streamer_sidecar is not None:
-            pod_body["spec"]["initContainers"] = [streamer_sidecar]
-            pod_body["spec"]["volumes"] = pod_volumes + [
-                {"name": "x11", "emptyDir": {}},
-                {"name": "pulse", "emptyDir": {}},
-            ]
 
         if user_details and "securityContext" in user_details:
             pod_body["spec"]["securityContext"] = user_details["securityContext"]

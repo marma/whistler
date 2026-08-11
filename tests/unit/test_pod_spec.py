@@ -192,3 +192,44 @@ def test_kata_runtime_class_wins_over_gpu():
 
 def test_no_gpu_requested_leaves_runtime_class_unset():
     assert "runtimeClassName" not in _build(template_spec={"image": "ubuntu:22.04"})["spec"]
+
+
+# --- moved from the retired desktop-pod suite ----------------------------- #
+# These assert container-pod behaviour that was only covered in desktop mode
+# before container desktops were retired (design/container_workloads.md).
+
+def test_requested_volume_with_subpath_does_not_mutate_source():
+    available = {"shared": {"name": "shared",
+                            "persistentVolumeClaim": {"claimName": "shared-pvc"},
+                            "subPath": "team"}}
+    pod = _build(template_spec={"image": "ubuntu:latest",
+                                "volumes": {"shared": "/data/shared"}},
+                 available_volumes=available)
+    # The source definition still carries subPath: it was copied, not mutated.
+    assert available["shared"]["subPath"] == "team"
+    mount = next(m for m in pod["spec"]["containers"][0]["volumeMounts"]
+                 if m["name"] == "shared")
+    assert mount == {"name": "shared", "mountPath": "/data/shared", "subPath": "team"}
+    vol = next(v for v in pod["spec"]["volumes"] if v["name"] == "shared")
+    assert "subPath" not in vol
+
+
+def test_fuse_flag_runs_container_privileged():
+    pod = _build(template_spec={"image": "ubuntu:latest", "fuse": True})
+    assert pod["spec"]["containers"][0]["securityContext"]["privileged"] is True
+
+
+def test_no_fuse_flag_leaves_container_unprivileged():
+    container = _build(template_spec={"image": "ubuntu:latest"})["spec"]["containers"][0]
+    assert "privileged" not in container.get("securityContext", {})
+
+
+def test_data_named_requested_volume_is_skipped():
+    available = {"data": {"name": "data",
+                          "persistentVolumeClaim": {"claimName": "other"}}}
+    pod = _build(template_spec={"image": "ubuntu:latest",
+                                "volumes": {"data": "/elsewhere"}},
+                 available_volumes=available)
+    data_vols = [v for v in pod["spec"]["volumes"] if v["name"] == "data"]
+    assert len(data_vols) == 1  # only the home PVC; the requested "data" was skipped
+    assert data_vols[0]["persistentVolumeClaim"]["claimName"] == "whistler-data-alice"

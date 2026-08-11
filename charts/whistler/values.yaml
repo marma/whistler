@@ -255,17 +255,19 @@ whistler:
       - python:3.11-slim
       - debian:12-slim
       - alpine:3.19
-    desktop:
-      - ghcr.io/marma/whistler-desktop-xfce-plain:latest
-      - ghcr.io/marma/whistler-desktop-gnome-plain:latest
+    # Desktops are VM-only (design/container_workloads.md), so this list is
+    # unreachable: a desktop template with a non-vm runtime is refused by
+    # policy before its image is ever checked. Kept empty rather than removed
+    # so the shape stays obvious if single-app containers revive it.
+    desktop: []
     vm:
       - quay.io/containerdisks/ubuntu:24.04
 
-  # Streamer sidecar default image (every desktop pod gets one): owns Xvfb +
-  # PulseAudio + Selkies next to the display-unaware workload container (built
-  # from desktops/streamer-selkies2). A template's streamerImage overrides this
-  # per template. Desktop pods need Kubernetes >= 1.29 (native sidecars:
-  # initContainer restartPolicy=Always, beta+default since 1.29).
+  # Streamer sidecar image for the retired container desktop. Unused: container
+  # sessions are web-terminal only and pods no longer get a streamer. Left here
+  # (and the image left buildable) as the reference for the sidecar mechanism —
+  # see design/container_workloads.md, which is also where the case for
+  # reviving it as single-app containers lives.
   streamer:
     image: ghcr.io/marma/whistler-streamer-selkies2:latest
 
@@ -329,12 +331,12 @@ whistler:
 #            templates expose a display server consumed by the web portal.
 #   runtime: container | kata | vm — plain pod, Kata-isolated pod, or KubeVirt VM.
 #
-# For desktop templates: the image is a display-unaware workload (a DE or app
-# with a session entrypoint — no Selkies/X server inside); the operator injects
-# the streamer sidecar, whose Selkies 2.x (pixelflux) server listens on
-# displayPort over HTTP/WebSockets. The per-session Service exposes it and the
-# portal reverse-proxies it to the browser. All desktop templates use
-# viewer: websockets — there is no guacd/RDP or webrtc/coturn path.
+# **mode: desktop requires runtime: vm.** A container session is a throwaway
+# workspace reached through the portal's web terminal; the machine — desktop,
+# SSH, root, systemd — is a VM. A desktop template on a container/kata runtime
+# is refused by policy at reconcile time, with the reason on the Session's
+# status. The streamed desktop-in-a-pod that used to serve them is retired;
+# see design/container_workloads.md.
 templates:
   small:
     description: "Small SSH instance"
@@ -344,38 +346,6 @@ templates:
     resources:
       cpu: 500m
       memory: 2Gi
-  xfce-desktop:
-    description: "XFCE desktop (streamer sidecar, Selkies 2.x/WebSockets)"
-    mode: desktop
-    runtime: container
-    # Display-unaware XFCE workload (desktops/xfce-plain); the operator injects
-    # the streamer sidecar. For local dev, skaffold overrides both images.
-    image: "ghcr.io/marma/whistler-desktop-xfce-plain:latest"
-    viewer: websockets
-    displayPort: 8082
-    persistence: ephemeral
-    resources:
-      cpu: "2000m"
-      memory: 4Gi
-  gnome-desktop:
-    description: "Real GNOME Shell (streamer sidecar, Selkies 2.x/WebSockets)"
-    mode: desktop
-    runtime: container
-    # Display-unaware GNOME Shell workload (desktops/gnome-plain; X11 backend,
-    # GNOME 46, unprivileged). For local dev, skaffold overrides both images.
-    image: "ghcr.io/marma/whistler-desktop-gnome-plain:latest"
-    viewer: websockets
-    streamerEnv:
-      # REQUIRED for GNOME: mutter is a GL compositor and emits no damage for
-      # static content — without streaming mode, static windows render black
-      # (see desktops/gnome-plain/README.md).
-      SELKIES_H264_STREAMING_MODE: "true"
-    displayPort: 8082
-    persistence: ephemeral
-    resources:
-      # GNOME Shell is heavier than XFCE (llvmpipe compositing).
-      cpu: "2000m"
-      memory: 8Gi
   # KubeVirt VM template (needs KubeVirt installed — scripts/install_kubevirt.sh).
   # The guest is a stock cloud image: cloud-init creates the real user
   # (username/uid/SSH keys), NFS-mounts the home from the user's storage
