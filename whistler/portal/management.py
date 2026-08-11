@@ -204,7 +204,7 @@ def _console_url(user: str, name: str) -> str:
     a view a user can act on: boot output is rarely where the problem is
     (that is usually Kubernetes-side), and one console per machine means it is
     inherently unscoped on any instance with more than one member."""
-    return f"{_DESKTOP_PORTAL_URL}/vnc/{name}?user={user}"
+    return f"{_DESKTOP_PORTAL_URL}/console/{name}?user={user}"
 
 
 def _merge_sessions(instances: list, desktop_sessions: list, user: str,

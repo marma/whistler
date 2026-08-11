@@ -7,8 +7,12 @@ Routes (all under a dev-only auth gate — see ``auth_middleware``):
                          to /desktop/<id>/ or /vnc/<id> by viewer
   ANY  /desktop/<id>/*   reverse proxy (HTTP + WebSocket) to the in-pod
                          Selkies 2.x server — see whistler.portal.proxy
-  GET  /vnc/<id>         noVNC viewer page (VM sessions)
+  GET  /vnc/<id>         noVNC *desktop* page (viewer:vnc VM sessions)
   GET  /ws-vnc/<id>      WebSocket <-> KubeVirt VNC subresource relay
+  GET  /console/<id>     the machine console (ADMIN): the same emulated
+                         display, but attached from power-on rather than
+                         waiting for Ready — firmware, bootloader, kernel
+  GET  /ws-console/<id>  WebSocket <-> the same subresource, admin-gated
   GET  /status/<id>      JSON readiness poll
   GET  /term/<id>        web-terminal page
   GET  /term-status/<id> JSON terminal-readiness poll
@@ -41,6 +45,7 @@ import logging
 import os
 import secrets
 import time
+from functools import partial
 
 import aiohttp
 from aiohttp import web
@@ -288,12 +293,21 @@ def _render_term(user, session_id):
             .replace("__USER__", html.escape(user)))
 
 
-# noVNC viewer page (vnc viewer, VM sessions): the vendored RFB module dials
-# /ws-vnc/<id>, which the portal bridges to the VMI's VNC subresource. Same
-# wait-for-ready pattern as the connect page; RFB reconnects after a drop by
-# re-running the poll (a halted VM comes back on the next connect trigger).
-# Placeholders replaced (not .format) so JS braces survive.
-_VNC_HTML = """<!doctype html><meta charset=utf-8><title>__ID__ — desktop</title>
+# noVNC page, serving two different products off the same KubeVirt subresource:
+#
+#   /vnc/<id>      the *desktop* of a viewer:vnc VM. Any owner may open it, and
+#                  it waits for Ready, because a desktop you can use is the
+#                  point.
+#   /console/<id>  the *machine console*. Admin-only, and attaches as soon as
+#                  there is a VM instance at all — firmware, bootloader and
+#                  kernel messages all happen long before Ready, so waiting for
+#                  it would mean the boot output has already scrolled past, and
+#                  a guest that never becomes Ready could never be looked at.
+#
+# Same RFB client, two gates and two waiting rules. __READY__ is the predicate
+# that decides when to attach. Placeholders are replaced (not .format) so JS
+# braces survive.
+_VNC_HTML = """<!doctype html><meta charset=utf-8><title>__ID__ — __KIND__</title>
 <style>
   html,body{margin:0;height:100%;background:#202020;overflow:hidden}
   #screen{position:absolute;inset:0}
@@ -318,8 +332,9 @@ async function waitReady() {
       const r = await fetch(`/status/${id}?user=${encodeURIComponent(user)}`);
       if (r.ok) {
         const j = await r.json();
-        setStatus('Session: ' + (j.phase || 'unknown'));
-        if (j.phase === 'Ready') return;
+        const phase = j.phase || 'unknown';
+        setStatus('__KIND_LABEL__: ' + phase);
+        if (__READY__) return;
       }
     } catch (e) {}
     await sleep(2000);
@@ -329,10 +344,10 @@ async function waitReady() {
 async function run() {
   for (;;) {
     await waitReady();
-    setStatus('Opening desktop…');
+    setStatus('__OPENING__');
     const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
     const rfb = new RFB(document.getElementById('screen'),
-                        proto + location.host + '/ws-vnc/' + encodeURIComponent(id) +
+                        proto + location.host + '__WSPATH__' + encodeURIComponent(id) +
                         '?user=' + encodeURIComponent(user));
     rfb.scaleViewport = true;
     const closed = new Promise(resolve => {
@@ -348,8 +363,28 @@ run();
 </script>"""
 
 
-def _render_vnc(user, session_id):
+def _render_vnc(user, session_id, console=False):
+    """Render the noVNC page for either product (see _VNC_HTML).
+
+    ``console=True`` is the machine console: it attaches as soon as a VM
+    instance exists rather than waiting for Ready, which is the whole reason
+    to have it — the boot sequence is over by the time a guest is Ready."""
+    if console:
+        kind, label, opening, ws = ("console", "Machine",
+                                    "Attaching to console…", "/ws-console/")
+        # Anything but Stopped means a VM instance exists (or is being made),
+        # and qemu drives the emulated display from power-on.
+        ready = "phase && phase !== 'Stopped'"
+    else:
+        kind, label, opening, ws = ("desktop", "Session",
+                                    "Opening desktop…", "/ws-vnc/")
+        ready = "phase === 'Ready'"
     return (_VNC_HTML
+            .replace("__READY__", ready)
+            .replace("__KIND_LABEL__", label)
+            .replace("__KIND__", kind)
+            .replace("__OPENING__", opening)
+            .replace("__WSPATH__", ws)
             .replace("__ID__", html.escape(session_id))
             .replace("__USER__", html.escape(user)))
 
@@ -607,27 +642,52 @@ async def vnc_page(request):
     """Serve the noVNC viewer page (VM sessions) and nudge the VM awake, like
     /connect does for the Selkies path.
 
-    **Admin-only**, enforced here and not merely by hiding the dashboard
-    button — a link is not an access control. This is the machine's console
-    (firmware, bootloader, kernel messages), which is a diagnostic view rather
-    than a user-actionable one, and on any instance with more than one member
-    it is inherently unscoped: one machine, one console."""
+    This is the session's **desktop** — `/connect` redirects viewer:vnc VMs
+    here — so it is open to the owner like any other desktop. The admin-only
+    machine console is `/console/<id>` (console_page); it dials a different
+    websocket and attaches without waiting for Ready."""
     cm, user = request.app["cm"], request["user"]
-    if not await _is_admin(request, user):
-        return web.Response(status=403, text="The machine console is admin-only")
     name = request.match_info["id"]
     await _run(request, cm.trigger_instance_start, user, name)
     return web.Response(text=_render_vnc(user, name), content_type="text/html")
 
 
-async def ws_vnc(request):
-    """Bridge the browser's RFB websocket to the VMI's VNC subresource. Same
-    ownership boundary as ws_term: the session must resolve in the requesting
-    user's namespace and be Ready — plus admin, since this is the machine
-    console (see vnc_page). Checked here as well as on the page, because the
-    websocket is reachable without ever loading it."""
+async def console_page(request):
+    """Serve the machine console: the emulated display from power-on —
+    firmware, bootloader, kernel messages — rather than the desktop.
+
+    **Admin-only**, enforced here and not merely by hiding the dashboard
+    button, because a link is not an access control. It is a diagnostic view
+    rather than one a user can act on (boot output is rarely where the problem
+    is; that is usually Kubernetes-side), and on any instance with more than
+    one member it is inherently unscoped: one machine, one console."""
     cm, user = request.app["cm"], request["user"]
     if not await _is_admin(request, user):
+        return web.Response(status=403, text="The machine console is admin-only")
+    name = request.match_info["id"]
+    await _run(request, cm.trigger_instance_start, user, name)
+    return web.Response(text=_render_vnc(user, name, console=True),
+                        content_type="text/html")
+
+
+async def ws_vnc(request, console=False):
+    """Bridge the browser's RFB websocket to the VMI's VNC subresource. Same
+    ownership boundary as ws_term: the session must resolve in the requesting
+    user's namespace.
+
+    Two entry points share this. ``/ws-vnc`` is the *desktop* of a viewer:vnc
+    VM and waits for Ready like any other desktop. ``/ws-console`` is the
+    machine console: admin-only, and attached as soon as there is a VM
+    instance — the emulated display is driven from power-on, and Ready means
+    "the desktop or sshd is answering", i.e. exactly the point at which the
+    boot output someone came to watch has already scrolled past. A guest that
+    never reaches Ready is also the one most worth looking at.
+
+    The admin check is here as well as on the page because the websocket is
+    reachable without ever loading it, and it runs before the session lookup
+    so 403-vs-404 cannot be used to probe which sessions exist."""
+    cm, user = request.app["cm"], request["user"]
+    if console and not await _is_admin(request, user):
         return web.Response(status=403, text="The machine console is admin-only")
     name = request.match_info["id"]
 
@@ -637,7 +697,11 @@ async def ws_vnc(request):
         return web.Response(status=404, text="unknown session")
     if sess.get("runtime") != "vm":
         return web.Response(status=400, text="VNC is only available for VM sessions")
-    if sess.get("phase") != "Ready" or not sess.get("vmiName"):
+    if not sess.get("vmiName"):
+        return web.Response(
+            status=409,
+            text=f"no VM instance to attach to yet (phase={sess.get('phase')})")
+    if not console and sess.get("phase") != "Ready":
         return web.Response(status=409, text=f"session not ready (phase={sess.get('phase')})")
 
     try:
@@ -722,6 +786,9 @@ def build_app(config_manager):
         web.route("*", "/desktop/{id}/{tail:.*}", desktop_proxy),
         web.get("/vnc/{id}", vnc_page),
         web.get("/ws-vnc/{id}", ws_vnc),
+        # The machine console: same subresource, admin-only, no wait for Ready.
+        web.get("/console/{id}", console_page),
+        web.get("/ws-console/{id}", partial(ws_vnc, console=True)),
         web.get("/status/{id}", status),
         web.get("/term/{id}", term),
         web.get("/term-status/{id}", term_status),

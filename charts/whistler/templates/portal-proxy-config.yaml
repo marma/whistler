@@ -9,7 +9,7 @@ routers/services in one ConfigMap.
        reverse-proxied Selkies viewer (/desktop), the noVNC viewer for VM
        sessions (/vnc + /ws-vnc + its /static assets) and the web terminal
        (/term + /term-status + /ws-term). */}}
-{{- $viewerPaths := "PathPrefix(`/connect`) || PathPrefix(`/desktop`) || PathPrefix(`/launch`) || PathPrefix(`/status`) || PathPrefix(`/term`) || PathPrefix(`/ws-term`) || PathPrefix(`/vnc`) || PathPrefix(`/ws-vnc`) || PathPrefix(`/static`)" }}
+{{- $viewerPaths := "PathPrefix(`/connect`) || PathPrefix(`/desktop`) || PathPrefix(`/launch`) || PathPrefix(`/status`) || PathPrefix(`/term`) || PathPrefix(`/ws-term`) || PathPrefix(`/vnc`) || PathPrefix(`/ws-vnc`) || PathPrefix(`/console`) || PathPrefix(`/ws-console`) || PathPrefix(`/static`)" }}
 {{- $viewerRule := $viewerPaths }}
 {{- $mgmtRule := "PathPrefix(`/`)" }}
 {{- if $host }}

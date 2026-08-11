@@ -51,6 +51,16 @@ RENEW_BEFORE_SECONDS = 30 * 24 * 3600
 GUEST_HOST_KEY_PATH = "/etc/ssh/ssh_host_whistler_ed25519_key"
 GUEST_HOST_CERT_PATH = f"{GUEST_HOST_KEY_PATH}-cert.pub"
 
+# sshd's built-in host keys, which have to be named explicitly once we name
+# ours: a HostKey directive replaces the defaults instead of adding to them.
+# Anything absent here is a warning; sshd only refuses to start when none of
+# the listed keys load. See cloudinit.build_user_data.
+DEFAULT_HOST_KEY_PATHS = (
+    "/etc/ssh/ssh_host_ed25519_key",
+    "/etc/ssh/ssh_host_rsa_key",
+    "/etc/ssh/ssh_host_ecdsa_key",
+)
+
 
 def generate_ca_key() -> bytes:
     """A new CA private key, in OpenSSH format."""

@@ -54,7 +54,8 @@ additional isolation.)
 
 import yaml
 
-from .hostca import GUEST_HOST_CERT_PATH, GUEST_HOST_KEY_PATH
+from .hostca import (DEFAULT_HOST_KEY_PATHS, GUEST_HOST_CERT_PATH,
+                     GUEST_HOST_KEY_PATH)
 
 STREAMER_ENV_PATH = "/etc/whistler/streamer.env"
 # The gateway's Ganesha pseudo-path (images/storage-gateway/ganesha.conf.template).
@@ -185,10 +186,23 @@ exit 1
         "/etc/ssh/authorized_keys.d/%u\n"
     )
     if host_key and host_cert:
-        # Additive: HostKey lines accumulate, so the image's own keys keep
-        # working for clients that don't know the CA. sshd offers the
-        # certificate to clients that advertise support and falls back to the
-        # plain key otherwise.
+        # The image's own host keys have to be listed explicitly alongside
+        # ours. A HostKey directive REPLACES sshd's built-in defaults rather
+        # than adding to them (fill_default_server_options only supplies
+        # defaults when num_host_key_files == 0), so naming only the Whistler
+        # key would make sshd depend entirely on a file cloud-init writes —
+        # and if it were missing or written late, sshd exits outright:
+        #
+        #     Unable to load host key: /etc/ssh/ssh_host_whistler_ed25519_key
+        #     sshd: no hostkeys available -- exiting.
+        #
+        # which is a guest with no SSH at all, not a guest without a
+        # certificate. Listing all of them makes a missing file a warning
+        # (sshd only refuses to start when *none* load), so the certificate is
+        # an upgrade and never a way to lose the service. Verified against a
+        # real sshd both ways.
+        for path in DEFAULT_HOST_KEY_PATHS:
+            sshd_conf += f"HostKey {path}\n"
         sshd_conf += (
             f"HostKey {GUEST_HOST_KEY_PATH}\n"
             f"HostCertificate {GUEST_HOST_CERT_PATH}\n"

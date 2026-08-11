@@ -27,7 +27,7 @@ def _row(rows, name):
 
 def test_admin_gets_a_console_url_for_a_vm():
     rows = _merge_sessions([], [_vm()], "alice", is_admin=True)
-    assert _row(rows, "v1")["console_url"] == "/vnc/v1?user=alice"
+    assert _row(rows, "v1")["console_url"] == "/console/v1?user=alice"
 
 
 def test_non_admin_gets_none():
@@ -56,9 +56,11 @@ def test_ssh_instances_have_no_console():
 
 
 def test_console_is_separate_from_the_desktop_url():
-    """Distinct actions, distinct links: conflating them is what made the
-    console unreachable for Selkies VMs in the first place."""
+    """Distinct actions, distinct links. Conflating them is what made the
+    console unreachable for Selkies VMs in the first place — and, briefly, what
+    made gating "the console" on admin take the *desktop* away from every
+    viewer:vnc VM, since /connect redirects those to the same page."""
     row = _row(_merge_sessions([], [_vm()], "alice", is_admin=True), "v1")
     assert row["connect_url"] != row["console_url"]
     assert "/connect/" in row["connect_url"]
-    assert "/vnc/" in row["console_url"]
+    assert "/console/" in row["console_url"]

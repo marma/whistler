@@ -341,15 +341,49 @@ async def test_machine_console_is_admin_only(portal):
     without ever loading the page — hiding the dashboard button is not an
     access control."""
     portal.cm.admins.discard("alice")
-    assert (await portal.get("/vnc/v1", params={"user": "alice"})).status == 403
-    assert (await portal.get("/ws-vnc/v1", params={"user": "alice"})).status == 403
+    assert (await portal.get("/console/v1", params={"user": "alice"})).status == 403
+    assert (await portal.get("/ws-console/v1", params={"user": "alice"})).status == 403
 
 
 async def test_machine_console_admin_check_precedes_session_lookup(portal):
     """A non-admin gets the same 403 for a session that doesn't exist, so the
     console can't be used to probe which sessions a user has."""
     portal.cm.admins.discard("alice")
-    assert (await portal.get("/ws-vnc/nope", params={"user": "alice"})).status == 403
+    assert (await portal.get("/ws-console/nope", params={"user": "alice"})).status == 403
+
+
+async def test_vnc_desktop_is_not_admin_only(portal):
+    """/connect redirects viewer:vnc VMs to /vnc, so gating it on admin would
+    take the desktop away from every VM that uses the noVNC viewer — which is
+    the default for VM sessions. Regression guard."""
+    portal.cm.admins.discard("alice")
+    assert (await portal.get("/vnc/v1", params={"user": "alice"})).status == 200
+
+
+async def test_console_attaches_before_the_session_is_ready(portal, backend, monkeypatch):
+    """The whole point of the console: firmware and kernel messages happen
+    long before Ready, so waiting for it would mean the boot output has
+    already scrolled past."""
+    monkeypatch.setattr(kubevirt, "open_subresource_ws",
+                        _fake_subresource_opener(backend))
+    booting = _vm_session("vbooting2", phase="Provisioning")
+    portal.cm.sessions["alice"].append(booting)
+    ws = await portal.ws_connect("/ws-console/vbooting2?user=alice")
+    assert (await ws.receive_bytes()) == b"HELLO:vnc"
+    await ws.close()
+
+
+async def test_console_still_needs_a_vm_instance(portal):
+    """Nothing to attach to before qemu exists — reported as a wait, not a
+    failure."""
+    assert (await portal.get("/ws-console/vbooting",
+                             params={"user": "alice"})).status == 409
+
+
+async def test_vnc_desktop_still_waits_for_ready(portal):
+    """The desktop keeps its Ready gate: a desktop you cannot use yet is not
+    worth showing, and that is the opposite of what the console is for."""
+    assert (await portal.get("/ws-vnc/vbooting", params={"user": "alice"})).status == 409
 
 
 async def test_ws_vnc_authorization(portal):

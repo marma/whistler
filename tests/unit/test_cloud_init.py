@@ -1,4 +1,8 @@
 """cloud-init userData builder (whistler.cloudinit) — pure, no cluster."""
+import os
+import subprocess
+
+import pytest
 import yaml
 
 from whistler.cloudinit import (
@@ -205,9 +209,48 @@ def test_sshd_configured_to_offer_the_certificate():
     assert "HostKey /etc/ssh/ssh_host_whistler_ed25519_key\n" in conf
     assert ("HostCertificate /etc/ssh/ssh_host_whistler_ed25519_key-cert.pub\n"
             in conf)
-    # Additive: the image's own keys keep working for clients that don't know
-    # the CA, and the authorized_keys directive is untouched.
+    # The authorized_keys directive is untouched.
     assert "/etc/ssh/authorized_keys.d/%u" in conf
+
+
+def test_image_host_keys_are_listed_alongside_ours():
+    """A HostKey directive REPLACES sshd's defaults rather than adding to
+    them, so naming only the Whistler key makes sshd depend entirely on a file
+    cloud-init writes — and a guest that cannot load it exits with "no
+    hostkeys available", i.e. no SSH at all rather than SSH without a
+    certificate. Regression guard for exactly that."""
+    conf = _file(_certified(), "/etc/ssh/sshd_config.d/60-whistler.conf")["content"]
+    for path in ("/etc/ssh/ssh_host_ed25519_key",
+                 "/etc/ssh/ssh_host_rsa_key",
+                 "/etc/ssh/ssh_host_ecdsa_key"):
+        assert f"HostKey {path}\n" in conf
+    # And ours comes last, so the certificate matches the key just above it.
+    keys = [l for l in conf.splitlines() if l.startswith("HostKey ")]
+    assert keys[-1].endswith("ssh_host_whistler_ed25519_key")
+
+
+@pytest.mark.skipif(not os.path.exists("/usr/sbin/sshd"),
+                    reason="needs a real sshd to validate the config")
+def test_generated_sshd_config_survives_missing_key_files(tmp_path):
+    """The claim above, checked against the real parser: with every key file
+    absent except one, sshd must still accept the config. (`sshd -t` reports
+    unloadable keys but only fails when none load.)"""
+    conf = _file(_certified(), "/etc/ssh/sshd_config.d/60-whistler.conf")["content"]
+    # Point the whole set at a directory holding exactly one real key, the way
+    # a guest whose Whistler key never landed would look.
+    real = tmp_path / "ssh_host_ed25519_key"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(real)],
+                   check=True)
+    conf = conf.replace("/etc/ssh/", f"{tmp_path}/")
+    # Drop the certificate line: the cert file is absent in this scenario too,
+    # and a HostCertificate without its key is a separate (non-fatal) warning.
+    conf = "\n".join(l for l in conf.splitlines()
+                     if not l.startswith(("HostCertificate", "AuthorizedKeysFile")))
+    cfg = tmp_path / "sshd_config"
+    cfg.write_text(conf + "\n")
+    result = subprocess.run(["/usr/sbin/sshd", "-t", "-f", str(cfg)],
+                            capture_output=True, text=True)
+    assert "no hostkeys available" not in result.stderr, result.stderr
 
 
 def test_sshd_reloaded_in_case_it_started_first():
