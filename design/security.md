@@ -63,6 +63,14 @@ These are not incidental; the model is built on them.
   isolation, and it must never be documented as if it were. (This was equally
   true of the SMB gateway it replaced, where `mount.cifs` took the path after
   the share name as a client-side *prefixpath*.)
+- **The endpoint is not Whistler's to control, and a normal browser is not a
+  safe one.** Every guarantee below concerns what the *server* offers a
+  session. What the person does with it at their own keyboard — a laptop with
+  a filesystem, a clipboard and a second browser tab — is governed by the
+  machine they are sitting at, which the deployment supplies and Whistler
+  never sees. This is not a gap to be closed; it is the fourth axis in
+  [The border has four axes](#the-border-has-four-axes), and stating it is
+  what stops a zone being read as self-sufficient.
 - **Out of scope:** a malicious administrator. The model constrains mistakes
   and ordinary users, and makes deliberate overrides visible.
 
@@ -93,6 +101,188 @@ credential distribution — but it is a *different* one, and **no design below
 may assume "the session doesn't have the password"**: there is no longer a
 password. Kerberos (`sec=krb5`, and `krb5p` for privacy) would restore
 per-principal authentication and encryption if that turns out to be needed.
+
+## The border has four axes
+
+Defining "restricted" is harder than defining a zone, and the reason is that
+containment is not one property. It is the conjunction of four, enforced in
+four different places — one of them not by Whistler at all. Most of the
+confusion about what a zone promises comes from collapsing them.
+
+1. **The data.** Which volumes a session can reach, in which direction, and
+   where they have been. Enforced server-side by the published export set and
+   the taint rules. This is the axis the rest of this document is about.
+2. **The channel.** Which mechanisms the person is given for moving bytes in
+   and out of a session — SSH and its file transfers, the relay, the web
+   terminal, the desktop clipboard, screenshots. Enforced by the gateway, the
+   portal and the streamer's configuration. See
+   [Access channels](#access-channels-the-second-axis).
+3. **The person.** How far they are trusted. Two people on the *same*
+   instance in the *same* zone may warrant different channels: a member of
+   staff helping an external researcher needs a shell; the researcher does
+   not get one. Enforced by per-user and per-group grants, the same shape as
+   `allowedZones` and the override grants today.
+4. **The endpoint.** The machine and software the person sits at. **Whistler
+   can neither enforce nor observe this** — but it can be closed by pairing a
+   server-side identity binding with a controlled network, which is what
+   [the kiosk situation](#closing-the-fourth-axis-the-kiosk-situation)
+   describes.
+
+The fourth axis is why this section exists. A locked-down thin client — a
+kiosk browser that reaches one desktop URL and has no local storage, no file
+manager and no clipboard of its own — is a real control, and for an external
+researcher it is the control doing most of the work. But the deployment
+supplies it, not Whistler, and a session that is safe on that thin client is
+not safe merely because Whistler served it: the same account opening the same
+desktop from an ordinary laptop gets an ordinary browser, with a clipboard
+and a filesystem. There is no point in a zone with no internet access if the
+person viewing it can paste out of the window.
+
+So the honest claim is the conjunction, and **any statement of the form "this
+zone is contained" that does not also name the channel set and the endpoint
+is incomplete.** The corollary is that the same zone means different things
+to different groups, by design rather than by accident: internal staff reach
+a restricted instance over SSH and *could* leak from it, which is accepted on
+a personnel control — a decision about who is trusted, not a technical
+guarantee, and it must never be written up as the latter.
+
+### Closing the fourth axis: the kiosk situation
+
+The fourth axis cannot be closed by Whistler alone, but it can be closed by a
+**situation** — a pair of guarantees, one from each side, whose conjunction is
+the containment. Neither half is a boundary on its own, and this is the
+intended answer for external researchers.
+
+- **Whistler's half — bound identity.** A user (or group) is bound to the
+  kiosk: the server will serve them the kiosk surface and nothing else. No
+  management portal, no web terminal, no SSH. This is enforced per user at
+  every entry point, so it holds whatever client they use and wherever they
+  connect from.
+- **The deployment's half — a controlled network.** The kiosk is reachable
+  only from a network on which *every* client is a controlled device. Not
+  "the researcher has been given a thin client", but "nothing else can be on
+  this network": managed switch ports, 802.1X or MAC admission, a dedicated
+  VLAN, a room.
+
+Whistler's half is the one to be precise about, because it is the one this
+document can promise: **the user cannot obtain a channel that was not granted
+to them.** That is a real, checkable property, and it is the channel-plane
+form of the rule the storage model already runs on — the server bounds the
+set, the far side chooses within it. What it does *not* say, alone, is
+anything about the device: a granted kiosk surface opens in any browser. The
+device claim comes entirely from the deployment's half.
+
+**The residual risk is therefore network admission, not endpoint control**,
+and that is the point of the trade. "Control every endpoint a researcher
+might use" is impossible. "Ensure only controlled devices are on this VLAN"
+is a standard, solved problem with standard tools. The unenforceable axis has
+been exchanged for a tractable one; it has not been eliminated.
+
+Each half fails independently, and each failure is nameable:
+
+- If a channel grant is missed at one entry point — the classic being the SSH
+  gateway, which is a different door on a different port from the portal —
+  then the identity half leaks and the network half is doing all the work.
+- If an unmanaged port exists on the VLAN, a laptop plugged into it presents
+  the same source address as the kiosk and is served the same surface. The
+  network half leaks and the identity half is doing all the work: the user
+  gets the kiosk *surface* in an ordinary browser, with a clipboard and a
+  filesystem behind it.
+
+#### Source address: the second, weaker check
+
+Both entry points see the client's real TCP peer address, so a grant can also
+be conditioned on **where the connection comes from**. This is worth having
+as a second, independent check — "the desktop from anywhere, a shell only
+from the lab network" is a rule the server can keep — but it is the weaker of
+the two and must not be mistaken for the identity binding. An address proves
+*location*, never *hardware*: it says a connection came from that network,
+not that the machine there is a kiosk.
+
+Two implementation facts, because they decide where the check can live:
+
+- **SSH is the easy case.** The gateway sees the peer address directly
+  (`SSHServer.connection_made` already logs it) with no header to trust.
+- **HTTP is the awkward one.** The portal sits behind the bundled Traefik
+  proxy and reads no client address at all today, so a rule written in the
+  portal would match the proxy on every request. It belongs in Traefik's
+  `ipAllowList`, or in the portal via deliberately-trusted
+  `X-Forwarded-For` — which is only trustworthy if that proxy is the sole
+  ingress and overwrites the header, a deployment property to state rather
+  than assume.
+
+The shape that gives both checks independently: kiosk on its own hostname or
+entrypoint, IP-restricted at the proxy, *and* the portal refusing every
+non-kiosk surface to a kiosk-bound user. The proxy already splits viewer
+paths from the management catch-all
+([`charts/whistler/templates/portal-proxy-config.yaml`](../charts/whistler/templates/portal-proxy-config.yaml)),
+so the routing seam exists — but the proxy does not know who the user is, so
+path routing alone is all-or-nothing for a deployment. **The identity check is
+the boundary; the address check is the location control.**
+
+#### What the kiosk situation does not fix
+
+- **The clipboard is in the streamer, not the portal**, so refusing the
+  portal does nothing to it. On a genuine kiosk device it is contained by the
+  device having nowhere to paste — but that is device containment again, and
+  the identity half provides no device proof. Clipboard-off still has to be
+  enforced server-side for this posture. Kiosk makes the channel far less
+  likely to be exercised; it does not remove the requirement.
+- **Screenshots close for the researcher and stay open elsewhere.** A
+  kiosk-bound user cannot fetch `/screenshot/`, but the images still leave
+  the zone into portal memory and onto staff browsers. A different threat,
+  untouched by any of this.
+
+## Access channels: the second axis
+
+The general rule this model already applies twice — the published export set
+is the access-control decision for storage, the splice set is the
+access-control decision for SSH — extends to the interaction plane as a
+whole: **the set of channels published to a session is the access-control
+decision for what a person can carry in and out of it.**
+
+The channels Whistler offers today, and where each would have to be closed:
+
+| Channel | Terminates in | Closed by | Status |
+| --- | --- | --- | --- |
+| End-to-end SSH (scp, sftp, rsync, `-L`/`-R`) | the guest's sshd | the gateway refusing the splice | implemented (`Zone.spec.ssh`) |
+| Relay / TUI handover (PTY) | the gateway | the gateway | designed, not built |
+| Portal web terminal | the guest / pod | the portal | not gated |
+| Desktop clipboard (bidirectional) | the streamer | streamer configuration | **not gated** |
+| Screenshots | the portal's memory, served over HTTP | the portal | globally tunable only |
+| The desktop stream itself | the browser | — | always on; it is the point |
+
+Two of those rows are the interesting ones, because they are the channels
+that survive turning off everything a shell can do.
+
+**The clipboard.** A desktop-only posture is the obvious answer for an
+external researcher, and it is not by itself a boundary: the streamer syncs
+the clipboard in both directions, `xclip` is installed in the image
+specifically to make that work, and no flag disabling it is passed
+([`desktops/streamer-selkies2/entrypoint.sh`](../desktops/streamer-selkies2/entrypoint.sh)).
+Locking the clipboard down in the thin client is enforcement in the client,
+which [Assumptions](#assumptions) says does not count. It has to be off
+server-side for a session in that posture. Whether Selkies 2.x exposes a
+toggle is unverified — the source is fetched at build time — so the fallbacks
+are the existing build-time patch pipeline, or simply not shipping `xclip` in
+a restricted variant, which is crude and effective given 2.x shells out to
+it.
+
+**Screenshots.** The portal grabs the X display of every desktop session on a
+timer, keeps a PNG in memory and serves it at `/screenshot/<id>` at full
+stored resolution. That is a data path *out of a restricted zone, created by
+Whistler itself*, and it survives disabling SSH, the terminal and the
+clipboard. It is documented as monitoring, which it is; it is also egress,
+which had not been priced in. `WHISTLER_SCREENSHOT_WIDTH` is currently the
+only dial and it is global — a per-zone setting is what this model needs, and
+a zone that means what it says probably wants them off entirely.
+
+**Shape of the setting.** A zone carries a channel **ceiling** — the most any
+session in it may use — and a user or group grant narrows it from there. Not
+a per-zone switch alone: the whole point of the third axis is that the
+internal helper and the external researcher meet in the same zone, on the
+same instance, and must not get the same channels. A maximally restricted
+zone sets its ceiling to the desktop stream alone, and no grant can widen it.
 
 ## Core model: taint plus security level
 
@@ -289,12 +479,21 @@ What this model adds to the `Zone` CR:
 
 - **`securityLevel`** (`0`–`100`) — the gradient in rule 1.
 - **A pinning requirement** — may this zone mount shareable volumes at all.
+- **A channel ceiling** — the most any session here may use
+  ([Access channels](#access-channels-the-second-axis)). A ceiling, not a
+  setting: the per-user grant narrows it, and nothing widens it. Today this
+  exists only as `Zone.spec.ssh`, which names one of the five channels
+  because it is the one the gateway work needed
+  ([design/proxyjump.md](proxyjump.md)); it should become the full set before
+  anything depends on the narrow spelling.
 - Possibly: permitted storage classes, and whether read-only cross-level mounts
   are allowed here.
 
-The egress posture and the data posture are two faces of the same object, and
-that is the point: a zone is low-level *because* it reaches the internet. Two
-separate primitives would let them drift apart.
+The egress posture, the data posture and the channel ceiling are three faces
+of the same object, and that is the point: a zone is low-level *because* it
+reaches the internet, and a zone that forbids the internet while permitting
+`scp` has not forbidden anything. Separate primitives would let them drift
+apart.
 
 **Live edits.** The current split — an edited zone re-fences running sessions in
 place, while zone *membership* changes need a restart — is worth preserving as
@@ -317,6 +516,15 @@ for each volume the group can reach, which members get `rw` and which get `ro`.
 That list is not merely a UI affordance — it renders directly to the gateway's
 export list, which is where the enforcement lives
 ([Shared instances](#shared-instances-and-shared-volumes)).
+
+A group also carries the **channel grant** — which of the zone's permitted
+channels its members actually get. This is where the third axis lives, and it
+is the reason the channel ceiling cannot be a per-zone switch on its own:
+"lab staff" and "visiting researchers" meet in the same restricted zone, on
+the same instance, and the whole design depends on them not getting the same
+doors. Two groups, one zone, different channel grants — no special case in
+code, and the grant can be conditioned on source network
+([source address](#source-address-the-second-weaker-check)).
 
 Still to design: naming, nesting (probably none), and who may edit a group.
 
@@ -675,6 +883,17 @@ Worth stating, because each is a plausible-sounding detour:
   reboot, silently and unrecoverably. It needs a deliberate guardrail —
   instances default to requiring a home, "no persistent home" is an explicit
   choice, and the session says so visibly.
+- **Can the desktop clipboard be turned off server-side?** A desktop-only
+  posture is not a boundary until it can
+  ([Access channels](#access-channels-the-second-axis)). Unverified whether
+  Selkies 2.x has a flag; the fallbacks are the build-time patch pipeline or
+  dropping `xclip` from a restricted image variant. This blocks the external-
+  researcher case, so it is the first thing to check, not the last.
+- **Screenshots need a per-zone setting, not a global width.** They are
+  monitoring *and* egress, and today the only dial applies to every session
+  in the cluster.
+- **Channel grants conditioned on source network** — worth having, worth
+  being honest that it correlates with the endpoint rather than proving it.
 - Audit trail and UI for declassification.
 - What `securityLevel` values mean in practice, and whether an unordered taint
   *set* is ever needed instead of a total order (two restricted collections
