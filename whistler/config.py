@@ -2062,7 +2062,20 @@ class KubeConfigManager(ConfigManager):
 
     def _ensure_session_service(self, *, session_name, username, uid, namespace,
                                 display_port):
-        """Create the per-session ClusterIP Service (idempotent)."""
+        """Create *or reconcile* the per-session ClusterIP Service.
+
+        Reconciled, not create-once. It used to return on the 409 and leave
+        whatever was there, which meant a Service outlived the shape Whistler
+        wanted from it: adding the ssh port published nothing on sessions that
+        already existed, and dialling that port on the ClusterIP hung — no
+        matching Service port means no DNAT, so the packet is dropped rather
+        than refused, and the caller sees a timeout with a healthy session on
+        the other side.
+
+        A merge patch of `spec.ports` (and the selector) replaces the list
+        wholesale while leaving everything the API server owns — clusterIP
+        above all, which is immutable — untouched.
+        """
         body = self._build_session_service(
             session_name=session_name, username=username, uid=uid,
             display_port=display_port,
@@ -2073,9 +2086,20 @@ class KubeConfigManager(ConfigManager):
             logger.info(f"Service {session_name} created")
             return True
         except ApiException as e:
-            if e.status == 409:
-                return True  # Already exists
-            logger.error(f"Failed to create service {session_name}: {e}")
+            if e.status != 409:
+                logger.error(f"Failed to create service {session_name}: {e}")
+                return False
+
+        try:
+            core_api.patch_namespaced_service(session_name, namespace, {
+                "spec": {
+                    "ports": body["spec"]["ports"],
+                    "selector": body["spec"]["selector"],
+                },
+            })
+            return True
+        except ApiException as e:
+            logger.error(f"Failed to reconcile service {session_name}: {e}")
             return False
 
     def _resolve_template(self, user_ns: str, template_ref: str) -> Optional[Dict[str, Any]]:
