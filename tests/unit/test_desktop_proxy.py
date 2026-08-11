@@ -87,6 +87,10 @@ class FakeCM:
 
     def __init__(self):
         self.sessions = {}
+        self.admins = set()
+
+    def is_user_admin(self, username):
+        return username in self.admins
 
     def get_user_desktop_sessions(self, username):
         return self.sessions.get(username, [])
@@ -138,6 +142,9 @@ async def portal(backend, monkeypatch):
     # the routes, so keep it from grabbing at a FakeCM (0 = disabled).
     monkeypatch.setenv("WHISTLER_SCREENSHOT_INTERVAL", "0")
     cm = FakeCM()
+    # The machine console is admin-only, and most VNC tests are about the
+    # relay rather than the gate; a separate test covers the refusal.
+    cm.admins.add("alice")
     cm.sessions["alice"] = [
         _session("d1", backend.port),
         _session("booting", backend.port, phase="Booting"),
@@ -327,6 +334,22 @@ async def test_vnc_page_serves_novnc_client(portal):
 async def test_novnc_module_served_statically(portal):
     resp = await portal.get("/static/novnc/core/rfb.js")
     assert resp.status == 200
+
+
+async def test_machine_console_is_admin_only(portal):
+    """Both the page and the websocket, because the socket is reachable
+    without ever loading the page — hiding the dashboard button is not an
+    access control."""
+    portal.cm.admins.discard("alice")
+    assert (await portal.get("/vnc/v1", params={"user": "alice"})).status == 403
+    assert (await portal.get("/ws-vnc/v1", params={"user": "alice"})).status == 403
+
+
+async def test_machine_console_admin_check_precedes_session_lookup(portal):
+    """A non-admin gets the same 403 for a session that doesn't exist, so the
+    console can't be used to probe which sessions a user has."""
+    portal.cm.admins.discard("alice")
+    assert (await portal.get("/ws-vnc/nope", params={"user": "alice"})).status == 403
 
 
 async def test_ws_vnc_authorization(portal):

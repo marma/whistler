@@ -14,6 +14,17 @@
   <i class="terminal icon"></i>
 </a>
 {% endif %}
+{# Admin only, and only for VMs: the machine's console rather than its desktop
+   — firmware, bootloader and kernel messages, i.e. the view that exists
+   before (and after) anything else works. The server enforces this too; the
+   template only decides whether to show it. #}
+{% if console_url %}
+<a class="ui grey tiny icon button{% if not can_connect %} disabled{% endif %}"
+   title="Machine console (admin) — firmware and boot output, not the desktop"
+   {% if can_connect %}href="{{ console_url }}" target="_blank"{% endif %}>
+  <i class="microchip icon"></i>
+</a>
+{% endif %}
 <button class="ui yellow tiny icon button{% if not can_stop %} disabled{% endif %}" title="Stop"
         {% if can_stop %}hx-post="/instances/{{ name }}/stop?user={{ user }}" hx-target="#status-{{ name }}" hx-swap="outerHTML"{% else %}disabled{% endif %}>
   <i class="stop icon"></i>

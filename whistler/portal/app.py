@@ -86,6 +86,19 @@ async def _run(request, func, *args):
     return await loop.run_in_executor(None, func, *args)
 
 
+# Admin overrides, read the same way the management app reads them so the two
+# halves of the portal cannot disagree about who is an admin.
+_ADMIN_USERS = set(
+    u.strip() for u in os.environ.get("WHISTLER_ADMIN_USERS", "").split(",") if u.strip())
+_ALLOW_ADMIN = os.environ.get("WHISTLER_AUTH_ALLOW_ADMIN", "false").lower() == "true"
+
+
+async def _is_admin(request, user):
+    if _ALLOW_ADMIN or user in _ADMIN_USERS:
+        return True
+    return bool(await _run(request, request.app["cm"].is_user_admin, user))
+
+
 def _resolve_session(sessions, short_name):
     """Find a desktop session by its short (per-user) name in a list from
     ``get_user_desktop_sessions``."""
@@ -592,8 +605,16 @@ async def ws_term(request):
 
 async def vnc_page(request):
     """Serve the noVNC viewer page (VM sessions) and nudge the VM awake, like
-    /connect does for the Selkies path."""
+    /connect does for the Selkies path.
+
+    **Admin-only**, enforced here and not merely by hiding the dashboard
+    button — a link is not an access control. This is the machine's console
+    (firmware, bootloader, kernel messages), which is a diagnostic view rather
+    than a user-actionable one, and on any instance with more than one member
+    it is inherently unscoped: one machine, one console."""
     cm, user = request.app["cm"], request["user"]
+    if not await _is_admin(request, user):
+        return web.Response(status=403, text="The machine console is admin-only")
     name = request.match_info["id"]
     await _run(request, cm.trigger_instance_start, user, name)
     return web.Response(text=_render_vnc(user, name), content_type="text/html")
@@ -602,8 +623,12 @@ async def vnc_page(request):
 async def ws_vnc(request):
     """Bridge the browser's RFB websocket to the VMI's VNC subresource. Same
     ownership boundary as ws_term: the session must resolve in the requesting
-    user's namespace and be Ready."""
+    user's namespace and be Ready — plus admin, since this is the machine
+    console (see vnc_page). Checked here as well as on the page, because the
+    websocket is reachable without ever loading it."""
     cm, user = request.app["cm"], request["user"]
+    if not await _is_admin(request, user):
+        return web.Response(status=403, text="The machine console is admin-only")
     name = request.match_info["id"]
 
     sessions = await _run(request, cm.get_user_desktop_sessions, user)

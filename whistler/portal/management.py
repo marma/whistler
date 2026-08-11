@@ -152,7 +152,8 @@ def _tr(url: str, user: str) -> RedirectResponse:
 
 def _render_status_html(name: str, status: str, user: str, controls: bool,
                         connect_url: str = None, term_url: str = None,
-                        ready: bool = True, editable: bool = False) -> str:
+                        ready: bool = True, editable: bool = False,
+                        console_url: str = None) -> str:
     """Render the polling status badge. With `controls`, also emit an out-of-band
     swap that re-renders the action buttons (connect/ssh/start/stop/edit) so they
     stay enabled/disabled in step with the status (used on the dashboard; the
@@ -161,6 +162,7 @@ def _render_status_html(name: str, status: str, user: str, controls: bool,
     return templates.env.get_template(tpl).render(
         name=name, status=status, user=user, controls=controls,
         connect_url=connect_url, term_url=term_url, ready=ready, editable=editable,
+        console_url=console_url,
     )
 
 
@@ -191,7 +193,22 @@ def _terminal_url(user: str, name: str) -> str:
     return f"{_DESKTOP_PORTAL_URL}/term/{name}?user={user}"
 
 
-def _merge_sessions(instances: list, desktop_sessions: list, user: str) -> list[dict]:
+def _console_url(user: str, name: str) -> str:
+    """The VM's *hardware* console (KubeVirt VNC subresource) — the emulated
+    display from power-on: firmware, bootloader, kernel messages, the login
+    prompt. Distinct from the desktop stream, which is a userspace X capture
+    and only exists once the session is up.
+
+    **Admin-only.** Not because it is more powerful than the desktop — it is
+    the diagnostic view when everything else is broken — but because it is not
+    a view a user can act on: boot output is rarely where the problem is
+    (that is usually Kubernetes-side), and one console per machine means it is
+    inherently unscoped on any instance with more than one member."""
+    return f"{_DESKTOP_PORTAL_URL}/vnc/{name}?user={user}"
+
+
+def _merge_sessions(instances: list, desktop_sessions: list, user: str,
+                    is_admin: bool = False) -> list[dict]:
     """Flatten ssh instances + desktop sessions into one list of rows with a
     common shape (name/template/status/mode), so the dashboard can render them in
     a single table. Desktop rows carry the browser viewer URL. Every row gets a
@@ -205,14 +222,19 @@ def _merge_sessions(instances: list, desktop_sessions: list, user: str) -> list[
             "term_url": _terminal_url(user, i["name"]),
             # ssh instances have no X display, so nothing to screenshot.
             "screenshot_url": None,
+            # Containers have no firmware and no emulated display.
+            "console_url": None,
         })
     for s in desktop_sessions:
+        is_vm = s.get("runtime") == "vm"
         rows.append({
             "name": s["name"], "template": s.get("template"),
             "status": s.get("phase"), "ready": True, "mode": "desktop",
             "connect_url": _desktop_viewer_url(user, s["name"]),
             "term_url": _terminal_url(user, s["name"]),
             "screenshot_url": _screenshot_url(user, s["name"]),
+            "console_url": (_console_url(user, s["name"])
+                            if is_vm and is_admin else None),
         })
     rows.sort(key=lambda r: r["name"])
     return rows
@@ -232,7 +254,8 @@ async def user_index(request: Request, cm: CM, user: User, is_admin: IsAdmin):
     return templates.TemplateResponse(
         request=request, name="user/index.html",
         context=_ctx(user, is_admin=is_admin,
-                     instances=_merge_sessions(instances, desktop_sessions, user),
+                     instances=_merge_sessions(instances, desktop_sessions, user,
+                                               is_admin=is_admin),
                      tpls=ssh_tpls + desk_tpls),
     )
 
@@ -438,7 +461,8 @@ async def instance_detail(request: Request, cm: CM, user: User, is_admin: IsAdmi
 
 
 async def _status_badge_response(request: Request, cm, user: str, name: str,
-                                 controls: bool) -> HTMLResponse:
+                                 controls: bool,
+                                 is_admin: bool = False) -> HTMLResponse:
     """Look up the current consolidated status (ssh pod phase or desktop CR phase)
     and render the polling badge (with Start/Stop buttons when `controls`)."""
     instances, desktop_sessions = await asyncio.gather(
@@ -453,6 +477,7 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
         status, connect_url = inst["status"], None
         ready = inst.get("ready", True)
         term_url = _terminal_url(user, name)
+        console_url = None      # containers have no emulated display
         editable = True
     else:
         sess = next((s for s in desktop_sessions if s["name"] == name), None)
@@ -461,38 +486,48 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
             ready = True
             connect_url = _desktop_viewer_url(user, name)
             term_url = _terminal_url(user, name)
+            # Re-rendered out-of-band on every status poll, so it has to be
+            # recomputed here too — otherwise the admin console button
+            # disappears the first time the badge refreshes.
+            console_url = (_console_url(user, name)
+                           if is_admin and sess.get("runtime") == "vm" else None)
             editable = True
         else:
-            status, connect_url, term_url = "Unknown", None, None
+            status, connect_url, term_url, console_url = "Unknown", None, None, None
             ready = True
     return HTMLResponse(
         _render_status_html(name, status, user, controls, connect_url, term_url,
-                            ready, editable))
+                            ready, editable, console_url))
 
 
-async def instance_status_badge(request: Request, cm: CM, user: User, name: str):
+async def instance_status_badge(request: Request, cm: CM, user: User, name: str,
+                                is_admin: IsAdmin):
     """HTMX polling endpoint — returns the status badge span. The dashboard passes
     ?controls=1 to also refresh the Start/Stop buttons (out-of-band); the detail
     view polls without it and gets just the badge."""
     controls = request.query_params.get("controls") == "1"
-    return await _status_badge_response(request, cm, user, name, controls)
+    return await _status_badge_response(request, cm, user, name, controls, is_admin)
 
 
-async def instance_connect(request: Request, cm: CM, user: User, name: str):
+async def instance_connect(request: Request, cm: CM, user: User, name: str,
+                           is_admin: IsAdmin):
     ok = await request.app.state.run(cm.trigger_instance_start, user, name)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to start instance.")
     # Dashboard buttons post via HTMX: swap the status badge (and buttons) in place
     # instead of navigating to the detail view. Plain form posts (detail) redirect.
     if request.headers.get("HX-Request"):
-        return await _status_badge_response(request, cm, user, name, controls=True)
+        return await _status_badge_response(request, cm, user, name, controls=True,
+                                            is_admin=is_admin)
     return _tr(f"/instances/{name}", user)
 
 
-async def instance_stop(request: Request, cm: CM, user: User, name: str):
+async def instance_stop(request: Request, cm: CM, user: User, name: str,
+                        is_admin: IsAdmin):
     await request.app.state.run(cm.stop_instance, user, name)
     if request.headers.get("HX-Request"):
-        return await _status_badge_response(request, cm, user, name, controls=True)
+        return await _status_badge_response(request, cm, user, name, controls=True,
+                                            is_admin=is_admin)
     return _tr(f"/instances/{name}", user)
 
 
