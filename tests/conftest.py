@@ -169,6 +169,22 @@ class FakeConfigManager(ConfigManager):
     def get_ssh_known_hosts_line(self):
         return "@cert-authority *.w ssh-ed25519 AAAAFAKE"
 
+    def list_ssh_targets(self, username):
+        targets = [
+            {"name": i.get("name"), "template": i.get("template"),
+             "status": i.get("status"), "runtime": "container",
+             "mode": "ssh", "sshReachable": False}
+            for i in self._instances.get(username, [])
+        ]
+        targets += [
+            {"name": s.get("name"), "template": s.get("template"),
+             "status": s.get("phase"), "runtime": s.get("runtime"),
+             "mode": "desktop", "sshReachable": s.get("runtime") == "vm"}
+            for s in self._desktop_sessions.get(username, [])
+        ]
+        targets.sort(key=lambda t: t.get("name") or "")
+        return targets
+
     def get_ssh_ca_public_key(self):
         return self.ssh_ca_public_key
 

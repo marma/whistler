@@ -286,6 +286,12 @@ class ConfigManager(ABC):
         instance."""
         pass
 
+    @abstractmethod
+    def list_ssh_targets(self, username: str) -> List[Dict[str, Any]]:
+        """Every session this user has (ssh-mode and desktop alike) with
+        whether SSH can reach it — the launcher's data source."""
+        pass
+
 
     @abstractmethod
     def get_ssh_ca_public_key(self) -> Optional[str]:
@@ -3212,6 +3218,44 @@ class KubeConfigManager(ConfigManager):
             "statusMessage": status.get("statusMessage"),
         }
 
+    def list_ssh_targets(self, username: str) -> List[Dict[str, Any]]:
+        """Every session this user has, in one list, with whether SSH can
+        actually reach it.
+
+        The launcher's data source. It spans ssh-mode instances *and* desktop
+        sessions because jump routing does — `resolve_ssh_target` looks a name
+        up regardless of mode — and listing only one kind meant the launcher
+        showed precisely the sessions it could *not* connect to (pods, which
+        have had no sshd since the exec bridge was removed) while omitting the
+        ones it reaches fine (VMs).
+
+        ``sshReachable`` keys on the runtime because that is the honest signal
+        today: VMs run sshd from cloud-init; a container runs whatever its
+        image runs, which is not sshd. When a Whistler-compatible pod image
+        lands (design/proxyjump.md) this is the single place to widen.
+        """
+        targets = []
+        for inst in self.get_user_instances(username):
+            targets.append({
+                "name": inst.get("name"),
+                "template": inst.get("template"),
+                "status": inst.get("status"),
+                "runtime": "container",
+                "mode": "ssh",
+                "sshReachable": False,
+            })
+        for sess in self.get_user_desktop_sessions(username):
+            runtime = sess.get("runtime")
+            targets.append({
+                "name": sess.get("name"),
+                "template": sess.get("template"),
+                "status": sess.get("phase"),
+                "runtime": runtime,
+                "mode": "desktop",
+                "sshReachable": runtime == "vm",
+            })
+        targets.sort(key=lambda t: t.get("name") or "")
+        return targets
 
     # ------------------------------------------------------------------ #
     # Admin / management operations                                        #

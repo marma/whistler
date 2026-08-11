@@ -307,8 +307,9 @@ class WhistlerApp(App):
             table.add_column("Template", width=col_width)
             table.add_column("Status", width=col_width)
             # The address rather than the IP: what the user would type from
-            # their own shell, so the TUI teaches the direct path by showing
-            # it next to every row.
+            # their own shell, so the launcher teaches the direct path by
+            # showing it next to every row — and says so plainly when a
+            # session has no SSH to offer.
             table.add_column("ssh", width=col_width)
         except Exception:
             # Widgets might not be ready yet
@@ -333,7 +334,7 @@ class WhistlerApp(App):
         loop = asyncio.get_running_loop()
         try:
             self.cached_instances = await loop.run_in_executor(
-                None, self.config_manager.get_user_instances, self.username)
+                None, self.config_manager.list_ssh_targets, self.username)
             if self._known_hosts is None:
                 self._known_hosts = await loop.run_in_executor(
                     None, self.config_manager.get_ssh_known_hosts_line) or ""
@@ -363,11 +364,16 @@ class WhistlerApp(App):
         table.clear()
         for instance in self.cached_instances:
             name = instance.get("name", "Unknown")
+            # Say what is true per row rather than showing an address that
+            # would hang: a container session has no sshd, and its way in is
+            # the portal's web terminal.
+            address = (f"{name}{self.suffix}" if instance.get("sshReachable")
+                       else "— web terminal only")
             table.add_row(
                 name,
                 instance.get("template", "Unknown"),
                 instance.get("status", "Unknown"),
-                f"{name}{self.suffix}",
+                address,
                 key=name)
 
         if selected:
@@ -383,6 +389,13 @@ class WhistlerApp(App):
         except Exception:
             return None
 
+    def _selected_target(self):
+        name = self._get_selected_instance()
+        if not name:
+            return None
+        return next((t for t in self.cached_instances if t.get("name") == name),
+                    None)
+
     def action_ssh_help(self) -> None:
         example = self._get_selected_instance() or "<instance>"
         self.push_screen(SshHelpScreen(
@@ -395,11 +408,18 @@ class WhistlerApp(App):
         (whistler/relay.py) — a Textual app cannot hand its own channel over,
         and the session drops back into a fresh TUI when the remote shell
         ends."""
-        instance_name = self._get_selected_instance()
-        if not instance_name:
+        target = self._selected_target()
+        if not target:
             self.notify("No instance selected.")
             return
-        self.exit(("connect", instance_name))
+        if not target.get("sshReachable"):
+            # Refuse here rather than letting the relay spend its whole
+            # connect budget failing: a container has no sshd to wait for.
+            self.notify(
+                f"{target['name']} has no SSH — open it in the portal's web "
+                f"terminal instead.", severity="warning")
+            return
+        self.exit(("connect", target["name"]))
 
     def action_delete(self) -> None:
         instance_name = self._get_selected_instance()
