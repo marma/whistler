@@ -215,6 +215,10 @@ def _merge_sessions(instances: list, desktop_sessions: list, user: str,
     web-terminal URL (VM sessions get the KubeVirt serial console)."""
     rows: list[dict] = []
     for i in instances:
+        # An ssh instance can be a VM (images/devbase). Containers have no
+        # firmware and no emulated display, but a VM does — so an ssh-mode VM
+        # gets the machine console for admins, like the desktop VM rows below.
+        is_vm = i.get("runtime") == "vm"
         rows.append({
             "name": i["name"], "template": i.get("template"),
             "status": i.get("status"), "ready": i.get("ready", True),
@@ -222,8 +226,8 @@ def _merge_sessions(instances: list, desktop_sessions: list, user: str,
             "term_url": _terminal_url(user, i["name"]),
             # ssh instances have no X display, so nothing to screenshot.
             "screenshot_url": None,
-            # Containers have no firmware and no emulated display.
-            "console_url": None,
+            "console_url": (_console_url(user, i["name"])
+                            if is_vm and is_admin else None),
         })
     for s in desktop_sessions:
         is_vm = s.get("runtime") == "vm"
@@ -477,7 +481,13 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
         status, connect_url = inst["status"], None
         ready = inst.get("ready", True)
         term_url = _terminal_url(user, name)
-        console_url = None      # containers have no emulated display
+        # An ssh instance is a container *or* a VM (images/devbase): containers
+        # have no emulated display, a VM does. Recomputed here for the same
+        # reason as the desktop branch below — this badge is re-rendered
+        # out-of-band on every poll, so hardcoding None made the machine-console
+        # button vanish the moment the VM started and polling kicked in.
+        console_url = (_console_url(user, name)
+                       if is_admin and inst.get("runtime") == "vm" else None)
         editable = True
     else:
         sess = next((s for s in desktop_sessions if s["name"] == name), None)
@@ -578,8 +588,10 @@ async def dashboard(request: Request, cm: CM, user: User, is_admin: IsAdmin):
         request.app.state.run(cm.get_cluster_resources),
         request.app.state.run(cm.get_all_instances),
     )
+    # Two vocabularies: a pod reports "Running", a VM session reports the
+    # operator's "Ready". Both mean the same thing on this dashboard.
     running = sorted(
-        (i for i in all_instances if i.get("status") == "Running"),
+        (i for i in all_instances if i.get("status") in ("Running", "Ready")),
         key=lambda i: (i["username"], i["name"]),
     )
     return templates.TemplateResponse(

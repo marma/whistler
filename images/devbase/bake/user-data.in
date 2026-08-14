@@ -1,0 +1,251 @@
+#cloud-config
+# Bake-time cloud-config (NOT the per-session userData — that comes from
+# whistler/cloudinit.py). build.sh serves this over NoCloud-net (qemu SMBIOS
+# serial points cloud-init at http://10.0.2.2:@HTTP_PORT@/) for a one-shot boot
+# that installs the devbase toolchain, then resets cloud-init so the published
+# image treats every session's seed as a fresh first boot.
+#
+# The server sibling of ../../../desktops/vm-*-selkies/bake/user-data.in: same
+# mechanics, none of the desktop. No X, no Selkies, no DE — a devbase session is
+# reached over SSH (mode: ssh, runtime: vm) and, being screenless, is not part
+# of the portal's screenshot path, so there is no xwd/x11-apps here either.
+#
+# users: [] — do NOT create the image's default `ubuntu` user. The session
+# userData suppresses the default user to keep uid 1000 free for the real
+# Whistler user (see whistler/cloudinit.py); a bake that let cloud-init create
+# `ubuntu` would permanently occupy uid 1000 in the published image.
+users: []
+
+write_files:
+  - path: /run/whistler-bake.sh
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # The actual bake. /run is tmpfs, so this script never ships.
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      SEED=http://10.0.2.2:@HTTP_PORT@
+
+      # The bake races the boot's own apt jobs (apt-news, esm-cache,
+      # apt-daily): the lock timeout waits them out instead of dying, and the
+      # retry absorbs transient mirror hiccups — an `update` failure here
+      # killed a whole bake once, mid-lists-store, with nothing else wrong.
+      APT="apt-get -o DPkg::Lock::Timeout=120"
+      i=0
+      until $APT update; do
+        i=$((i + 1)); [ "$i" -ge 3 ] && exit 1
+        sleep 15
+      done
+
+      # --- The toolchain ---------------------------------------------------
+      # Ubuntu 26.04 is chosen for exactly this: python3 IS 3.14 and `clang` IS
+      # clang 21 in the archive, so neither needs a third-party repo (24.04,
+      # which the GNOME desktop image is stuck on, would need deadsnakes + the
+      # LLVM apt repo for the same two).
+      #
+      # --no-install-recommends throughout — the base is the union of what a
+      # C/C++ and Python developer needs to build, debug, edit and move code,
+      # and nothing else. Notes on the less obvious entries:
+      #   build-essential  gcc/g++/make/libc6-dev. Not redundant next to clang:
+      #                    clang++ uses GNU libstdc++ headers from g++, the
+      #                    linker driver wants binutils, and nvcc (cuda-dev
+      #                    variant) requires a *GNU* host compiler.
+      #   clangd/-format/  the LSP + tooling half of clang. This image is meant
+      #     -tidy          to be used from VS Code Remote over the SSH jump
+      #                    host, where clangd is what makes C++ navigable.
+      #   libclang-rt-dev  clang's compiler-rt. Without it -fsanitize=address
+      #                    (or =undefined) fails at LINK time with a missing
+      #                    libclang_rt.asan_cxx.a — verified, not assumed. It
+      #                    is the version-tracking meta, so it follows whatever
+      #                    release `clang` points at.
+      #   python3-dev      headers, so `pip install` can build wheels from
+      #                    source when a project has no manylinux wheel.
+      #   pipx             the supported way to install Python CLI apps on a
+      #                    PEP-668 externally-managed interpreter (26.04's
+      #                    python3 is one) without a venv dance.
+      #   nfs-common       gives cloud-init's home mount its mount.nfs4 fast
+      #                    path; without it the guest falls back to a raw
+      #                    kernel mount (see whistler/cloudinit.py).
+      #   bash-completion  makes /etc/bash_completion.d (pixi's completions,
+      #                    written below) actually load.
+      $APT install -y --no-install-recommends \
+        build-essential pkg-config make cmake ninja-build \
+        clang clang-format clang-tidy clangd libclang-rt-dev lld lldb gdb \
+        python3 python3-dev python3-venv python3-pip pipx \
+        git git-lfs curl wget rsync unzip zip xz-utils zstd jq \
+        vim nano tmux htop less man-db manpages bash-completion \
+        ca-certificates gnupg openssh-server nfs-common \
+        sudo
+
+      # --- pixi ------------------------------------------------------------
+      # Pinned static musl build straight to /usr/local/bin, system-wide and
+      # rebuildable. NOT the upstream install script, which targets ~/.pixi —
+      # $HOME here is the user's NFS PVC, so an installer-placed pixi would be
+      # per-user state that no image rebuild could ever update.
+      # `pixi global install` still writes to $HOME/.pixi/bin (on PATH via
+      # /etc/profile.d/50-whistler-devbase.sh), which is the right place for a
+      # user's own tools: it persists across sessions and across variants.
+      curl -fL -o /run/pixi.tar.gz \
+        "https://github.com/prefix-dev/pixi/releases/download/v@PIXI_VERSION@/pixi-x86_64-unknown-linux-musl.tar.gz"
+      tar -xzf /run/pixi.tar.gz -C /usr/local/bin pixi
+      chmod 0755 /usr/local/bin/pixi
+      rm -f /run/pixi.tar.gz
+      /usr/local/bin/pixi --version
+      /usr/local/bin/pixi completion --shell bash > /etc/bash_completion.d/pixi
+
+      # --- NVIDIA driver (cuda / cuda-dev variants) ------------------------
+      # The GPU *runtime*: libcuda.so.1, the PTX JIT, OptiX, NVENC, nvidia-smi
+      # — which is what PyTorch/JAX wheels (they carry their own
+      # cudart/cuBLAS/cuDNN) and Blender actually load. Baked, not
+      # session-installed, because the default zone blocks package mirrors.
+      # nvtop rides along: a GPU box wants a GPU top.
+      if [ -n "@NVIDIA_DRIVER_PACKAGE@" ]; then
+        $APT install -y --no-install-recommends "@NVIDIA_DRIVER_PACKAGE@" nvtop
+      fi
+
+      # --- CUDA SDK (cuda-dev variant only) --------------------------------
+      # NVIDIA's apt repo, curated package list — see build.sh for why not
+      # 26.04's archive nvidia-cuda-toolkit (CUDA 12.4, rejects gcc 15) and why
+      # not the cuda-toolkit-13-3 umbrella (hard-Depends on the docs and the
+      # Nsight GUI profilers).
+      #
+      # The pin matters: NVIDIA's repo also ships driver packages that would
+      # otherwise outrank Ubuntu's by version, quietly replacing the open
+      # driver installed above with theirs. Priority 400 keeps every
+      # nvidia-driver*/libnvidia* on the Ubuntu archive while the cuda-* and
+      # libcu*/libnpp/libnv* SDK packages (which the archive does not ship at
+      # all) still resolve from NVIDIA.
+      if [ -n "@CUDA_TOOLKIT_PACKAGES@" ]; then
+        curl -fL -o /run/cuda-keyring.deb \
+          "https://developer.download.nvidia.com/compute/cuda/repos/@CUDA_REPO_DISTRO@/x86_64/cuda-keyring_1.1-1_all.deb"
+        dpkg -i /run/cuda-keyring.deb
+        rm -f /run/cuda-keyring.deb
+        printf 'Package: nvidia-* libnvidia-* linux-modules-nvidia-*\nPin: origin developer.download.nvidia.com\nPin-Priority: 400\n' \
+          > /etc/apt/preferences.d/nvidia-archive-wins
+        $APT update
+        # Unquoted on purpose: this is a package *list*.
+        $APT install -y --no-install-recommends @CUDA_TOOLKIT_PACKAGES@
+
+        # /usr/local/cuda: the version-independent path everything (CMake's
+        # FindCUDAToolkit, CUDA_HOME, our profile.d) expects. The versioned
+        # packages normally manage it; create it if this package set didn't.
+        if [ ! -e /usr/local/cuda ]; then
+          CUDA_DIR=$(ls -d /usr/local/cuda-* 2>/dev/null | sort -V | tail -1)
+          [ -n "$CUDA_DIR" ] && ln -s "$CUDA_DIR" /usr/local/cuda
+        fi
+        # The SDK's shared libraries are not on the default ld.so path (NVIDIA
+        # documents LD_LIBRARY_PATH instead); make them findable for everyone,
+        # including non-login shells that never source profile.d.
+        printf '/usr/local/cuda/targets/x86_64-linux/lib\n/usr/local/cuda/lib64\n' \
+          > /etc/ld.so.conf.d/999-cuda.conf
+        ldconfig
+
+        # ...and the same problem for the binaries: /usr/local/cuda/bin is on
+        # PATH only via profile.d, which LOGIN shells read and
+        # `ssh <session>.w nvcc ...` does not — so a remote build command, a
+        # CI-style one-shot ssh, or a VS Code Remote server started without a
+        # login shell all get "nvcc: command not found" on an image that
+        # plainly has nvcc. (Caught by test.sh, which is why it now runs its
+        # checks with pipefail.)
+        #
+        # The fix is PATH in /etc/environment, which pam_env applies to every
+        # sshd session, login or not. The obvious alternative — symlinking the
+        # tools into /usr/local/bin — looks right and is WRONG: nvcc derives
+        # its toolkit root from the path it was invoked as and does not resolve
+        # the symlink, so /usr/local/bin/nvcc hunts for headers under
+        # /usr/local/include and dies with "cuda_runtime.h: No such file or
+        # directory". Measured, not theorised: that is exactly what test.sh's
+        # "nvcc compiles" check reported when this was a symlink loop.
+        #
+        # Caveat: this does not cover `sudo nvcc` (sudo uses its own
+        # secure_path), which is fine — you do not build as root.
+        if grep -q '^PATH=' /etc/environment; then
+          sed -i 's|^PATH="\?\([^"]*\)"\?$|PATH="\1:/usr/local/cuda/bin"|' /etc/environment
+        else
+          echo 'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/cuda/bin"' >> /etc/environment
+        fi
+        grep '^PATH=' /etc/environment | grep -q /usr/local/cuda/bin
+
+        # Assert the SDK is actually usable, not merely present: a real
+        # compile, which is what catches a broken include root.
+        test -x /usr/local/cuda/bin/nvcc
+        printf '__global__ void k(float *p){ p[threadIdx.x] = 1.f; }\n' > /run/t.cu
+        /usr/local/cuda/bin/nvcc -ptx /run/t.cu -o /run/t.ptx
+        rm -f /run/t.cu /run/t.ptx
+      fi
+
+      # --- VS Code Remote: keep the server off the NFS home ----------------
+      # $HOME is an NFS share from the user's storage gateway, and the VS Code
+      # server is the worst workload you can point at one: ~700MB and ~3000
+      # files downloaded, extracted, then directory-renamed into place, over a
+      # single TCP connection. Measured on this setup, that install never
+      # completed — it re-extracted into <commit>.staging forever, never
+      # promoting it — and while it ran, unrelated stat()s elsewhere in the
+      # home intermittently failed (`ls` printing `d?????????` for entries as
+      # innocent as ~/.gnupg). With the install on local disk the home sees
+      # none of that traffic.
+      #
+      # VSCODE_AGENT_FOLDER goes in /etc/environment because pam_env applies it
+      # to every sshd session, and VS Code launches its server over ssh with no
+      # login shell — profile.d would never be read (the same reason nvcc lives
+      # there in the cuda-dev variant).
+      #
+      # The cost, stated plainly: this path is the VM's *ephemeral* root disk,
+      # so each new session re-downloads the server (~227MB) and re-installs
+      # extensions. Settings Sync covers the latter. A user who would rather
+      # keep both on the persistent home can override it per session:
+      #     export VSCODE_AGENT_FOLDER="$HOME/.vscode-server"
+      # 1777 like /tmp: the directory is created at bake time, before any user
+      # exists, and the session user must own what it creates inside.
+      install -d -m 1777 /var/lib/vscode-server
+      echo 'VSCODE_AGENT_FOLDER=/var/lib/vscode-server' >> /etc/environment
+
+      # --- Guest payload ---------------------------------------------------
+      # profile.d PATH bits + the motd hook (guest/). --no-overwrite-dir: never
+      # restore the archive's metadata onto existing system dirs (/etc, ...) —
+      # a group-writable /etc from the build host's umask breaks sshd
+      # StrictModes for /etc/ssh/authorized_keys.d.
+      curl -fsS "$SEED/artifacts.tar.gz" | tar -xz --no-overwrite-dir -C /
+      chmod 0755 /etc/update-motd.d/99-whistler-devbase
+      chmod 0644 /etc/profile.d/50-whistler-devbase.sh
+
+      # What this image is, resolved once here instead of on every login (the
+      # motd hook just cats it). Doubles as a build receipt: `cat
+      # /etc/whistler-devbase-release` in a session tells you which variant and
+      # which toolchain you are actually on.
+      {
+        echo "Whistler devbase (@VARIANT@) — built $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "  $(. /etc/os-release; echo "$PRETTY_NAME")"
+        echo "  python3   $(python3 --version 2>&1 | cut -d' ' -f2)"
+        echo "  clang     $(clang --version | head -1 | sed 's/.*version //')"
+        echo "  gcc       $(gcc -dumpfullversion)"
+        echo "  pixi      $(pixi --version | cut -d' ' -f2)"
+        if [ -x /usr/local/cuda/bin/nvcc ]; then
+          echo "  nvcc      $(/usr/local/cuda/bin/nvcc --version | sed -n 's/.*release \([0-9.]*\).*/\1/p')"
+        fi
+        if [ -n "@NVIDIA_DRIVER_PACKAGE@" ]; then
+          echo "  nvidia    @NVIDIA_DRIVER_PACKAGE@ (GPU runtime; nvidia-smi, nvtop)"
+        fi
+      } > /etc/whistler-devbase-release
+
+      # Session boots must be fast: snapd.seeded alone holds multi-user.target
+      # (and with it cloud-init's runcmd stage) for ~30s on stock images —
+      # measured, see whistler/cloudinit.py. No snaps are used; purge it.
+      $APT purge -y snapd unattended-upgrades || true
+      $APT autoremove -y --purge
+      apt-get clean
+      rm -rf /var/lib/apt/lists/*
+
+      # Reset so the published image runs the per-session seed as a true
+      # first boot: instance state gone, logs gone, machine-id regenerates.
+      cloud-init clean --logs --machine-id
+      # Return freed blocks so the compressed qcow2 doesn't carry them.
+      fstrim -av || true
+
+runcmd:
+  # One wrapper, not a list of runcmd items: runcmd does not stop on failure,
+  # so the bake runs under its own `set -e` and reports a single verdict on
+  # the serial console for build.sh to grep. Output lands in a persistent log
+  # (live-tailed to ttyS0 for console.log; getty escape codes once ATE the
+  # only copy of an apt error, hence the file) whose tail is replayed on FAIL.
+  - [sh, -c, "tail -F /var/log/whistler-bake.log >/dev/ttyS0 2>/dev/null & sh /run/whistler-bake.sh >/var/log/whistler-bake.log 2>&1 && echo WHISTLER-BAKE-OK >/dev/ttyS0 || { echo WHISTLER-BAKE-FAIL >/dev/ttyS0; tail -40 /var/log/whistler-bake.log >/dev/ttyS0; }; shutdown -P now"]

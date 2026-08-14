@@ -20,7 +20,8 @@ SELKIES2_RESOLUTION ?= 1280x720
 
 .PHONY: test test-local cluster-up cluster-down integration integration-keep \
         desktop-sidecar-local desktop-gnome-sidecar-local \
-        desktop-sidecar-local-down vm-desktop-image vm-gnome-desktop-image clean help
+        desktop-sidecar-local-down vm-desktop-image vm-gnome-desktop-image \
+        devbase-image clean help
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?#' $(MAKEFILE_LIST) | sed 's/:.*#/\t/' | sort
@@ -92,6 +93,9 @@ vm-desktop-image: # Bake the XFCE+Selkies KubeVirt containerDisk (needs qemu/KVM
 
 vm-gnome-desktop-image: # Bake the GNOME-Shell+Selkies KubeVirt containerDisk (24.04; needs qemu/KVM; PUSH=1 to push, CUDA=1 for the -cuda GPU variant, IMAGE/TAG to override)
 	PUSH=$(or $(PUSH),0) CUDA=$(or $(CUDA),0) desktops/vm-gnome-selkies/build.sh
+
+devbase-image: # Bake the devbase dev-server containerDisk — no desktop, SSH only (26.04; needs qemu/KVM; PUSH=1 to push, VARIANT=base|cuda|cuda-dev, IMAGE/TAG to override)
+	PUSH=$(or $(PUSH),0) VARIANT=$(or $(VARIANT),base) images/devbase/build.sh
 
 clean: # Remove the test image and any leftover cluster
 	-docker rmi $(TEST_IMAGE) 2>/dev/null

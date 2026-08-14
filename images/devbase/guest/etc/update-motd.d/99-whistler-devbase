@@ -1,0 +1,9 @@
+#!/bin/sh
+# Print what this image actually ships, at login. The versions are resolved
+# once at bake time into /etc/whistler-devbase-release (see
+# ../../../bake/user-data.in) rather than by shelling out to `clang --version`
+# & friends on every login — a devbase session is SSHed into constantly.
+[ -r /etc/whistler-devbase-release ] || exit 0
+echo
+cat /etc/whistler-devbase-release
+echo

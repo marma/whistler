@@ -396,11 +396,21 @@ def _resolve_target(instances, desktop_sessions, name):
     console subresource), plus namespace and readiness."""
     for i in instances:
         if i["name"] == name:
+            # An ssh-mode session is a container *or* a VM (images/devbase):
+            # attach to the pod via kubectl exec for the former, to the KubeVirt
+            # serial console for the latter, exactly as the desktop branch below
+            # does. The VM phase vocabulary is the operator's ("Ready"), not the
+            # pod's ("Running").
+            runtime = i.get("runtime") or "container"
+            if runtime == "vm":
+                ready = i.get("status") == "Ready" and bool(i.get("vmiName"))
+            else:
+                ready = i.get("status") == "Running" and bool(i.get("podName"))
             return {
                 "podName": i.get("podName"), "namespace": i.get("namespace"),
-                "phase": i.get("status"), "runtime": "container",
-                "vmiName": None,
-                "ready": i.get("status") == "Running" and bool(i.get("podName")),
+                "phase": i.get("status"), "runtime": runtime,
+                "vmiName": i.get("vmiName"),
+                "ready": ready,
                 "supported": True,
             }
     for s in desktop_sessions:

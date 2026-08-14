@@ -24,6 +24,11 @@ whistler:
       - localhost:5000/whistler-vm-xfce-selkies-cuda:latest
       - localhost:5000/whistler-vm-gnome-selkies:latest
       - localhost:5000/whistler-vm-gnome-selkies-cuda:latest
+      # Dev-server VMs (no desktop, SSH only) — `make devbase-image
+      # [VARIANT=cuda|cuda-dev] PUSH=1`; see images/devbase/README.md.
+      - localhost:5000/whistler-devbase:latest
+      - localhost:5000/whistler-devbase-cuda:latest
+      - localhost:5000/whistler-devbase-cuda-dev:latest
 
 templates:
   # containerDisk boot: the qcow2 ships inside an OCI image. Fast pull-and-boot,
@@ -138,6 +143,60 @@ templates:
     resources:
       cpu: "4"
       memory: 8Gi
+      gpu: "1"
+
+  # --- devbase: development server VMs, no desktop --------------------------
+  # mode: ssh + runtime: vm — the guest is a plain SSH host (cloud-init creates
+  # the user, installs their keys, NFS-mounts the home), reached through the
+  # gateway's jump host as `ssh <session>.w`. No viewer, no streamer, no
+  # screenshots; the KubeVirt serial console and the portal's web terminal
+  # remain as rescue paths.
+  #
+  # persistence: persistent, unlike the desktop templates above: an ephemeral
+  # session is torn down on disconnect, which is wrong for a box someone leaves
+  # a build or a tmux running on.
+  #
+  # Toolchain: clang 21, Python 3.14, pixi (+ cmake/ninja/git/editors). Three
+  # variants — see images/devbase/README.md for what "CUDA available" means in
+  # each. Build: `make devbase-image [VARIANT=cuda|cuda-dev] PUSH=1`.
+  devbase:
+    description: "Ubuntu 26.04 dev server (SSH; clang, Python 3.14, pixi)"
+    mode: ssh
+    runtime: vm
+    image: "localhost:5000/whistler-devbase:latest"
+    persistence: persistent
+    resources:
+      cpu: "4"
+      memory: 8Gi
+
+  # + the NVIDIA driver, i.e. the GPU runtime (libcuda, PTX JIT, NVENC,
+  # nvidia-smi) — what PyTorch/JAX wheels load. No nvcc. k3s-metal only.
+  devbase-cuda:
+    description: "Ubuntu 26.04 dev server + RTX 4090 runtime (SSH; no nvcc)"
+    mode: ssh
+    runtime: vm
+    image: "localhost:5000/whistler-devbase-cuda:latest"
+    persistence: persistent
+    nodeSelector:
+      nvidia.com/gpu.product: NVIDIA-GeForce-RTX-4090
+    resources:
+      cpu: "4"
+      memory: 16Gi
+      gpu: "1"
+
+  # + the CUDA SDK (nvcc, headers, dev libraries, cuda-gdb/compute-sanitizer)
+  # for compiling CUDA C++ in-guest. k3s-metal only.
+  devbase-cuda-dev:
+    description: "Ubuntu 26.04 dev server + RTX 4090 + CUDA SDK (SSH; nvcc)"
+    mode: ssh
+    runtime: vm
+    image: "localhost:5000/whistler-devbase-cuda-dev:latest"
+    persistence: persistent
+    nodeSelector:
+      nvidia.com/gpu.product: NVIDIA-GeForce-RTX-4090
+    resources:
+      cpu: "8"
+      memory: 16Gi
       gpu: "1"
 
   # GPU passthrough smoke test (k3s-metal only): requests the RTX 4090 via

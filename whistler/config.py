@@ -733,23 +733,56 @@ class KubeConfigManager(ConfigManager):
                 pod_map = {p.metadata.labels.get("instance"): p for p in pods.items}
             except ApiException:
                 pod_map = {}
+            # ...and the VMIs, because an ssh-mode session is not necessarily a
+            # pod: `mode: ssh, runtime: vm` (images/devbase) is a KubeVirt VM
+            # reached over the jump host. Its launcher pod is virt-launcher-*
+            # with KubeVirt's own labels, so it never matches the user=/instance=
+            # selectors above — which used to leave `pod = None` and report a
+            # perfectly healthy VM as "Stopped" forever. Same split as
+            # get_user_desktop_sessions.
+            vmi_map = {}
+            if any((item.get("status") or {}).get("runtime") == "vm"
+                   for item in resp.get("items", [])):
+                try:
+                    vmis = self.api.list_namespaced_custom_object(
+                        KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns,
+                        KUBEVIRT_VMI_PLURAL,
+                    )
+                    vmi_map = {v["metadata"]["name"]: v for v in vmis.get("items", [])}
+                except ApiException:
+                    vmi_map = {}
 
             for item in resp.get("items", []):
                 spec = item.get("spec", {})
+                status_obj = item.get("status", {}) or {}
+                runtime = status_obj.get("runtime") or "container"
                 full_name = item["metadata"]["name"]
                 # Strip username prefix for display
                 display_name = full_name
                 if full_name.startswith(f"{username}-"):
                     display_name = full_name[len(username)+1:]
-                        
+
                 pod = pod_map.get(full_name)
-                
+
                 pod_status = "Stopped" # Default if no pod
                 pod_name = None
                 pod_ip = None
                 pod_ready = False
+                vmi_name = None
 
-                if pod:
+                if runtime == "vm":
+                    # The operator's phase vocabulary (Ready/Booting/Stopped/...),
+                    # exactly as the desktop lister reports it — the CR status is
+                    # the only live source for a VM here.
+                    pod_status = status_obj.get("phase", "Unknown")
+                    vmi_name = status_obj.get("vmiName")
+                    pod_name = status_obj.get("podName")
+                    pod_ip = status_obj.get("address")
+                    vmi = vmi_map.get(full_name)
+                    if vmi and (vmi.get("metadata") or {}).get("deletionTimestamp"):
+                        pod_status = "Terminating"
+                    pod_ready = pod_status == "Ready"
+                elif pod:
                     pod_name = pod.metadata.name
                     pod_status = pod.status.phase
                     if pod.metadata.deletion_timestamp:
@@ -757,6 +790,12 @@ class KubeConfigManager(ConfigManager):
                     pod_ip = pod.status.pod_ip
                     statuses = pod.status.container_statuses or []
                     pod_ready = bool(statuses) and all(cs.ready for cs in statuses)
+
+                # A deleting CR beats any derived phase (see the desktop lister):
+                # the operator's timer skips deleting sessions, so status.phase
+                # would otherwise sit at its last value for the whole teardown.
+                if item["metadata"].get("deletionTimestamp"):
+                    pod_status = "Terminating"
 
                 mounts = []
                 if pod and pod.spec and pod.spec.containers:
@@ -773,6 +812,8 @@ class KubeConfigManager(ConfigManager):
                     "status": pod_status,
                     "ready": pod_ready,
                     "podName": pod_name,
+                    "vmiName": vmi_name,
+                    "runtime": runtime,
                     "namespace": user_ns,
                     "ip": pod_ip,
                     "sshHost": None, 
@@ -2029,7 +2070,23 @@ class KubeConfigManager(ConfigManager):
         gateway splices to this Service's cluster DNS name rather than to a
         pod/VMI IP, so an instance keeps one address across reboots. Harmless
         where nothing listens (a desktop pod with no sshd yet): the connection
-        is simply refused."""
+        is simply refused.
+
+        ``display_port`` is optional: an ssh-mode session has no display, and
+        this Service exists for it purely to carry port 22."""
+        ports = [
+            {
+                "name": "ssh",
+                "port": SESSION_SSH_PORT,
+                "targetPort": SESSION_SSH_PORT,
+            },
+        ]
+        if display_port:
+            ports.insert(0, {
+                "name": "display",
+                "port": display_port,
+                "targetPort": display_port,
+            })
         return {
             "apiVersion": "v1",
             "kind": "Service",
@@ -2045,18 +2102,7 @@ class KubeConfigManager(ConfigManager):
             "spec": {
                 "type": "ClusterIP",
                 "selector": {"session": session_name},
-                "ports": [
-                    {
-                        "name": "display",
-                        "port": display_port,
-                        "targetPort": display_port,
-                    },
-                    {
-                        "name": "ssh",
-                        "port": SESSION_SSH_PORT,
-                        "targetPort": SESSION_SSH_PORT,
-                    },
-                ],
+                "ports": ports,
             },
         }
 
@@ -2246,14 +2292,26 @@ class KubeConfigManager(ConfigManager):
         if not ok:
             return result
 
-        # Desktop sessions are reached through a per-session Service (the portal dials
-        # it); SSH sessions are bridged via `kubectl exec` and need no Service.
-        if mode == 'desktop':
-            if not self._ensure_session_service(
-                session_name=full_name, username=username, uid=uid,
-                namespace=user_ns, display_port=display_port,
-            ):
-                return result
+        # EVERY session gets the Service, not just desktops. The old rule
+        # ("SSH sessions are bridged via kubectl exec and need no Service")
+        # died with the exec bridge: jump routing splices to this Service's
+        # cluster DNS name (resolve_ssh_target returns exactly that), so an
+        # ssh-mode session without one resolves to nothing and the client hangs
+        # after authenticating to the gateway — which is what a `mode: ssh,
+        # runtime: vm` devbase session hit, the first of its kind.
+        # Container sessions get it too: they carry the same `session` label,
+        # the Service is free, and it is the address a pod image with sshd will
+        # need (design/proxyjump.md). display_port is None for ssh mode, so the
+        # Service then publishes port 22 alone.
+        if not self._ensure_session_service(
+            session_name=full_name, username=username, uid=uid,
+            namespace=user_ns,
+            # `displayPort` defaults to 8082 for every template, so it must be
+            # gated on the mode here (as at the other call sites) or an ssh
+            # Service would advertise a display nothing serves.
+            display_port=display_port if mode == 'desktop' else None,
+        ):
+            return result
 
         result["ok"] = True
         return result
@@ -3260,13 +3318,20 @@ class KubeConfigManager(ConfigManager):
         """
         targets = []
         for inst in self.get_user_instances(username):
+            # The runtime comes from the session, not from the mode: an
+            # ssh-mode session is a container *or* a VM (images/devbase is
+            # `mode: ssh, runtime: vm`). Hardcoding "container" here listed a
+            # devbase VM as "web terminal only" and made connect refuse it up
+            # front — the launcher showing exactly the sessions it cannot reach,
+            # which is the failure this method was written to end.
+            runtime = inst.get("runtime") or "container"
             targets.append({
                 "name": inst.get("name"),
                 "template": inst.get("template"),
                 "status": inst.get("status"),
-                "runtime": "container",
+                "runtime": runtime,
                 "mode": "ssh",
-                "sshReachable": False,
+                "sshReachable": runtime == "vm",
             })
         for sess in self.get_user_desktop_sessions(username):
             runtime = sess.get("runtime")
@@ -3466,12 +3531,21 @@ class KubeConfigManager(ConfigManager):
 
                 for item in resp.get("items", []):
                     spec = item.get("spec", {})
+                    status_obj = item.get("status", {}) or {}
                     full_name = item["metadata"]["name"]
                     display_name = full_name.removeprefix(f"{username}-")
                     pod = pod_map.get(full_name)
                     pod_status = "Stopped"
                     pod_name = None
-                    if pod:
+                    if status_obj.get("runtime") == "vm":
+                        # ssh-mode VMs (images/devbase) have no whistler-labelled
+                        # pod; report status.phase as the operator wrote it.
+                        # Deliberately no per-namespace VMI list here — this is
+                        # the cluster-wide admin view, the same tradeoff
+                        # list_all_desktop_sessions documents.
+                        pod_status = status_obj.get("phase", "Unknown")
+                        pod_name = status_obj.get("vmiName") or status_obj.get("podName")
+                    elif pod:
                         pod_name = pod.metadata.name
                         pod_status = pod.status.phase or "Unknown"
                         if pod.metadata.deletion_timestamp:

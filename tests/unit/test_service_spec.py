@@ -34,6 +34,17 @@ def test_exposes_ssh_for_jump_routing():
     assert ports["display"] == 8082
 
 
+def test_ssh_mode_session_publishes_ssh_alone():
+    """An ssh-mode session (images/devbase: `mode: ssh, runtime: vm`) has no
+    display, but it still needs this Service: resolve_ssh_target hands the
+    gateway the Service's DNS name, so without one the jump resolves to nothing
+    and the client hangs after authenticating. display_port is None there, and
+    a display port nothing serves must not be advertised."""
+    svc = _build(session_name="alice-devbox", display_port=None)
+    assert svc["spec"]["ports"] == [{"name": "ssh", "port": 22, "targetPort": 22}]
+    assert svc["spec"]["selector"] == {"session": "alice-devbox"}
+
+
 def test_owner_reference_to_session():
     owner = _build()["metadata"]["ownerReferences"][0]
     assert owner["kind"] == "Session"

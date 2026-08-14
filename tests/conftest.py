@@ -170,10 +170,14 @@ class FakeConfigManager(ConfigManager):
         return "@cert-authority *.w ssh-ed25519 AAAAFAKE"
 
     def list_ssh_targets(self, username):
+        # Mirrors KubeConfigManager: the runtime comes from the session, so an
+        # ssh-mode VM (images/devbase) is SSH-reachable like a desktop VM.
         targets = [
             {"name": i.get("name"), "template": i.get("template"),
-             "status": i.get("status"), "runtime": "container",
-             "mode": "ssh", "sshReachable": False}
+             "status": i.get("status"),
+             "runtime": i.get("runtime") or "container",
+             "mode": "ssh",
+             "sshReachable": (i.get("runtime") or "container") == "vm"}
             for i in self._instances.get(username, [])
         ]
         targets += [
