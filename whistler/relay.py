@@ -168,6 +168,11 @@ async def open_relay(*, chan, host, port, username, private_key,
             asyncssh.connect(
                 host, port=port, username=username, client_keys=[key],
                 known_hosts=known_hosts_for(ca_public_key),
+                # asyncssh reads ~/.ssh/config by default. Nothing should be
+                # able to redirect the gateway's own connections by dropping a
+                # file in its home — and a `Host *` stanza there would apply
+                # to every session Whistler relays into.
+                config=None,
                 agent_path=agent_path,
                 agent_forwarding=bool(agent_path),
             ),

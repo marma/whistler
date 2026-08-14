@@ -288,7 +288,9 @@ async def capture_vm(host: str, username: str, private_key_pem: str,
     try:
         async with asyncssh.connect(
             host, username=username, client_keys=[key],
-            known_hosts=None, connect_timeout=10,
+            # config=None for the same reason as the relay: the portal's own
+            # connections must not be steerable by a ~/.ssh/config in its home.
+            known_hosts=None, config=None, connect_timeout=10,
         ) as conn:
             result = await asyncio.wait_for(
                 conn.run(grab_script(display), encoding=None, check=False),

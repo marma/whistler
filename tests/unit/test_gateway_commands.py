@@ -147,8 +147,10 @@ async def test_over_a_real_channel_the_output_is_appendable(make_config):
     port = next(iter(server.sockets)).getsockname()[1]
 
     async def _run_all():
+        # config=None so a developer's own ~/.ssh/config cannot steer the
+        # client (see test_hostca.py, where it silently did).
         async with asyncssh.connect("127.0.0.1", port, username="alice",
-                                    known_hosts=None) as conn:
+                                    known_hosts=None, config=None) as conn:
             return (await conn.run("known-hosts", check=True),
                     await conn.run("ssh-config", check=True),
                     await conn.run("nope"))

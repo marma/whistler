@@ -146,9 +146,15 @@ async def _try_connect(port, dialled_name, ca_pub):
     try:
         # known_hosts as (host_keys, ca_keys, revoked_keys): no host keys at
         # all, so acceptance can only come from the CA signature.
+        # config=None: asyncssh reads ~/.ssh/config by default, and the name
+        # dialled here is `box.w` — which matches the very `Host *.w` /
+        # ProxyJump stanza this feature tells users to install. Without this
+        # the test tries to jump through the developer's real gateway and
+        # fails with PermissionDenied, so the suite passed only on machines
+        # that had not followed our own instructions.
         conn = await asyncssh.connect(
             host=dialled_name, sock=sock, username="whoever",
-            known_hosts=([], [ca_pub], []))
+            config=None, known_hosts=([], [ca_pub], []))
         conn.close()
         await conn.wait_closed()
         return True
