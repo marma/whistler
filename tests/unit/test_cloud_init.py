@@ -196,8 +196,8 @@ def _file(doc, path):
 
 def test_host_key_and_cert_written_with_sane_modes():
     doc = _certified()
-    key = _file(doc, "/etc/ssh/ssh_host_whistler_ed25519_key")
-    cert = _file(doc, "/etc/ssh/ssh_host_whistler_ed25519_key-cert.pub")
+    key = _file(doc, "/etc/ssh/whistler_host_ed25519_key")
+    cert = _file(doc, "/etc/ssh/whistler_host_ed25519_key-cert.pub")
     assert key["content"] == HOST_KEY.decode()
     assert key["permissions"] == "0600"   # sshd refuses a world-readable key
     assert cert["content"] == HOST_CERT + "\n"
@@ -206,8 +206,8 @@ def test_host_key_and_cert_written_with_sane_modes():
 
 def test_sshd_configured_to_offer_the_certificate():
     conf = _file(_certified(), "/etc/ssh/sshd_config.d/60-whistler.conf")["content"]
-    assert "HostKey /etc/ssh/ssh_host_whistler_ed25519_key\n" in conf
-    assert ("HostCertificate /etc/ssh/ssh_host_whistler_ed25519_key-cert.pub\n"
+    assert "HostKey /etc/ssh/whistler_host_ed25519_key\n" in conf
+    assert ("HostCertificate /etc/ssh/whistler_host_ed25519_key-cert.pub\n"
             in conf)
     # The authorized_keys directive is untouched.
     assert "/etc/ssh/authorized_keys.d/%u" in conf
@@ -226,7 +226,7 @@ def test_image_host_keys_are_listed_alongside_ours():
         assert f"HostKey {path}\n" in conf
     # And ours comes last, so the certificate matches the key just above it.
     keys = [l for l in conf.splitlines() if l.startswith("HostKey ")]
-    assert keys[-1].endswith("ssh_host_whistler_ed25519_key")
+    assert keys[-1].endswith("whistler_host_ed25519_key")
 
 
 @pytest.mark.skipif(not os.path.exists("/usr/sbin/sshd"),

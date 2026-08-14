@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 # (design/proxyjump.md).
 SESSION_SSH_PORT = 22
 
+# Cluster DNS suffix for the per-session Service. Whistler's own components
+# dial a session by that name, so the host certificate has to carry it as a
+# principal — see session_service_host / session_ssh_principals.
+CLUSTER_DNS_SUFFIX = "svc.cluster.local"
+
 # How a zone treats interactive SSH. An inbound session is an egress channel
 # the zone's (egress-only) NetworkPolicies never see, so the posture is the
 # only place that can constrain it — see design/proxyjump.md, "SSH is an
@@ -3134,14 +3139,39 @@ class KubeConfigManager(ConfigManager):
             return None
         return hostca.known_hosts_line(ca_pub, f"*{self.ssh_domain_suffix}")
 
+    def session_service_host(self, username: str, session_name: str) -> str:
+        """The address Whistler's own components dial a session by: the
+        per-session Service's cluster DNS name.
+
+        One function so the relay's target and the certificate's principals
+        cannot drift. They did: the relay dialled the FQDN while the
+        certificate only carried the bare Service name, and asyncssh checks a
+        host certificate's principals against *the name it connected to*
+        (`_validate_openssh_host_certificate` → `cert.validate(CERT_TYPE_HOST,
+        host)`), so every relay failed verification against a perfectly valid
+        certificate — reported to the user as "could not open a session",
+        which reads like a missing sshd.
+        """
+        return (f"{username}-{session_name}."
+                f"{self._get_user_namespace(username)}.{CLUSTER_DNS_SUFFIX}")
+
     def session_ssh_principals(self, username: str, session_name: str) -> List[str]:
         """Host principals a session's certificate must carry: the names a
-        client can dial it by. The suffixed form is the one clients actually
-        verify; the internal ``<user>-<session>`` name is what Whistler's own
-        components (the relay, the screenshot grabber) reach it as."""
+        client can dial it by. The suffixed form is the one end users actually
+        verify (`ssh box.w`); the rest are the internal names Whistler's own
+        components (the relay, the screenshot grabber, the portal) reach it as
+        — the bare ``<user>-<session>`` Service name and the three
+        search-path forms of its cluster DNS name, since a resolver's search
+        list decides which of them a caller ends up dialling.
+        """
+        full_name = f"{username}-{session_name}"
+        user_ns = self._get_user_namespace(username)
         return hostca.session_principals(
             session_name, self.ssh_domain_suffix,
-            extra=[f"{username}-{session_name}"])
+            extra=[full_name,
+                   f"{full_name}.{user_ns}",
+                   f"{full_name}.{user_ns}.svc",
+                   f"{full_name}.{user_ns}.{CLUSTER_DNS_SUFFIX}"])
 
     def _host_cert_secret_name(self, full_name: str) -> str:
         return f"{full_name}-hostcert"
@@ -3284,7 +3314,7 @@ class KubeConfigManager(ConfigManager):
             "namespace": user_ns,
             "runtime": status.get("runtime") or template_spec.get("runtime", "container"),
             "mode": status.get("mode") or template_spec.get("mode", "ssh"),
-            "host": f"{full_name}.{user_ns}.svc.cluster.local",
+            "host": self.session_service_host(username, name),
             "port": SESSION_SSH_PORT,
             "zone": zone,
             "sshPosture": self.zone_ssh_posture(zone),

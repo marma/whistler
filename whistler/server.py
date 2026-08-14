@@ -14,8 +14,9 @@ from textual.geometry import Size
 from textual.events import Resize
 from textual._xterm_parser import XTermParser
 import time
-from whistler.tui import WhistlerApp, LoadingScreen
+from whistler.tui import WhistlerApp, LoadingScreen, ssh_config_stanza
 from whistler import relay
+from whistler.logsetup import quiet_chatty_libraries
 
 import argparse
 from functools import partial
@@ -125,10 +126,7 @@ class WhistlerDriver(Driver):
              if term_size:
                  size = term_size[:2]
         
-        # Enable mouse support
-        self.write("\x1b[?1000h")
-        self.write("\x1b[?1006h")
-        self.write("\x1b[?1015h")
+        self.set_mouse_tracking(True)
         self.write("\x1b[?1049h") # Alt screen
         self.write("\x1b[?25l")   # Hide cursor
         self.flush()
@@ -140,40 +138,26 @@ class WhistlerDriver(Driver):
         loop = asyncio.get_running_loop()
         loop.call_later(0.05, self.process_message, event)
 
-    def disable_input(self) -> None:
-        logger.debug("WhistlerDriver.disable_input")
-        self.exit_event.set()
+    def set_mouse_tracking(self, enabled: bool) -> None:
+        """Turn xterm mouse reporting on or off mid-run.
 
-    def stop_application_mode(self) -> None:
-        logger.debug("WhistlerDriver.stop_application_mode")
-        self.write("\x1b[?1000l") # Disable mouse support
-        self.write("\x1b[?1006l")
-        self.write("\x1b[?1015l")
-        self.write("\x1b[?1049l") # Disable alt screen
-        self.write("\x1b[?25h")   # Show cursor
+        A screen whose content the user has to copy out (the launcher's `?`)
+        turns it off while it is open: a terminal in reporting mode delivers
+        drags to the application, so native selection stops working — see
+        SshHelpScreen in whistler/tui.py.
+        """
+        end = "h" if enabled else "l"
+        for mode in ("1000", "1006", "1015"):
+            self.write(f"\x1b[?{mode}{end}")
         self.flush()
 
-    def feed_data(self, data: str | bytes) -> None:
-        if isinstance(data, bytes):
-            data = data.decode('utf-8')
-        # if len(data) > 0 and data[0] == '\x1b':
-        #    print(f"WhistlerDriver.feed_data escape: {repr(data)}", file=sys.stderr, flush=True)
-        for event in self._parser.feed(data):
-            self.process_message(event)
-
-    def process_message(self, event: Event) -> None:
-        if self._app:
-            self._app.post_message(event)
-
     def disable_input(self) -> None:
         logger.debug("WhistlerDriver.disable_input")
         self.exit_event.set()
 
     def stop_application_mode(self) -> None:
         logger.debug("WhistlerDriver.stop_application_mode")
-        self.write("\x1b[?1000l") # Disable mouse support
-        self.write("\x1b[?1006l")
-        self.write("\x1b[?1015l")
+        self.set_mouse_tracking(False)
         self.write("\x1b[?1049l") # Disable alt screen
         self.write("\x1b[?25h")   # Show cursor
         self.flush()
@@ -235,8 +219,10 @@ async def start_server():
         stream=sys.stderr,
         force=True
     )
-    logger.info(f"Starting in Kubernetes mode ({mode}) with log level {log_level}")
-    
+    lib_level = quiet_chatty_libraries(log_level)
+    logger.info(f"Starting in Kubernetes mode ({mode}) with log level "
+                f"{log_level} (libraries: {lib_level})")
+
     config_manager = KubeConfigManager(kubeconfig=args.kubeconfig)
 
     # The SSH host CA (design/proxyjump.md). Ensured here rather than left to
@@ -762,7 +748,61 @@ class WhistlerSession(asyncssh.SSHServerSession):
         logger.info(f"WhistlerSession.exec_requested: {command}")
         self.exec_command = command
         return True
-    
+
+    async def _run_gateway_command(self, command):
+        """Answer the handful of commands the *gateway* itself understands.
+
+        `ssh <gateway> <command>` used to be a flat error. It is now the way
+        to obtain the two strings a user has to get into their own ~/.ssh —
+        by redirection rather than by selecting text out of a full-screen TUI,
+        which a terminal in mouse-reporting mode will not let you do:
+
+            ssh gw ssh-config  >> ~/.ssh/config
+            ssh gw known-hosts >> ~/.ssh/known_hosts
+
+        Deliberately a closed list of nouns, not a shell: this channel is the
+        gateway process, and the place to run commands is an instance.
+        """
+        # LF, not CRLF: the point is redirection into a file. A client that
+        # asked for a PTY wants its terminal's convention instead.
+        nl = "\r\n" if self.term_type else "\n"
+        name = (command or "").strip()
+        cm = self.config_manager
+
+        # connection_made puts the channel in binary mode (set_encoding(None)),
+        # so everything written to it has to be bytes — a str reaches
+        # asyncssh's `bytes(data)` and raises TypeError out of session_started,
+        # which the client sees as "closed by remote host".
+        def out(text):
+            self._chan.write(text.encode('utf-8'))
+
+        def err(text):
+            self._chan.write_stderr(text.encode('utf-8'))
+
+        if name == "known-hosts":
+            # In an executor: the CA lives in a Secret and the kubernetes
+            # client is synchronous, so reading it on the loop thread would
+            # stall every other session for the round trip.
+            line = await asyncio.get_running_loop().run_in_executor(
+                None, cm.get_ssh_known_hosts_line)
+            if not line:
+                err(f"No SSH host CA is configured on this gateway.{nl}")
+                self._chan.exit(1)
+                return
+            out(line + nl)
+        elif name == "ssh-config":
+            out(ssh_config_stanza(
+                self.username,
+                getattr(cm, "ssh_domain_suffix", "")).replace("\n", nl) + nl)
+        else:
+            err(f"Unknown gateway command '{name}'.{nl}"
+                f"Try one of: known-hosts, ssh-config — or connect to an "
+                f"instance: ssh <instance>"
+                f"{getattr(cm, 'ssh_domain_suffix', '')}{nl}")
+            self._chan.exit(1)
+            return
+        self._chan.exit(0)
+
     def session_started(self):
         logger.debug("WhistlerSession.session_started")
 
@@ -779,11 +819,8 @@ class WhistlerSession(asyncssh.SSHServerSession):
         try:
             if self.target_type == "tui":
                 if self.exec_command:
-                     # If the user tries to run a command against the TUI, we should likely fail or just print it?
-                     # For now, let's just warn and run the TUI anyway, or maybe we shouldn't support exec on TUI?
-                     # Standard behavior: ignore command or error. Let's error.
-                     self._chan.write("Exec commands not supported on TUI interface. Connect to an instance.\r\n".encode('utf-8'))
-                     self._chan.exit(1)
+                     self._shell_task = asyncio.create_task(
+                         self._run_gateway_command(self.exec_command))
                 else:
                     self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
                     self._app.ssh_channel = self._chan
@@ -927,9 +964,15 @@ class WhistlerSession(asyncssh.SSHServerSession):
         if interactive and announced:
             self._chan.write(b"\r\n")
 
-        if not await self._run_relay_shell(target, command=command):
-            self._fail(f"Could not open a session on '{name}'. If this is a "
-                       f"pod, it may not run an sshd yet.")
+        error = await self._run_relay_shell(target, command=command)
+        if error:
+            # The relay's own words, not a guess. The generic "if this is a
+            # pod it may not run an sshd yet" that used to stand here was
+            # wrong for every other cause — a certificate the gateway won't
+            # accept reads identically to a missing sshd — and the real reason
+            # only existed in a log line that had usually rotated away by the
+            # time anyone looked.
+            self._fail(f"Could not open a session on '{name}': {error}")
 
 
     async def _run_relay_shell(self, target, command=None):
@@ -939,9 +982,10 @@ class WhistlerSession(asyncssh.SSHServerSession):
         a PTY, a `kubectl exec` subprocess, fd readers and a hand-rolled agent
         bridge — and identical for pods and VMs, since both are just sshd.
 
-        Returns True if the relay ran; False if it could not be established,
-        which leaves the caller free to fall back to the exec bridge for a
-        workload that has no sshd yet.
+        Returns None once the relay has run to completion, or the reason it
+        could not be established — a message meant for the user's terminal,
+        since they are the only one who can act on "your instance's host
+        certificate isn't one I trust".
         """
         loop = asyncio.get_running_loop()
         cm = self.config_manager
@@ -972,7 +1016,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
         except relay.RelayError as e:
             logger.warning(f"Relay to {target['name']} failed: {e}")
             self._relay = None
-            return False
+            return str(e)
 
         try:
             status = await self._relay.wait_closed()
@@ -986,7 +1030,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 self._chan.exit(status if status is not None else 0)
             except OSError:
                 pass
-        return True
+        return None
 
 
     def _trigger_reconcile(self, instance_full_name, namespace):

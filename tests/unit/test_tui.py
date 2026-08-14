@@ -132,8 +132,13 @@ async def test_ssh_help_screen_shows_a_usable_config_stanza(make_config):
         assert isinstance(screen, SshHelpScreen)
         text = screen.help_text()
         assert "Host *.w" in text
-        assert "ProxyJump alice@" in text
+        assert "ProxyJump whistler-gateway" in text
         assert "@cert-authority" in text   # from the fake's CA line
+        # A jump authenticates twice (gateway, then instance), so a stanza
+        # without these asks for the key passphrase twice per connection —
+        # and VS Code Remote opens several.
+        assert "AddKeysToAgent yes" in text
+        assert "ControlPersist" in text
 
 
 @pytest.mark.asyncio
@@ -174,3 +179,25 @@ def test_config_screens_are_gone():
     for removed in ("InstanceCreateScreen", "TemplateEditScreen",
                     "TemplateViewScreen"):
         assert not hasattr(tui, removed)
+
+
+@pytest.mark.asyncio
+async def test_ssh_help_screen_releases_the_mouse_so_it_can_be_copied(make_config):
+    """A terminal in xterm mouse-reporting mode routes drags to the app
+    instead of selecting text — so the one screen whose whole purpose is text
+    the user must paste into ~/.ssh was the one screen they could not select
+    from. The screen turns reporting off while it is up and back on after."""
+    app = WhistlerApp(config_manager=_config(make_config), username="alice")
+    toggles = []
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.driver.set_mouse_tracking = toggles.append
+
+        app.action_ssh_help()
+        await pilot.pause()
+        assert toggles == [False]
+
+        await app.pop_screen()
+        await pilot.pause()
+        assert toggles == [False, True]

@@ -7,6 +7,7 @@ accepts this host without a TOFU prompt" are different claims and only the
 second one is the feature.
 """
 import asyncio
+import fnmatch
 import socket
 
 import asyncssh
@@ -33,6 +34,26 @@ def test_known_hosts_line_shape():
     assert marker == "@cert-authority"
     assert pattern == "*.w"
     assert algo == "ssh-ed25519"
+
+
+def test_guest_key_path_survives_cloud_inits_host_key_purge():
+    """cloud-init's `ssh` module deletes /etc/ssh/ssh_host_*key* on every new
+    instance (`ssh_deletekeys`, default true), and it runs *after*
+    `write_files`. The first name used here matched that glob, so every VM
+    wrote the key and certificate and deleted them 426ms later — sshd then
+    named two nonexistent files and reset CA-pinned clients mid-handshake.
+
+    The glob is copied from cc_ssh verbatim rather than described, because a
+    paraphrase is what let this through the first time.
+    """
+    purged = fnmatch.filter(
+        [hostca.GUEST_HOST_KEY_PATH, hostca.GUEST_HOST_CERT_PATH],
+        "/etc/ssh/ssh_host_*key*")
+    assert purged == [], f"cloud-init would delete {purged} on every boot"
+
+    # And the guard only means something if the glob still bites the old name.
+    assert fnmatch.fnmatch("/etc/ssh/ssh_host_whistler_ed25519_key",
+                           "/etc/ssh/ssh_host_*key*")
 
 
 def test_session_principals_covers_dialled_and_internal_names():

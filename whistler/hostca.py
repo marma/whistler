@@ -48,7 +48,20 @@ RENEW_BEFORE_SECONDS = 30 * 24 * 3600
 # Where the guest keeps them. A Whistler-specific name rather than replacing
 # ssh_host_ed25519_key: the image's own key stays valid, so a client that has
 # not adopted the CA still connects (with a TOFU prompt) instead of failing.
-GUEST_HOST_KEY_PATH = "/etc/ssh/ssh_host_whistler_ed25519_key"
+#
+# The name must NOT begin with `ssh_host_`, and that is load-bearing rather
+# than cosmetic. cloud-init's `ssh` module deletes `/etc/ssh/ssh_host_*key*`
+# on every new instance (`ssh_deletekeys`, default true) so an image's baked
+# keys never become a fleet-wide shared identity — and it runs AFTER
+# `write_files` in cloud_init_modules. The original name here,
+# ssh_host_whistler_ed25519_key, matched that glob: the key and certificate
+# were written and then deleted 426ms later, on every boot of every VM, which
+# is why no guest ever served a certificate. sshd was left naming two files
+# that did not exist (a warning, not a failure — see DEFAULT_HOST_KEY_PATHS)
+# and answered CA-pinned clients with "no matching host key type", i.e. a
+# connection reset in the middle of key exchange. Verified in the guest's
+# cloud-init.log, both the write and the removal.
+GUEST_HOST_KEY_PATH = "/etc/ssh/whistler_host_ed25519_key"
 GUEST_HOST_CERT_PATH = f"{GUEST_HOST_KEY_PATH}-cert.pub"
 
 # sshd's built-in host keys, which have to be named explicitly once we name

@@ -232,7 +232,7 @@ exit 1
         # key would make sshd depend entirely on a file cloud-init writes —
         # and if it were missing or written late, sshd exits outright:
         #
-        #     Unable to load host key: /etc/ssh/ssh_host_whistler_ed25519_key
+        #     Unable to load host key: /etc/ssh/whistler_host_ed25519_key
         #     sshd: no hostkeys available -- exiting.
         #
         # which is a guest with no SSH at all, not a guest without a

@@ -54,12 +54,36 @@ Client-side UX (printed by the TUI / portal on first use):
 
 ```
 # ~/.ssh/config
-Host *.w
-    ProxyJump marma@ssh.example.com
+Host whistler-gateway
+    HostName ssh.example.com
     User marma
+    AddKeysToAgent yes
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    ControlPersist 10m
+
+Host *.w
+    ProxyJump whistler-gateway
+    User marma
+    AddKeysToAgent yes
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    ControlPersist 10m
 ```
 
 Then: `ssh test.w`, `scp file test.w:`, `code --remote ssh-remote+test.w`.
+
+The agent and multiplexing lines are not decoration. **A jump is two logins**
+— the gateway authenticates the user, then the instance authenticates them
+again — so an encrypted key with no agent prompts for its passphrase *twice
+per connection*, and VS Code Remote opens several connections. `AddKeysToAgent`
+makes that one prompt ever; `ControlMaster` then reuses the open connections.
+The gateway cannot collapse the two logins: authenticating the user is the
+access-control decision the whole SSH plane rests on.
+
+One consequence worth knowing: `ControlPersist` holds the connection open
+after the last session exits, which delays the "last spliced channel closed"
+signal that ephemeral instances are cleaned up on (below).
 
 Key properties:
 
@@ -341,6 +365,36 @@ verification at all. Fix both with an SSH host CA:
   `@cert-authority *.w ssh-ed25519 AAAA...` — no TOFU ever again.
 - The portal and the gateway relay validate against the same CA instead of
   `known_hosts=None`.
+
+**The principals are not just the user-facing names.** A verifier checks the
+certificate against *the name it dialled* — OpenSSH against the host pattern,
+asyncssh in `_validate_openssh_host_certificate` → `cert.validate(CERT_TYPE_HOST,
+host)` — and Whistler's own components dial the per-session Service's cluster
+DNS name, not `test.w`. Issuing only the user-facing names cost every relayed
+connect: `resolve_ssh_target` returned the FQDN, the certificate carried the
+bare Service name, and a valid certificate was refused with "could not open a
+session", which reads like a missing sshd. `session_service_host` is now the
+one place that name is constructed and `session_ssh_principals` is built from
+it, so the dialled name and the signed name cannot drift again
+([config.py](../whistler/config.py)). Widening the principals does not widen
+access: a certificate still answers only for its own session, and changing the
+set makes `needs_reissue` true, so the fix reaches a guest on its next boot.
+
+Two things fall out of a certificate living behind a `?` screen. The
+`@cert-authority` line is ~90 characters and the launcher runs in xterm
+mouse-reporting mode, where a drag goes to the application instead of
+selecting text — so the one screen that exists to be copied out of was the one
+screen you could not copy out of. Both are fixed: `SshHelpScreen` turns mouse
+reporting off while it is open, and the gateway answers two non-interactive
+commands so the strings can be redirected rather than retyped:
+
+```
+ssh whistler-gateway ssh-config  >> ~/.ssh/config
+ssh whistler-gateway known-hosts >> ~/.ssh/known_hosts
+```
+
+A closed list of nouns, not a shell: this channel is the gateway process, and
+the place to run commands is an instance.
 
 ## Session handover (TUI → instance) over SSH
 

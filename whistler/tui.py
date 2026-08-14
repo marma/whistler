@@ -129,6 +129,38 @@ class LoadingScreen(Screen):
         except Exception:
             pass
 
+GATEWAY_HOST_PLACEHOLDER = "<gateway-host>"
+
+
+def ssh_config_stanza(username: str, suffix: str,
+                      gateway_host: str = GATEWAY_HOST_PLACEHOLDER) -> str:
+    """The ``~/.ssh/config`` a jump needs, as plain unindented text.
+
+    A module function with two consumers: the `?` screen renders it (indented
+    into its box), and ``ssh <gateway> ssh-config`` prints it for redirection.
+    The second exists because the first cannot be copied — a terminal in
+    mouse-reporting mode hands drags to the application instead of selecting
+    text, and this is exactly the text a user has to get into a file.
+    """
+    return "\n".join([
+        "Host whistler-gateway",
+        f"    HostName {gateway_host}",
+        f"    User {username}",
+        "    AddKeysToAgent yes",
+        "    ControlMaster auto",
+        "    ControlPath ~/.ssh/cm-%C",
+        "    ControlPersist 10m",
+        "",
+        f"Host *{suffix}",
+        "    ProxyJump whistler-gateway",
+        f"    User {username}",
+        "    AddKeysToAgent yes",
+        "    ControlMaster auto",
+        "    ControlPath ~/.ssh/cm-%C",
+        "    ControlPersist 10m",
+    ])
+
+
 class SshHelpScreen(ModalScreen):
     """How to reach instances directly, without going through this TUI.
 
@@ -164,15 +196,21 @@ class SshHelpScreen(ModalScreen):
         """The instructions, as plain text — built here rather than inline in
         compose so it can be asserted on, and reused wherever else the hint
         needs printing."""
-        host = "<gateway-host>"
+        stanza = [f"    {line}" if line else ""
+                  for line in ssh_config_stanza(
+                      self.username, self.suffix).split("\n")]
         body = [
             "[b]Connect straight to an instance[/b]",
             "",
             "Add this once to [b]~/.ssh/config[/b]:",
             "",
-            f"    Host *{self.suffix}",
-            f"        ProxyJump {self.username}@{host}",
-            f"        User {self.username}",
+            *stanza,
+            "",
+            "A jump is [b]two[/b] logins — the gateway, then the instance — so",
+            "without an agent your key's passphrase is asked for twice, and",
+            "again per connection (VS Code Remote opens several).",
+            "AddKeysToAgent asks once; ControlMaster then reuses the open",
+            "connections instead of making new ones.",
             "",
             "Then, from your own shell:",
             "",
@@ -191,12 +229,41 @@ class SshHelpScreen(ModalScreen):
                 "",
                 f"    {self.known_hosts}",
             ]
+        body += [
+            "",
+            "Rather than copying either out of here, redirect them:",
+            "",
+            f"    ssh {self.username}@{GATEWAY_HOST_PLACEHOLDER} ssh-config"
+            "  >> ~/.ssh/config",
+            f"    ssh {self.username}@{GATEWAY_HOST_PLACEHOLDER} known-hosts"
+            " >> ~/.ssh/known_hosts",
+        ]
         body += ["", "[dim]esc to close[/dim]"]
         return "\n".join(body)
 
     def compose(self) -> ComposeResult:
         with Container(id="help-box"):
             yield Static(self.help_text(), markup=True)
+
+    # Mouse reporting off while this screen is up, restored on close. This
+    # screen's entire purpose is text the user must get into their own files,
+    # and a terminal in mouse-reporting mode routes drags to the application
+    # instead of selecting — so the one screen that exists to be copied out of
+    # was the one screen you could not copy out of. Nothing here needs the
+    # mouse; it closes on a keypress. Guarded because a locally-run Textual
+    # driver has no such hook (whistler/server.py, WhistlerDriver).
+
+    def on_mount(self) -> None:
+        self._set_mouse(False)
+
+    def on_unmount(self) -> None:
+        self._set_mouse(True)
+
+    def _set_mouse(self, enabled: bool) -> None:
+        setter = getattr(getattr(self.app, "driver", None),
+                         "set_mouse_tracking", None)
+        if setter:
+            setter(enabled)
 
 
 class WhistlerApp(App):

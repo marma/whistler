@@ -4,6 +4,7 @@ import logging
 import kopf
 from kubernetes import client
 
+from whistler.logsetup import quiet_chatty_libraries
 from whistler.config import (
     KubeConfigManager,
     PolicyError,
@@ -44,6 +45,10 @@ _instance_short_name = _session_short_name
 def configure(settings: kopf.OperatorSettings, **_):
     level = os.environ.get("OPERATOR_LOG_LEVEL", "INFO").upper()
     logging.getLogger("whistler").setLevel(level)
+    # `kopf run --verbose` sets the root logger to DEBUG, which turns on the
+    # kubernetes client's per-request logging — including the body of every
+    # Secret it reads (whistler/logsetup.py).
+    quiet_chatty_libraries(level)
     # Instantiate eagerly so config-loading problems surface at startup.
     cm = _get_config_manager()
     # Seed the first admin account (whistler.bootstrapAdmin) if it doesn't
