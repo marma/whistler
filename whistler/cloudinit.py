@@ -153,6 +153,45 @@ mountpoint -q "$HOME_DIR" && exit 0
 # root-owned on purpose — see the module docstring, it is the "home not
 # ready" signal.
 mkdir -p "$HOME_DIR"
+# Turn OFF the client's NFSv4.1 directory delegations before mounting.
+#
+# Linux 6.19 gave the NFS client directory delegations, so a guest on that
+# kernel or newer (Ubuntu 26.04 ships 7.0 — images/devbase) sends
+# GET_DIR_DELEGATION the first time it caches a directory. nfs-ganesha does not
+# implement that operation and answers NFS4ERR_OP_ILLEGAL — not "unsupported"
+# but "you sent garbage" — so the client fails the WHOLE compound and the
+# application gets EREMOTEIO on a directory that is perfectly fine:
+#
+#     $ mkdir bla && touch bla/test && ls -alF bla
+#     ls: unknown io error: 'bla', Os code 121 "Remote I/O error"
+#
+# succeeding again a try or two later, once the client gives up asking. It hits
+# freshly created directories, which is why a VS Code Remote install (thousands
+# of new dirs, permanently cold cache) could never finish on an NFS home while
+# an idle session looked perfectly healthy. Measured against Ganesha 6.5; 9.14
+# is no better — neither ships the GDD4_UNAVAIL reply that Linux's own nfsd had
+# to add for exactly this case.
+#
+# Set through sysfs, NOT /etc/modprobe.d: an `options nfs <name>=0` for a
+# parameter this kernel does not have makes the module fail to LOAD, which
+# would cost every guest its home — a far worse failure than the one being
+# fixed. Loading the module first and writing the file only if it exists is
+# inert on kernels without the feature, and the name is unstable enough
+# (the posted patch and the merged code disagree) to be worth trying both.
+# It lives on the nfsv4 module, not nfs: /sys/module/nfsv4/parameters/
+# directory_delegations (verified on Ubuntu 26.04, kernel 7.0). Matched by
+# exact name rather than a *deleg* glob on purpose — that same directory holds
+# delegation_watermark, which is a FILE-delegation tuning value, not a boolean,
+# and zeroing it would be an unrelated behaviour change.
+modprobe nfs 2>/dev/null || true
+modprobe nfsv4 2>/dev/null || true
+for m in nfsv4 nfs; do
+    for p in directory_delegations nfs_dir_delegation_enabled; do
+        f="/sys/module/$m/parameters/$p"
+        [ -w "$f" ] && echo 0 > "$f" 2>/dev/null
+    done
+done
+true
 mount_once() {{
     if command -v mount.nfs4 >/dev/null 2>&1; then
         mount "$HOME_DIR"

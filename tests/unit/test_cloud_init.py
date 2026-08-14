@@ -377,3 +377,53 @@ def test_primary_group_defaults_to_uid_when_gid_omitted():
     (user,) = doc["users"]
     assert user["primary_group"] == "1001"
     assert "groupadd -g 1001 alice" in doc["bootcmd"][0]
+
+
+# --------------------------------------------------------------------------- #
+# Directory delegations                                                        #
+# --------------------------------------------------------------------------- #
+
+def test_directory_delegations_are_disabled_before_mounting():
+    """Linux 6.19+ clients (Ubuntu 26.04 ships 7.0) ask for NFSv4.1 directory
+    delegations; nfs-ganesha answers NFS4ERR_OP_ILLEGAL, which fails the whole
+    compound and hands the application EREMOTEIO on any freshly created
+    directory. Turn the feature off client-side, before the mount."""
+    files = {f["path"]: f for f in _doc()["write_files"]}
+    script = files["/usr/local/sbin/whistler-mount-home"]["content"]
+    # The knob is /sys/module/nfsv4/parameters/directory_delegations
+    # (verified on kernel 7.0); nfs/ and the alternative spelling are tried
+    # too, since the posted patch and the merged code disagree on the name.
+    assert "directory_delegations" in script
+    assert "nfsv4" in script
+    # Modules have to be loaded for the sysfs files to exist at all.
+    assert script.index("modprobe nfs") < script.index("mount_once")
+
+
+def test_delegations_are_not_disabled_via_modprobe_d():
+    """NEVER `options nfs <name>=0`: if the parameter does not exist on this
+    kernel the module fails to load and the guest loses its home entirely —
+    worse than the bug being fixed."""
+    doc = _doc()
+    paths = [f["path"] for f in doc["write_files"]]
+    assert not any("modprobe.d" in p for p in paths)
+
+
+def test_only_the_directory_delegation_knob_is_touched():
+    """That sysfs directory also holds delegation_watermark, a FILE-delegation
+    tuning value. A *deleg* glob would zero it — match exact names only."""
+    files = {f["path"]: f for f in _doc()["write_files"]}
+    script = files["/usr/local/sbin/whistler-mount-home"]["content"]
+    # Comments may name it (they explain why it is avoided); the CODE may not.
+    code = [l for l in script.splitlines() if not l.lstrip().startswith("#")]
+    assert not any("watermark" in l for l in code)
+    assert not any("*deleg*" in l for l in code)          # no glob write
+    assert any("directory_delegations" in l for l in code)
+
+
+def test_disabling_delegations_cannot_fail_the_mount():
+    """A kernel without the feature has no such file; the script must carry on."""
+    files = {f["path"]: f for f in _doc()["write_files"]}
+    script = files["/usr/local/sbin/whistler-mount-home"]["content"]
+    head = script[:script.index("mount_once")]
+    assert "[ -w " in head          # guarded write
+    assert "2>/dev/null" in head
