@@ -323,9 +323,15 @@ whistler:
   # One disk per INSTANCE, not per user. A home that followed a user would be
   # a channel between zones — zone membership changes on reboot, and the disk
   # would follow — so a user with several instances has several homes.
-  # Ephemeral sessions get no disk at all: their data is discarded anyway, so
-  # $HOME stays on the root disk. A template may raise the size per-session
-  # with `homeDiskSize`; this is the default every VM gets.
+  #
+  # EVERY VM gets one, regardless of `persistence`. That field says whether
+  # the instance is reaped, not whether the user's data is disposable: the
+  # desktop templates are `persistence: ephemeral` and their sessions live for
+  # weeks. The claim is owner-referenced to its Session, so the lifetime is
+  # already right — reaped with the instance, kept while it lives.
+  #
+  # A template may raise the size per-session with `homeDiskSize`; this is the
+  # default every VM gets.
   homeDisk:
     size: 20Gi
 

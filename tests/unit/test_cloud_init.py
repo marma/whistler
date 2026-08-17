@@ -116,9 +116,10 @@ def test_no_package_install_and_mount_unit_armed():
     assert cmds[-1] == "systemctl start --no-block whistler-home.service"
 
 
-def test_ephemeral_session_gets_no_home_disk_machinery():
-    # Ephemeral data is discarded anyway, so /home stays on the root disk and
-    # none of the mount machinery is emitted — no script, no unit, no poller.
+def test_without_a_home_disk_no_mount_machinery_is_emitted():
+    # Every VM gets a home disk today, so this is the contract of the flag
+    # rather than a live configuration: given no disk, emit nothing that would
+    # sit in a retry loop looking for one.
     doc = _doc(home_disk=False)
     paths = [f["path"] for f in doc["write_files"]]
     assert MOUNT_SCRIPT not in paths

@@ -57,9 +57,10 @@ spec:
                     disk.img, attached as a second virtio-blk disk and formatted
                     ext4 by the guest (design/storage.md). Per instance, not per
                     user: a home that followed a user would carry data between
-                    zones, since zone membership changes on reboot. Ephemeral
-                    sessions get no home disk at all ($HOME stays on the root
-                    disk). Defaults to WHISTLER_HOME_DISK_SIZE (20Gi).
+                    zones, since zone membership changes on reboot. Every VM gets
+                    one regardless of persistence — the claim is owner-referenced
+                    to its Session, so it is reaped with the instance and kept
+                    while it lives. Defaults to WHISTLER_HOME_DISK_SIZE (20Gi).
                 displayName:
                   type: string
                 description:

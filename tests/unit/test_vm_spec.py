@@ -100,9 +100,10 @@ def test_home_disk_carries_the_serial_the_guest_looks_up():
     assert home["disk"]["bus"] == "virtio"
 
 
-def test_ephemeral_session_gets_no_home_disk():
-    # No home_pvc (ephemeral): /home stays on the root disk, and neither the
-    # disk nor the volume is emitted.
+def test_no_home_pvc_attaches_no_disk():
+    # Every VM gets a home disk today (gating it on `persistence` gave the
+    # desktop templates no home at all), so this pins the None contract
+    # rather than a live configuration.
     spec = _build(home_pvc=None)["spec"]["template"]["spec"]
     assert not any(v["name"] == "homedisk" for v in spec["volumes"])
     assert [d["name"] for d in spec["domain"]["devices"]["disks"]] == \

@@ -46,9 +46,10 @@ so a console shell opened early doesn't keep the shadowed directory as its
 cwd. ``useradd -m`` neither chowns nor skels the existing mountpoint —
 harmless; the script chowns the mount root to the user after mounting.
 
-Ephemeral sessions get **no** home disk: their data is discarded anyway, so
-``/home/<user>`` stays on the root disk and none of the machinery above is
-emitted.
+``home_disk=False`` emits none of the machinery above. Every VM gets a home
+disk today — gating it on ``persistence`` gave the desktop templates (which
+are ``persistence: ephemeral`` and live for weeks) no home at all — so the
+flag is the honest interface rather than a live configuration.
 
 Console access is via serial-getty autologin rather than a generated
 password: the portal's auth + RBAC already gate who can reach the console

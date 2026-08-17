@@ -2567,22 +2567,27 @@ class KubeConfigManager(ConfigManager):
 
         if effective_runtime == 'vm':
             # The home is a per-INSTANCE disk, not a share (design/storage.md).
-            # Ephemeral sessions get none: their data is discarded anyway, so
-            # /home stays on the root disk and no PVC is provisioned or
-            # reaped for a throwaway session.
+            #
+            # EVERY VM gets one, deliberately not gated on `persistence`.
+            # That field describes whether the *instance* is reaped, not
+            # whether the user's data is disposable: the desktop templates
+            # are `persistence: ephemeral` and their sessions live for weeks.
+            # Gating on it silently gave those guests no home at all, which is
+            # how this was found. The lifetime is already right without a
+            # gate, because the claim is owner-referenced to the Session — if
+            # the Session is reaped the PVC goes with it, and if it lives the
+            # home lives.
             #
             # Ensured BEFORE the VM: a guest that boots with no disk to mount
             # comes up with a root-owned empty home, so a failure here is
             # transient (the operator retries), not a degraded boot.
-            home_pvc = None
-            if persistence != 'ephemeral':
-                try:
-                    home_pvc = self._ensure_home_disk_pvc(
-                        full_name, user_ns, uid,
-                        size=template_spec.get('homeDiskSize'),
-                        logger=logger)
-                except Exception:
-                    return result
+            try:
+                home_pvc = self._ensure_home_disk_pvc(
+                    full_name, user_ns, uid,
+                    size=template_spec.get('homeDiskSize'),
+                    logger=logger)
+            except Exception:
+                return result
             ok = self._create_vm(
                 user_ns, full_name, session_name, username, uid,
                 template_spec, display_port,
