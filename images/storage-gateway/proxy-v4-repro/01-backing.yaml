@@ -1,0 +1,63 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: proxyv4-repro
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backing-home
+  namespace: proxyv4-repro
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backing
+  namespace: proxyv4-repro
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: backing}
+  template:
+    metadata:
+      labels: {app: backing}
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+      - name: ganesha
+        image: localhost:5000/whistler-storage-gateway:v0.0.1-alpha14-71-gf39cb8e-dirty
+        imagePullPolicy: IfNotPresent
+        env:
+        - {name: SHARE_USER, value: marma}
+        - {name: SHARE_UID, value: "1000"}
+        - {name: SHARE_GID, value: "1000"}
+        ports:
+        - {containerPort: 2049, name: nfs}
+        securityContext:
+          capabilities:
+            add: [DAC_READ_SEARCH, SYS_RESOURCE]
+        startupProbe:
+          exec: {command: [/usr/local/bin/gateway-ready]}
+          periodSeconds: 2
+          failureThreshold: 30
+        volumeMounts:
+        - {mountPath: /shares/home, name: home}
+      volumes:
+      - name: home
+        persistentVolumeClaim: {claimName: backing-home}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backing
+  namespace: proxyv4-repro
+spec:
+  selector: {app: backing}
+  ports:
+  - {name: nfs, port: 2049, targetPort: 2049}

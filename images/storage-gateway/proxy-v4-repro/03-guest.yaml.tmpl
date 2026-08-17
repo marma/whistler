@@ -1,0 +1,53 @@
+# Template: @GWPROXY_IP@ is substituted by repro.sh with the gwproxy Service's
+# ClusterIP. An in-tree nfs: PV makes the *kubelet* perform the mount, so no
+# privileged pod is needed anywhere in this rig.
+#
+# soft is deliberate: with hard, a crash-looping server leaves the guest pod
+# unkillable and strands an NFS mount on the node that needs `umount -f -l`.
+# Always delete guest pods before their servers.
+#
+# @TIMEO@ is 50 (5s) for a plain run and 600 (60s) under valgrind, which slows
+# ganesha enough that the client would otherwise give up before the server
+# misbehaves — and a client EIO looks exactly like the bug not reproducing.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: guest-proxy-pv
+spec:
+  capacity: {storage: 2Gi}
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions: [nfsvers=4.1, soft, timeo=@TIMEO@, retrans=2]
+  nfs:
+    server: "@GWPROXY_IP@"
+    path: /home
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: guest-proxy-pvc
+  namespace: proxyv4-repro
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: guest-proxy-pv
+  resources:
+    requests: {storage: 2Gi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: guest
+  namespace: proxyv4-repro
+spec:
+  terminationGracePeriodSeconds: 2
+  containers:
+  - name: guest
+    image: python:3-slim
+    command: [sleep, infinity]
+    volumeMounts:
+    - {mountPath: /data, name: share}
+  volumes:
+  - name: share
+    persistentVolumeClaim: {claimName: guest-proxy-pvc}

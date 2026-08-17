@@ -1,0 +1,157 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gwproxy-cfg
+  namespace: proxyv4-repro
+data:
+  ganesha.conf.tmpl: |
+    NFS_CORE_PARAM { NFS_Port = 2049; NFS_Protocols = 4; Enable_NLM = false;
+                     Enable_RQUOTA = false; Enable_UDP = false; }
+    NFSV4 { Minor_Versions = 1, 2; Only_Numeric_Owners = true; Delegations = false; }
+    NFS_KRB5 { Active_krb5 = false; }
+    EXPORT {
+        Export_Id = 1; Path = /home; Pseudo = /home; Access_Type = RW;
+        Protocols = 4; Transports = TCP; SecType = sys;
+        Squash = All_Squash; Anonymous_Uid = 1000; Anonymous_Gid = 1000;
+        FSAL { Name = PROXY_V4; Srv_Addr = @SRV@; }
+    }
+    LOG { Default_Log_Level = @LOGLEVEL@; }
+  run.sh: |
+    #!/bin/sh
+    set -eu
+
+    # GANESHA_SUITE selects which ganesha the PROXY_V4 side runs:
+    #   trixie            (default) 6.5-5, the version the bug was found on
+    #   trixie-backports  9.14-1~bpo13+1
+    # Only this pod is upgraded. The backing server deliberately stays on the
+    # image's 6.5 so it is a constant across runs and any change is
+    # attributable to the proxy side.
+    #   preinstalled      the image already carries ganesha (a source build,
+    #                     see Dockerfile.ganesha-src) — install nothing
+    SUITE="${GANESHA_SUITE:-trixie}"
+    if [ "$SUITE" = "preinstalled" ]; then
+        echo "=== repro: using the image's own ganesha, installing nothing ==="
+    else
+        echo "=== repro: installing FSAL_PROXY_V4 from $SUITE ==="
+        if [ "$SUITE" != "trixie" ]; then
+            echo "deb http://deb.debian.org/debian $SUITE main" \
+                > /etc/apt/sources.list.d/ganesha-suite.list
+        fi
+        apt-get update -qq
+        # nfs-ganesha and nfs-ganesha-vfs are already present at the image's
+        # version; name them explicitly so the whole set moves together rather
+        # than leaving a 9.x FSAL against a 6.5 server.
+        apt-get install -y -qq --no-install-recommends -t "$SUITE" \
+            nfs-ganesha nfs-ganesha-vfs nfs-ganesha-proxy-v4 >/dev/null
+    fi
+    echo "=== repro: ganesha is $(ganesha.nfsd -v 2>&1 | head -1) ==="
+
+    if [ "${INSTALL_DEBUG:-0}" = "1" ]; then
+        echo "=== repro: installing gdb + debug symbols ==="
+        echo "deb http://deb.debian.org/debian-debug trixie-debug main" \
+            > /etc/apt/sources.list.d/debug.list
+        [ "$SUITE" = "trixie" ] || echo \
+            "deb http://deb.debian.org/debian-debug ${SUITE}-debug main" \
+            >> /etc/apt/sources.list.d/debug.list
+        apt-get update -qq || true
+        apt-get install -y -qq --no-install-recommends gdb >/dev/null || true
+        # A source build is already RelWithDebInfo; dbgsym only applies to the
+        # Debian packages, and there is none for the proxy FSAL's internals.
+        if [ "$SUITE" != "preinstalled" ]; then
+            apt-get install -y -qq --no-install-recommends -t "$SUITE" \
+                nfs-ganesha-dbgsym >/dev/null \
+                || echo "repro: nfs-ganesha-dbgsym unavailable, continuing without"
+        fi
+        apt-get install -y -qq --no-install-recommends valgrind >/dev/null || true
+    fi
+
+    # Srv_Addr wants an address, not a name: resolve the backing Service.
+    SRV=$(getent hosts backing.proxyv4-repro.svc.cluster.local | awk '{print $1; exit}')
+    [ -n "$SRV" ] || { echo "repro: could not resolve backing Service" >&2; exit 1; }
+    echo "=== repro: backing server at $SRV ==="
+
+    sed -e "s/@SRV@/$SRV/" -e "s/@LOGLEVEL@/${LOGLEVEL:-EVENT}/" \
+        /cfg/ganesha.conf.tmpl > /etc/ganesha/ganesha.conf
+
+    mkdir -p /var/lib/nfs/ganesha /var/run/ganesha /run/dbus
+    dbus-uuidgen --ensure >/dev/null 2>&1 || true
+    dbus-daemon --system --fork
+    for _ in 1 2 3 4 5; do
+        [ -S /run/dbus/system_bus_socket ] && break
+        sleep 0.2
+    done
+
+    echo "=== repro: MALLOC_CHECK_=${MALLOC_CHECK_:-unset} MALLOC_PERTURB_=${MALLOC_PERTURB_:-unset} ==="
+    echo "=== repro: cgroup memory.max = $(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unknown) ==="
+
+    if [ "${USE_VALGRIND:-0}" = "1" ] && command -v valgrind >/dev/null 2>&1; then
+        echo "=== repro: running under valgrind memcheck ==="
+        exec valgrind --tool=memcheck --trace-children=yes \
+             --error-limit=no --num-callers=30 \
+             /usr/bin/ganesha.nfsd -F -f /etc/ganesha/ganesha.conf \
+             -L STDOUT -N NIV_${LOGLEVEL:-EVENT}
+    fi
+
+    if [ "${USE_GDB:-0}" = "1" ] && command -v gdb >/dev/null 2>&1; then
+        exec gdb -batch -ex "handle SIGPIPE nostop noprint pass" \
+                 -ex run -ex "bt full" -ex "thread apply all bt" \
+                 --args /usr/bin/ganesha.nfsd -F -f /etc/ganesha/ganesha.conf \
+                        -L STDOUT -N NIV_${LOGLEVEL:-EVENT}
+    fi
+
+    exec /usr/bin/ganesha.nfsd -F -f /etc/ganesha/ganesha.conf -L STDOUT \
+         -N NIV_${LOGLEVEL:-EVENT}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gwproxy
+  namespace: proxyv4-repro
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: gwproxy}
+  template:
+    metadata:
+      labels: {app: gwproxy}
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+      - name: ganesha
+        image: localhost:5000/whistler-storage-gateway:v0.0.1-alpha14-71-gf39cb8e-dirty
+        imagePullPolicy: IfNotPresent
+        command: [/bin/sh, /cfg/run.sh]
+        env:
+        # The discriminator: make glibc check every allocation, and poison
+        # freed memory, so an out-of-bounds write fails at (or near) the
+        # write instead of at the next arena growth.
+        - {name: MALLOC_CHECK_, value: "3"}
+        - {name: MALLOC_PERTURB_, value: "165"}
+        - {name: LOGLEVEL, value: "EVENT"}
+        - {name: INSTALL_DEBUG, value: "0"}
+        - {name: USE_GDB, value: "0"}
+        - {name: USE_VALGRIND, value: "0"}
+        - {name: GANESHA_SUITE, value: "trixie"}
+        ports:
+        - {containerPort: 2049, name: nfs}
+        securityContext:
+          capabilities:
+            add: [DAC_READ_SEARCH, SYS_RESOURCE]
+        # Deliberately no memory limit: this run must have headroom so that a
+        # crash cannot be blamed on a cgroup ceiling.
+        resources: {}
+        volumeMounts:
+        - {mountPath: /cfg, name: cfg}
+      volumes:
+      - name: cfg
+        configMap: {name: gwproxy-cfg}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gwproxy
+  namespace: proxyv4-repro
+spec:
+  selector: {app: gwproxy}
+  ports:
+  - {name: nfs, port: 2049, targetPort: 2049}

@@ -1,0 +1,68 @@
+# Build nfs-ganesha from upstream source for version bisection of the
+# FSAL_PROXY_V4 read-path overflow (../proxy-v4-heap-bug.md).
+#
+# Debian carries 6.5 in trixie and 9.14 everywhere else (sid and forky
+# included), and upstream is releasing far faster than that — V10 through V14
+# all landed between 2026-06-19 and 2026-08-05 — so testing anything newer
+# than 9.14 means building it.
+#
+#   docker build -f Dockerfile.ganesha-src --build-arg GANESHA_REF=V14.1 \
+#       -t localhost:5000/ganesha-src:V14.1 . && docker push localhost:5000/ganesha-src:V14.1
+#
+# Built RelWithDebInfo on purpose: the Debian packages ship no dbgsym for the
+# proxy FSAL's internals, so every frame inside libfsalproxy_v4.so came back
+# unsymbolised. With symbols, valgrind names the offending function and line
+# directly, which is what an upstream report needs.
+#
+# Single stage, deliberately: this is a debugging image, and keeping the build
+# tree means gdb and valgrind can find sources. Size is not a goal.
+FROM debian:trixie-slim
+
+ARG GANESHA_REF=V14.1
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake git ca-certificates pkg-config \
+      bison flex \
+      libkrb5-dev libdbus-1-dev libcap-dev libblkid-dev uuid-dev \
+      libacl1-dev libjemalloc-dev libssl-dev liburcu-dev libnsl-dev \
+      zlib1g-dev libsqlite3-dev \
+      dbus dbus-bin \
+      python3 \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --branch "${GANESHA_REF}" \
+      --recurse-submodules --shallow-submodules \
+      https://github.com/nfs-ganesha/nfs-ganesha /src
+
+# Only the two FSALs this rig uses. Everything else is off so the build needs
+# no ceph/gluster/rgw headers and finishes in minutes.
+RUN cmake -S /src/src -B /build \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DCMAKE_INSTALL_PREFIX=/usr \
+      -DUSE_FSAL_PROXY_V4=ON \
+      -DUSE_FSAL_VFS=ON \
+      -DUSE_FSAL_CEPH=OFF -DUSE_FSAL_RGW=OFF -DUSE_FSAL_GLUSTER=OFF \
+      -DUSE_FSAL_GPFS=OFF -DUSE_FSAL_LUSTRE=OFF -DUSE_FSAL_KVSFS=OFF \
+      -DUSE_FSAL_MEM=OFF -DUSE_FSAL_NULL=OFF -DUSE_FSAL_XFS=OFF \
+      -DUSE_RADOS_RECOV=OFF -DRADOS_URLS=OFF \
+      -DUSE_DBUS=ON \
+ && cmake --build /build -j"$(nproc)" \
+ && cmake --install /build
+
+# Ganesha builds its filesystem table with setmntent(/etc/mtab) and refuses to
+# create ANY export if that fails. containerd does not create it (docker does),
+# so own the symlink here — same reasoning as the gateway image proper.
+RUN ln -sf /proc/mounts /etc/mtab && mkdir -p /etc/ganesha /shares/home
+
+# `cmake --install` does NOT install the DBus policy that lets ganesha own
+# org.ganesha.nfsd on the system bus; the Debian package does. Without it
+# ganesha logs "DBUS not initialized, service thread exiting" and the rig's
+# ShowExports check — the only honest way to tell a built export from a failed
+# one — silently never succeeds. The Debian packages carry this for free, so
+# this trap only exists on source builds.
+RUN cp /src/src/scripts/ganeshactl/org.ganesha.nfsd.conf /etc/dbus-1/system.d/
+
+RUN ganesha.nfsd -v
+
+EXPOSE 2049
