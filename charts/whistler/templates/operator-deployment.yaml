@@ -61,6 +61,8 @@ spec:
               value: {{ .Values.whistler.storageGateway.nodeSelector | toJson | quote }}
             - name: WHISTLER_STORAGE_GATEWAY_RESOURCES
               value: {{ .Values.whistler.storageGateway.resources | toJson | quote }}
+            - name: WHISTLER_HOME_DISK_SIZE
+              value: {{ .Values.whistler.homeDisk.size | quote }}
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
           # ensure_pod() runs here now, so the operator needs the same user and

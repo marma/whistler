@@ -50,6 +50,16 @@ spec:
                   description: >-
                     VM-only. Size of the CDI-imported root disk PVC (only used with
                     imageURL; containerDisk roots are ephemeral and unsized).
+                homeDiskSize:
+                  type: string
+                  description: >-
+                    VM-only. Size of the per-INSTANCE home disk — a PVC carrying a
+                    disk.img, attached as a second virtio-blk disk and formatted
+                    ext4 by the guest (design/storage.md). Per instance, not per
+                    user: a home that followed a user would carry data between
+                    zones, since zone membership changes on reboot. Ephemeral
+                    sessions get no home disk at all ($HOME stays on the root
+                    disk). Defaults to WHISTLER_HOME_DISK_SIZE (20Gi).
                 displayName:
                   type: string
                 description:

@@ -3,46 +3,52 @@
 Pure (no Kubernetes imports) so it is unit-testable without a cluster, like
 `KubeConfigManager._build_pod_spec`. The generated ``#cloud-config`` document
 creates the Whistler user with their real username/uid inside the guest and
-mounts their home from the per-user NFS storage gateway
-(``whistler-storage-<user>``, see images/storage-gateway/) over NFSv4.2.
+mounts their home from a **per-instance virtio-blk disk** — an ordinary PVC
+carrying a ``disk.img``, formatted ext4 by the guest on first boot.
 
-Why a gateway and not virtiofs: KubeVirt (<= 1.8) runs virtiofsd unprivileged
-(hardcoded uid 107, --sandbox=none, caps dropped — upstream kubevirt#13028),
-which makes a virtiofs-shared home read-only for the guest user. The gateway
-gives server-side identity instead: client uids are never trusted, and its
-``Squash = All_Squash`` to the user's real uid/gid lands every write on the
-PVC as that uid (the successor to Samba's ``force user``).
+Why a disk and not a share (see design/storage.md): the production storage
+class is NFS-backed, and ganesha cannot re-export one — `FSAL_VFS` refuses to
+build the export and `FSAL_PROXY_V4` overflows its read buffer in every
+released version. virtiofs is not the answer either: KubeVirt (<= 1.8) runs
+virtiofsd unprivileged (kubevirt#13028), making a shared home read-only for
+the guest user. A block device sidesteps all of it — ownership is whatever the
+guest writes, and locking is ordinary local kernel locking on ext4.
 
-Mount mechanics: a systemd oneshot (whistler-home.service, written by
-write_files, kicked off by runcmd and enabled for later boots) retries the
-mount. It prefers mount.nfs4 (the fstab entry) when the image ships
-nfs-common, and otherwise does a raw kernel mount: the kernel's NFSv4 text
-mount interface cannot resolve DNS, so the script resolves the gateway
-itself (getent; DNS egress is open) and passes the result as ``addr=``.
-Both paths verified against the real gateway image.
-Deliberately NO ``packages: [nfs-common]``: the default user-namespace
-egress is DNS + gateway-NFS only, so apt just burns ~50s timing out on
-unreachable mirrors — and the packages module runs *before* runcmd, which
-delayed the mount by that much past the login prompt (measured live). The
-raw kernel path needs no userspace helper. A unit rather than a bare runcmd
-mount so persistent-root (CDI) guests remount on every boot — runcmd is
-once-per-instance.
+**Per instance, not per user.** A home that followed a user would carry data
+across zones: write in a restricted zone, reboot into a permissive one (zone
+membership changes on reboot), read it out. The disk belongs to the instance,
+and the instance is pinned to its zone.
+
+Finding the disk: by ``/dev/disk/by-id/virtio-<serial>``, never ``/dev/vdb``.
+Device order is not guaranteed, and mounting the wrong disk as ``$HOME`` fails
+silently.
+
+Formatting is guarded: ``mkfs.ext4`` runs only when ``blkid`` reports no
+filesystem on the device, and never with ``-F``. If ``blkid`` is missing the
+script refuses to format at all — a guest with no home is recoverable, a
+reformatted home is not. This is the one line in this module that can destroy
+a user's data.
 
 Mount latency: runcmd alone is too late a trigger — cloud-final waits for
 multi-user.target, which snapd.seeded holds up for ~30s on stock Ubuntu
 images (measured), all after the login prompt. So a detached ``bootcmd``
-poller kicks the mount script the moment write_files lands it (seconds
-into boot, typically before the first getty); the runcmd start remains as
-the systemd-visible belt-and-braces.
+poller kicks the script the moment write_files lands it (seconds into boot,
+typically before the first getty); the runcmd start remains as the
+systemd-visible belt-and-braces. A unit rather than a bare runcmd mount so
+persistent-root (CDI) guests remount on every boot — runcmd is
+once-per-instance.
 
 The pre-mount window (getty/sshd up seconds before the mount lands): the
-mountpoint stays root-owned until the share arrives — deliberately, as an
+mountpoint stays root-owned until the disk arrives — deliberately, as an
 honest "home not ready" signal; anything written there would be shadowed
-by the mount. The mount script respawns the autologin getty once the share
-lands so a console shell opened early doesn't keep the shadowed directory
-as its cwd. ``useradd -m`` neither chowns nor skels the existing mountpoint
-— harmless; ownership after the mount is whatever the PVC says, which the
-gateway's entrypoint has already claimed for the user.
+by the mount. The script respawns the autologin getty once the home lands
+so a console shell opened early doesn't keep the shadowed directory as its
+cwd. ``useradd -m`` neither chowns nor skels the existing mountpoint —
+harmless; the script chowns the mount root to the user after mounting.
+
+Ephemeral sessions get **no** home disk: their data is discarded anyway, so
+``/home/<user>`` stays on the root disk and none of the machinery above is
+emitted.
 
 Console access is via serial-getty autologin rather than a generated
 password: the portal's auth + RBAC already gate who can reach the console
@@ -58,12 +64,16 @@ from .hostca import (DEFAULT_HOST_KEY_PATHS, GUEST_HOST_CERT_PATH,
                      GUEST_HOST_KEY_PATH)
 
 STREAMER_ENV_PATH = "/etc/whistler/streamer.env"
-# The gateway's Ganesha pseudo-path (images/storage-gateway/ganesha.conf.template).
-NFS_EXPORT = "/home"
+# KubeVirt stamps this on the home disk (domain.devices.disks[].serial) and
+# udev turns it into /dev/disk/by-id/virtio-<serial>. Both sides must agree:
+# _build_vm_spec sets it, the guest script looks it up. Keep it short and
+# alphanumeric — KubeVirt caps the serial and udev does not escape it.
+HOME_DISK_SERIAL = "whistlerhome"
+HOME_DISK_PATH = f"/dev/disk/by-id/virtio-{HOME_DISK_SERIAL}"
 
 
 def build_user_data(*, username: str, uid: int, ssh_keys: list,
-                    hostname: str, nfs_host: str,
+                    hostname: str, home_disk: bool = True,
                     gid: int = None,
                     autologin: bool = True, desktop: bool = False,
                     streamer_env: dict = None,
@@ -71,9 +81,10 @@ def build_user_data(*, username: str, uid: int, ssh_keys: list,
                     host_key: bytes = None, host_cert: str = None) -> str:
     """Return a ``#cloud-config`` userData document for cloudInitNoCloud.
 
-    ``nfs_host`` is the storage gateway Service DNS name. There is no
-    credential to pass: NFS AUTH_SYS has none, and reaching the export is the
-    whole permission (fenced by NetworkPolicy — see design/security.md).
+    ``home_disk`` is whether this session has a per-instance home disk to
+    format and mount. False for ephemeral sessions, whose home simply lives on
+    the root disk — the mount script, its unit and its bootcmd poller are then
+    not emitted at all.
 
     ``host_key``/``host_cert`` install a Whistler-CA-signed host certificate
     (see hostca.py) so clients verify the guest against one
@@ -97,123 +108,70 @@ def build_user_data(*, username: str, uid: int, ssh_keys: list,
     home = f"/home/{username}"
     keys = list(ssh_keys or [])
     gid = uid if gid is None else gid
-    # Mount options. Unlike cifs there is no client-side uid=/gid= remapping:
-    # NFSv4 with AUTH_SYS and numeric owners (the gateway sets
-    # Only_Numeric_Owners) passes the PVC's real ids straight through, and the
-    # guest user is created with exactly those ids below — so the view in the
-    # guest and the ownership on disk are the same thing, not two things kept
-    # in sync. What lands on the PVC is still decided server-side by the
-    # export's Squash = All_Squash, whatever uid the (root) guest asserts.
-    #
-    # Nothing here corresponds to the old `posix` / `mfsymlinks` / `nobrl`
-    # trio: NFS carries per-file modes, real symlinks and byte-range locks
-    # natively. The last of those is why this is NFS at all — cifs answered
-    # SQLite's past-EOF F_WRLCK with EACCES, costing a flat 100s stall and
-    # then "database is locked" for nautilus, dconf, gnome-keyring and
-    # Chrome's profile; the same lock over NFSv4 is granted immediately.
-    #
-    # vers=4.2 pins the dialect (the gateway allows 4.1+ only: NFSv4.0 puts
-    # callbacks on a server->client connection its ingress fencing can never
-    # permit). hard (not soft) so a gateway blip blocks I/O instead of
-    # corrupting it; nofail + _netdev so boot survives an absent gateway.
-    #
-    # `noauto` is load-bearing for boot latency. cloud-init's `mounts` module
-    # runs `mount -a` synchronously in the init stage, and a gateway that
-    # silently drops packets (rather than refusing the connection) costs one
-    # TCP connect budget there — measured at 181s against a black hole, well
-    # past the login prompt. noauto keeps `mount -a` and systemd's fstab
-    # generator off this entry entirely, leaving whistler-home.service as the
-    # only mounter; it runs detached, so a slow attempt delays the home and
-    # nothing else. The entry still exists because the script mounts by
-    # mountpoint (`mount $HOME_DIR`) and reads its options from here.
-    #
-    # retry=0 then bounds each of those attempts to a single try instead of
-    # mount.nfs retrying internally for two minutes on top. It is a mount.nfs
-    # option, so it is deliberately absent from the raw kernel options below,
-    # which the kernel would reject.
-    base_opts = "vers=4.2,hard,nosuid,nodev"
-    mount_opts = f"{base_opts},retry=0,noauto,nofail,_netdev"
-    # Fallback mounter (see module docstring): raw kernel mount for guests
-    # without nfs-common. The kernel's NFSv4 text mount interface cannot
-    # resolve DNS, so the script resolves the gateway and passes addr=.
     # After a successful mount the autologin getty is respawned: a console
     # shell spawned in the pre-mount window keeps the now-shadowed directory
     # as its cwd.
     getty_respawn = (
         "systemctl try-restart serial-getty@ttyS0.service\n" if autologin
         else "")
+    # nosuid,nodev: the home is user-controlled storage, and nothing in it has
+    # any business being setuid or a device node. No _netdev/nofail dance —
+    # this is a local disk, not a share whose server might be missing.
+    mount_opts = "nosuid,nodev"
     mount_script = f"""#!/bin/sh
 # Written by Whistler cloud-init; run by whistler-home.service.
 set -u
-HOST={nfs_host}
+DISK={HOME_DISK_PATH}
 HOME_DIR={home}
+OWNER={uid}:{gid}
+
 mountpoint -q "$HOME_DIR" && exit 0
 # Own the mountpoint rather than waiting for cloud-init's mounts module to
 # make it: bootcmd kicks this script off well before that module runs. Left
-# root-owned on purpose — see the module docstring, it is the "home not
-# ready" signal.
+# root-owned until the disk lands — see the module docstring, it is the
+# "home not ready" signal.
 mkdir -p "$HOME_DIR"
-# Turn OFF the client's NFSv4.1 directory delegations before mounting.
-#
-# Linux 6.19 gave the NFS client directory delegations, so a guest on that
-# kernel or newer (Ubuntu 26.04 ships 7.0 — images/devbase) sends
-# GET_DIR_DELEGATION the first time it caches a directory. nfs-ganesha does not
-# implement that operation and answers NFS4ERR_OP_ILLEGAL — not "unsupported"
-# but "you sent garbage" — so the client fails the WHOLE compound and the
-# application gets EREMOTEIO on a directory that is perfectly fine:
-#
-#     $ mkdir bla && touch bla/test && ls -alF bla
-#     ls: unknown io error: 'bla', Os code 121 "Remote I/O error"
-#
-# succeeding again a try or two later, once the client gives up asking. It hits
-# freshly created directories, which is why a VS Code Remote install (thousands
-# of new dirs, permanently cold cache) could never finish on an NFS home while
-# an idle session looked perfectly healthy. Measured against Ganesha 6.5; 9.14
-# is no better — neither ships the GDD4_UNAVAIL reply that Linux's own nfsd had
-# to add for exactly this case.
-#
-# Set through sysfs, NOT /etc/modprobe.d: an `options nfs <name>=0` for a
-# parameter this kernel does not have makes the module fail to LOAD, which
-# would cost every guest its home — a far worse failure than the one being
-# fixed. Loading the module first and writing the file only if it exists is
-# inert on kernels without the feature, and the name is unstable enough
-# (the posted patch and the merged code disagree) to be worth trying both.
-# It lives on the nfsv4 module, not nfs: /sys/module/nfsv4/parameters/
-# directory_delegations (verified on Ubuntu 26.04, kernel 7.0). Matched by
-# exact name rather than a *deleg* glob on purpose — that same directory holds
-# delegation_watermark, which is a FILE-delegation tuning value, not a boolean,
-# and zeroing it would be an unrelated behaviour change.
-modprobe nfs 2>/dev/null || true
-modprobe nfsv4 2>/dev/null || true
-for m in nfsv4 nfs; do
-    for p in directory_delegations nfs_dir_delegation_enabled; do
-        f="/sys/module/$m/parameters/$p"
-        [ -w "$f" ] && echo 0 > "$f" 2>/dev/null
-    done
-done
-true
-mount_once() {{
-    if command -v mount.nfs4 >/dev/null 2>&1; then
-        mount "$HOME_DIR"
-    else
-        modprobe nfsv4 2>/dev/null || true
-        ip="$(getent hosts "$HOST" | cut -d' ' -f1)"
-        [ -n "$ip" ] || return 1
-        mount -t nfs4 "$HOST:{NFS_EXPORT}" "$HOME_DIR" \\
-            -o "addr=$ip,{base_opts}"
-    fi
-}}
+
+# The virtio disk can probe in after bootcmd has already fired.
 i=0
-while [ "$i" -lt 30 ]; do
-    if mount_once; then
-        {getty_respawn.strip() or ":"}
-        exit 0
-    fi
+while [ ! -e "$DISK" ] && [ "$i" -lt 60 ]; do
     i=$((i + 1))
-    sleep 5
+    sleep 1
 done
-echo "whistler: could not mount $HOME_DIR from $HOST" >&2
-exit 1
+if [ ! -e "$DISK" ]; then
+    echo "whistler: home disk $DISK never appeared" >&2
+    exit 1
+fi
+
+# Format ONLY on a device carrying no filesystem.
+#
+# This is the one place in Whistler that can destroy a user's data, so it is
+# guarded twice. blkid exits non-zero when it finds no signature, which is the
+# actual test; but if blkid is missing its failure would look exactly like an
+# empty disk and we would reformat a populated home on every boot. So a
+# missing blkid refuses to format instead of assuming. A guest that comes up
+# with no home is recoverable in a way that a wiped home is not.
+#
+# mkfs is deliberately NOT given -F: if blkid is somehow wrong, mkfs's own
+# "will not make a filesystem here" is the last thing standing between a
+# reboot and an empty home.
+if ! command -v blkid >/dev/null 2>&1; then
+    echo "whistler: blkid missing; refusing to risk formatting $DISK" >&2
+    exit 1
+fi
+if ! blkid "$DISK" >/dev/null 2>&1; then
+    echo "whistler: no filesystem on $DISK, creating ext4" >&2
+    mkfs.ext4 -q -L whistler-home "$DISK" || exit 1
+fi
+
+mount -o {mount_opts} "$DISK" "$HOME_DIR" || exit 1
+# Non-recursive on purpose: claim the mount root so the user owns their home,
+# but never walk the tree — that would be slow on a large home and would undo
+# any ownership the user set deliberately.
+chown "$OWNER" "$HOME_DIR"
+chmod 0755 "$HOME_DIR"
+{getty_respawn.strip() or ":"}
+exit 0
 """
     # Authorized keys live on the ROOT disk (/etc/ssh/authorized_keys.d), not
     # in ~/.ssh: the home is a network share that is not mounted for the
@@ -257,29 +215,35 @@ exit 1
             "path": "/etc/ssh/sshd_config.d/60-whistler.conf",
             "content": sshd_conf,
         },
-        {
-            "path": "/usr/local/sbin/whistler-mount-home",
-            "permissions": "0755",
-            "content": mount_script,
-        },
-        {
-            "path": "/etc/systemd/system/whistler-home.service",
-            "content": (
-                "[Unit]\n"
-                "Description=Mount the Whistler home share\n"
-                "Wants=network-online.target\n"
-                "After=network-online.target\n"
-                "\n"
-                "[Service]\n"
-                "Type=oneshot\n"
-                "RemainAfterExit=yes\n"
-                "ExecStart=/usr/local/sbin/whistler-mount-home\n"
-                "\n"
-                "[Install]\n"
-                "WantedBy=multi-user.target\n"
-            ),
-        },
     ]
+    if home_disk:
+        write_files.extend([
+            {
+                "path": "/usr/local/sbin/whistler-mount-home",
+                "permissions": "0755",
+                "content": mount_script,
+            },
+            {
+                "path": "/etc/systemd/system/whistler-home.service",
+                "content": (
+                    "[Unit]\n"
+                    "Description=Mount the Whistler home disk\n"
+                    # local-fs, not network-online: this is a virtio disk now,
+                    # so the thing worth waiting for is udev having populated
+                    # /dev/disk/by-id (the script polls for it anyway).
+                    "Wants=local-fs.target systemd-udev-settle.service\n"
+                    "After=local-fs.target systemd-udev-settle.service\n"
+                    "\n"
+                    "[Service]\n"
+                    "Type=oneshot\n"
+                    "RemainAfterExit=yes\n"
+                    "ExecStart=/usr/local/sbin/whistler-mount-home\n"
+                    "\n"
+                    "[Install]\n"
+                    "WantedBy=multi-user.target\n"
+                ),
+            },
+        ])
     if host_key and host_cert:
         key_pem = host_key.decode() if isinstance(host_key, bytes) else host_key
         write_files.extend([
@@ -304,23 +268,16 @@ exit 1
         # never blocked. Waiting for runcmd instead would sit behind
         # snapd.seeded/multi-user, ~30s past the login prompt.
         "bootcmd": [
-            # The guest's primary group must really BE the PVC's gid: NFS
-            # passes numeric owners through untranslated, so unlike the old
-            # cifs gid= there is nothing remapping the view. useradd would
-            # otherwise invent a user-private group at whatever gid happens
-            # to be free. bootcmd runs before cloud-init's users-groups
-            # module (and on every boot, so it is idempotent by construction),
-            # which is what lets `primary_group` below reference this gid.
+            # The guest's primary group must really BE the gid the rest of
+            # Whistler believes the user has: ownership on the home disk is
+            # whatever the guest writes, and pod sessions mounting the same
+            # user's other volumes expect these ids. useradd would otherwise
+            # invent a user-private group at whatever gid happens to be free.
+            # bootcmd runs before cloud-init's users-groups module (and on
+            # every boot, so it is idempotent by construction), which is what
+            # lets `primary_group` below reference this gid.
             f"getent group {gid} >/dev/null || groupadd -g {gid} {username}"
             " || true",
-            "setsid sh -c 'i=0; while [ ! -x /usr/local/sbin/whistler-mount-home ]"
-            " && [ $i -lt 120 ]; do i=$((i+1)); sleep 1; done;"
-            " exec /usr/local/sbin/whistler-mount-home'"
-            " </dev/null >/dev/null 2>&1 &",
-        ],
-        # [fs_spec, fs_file, fs_vfstype, fs_mntops, fs_freq, fs_passno].
-        "mounts": [
-            [f"{nfs_host}:{NFS_EXPORT}", home, "nfs4", mount_opts, "0", "0"],
         ],
         # No `default` entry: this suppresses the image's built-in user
         # (uid 1000 in containerdisks images), freeing that uid for ours.
@@ -339,15 +296,26 @@ exit 1
             }
         ],
         "write_files": write_files,
-        # Final stage: arm the mount unit (enable makes CDI persistent-root
-        # guests remount on later boots) and kick it off now, non-blocking —
-        # its retry loop must not stall the rest of first boot.
-        "runcmd": [
-            "systemctl daemon-reload",
+        "runcmd": ["systemctl daemon-reload"],
+    }
+    if home_disk:
+        # Early mount kick (see module docstring): bootcmd runs in the init
+        # stage BEFORE write_files, so poll for the script and run it as soon
+        # as it lands — detached (setsid, fds closed) so cloud-init is never
+        # blocked. Waiting for runcmd instead would sit behind
+        # snapd.seeded/multi-user, ~30s past the login prompt.
+        doc["bootcmd"].append(
+            "setsid sh -c 'i=0; while [ ! -x /usr/local/sbin/whistler-mount-home ]"
+            " && [ $i -lt 120 ]; do i=$((i+1)); sleep 1; done;"
+            " exec /usr/local/sbin/whistler-mount-home'"
+            " </dev/null >/dev/null 2>&1 &")
+        # Final stage: arm the mount unit (enable makes persistent-root guests
+        # remount on later boots) and kick it off now, non-blocking — the
+        # disk-probe wait must not stall the rest of first boot.
+        doc["runcmd"].extend([
             "systemctl enable whistler-home.service",
             "systemctl start --no-block whistler-home.service",
-        ],
-    }
+        ])
     if host_key and host_cert:
         # Normally redundant — write_files lands in the init stage, well
         # before sshd starts — but a guest whose sshd came up first would

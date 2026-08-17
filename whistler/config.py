@@ -16,7 +16,8 @@ import json
 import os
 import yaml
 
-from whistler.cloudinit import build_user_data, resolve_uid, resolve_gid
+from whistler.cloudinit import (HOME_DISK_SERIAL, build_user_data,
+                                resolve_uid, resolve_gid)
 from whistler import hostca
 
 logger = logging.getLogger(__name__)
@@ -725,6 +726,10 @@ class KubeConfigManager(ConfigManager):
             "WHISTLER_STORAGE_GATEWAY_NODE_SELECTOR", {})
         self.storage_gateway_resources = self._env_json(
             "WHISTLER_STORAGE_GATEWAY_RESOURCES", {})
+        # Default size of a VM's per-instance home disk. A template may raise
+        # it per-session with `homeDiskSize`; this is the floor every VM gets.
+        self.home_disk_size = os.environ.get(
+            "WHISTLER_HOME_DISK_SIZE", "20Gi")
 
     @staticmethod
     def _env_json(name, default):
@@ -1852,6 +1857,64 @@ class KubeConfigManager(ConfigManager):
             if logger: logger.error(f"Failed to create PVC: {e}")
             raise
 
+    def _ensure_home_disk_pvc(self, session_name, namespace, uid, size=None,
+                              logger=None):
+        """Ensure the per-INSTANCE home-disk PVC exists, returning its name.
+
+        A VM cannot mount a PVC, so its home is a `disk.img` on this claim
+        attached as a virtio-blk disk and formatted ext4 by the guest
+        (see design/storage.md, and cloudinit.build_user_data for the guest
+        side). `volumeMode: Filesystem` is deliberate and is what puts a
+        `disk.img` on the share — it is also the only mode `csi-driver-nfs`
+        can serve.
+
+        Per instance, not per user: a home that followed a *user* would carry
+        data between zones, because zone membership changes on reboot and the
+        disk would follow. Owner-referenced to the Session so Kubernetes GC
+        reaps it with the instance — which is also why ephemeral sessions
+        simply don't call this (their home stays on the root disk).
+        """
+        pvc_name = f"whistler-home-{session_name}"
+        api = client.CoreV1Api()
+        try:
+            api.read_namespaced_persistent_volume_claim(pvc_name, namespace)
+            return pvc_name
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+        if logger:
+            logger.info(f"Creating home disk PVC {pvc_name}")
+        pvc_body = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": pvc_name,
+                "labels": {"app": "whistler", "session": session_name},
+                "ownerReferences": [
+                    self._session_owner_reference(session_name, uid)],
+            },
+            "spec": {
+                # RWO: exactly one VM attaches this disk. Sharing a block
+                # device between writers corrupts it, and nothing here would
+                # notice — see design/storage.md on why shared homes need a
+                # file-level share instead.
+                "accessModes": ["ReadWriteOnce"],
+                "volumeMode": "Filesystem",
+                "resources": {"requests": {
+                    "storage": size or self.home_disk_size}},
+            },
+        }
+        try:
+            api.create_namespaced_persistent_volume_claim(namespace, pvc_body)
+            return pvc_name
+        except ApiException as e:
+            if e.status == 409:
+                return pvc_name
+            if logger:
+                logger.error(f"Failed to create home disk PVC: {e}")
+            raise
+
     def _load_volume_definitions_from_file(self):
         try:
             with open(VOLUMES_FILE, "r") as f:
@@ -2062,7 +2125,7 @@ class KubeConfigManager(ConfigManager):
 
     def _build_vm_spec(self, *, session_name, hostname, username, uid,
                        template_spec, display_port, instancetype,
-                       preemptible, nfs_host,
+                       preemptible, home_pvc=None,
                        user_details=None, run_strategy="Halted",
                        portal_public_key=None, viewer=None,
                        host_key=None, host_cert=None):
@@ -2073,13 +2136,17 @@ class KubeConfigManager(ConfigManager):
 
         Boot source: `image` is a containerDisk (OCI-wrapped qcow2, ephemeral
         root), `imageURL` an HTTP qcow2/raw imported by CDI into a per-session
-        root PVC via dataVolumeTemplates. The user's home PVC is NOT attached
-        to the VM: it is mounted by the per-user storage gateway
-        (ensure_storage_gateway) and reaches the guest as an NFSv4.2 mount of
-        ``nfs_host:/home`` set up by cloud-init — KubeVirt's unprivileged
-        virtiofsd made a directly-shared home read-only for the guest user
-        (kubevirt#13028), and keeping the PVC off the VM also sidesteps RWO
-        contention with the gateway. cloud-init creates the real user
+        root PVC via dataVolumeTemplates. ``home_pvc`` is the per-INSTANCE
+        home-disk claim (_ensure_home_disk_pvc), attached as a second
+        virtio-blk disk and formatted ext4 by the guest; None for ephemeral
+        sessions, whose home stays on the root disk. The user's per-user PVC
+        is NOT attached — it serves pod sessions only.
+
+        This replaced an NFS mount from the per-user storage gateway. Ganesha
+        cannot re-export an NFS-backed PVC (FSAL_VFS refuses; FSAL_PROXY_V4
+        overflows its read buffer in every released version), and virtiofs is
+        no help either because KubeVirt runs virtiofsd unprivileged
+        (kubevirt#13028). See design/storage.md. cloud-init creates the real user
         (username/uid/keys); serial console + VNC graphics rely on KubeVirt's
         autoattach defaults (both true), which the portal's terminal and noVNC
         viewer depend on.
@@ -2109,6 +2176,17 @@ class KubeConfigManager(ConfigManager):
             ],
             "interfaces": [{"name": "default", "masquerade": {}}],
         }
+        if home_pvc:
+            # `serial` is load-bearing, not cosmetic: it is what udev turns
+            # into /dev/disk/by-id/virtio-<serial>, which is how the guest
+            # finds this disk. Addressing it as /dev/vdb instead would be a
+            # bet on probe order, and losing that bet means formatting or
+            # mounting the wrong disk as someone's home, silently.
+            devices["disks"].append({
+                "name": "homedisk",
+                "serial": HOME_DISK_SERIAL,
+                "disk": {"bus": "virtio"},
+            })
         if 'gpu' in resources:
             gpu_resource_name = getattr(self, "gpu_vm_resource_name", "nvidia.com/gpu")
             devices["gpus"] = [{"name": "gpu0", "deviceName": gpu_resource_name}]
@@ -2137,7 +2215,7 @@ class KubeConfigManager(ConfigManager):
             gid=resolve_gid(user_details),
             ssh_keys=ssh_keys,
             hostname=hostname,
-            nfs_host=nfs_host,
+            home_disk=bool(home_pvc),
             desktop=desktop_stream,
             streamer_env=template_spec.get('streamerEnv') if desktop_stream else None,
             display_port=display_port if desktop_stream else None,
@@ -2228,7 +2306,10 @@ class KubeConfigManager(ConfigManager):
                         {"name": "cloudinit", "cloudInitNoCloud": {
                             "secretRef": {
                                 "name": cloudinit_secret["metadata"]["name"]}}},
-                    ],
+                    ] + ([
+                        {"name": "homedisk", "persistentVolumeClaim": {
+                            "claimName": home_pvc}},
+                    ] if home_pvc else []),
                 },
             },
         }
@@ -2465,10 +2546,15 @@ class KubeConfigManager(ConfigManager):
             result["displayPort"] = display_port
             result["viewer"] = viewer
 
-        try:
-            pvc_name = self._ensure_pvc(username, user_ns, logger)
-        except Exception:
-            return result
+        # The per-user PVC is the POD home. VMs get a per-instance disk
+        # instead (below), so provisioning this for a VM-only user would
+        # reserve storage nobody ever mounts.
+        pvc_name = None
+        if effective_runtime != 'vm':
+            try:
+                pvc_name = self._ensure_pvc(username, user_ns, logger)
+            except Exception:
+                return result
 
         # A connect (portal connect/term/vnc, or SSH) bumps this annotation
         # before/while reconcile runs; its presence means "the user wants in
@@ -2480,18 +2566,28 @@ class KubeConfigManager(ConfigManager):
             cr['metadata'].get('annotations') or {})
 
         if effective_runtime == 'vm':
-            # The home reaches the guest through the per-user NFS storage
-            # gateway, not virtiofs (see _build_vm_spec). Ensured BEFORE the
-            # VM: a guest that boots with no export to mount comes up with a
-            # root-owned empty home, so a missing gateway is a transient
-            # failure (operator retries), not a degraded boot.
-            if not self.ensure_storage_gateway(username, user_ns, pvc_name):
-                return result
+            # The home is a per-INSTANCE disk, not a share (design/storage.md).
+            # Ephemeral sessions get none: their data is discarded anyway, so
+            # /home stays on the root disk and no PVC is provisioned or
+            # reaped for a throwaway session.
+            #
+            # Ensured BEFORE the VM: a guest that boots with no disk to mount
+            # comes up with a root-owned empty home, so a failure here is
+            # transient (the operator retries), not a degraded boot.
+            home_pvc = None
+            if persistence != 'ephemeral':
+                try:
+                    home_pvc = self._ensure_home_disk_pvc(
+                        full_name, user_ns, uid,
+                        size=template_spec.get('homeDiskSize'),
+                        logger=logger)
+                except Exception:
+                    return result
             ok = self._create_vm(
                 user_ns, full_name, session_name, username, uid,
                 template_spec, display_port,
                 template_spec.get('instancetype'), preemptible,
-                nfs_host=self._gateway_host(username, user_ns),
+                home_pvc=home_pvc,
                 start=wants_start,
                 viewer=result.get("viewer"),
                 user_details=user_details,
@@ -2897,7 +2993,7 @@ class KubeConfigManager(ConfigManager):
 
     def _create_vm(self, user_ns, full_name, session_name, username, uid,
                    template_spec, display_port, instancetype,
-                   preemptible, nfs_host, start=False,
+                   preemptible, home_pvc=None, start=False,
                    viewer=None, user_details=None) -> bool:
         # Issued (or renewed) before the cloud-init Secret is written, since
         # that document carries it into the guest. Best-effort: a cluster with
@@ -2912,7 +3008,7 @@ class KubeConfigManager(ConfigManager):
             uid=uid,
             template_spec=template_spec,
             display_port=display_port,
-            nfs_host=nfs_host,
+            home_pvc=home_pvc,
             instancetype=instancetype,
             preemptible=preemptible,
             user_details=user_details if user_details is not None else self.get_user(username),

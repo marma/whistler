@@ -6,20 +6,25 @@ import pytest
 import yaml
 
 from whistler.cloudinit import (
-    build_user_data, resolve_uid, resolve_gid, NFS_EXPORT,
+    build_user_data, resolve_uid, resolve_gid, HOME_DISK_PATH,
+    HOME_DISK_SERIAL,
 )
 
-NFS_HOST = "whistler-storage-alice.whistler-user-alice.svc.cluster.local"
+MOUNT_SCRIPT = "/usr/local/sbin/whistler-mount-home"
 
 
 def _doc(**overrides):
     args = dict(username="alice", uid=1001,
-                ssh_keys=["ssh-ed25519 AAA alice"], hostname="desk",
-                nfs_host=NFS_HOST)
+                ssh_keys=["ssh-ed25519 AAA alice"], hostname="desk")
     args.update(overrides)
     text = build_user_data(**args)
     assert text.startswith("#cloud-config\n")
     return yaml.safe_load(text.split("\n", 1)[1])
+
+
+def _script(**overrides):
+    return next(f for f in _doc(**overrides)["write_files"]
+                if f["path"] == MOUNT_SCRIPT)["content"]
 
 
 def test_user_created_with_uid_keys_and_locked_password():
@@ -38,55 +43,91 @@ def test_no_default_user_entry():
     assert "default" not in doc["users"]
 
 
-def test_home_mounted_via_nfs_from_gateway():
-    (mount,) = _doc()["mounts"]
-    fs_spec, fs_file, fs_vfstype, fs_mntops, freq, passno = mount
-    assert fs_spec == f"{NFS_HOST}:{NFS_EXPORT}"
-    assert fs_file == "/home/alice"
-    assert fs_vfstype == "nfs4"
-    assert (freq, passno) == ("0", "0")
-    opts = fs_mntops.split(",")
-    # 4.2 pinned: the gateway refuses 4.0, whose callbacks would need a
-    # server->client connection its ingress fencing can't allow.
-    assert "vers=4.2" in opts
-    assert "nosuid" in opts and "nodev" in opts
-    # hard (not soft): a gateway blip blocks I/O instead of corrupting it;
-    # nofail + _netdev keep first boot alive when the gateway is absent.
-    assert "hard" in opts
-    assert "nofail" in opts and "_netdev" in opts
-    # noauto: cloud-init's mounts module runs `mount -a` synchronously in the
-    # init stage, where one TCP connect budget against a black-holed gateway
-    # measured 181s — past the login prompt. Mounting is whistler-home's job,
-    # off the boot path; this entry exists only to hold the options.
-    assert "noauto" in opts
-    # retry=0 then bounds each of those attempts to one try.
-    assert "retry=0" in opts
-    # No client-side identity remapping and no cifs workarounds: NFS carries
-    # real owners, modes, symlinks and byte-range locks.
-    for gone in ("uid=", "gid=", "posix", "mfsymlinks", "nobrl", "seal",
-                 "credentials="):
-        assert gone not in fs_mntops
+def test_home_is_a_local_disk_not_a_share():
+    # The home is a per-instance virtio-blk disk now (design/storage.md), so
+    # there is nothing for cloud-init's `mounts` module to do and no server
+    # to name. A `mounts` entry would also put `mount -a` back on the boot
+    # path, which is what `noauto` used to exist to prevent.
+    doc = _doc()
+    assert "mounts" not in doc
+    body = _script()
+    for gone in ("nfs", "NFS", "getent hosts", "mount.nfs4", "vers=4.2"):
+        assert gone not in body
+
+
+def test_disk_addressed_by_id_never_by_device_order():
+    # /dev/vdb is a bet on probe order; losing it means formatting or
+    # mounting the wrong disk as someone's home, silently. udev builds the
+    # by-id path out of the serial _build_vm_spec stamps on the disk.
+    body = _script()
+    assert f"DISK={HOME_DISK_PATH}" in body
+    assert HOME_DISK_SERIAL in HOME_DISK_PATH
+    assert "/dev/vd" not in body
+
+
+def test_mkfs_only_runs_when_blkid_finds_no_filesystem():
+    # THE dangerous line in this module: reformatting on the second boot
+    # destroys a home. blkid failing is the only thing that may trigger mkfs.
+    body = _script()
+    assert 'if ! blkid "$DISK" >/dev/null 2>&1; then' in body
+    mkfs = next(l for l in body.splitlines()
+                if l.strip().startswith("mkfs.ext4"))
+    # never -F: if blkid is somehow wrong, mkfs's own refusal is the last
+    # thing between a reboot and an empty home.
+    assert " -F" not in mkfs and "--force" not in mkfs
+
+
+def test_missing_blkid_refuses_to_format_rather_than_guess():
+    # A missing blkid would fail exactly like an empty disk, so it must fail
+    # closed. A guest with no home is recoverable; a wiped home is not.
+    body = _script()
+    assert "command -v blkid" in body
+    guard = body.index("command -v blkid")
+    assert "refusing" in body[guard:body.index("mkfs.ext4")]
+
+
+def test_mount_root_is_chowned_but_never_recursively():
+    # The mount root must end up owned by the user, but chown -R would be
+    # slow on a large home and would undo ownership the user set on purpose.
+    body = _script()
+    assert "OWNER=1001:1001" in body
+    assert 'chown "$OWNER" "$HOME_DIR"' in body
+    assert "chown -R" not in body
 
 
 def test_no_credentials_file_written():
-    # AUTH_SYS has no per-share secret to leak into the guest; the boundary
-    # is the gateway's fencing NetworkPolicy.
+    # A local disk has no credential at all — nothing to leak into a guest
+    # whose user has root.
     doc = _doc()
     assert not any("credential" in f["path"] for f in doc["write_files"])
 
 
 def test_no_package_install_and_mount_unit_armed():
-    # NO packages: [nfs-common] — with the default locked-down egress apt
-    # burns ~50s timing out on unreachable mirrors, and the packages module
-    # runs before runcmd, delaying the mount that long past the login
-    # prompt. The raw kernel mount needs no helper. The unit is started
-    # non-blocking — its retry loop must not stall the rest of first boot —
-    # and enabled so persistent-root (CDI) guests remount on later boots.
+    # NO packages: — with the default locked-down egress apt burns ~50s
+    # timing out on unreachable mirrors, and the packages module runs before
+    # runcmd, delaying the home that long past the login prompt. Nothing here
+    # needs a package: mkfs.ext4 and blkid are in every image. The unit is
+    # started non-blocking (the disk-probe wait must not stall boot) and
+    # enabled so persistent-root guests remount on later boots.
     doc = _doc()
     assert "packages" not in doc
     cmds = doc["runcmd"]
     assert "systemctl enable whistler-home.service" in cmds
     assert cmds[-1] == "systemctl start --no-block whistler-home.service"
+
+
+def test_ephemeral_session_gets_no_home_disk_machinery():
+    # Ephemeral data is discarded anyway, so /home stays on the root disk and
+    # none of the mount machinery is emitted — no script, no unit, no poller.
+    doc = _doc(home_disk=False)
+    paths = [f["path"] for f in doc["write_files"]]
+    assert MOUNT_SCRIPT not in paths
+    assert "/etc/systemd/system/whistler-home.service" not in paths
+    assert not any("whistler-mount-home" in c for c in doc["bootcmd"])
+    assert not any("whistler-home.service" in c for c in doc["runcmd"])
+    # The user is still created, with the same identity.
+    (user,) = doc["users"]
+    assert user["uid"] == "1001"
 
 
 def test_bootcmd_kicks_mount_before_runcmd_stage():
@@ -116,31 +157,23 @@ def test_getty_respawned_after_mount_lands():
     assert "serial-getty" not in no_autologin["content"]
 
 
-def test_mount_unit_and_fallback_script_written():
+def test_mount_unit_and_script_written():
     doc = _doc()
     unit = next(f for f in doc["write_files"]
                 if f["path"] == "/etc/systemd/system/whistler-home.service")
-    assert "ExecStart=/usr/local/sbin/whistler-mount-home" in unit["content"]
+    assert f"ExecStart={MOUNT_SCRIPT}" in unit["content"]
     assert "WantedBy=multi-user.target" in unit["content"]
+    # A local disk waits on udev, not on the network.
+    assert "local-fs.target" in unit["content"]
+    assert "network-online" not in unit["content"]
 
-    script = next(f for f in doc["write_files"]
-                  if f["path"] == "/usr/local/sbin/whistler-mount-home")
+    script = next(f for f in doc["write_files"] if f["path"] == MOUNT_SCRIPT)
     assert script["permissions"] == "0755"
     body = script["content"]
-    # Prefers the fstab/mount.nfs4 path...
-    assert "command -v mount.nfs4" in body
-    # ...and falls back to a raw kernel mount when nfs-common is absent
-    # (locked-down egress: no package mirrors). The kernel's NFSv4 text mount
-    # interface can't resolve DNS, so the script resolves and passes addr=.
-    assert f"HOST={NFS_HOST}" in body
-    assert "getent hosts" in body
-    assert f'mount -t nfs4 "$HOST:{NFS_EXPORT}"' in body
-    assert "-o \"addr=$ip,vers=4.2,hard,nosuid,nodev\"" in body
-    # The fallback options must not carry mount.nfs-only or fstab-only ones:
-    # the kernel rejects options it doesn't know.
-    assert "retry=0" not in body
-    assert "nofail" not in body and "_netdev" not in body and \
-        "noauto" not in body
+    assert "mount -o nosuid,nodev \"$DISK\" \"$HOME_DIR\"" in body
+    # The virtio disk can probe in after bootcmd has fired, so wait for it
+    # rather than failing the boot.
+    assert 'while [ ! -e "$DISK" ]' in body
     # bootcmd kicks this off before cloud-init's mounts module exists to make
     # the mountpoint, so the script makes it itself.
     assert 'mkdir -p "$HOME_DIR"' in body
@@ -381,49 +414,4 @@ def test_primary_group_defaults_to_uid_when_gid_omitted():
 
 # --------------------------------------------------------------------------- #
 # Directory delegations                                                        #
-# --------------------------------------------------------------------------- #
 
-def test_directory_delegations_are_disabled_before_mounting():
-    """Linux 6.19+ clients (Ubuntu 26.04 ships 7.0) ask for NFSv4.1 directory
-    delegations; nfs-ganesha answers NFS4ERR_OP_ILLEGAL, which fails the whole
-    compound and hands the application EREMOTEIO on any freshly created
-    directory. Turn the feature off client-side, before the mount."""
-    files = {f["path"]: f for f in _doc()["write_files"]}
-    script = files["/usr/local/sbin/whistler-mount-home"]["content"]
-    # The knob is /sys/module/nfsv4/parameters/directory_delegations
-    # (verified on kernel 7.0); nfs/ and the alternative spelling are tried
-    # too, since the posted patch and the merged code disagree on the name.
-    assert "directory_delegations" in script
-    assert "nfsv4" in script
-    # Modules have to be loaded for the sysfs files to exist at all.
-    assert script.index("modprobe nfs") < script.index("mount_once")
-
-
-def test_delegations_are_not_disabled_via_modprobe_d():
-    """NEVER `options nfs <name>=0`: if the parameter does not exist on this
-    kernel the module fails to load and the guest loses its home entirely —
-    worse than the bug being fixed."""
-    doc = _doc()
-    paths = [f["path"] for f in doc["write_files"]]
-    assert not any("modprobe.d" in p for p in paths)
-
-
-def test_only_the_directory_delegation_knob_is_touched():
-    """That sysfs directory also holds delegation_watermark, a FILE-delegation
-    tuning value. A *deleg* glob would zero it — match exact names only."""
-    files = {f["path"]: f for f in _doc()["write_files"]}
-    script = files["/usr/local/sbin/whistler-mount-home"]["content"]
-    # Comments may name it (they explain why it is avoided); the CODE may not.
-    code = [l for l in script.splitlines() if not l.lstrip().startswith("#")]
-    assert not any("watermark" in l for l in code)
-    assert not any("*deleg*" in l for l in code)          # no glob write
-    assert any("directory_delegations" in l for l in code)
-
-
-def test_disabling_delegations_cannot_fail_the_mount():
-    """A kernel without the feature has no such file; the script must carry on."""
-    files = {f["path"]: f for f in _doc()["write_files"]}
-    script = files["/usr/local/sbin/whistler-mount-home"]["content"]
-    head = script[:script.index("mount_once")]
-    assert "[ -w " in head          # guarded write
-    assert "2>/dev/null" in head

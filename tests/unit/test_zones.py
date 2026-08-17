@@ -175,7 +175,8 @@ def test_vm_template_carries_zone_label_and_dns():
         session_name="alice-desk", hostname="desk", username="alice",
         uid="uid-1", template_spec={"image": "q/x:1", "zone": "z"},
         display_port=5900, instancetype=None, preemptible=False,
-        nfs_host="gw", user_details={"name": "alice"},
+        home_pvc="whistler-home-alice-desk",
+        user_details={"name": "alice"},
     )
     tpl_meta = vm["spec"]["template"]["metadata"]
     # On the VMI template so the virt-launcher pod (which carries the guest's

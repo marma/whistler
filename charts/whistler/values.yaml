@@ -317,11 +317,27 @@ whistler:
   streamer:
     image: ghcr.io/marma/whistler-streamer-selkies2:latest
 
-  # Per-user NFS storage gateway (built from images/storage-gateway). Created
-  # lazily by the operator with a user's first runtime:vm session: it mounts
-  # the user's home PVC via normal CSI and exports it as NFSv4.2; the VM guest
-  # mounts it from cloud-init. Replaces virtiofs, which KubeVirt runs
-  # unprivileged (kubevirt#13028) making a shared home read-only in the guest.
+  # A VM's home: a PVC carrying a disk.img, attached as a second virtio-blk
+  # disk and formatted ext4 by the guest on first boot (design/storage.md).
+  #
+  # One disk per INSTANCE, not per user. A home that followed a user would be
+  # a channel between zones — zone membership changes on reboot, and the disk
+  # would follow — so a user with several instances has several homes.
+  # Ephemeral sessions get no disk at all: their data is discarded anyway, so
+  # $HOME stays on the root disk. A template may raise the size per-session
+  # with `homeDiskSize`; this is the default every VM gets.
+  homeDisk:
+    size: 20Gi
+
+  # Per-user NFS storage gateway (built from images/storage-gateway).
+  #
+  # NO LONGER ON THE HOME PATH — VM homes are disks now (homeDisk above),
+  # because ganesha cannot re-export an NFS-backed PVC: FSAL_VFS refuses to
+  # build the export and FSAL_PROXY_V4 returns the wrong bytes in every
+  # released version (6.5, 9.14, 14.1 — see
+  # images/storage-gateway/proxy-v4-heap-bug.md). Kept because it works on
+  # block-backed storage classes and a shared *tree* would need it back; see
+  # design/security.md on why such a tree needs exactly ONE gateway.
   #
   # NFS AUTH_SYS has no per-share credential — the export trusts whoever can
   # open a connection to it — so the fencing NetworkPolicy (this user's own

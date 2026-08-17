@@ -25,7 +25,7 @@ def _build_both(**overrides):
         display_port=5900,
         instancetype=None,
         preemptible=False,
-        nfs_host="whistler-storage-alice.whistler-user-alice.svc.cluster.local",
+        home_pvc="whistler-home-alice-desk",
         user_details={"name": "alice", "uid": 1001,
                       "publicKeys": ["ssh-ed25519 AAA alice"]},
     )
@@ -72,27 +72,48 @@ def test_session_label_on_template_for_service_selection():
     assert labels["app"] == "whistler-desktop"
 
 
-def test_root_container_disk_and_no_home_attachment():
+def test_root_container_disk_and_home_disk_attached():
     spec = _build()["spec"]["template"]["spec"]
     volumes = spec["volumes"]
     root = next(v for v in volumes if v["name"] == "rootdisk")
     assert root["containerDisk"]["image"] == "quay.io/example/desktop:latest"
-    # The home PVC is NOT attached to the VM (no virtiofs, no disk): it is
-    # mounted by the per-user storage gateway and reaches the guest as an
-    # NFS mount set up by cloud-init (kubevirt#13028 made virtiofs homes
-    # read-only for the guest user).
-    assert not any(v["name"] == "home" for v in volumes)
+    # The home is a per-instance PVC attached as a second virtio-blk disk.
+    # Never virtiofs: KubeVirt runs virtiofsd unprivileged (kubevirt#13028),
+    # which makes a shared home read-only for the guest user.
+    home = next(v for v in volumes if v["name"] == "homedisk")
+    assert home["persistentVolumeClaim"]["claimName"] == \
+        "whistler-home-alice-desk"
     devices = spec["domain"]["devices"]
     assert "filesystems" not in devices
-    disk_names = [d["name"] for d in devices["disks"]]
-    assert "home" not in disk_names
+    assert [d["name"] for d in devices["disks"]] == \
+        ["rootdisk", "cloudinit", "homedisk"]
 
 
-def test_cloud_init_mounts_home_from_gateway():
+def test_home_disk_carries_the_serial_the_guest_looks_up():
+    # udev turns this into /dev/disk/by-id/virtio-<serial>, which is how the
+    # guest finds the disk. Without it the guest would have to guess a device
+    # name and could format or mount the wrong disk as someone's home.
+    from whistler.cloudinit import HOME_DISK_SERIAL
+    disks = _build()["spec"]["template"]["spec"]["domain"]["devices"]["disks"]
+    home = next(d for d in disks if d["name"] == "homedisk")
+    assert home["serial"] == HOME_DISK_SERIAL
+    assert home["disk"]["bus"] == "virtio"
+
+
+def test_ephemeral_session_gets_no_home_disk():
+    # No home_pvc (ephemeral): /home stays on the root disk, and neither the
+    # disk nor the volume is emitted.
+    spec = _build(home_pvc=None)["spec"]["template"]["spec"]
+    assert not any(v["name"] == "homedisk" for v in spec["volumes"])
+    assert [d["name"] for d in spec["domain"]["devices"]["disks"]] == \
+        ["rootdisk", "cloudinit"]
+
+
+def test_cloud_init_formats_and_mounts_the_home_disk():
     user_data = _cloud_init()
-    assert "whistler-storage-alice.whistler-user-alice.svc.cluster.local:/home" \
-        in user_data
-    assert "nfs4" in user_data
+    assert "/dev/disk/by-id/virtio-" in user_data
+    assert "mkfs.ext4" in user_data
+    assert "nfs4" not in user_data
 
 
 def test_cloud_init_travels_via_session_secret():
