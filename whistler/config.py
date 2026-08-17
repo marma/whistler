@@ -14,6 +14,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import secrets
 import yaml
 
 from whistler.cloudinit import (HOME_DISK_SERIAL, build_user_data,
@@ -116,6 +117,10 @@ GPU_NODE_LABEL = "nvidia.com/gpu.product"
 # config the pod was built under — "what rules was this actually running with"
 # stays answerable after the zone definition changes.
 ZONE_LABEL = "whistler.martinmalmsten.net/zone"
+# Stamped on every per-user namespace at creation (_ensure_user_namespace).
+# The S3 proxy's fencing policy selects namespaces by it, so the two must
+# agree — hence a constant rather than the literal in two places.
+USER_NS_LABEL = "whistler.martinmalmsten.net/user"
 ZONE_POLICY_LABEL = "whistler.martinmalmsten.net/zone-policy"
 ZONE_HASH_ANNOTATION = "whistler.martinmalmsten.net/zone-config-hash"
 DEFAULT_ZONE = "default"
@@ -730,6 +735,11 @@ class KubeConfigManager(ConfigManager):
         # it per-session with `homeDiskSize`; this is the floor every VM gets.
         self.home_disk_size = os.environ.get(
             "WHISTLER_HOME_DISK_SIZE", "20Gi")
+        # S3 dataset proxies (design/storage.md).
+        self.s3_proxy_image = os.environ.get(
+            "WHISTLER_S3_PROXY_IMAGE", "rclone/rclone:latest")
+        self.s3_proxy_resources = self._env_json(
+            "WHISTLER_S3_PROXY_RESOURCES", {})
 
     @staticmethod
     def _env_json(name, default):
@@ -762,7 +772,7 @@ class KubeConfigManager(ConfigManager):
                     "metadata": {
                         "name": ns_name,
                         "labels": {
-                            "whistler.martinmalmsten.net/user": username,
+                            USER_NS_LABEL: username,
                             "whistler.martinmalmsten.net/managed": "true"
                         }
                     }
@@ -1718,6 +1728,25 @@ class KubeConfigManager(ConfigManager):
                     "matchLabels": {"app": "whistler-storage-gateway"}}}],
                 "ports": [{"port": 2049, "protocol": "TCP"}],
             },
+            # Session pods may reach the shared-dataset S3 proxies, which live
+            # in Whistler's own namespace rather than the user's (a dataset is
+            # shared, so its proxy cannot belong to one user).
+            #
+            # This is deliberately a BASELINE allow, so a zone cannot revoke
+            # it — NetworkPolicy allows are union'd, so anything here is
+            # irrevocable by a zone. That is safe only because reaching a
+            # proxy is not the same as reaching a dataset: each proxy's own
+            # policy (_build_s3_proxy_network_policy) admits only the users
+            # actually granted it, and fails closed when that list is empty.
+            {
+                "to": [{
+                    "namespaceSelector": {"matchLabels": {
+                        "kubernetes.io/metadata.name": self.namespace}},
+                    "podSelector": {"matchLabels": {
+                        "app": "whistler-s3-proxy"}},
+                }],
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+            },
         ]
 
     def _build_egress_rules(self, zone: str) -> list:
@@ -2125,7 +2154,7 @@ class KubeConfigManager(ConfigManager):
 
     def _build_vm_spec(self, *, session_name, hostname, username, uid,
                        template_spec, display_port, instancetype,
-                       preemptible, home_pvc=None,
+                       preemptible, home_pvc=None, shared_datasets=None,
                        user_details=None, run_strategy="Halted",
                        portal_public_key=None, viewer=None,
                        host_key=None, host_cert=None):
@@ -2216,6 +2245,7 @@ class KubeConfigManager(ConfigManager):
             ssh_keys=ssh_keys,
             hostname=hostname,
             home_disk=bool(home_pvc),
+            shared_datasets=shared_datasets,
             desktop=desktop_stream,
             streamer_env=template_spec.get('streamerEnv') if desktop_stream else None,
             display_port=display_port if desktop_stream else None,
@@ -2593,6 +2623,7 @@ class KubeConfigManager(ConfigManager):
                 template_spec, display_port,
                 template_spec.get('instancetype'), preemptible,
                 home_pvc=home_pvc,
+                shared_datasets=self.session_shared_datasets(username),
                 start=wants_start,
                 viewer=result.get("viewer"),
                 user_details=user_details,
@@ -2890,6 +2921,331 @@ class KubeConfigManager(ConfigManager):
             },
         }
 
+    # ------------------------------------------------------------------ #
+    # Shared datasets over S3 (design/storage.md).                        #
+    #                                                                     #
+    # Sessions never talk to the real S3 server. Whistler starts a proxy  #
+    # per (volume, mode) and the zone egress rule names THAT — a Service  #
+    # whose address Whistler assigned and therefore knows. Pointing a     #
+    # zone rule straight at an external endpoint binds it to an address   #
+    # nobody here owns: move the server, or let a CIDR be reused, and the #
+    # rule silently means something else, with restricted data reachable  #
+    # from a more permissive zone. Silent and fail-open, which is the     #
+    # combination refused everywhere else in this codebase.               #
+    #                                                                     #
+    # The proxy also holds the bucket credential, so it never enters a    #
+    # guest whose user has root. A guest cannot exfiltrate what it never  #
+    # received, and revocation is real rather than theoretical.           #
+    #                                                                     #
+    # One proxy per (volume, mode) because rclone's --read-only is a      #
+    # server-wide flag, not a per-key one. That is what finally makes     #
+    # `mode: ro` a boundary on a VM, where a mount flag is not.           #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def s3_volume_definitions(volumes) -> Dict[str, Dict[str, Any]]:
+        """``{name: definition}`` for the S3-backed entries of a volume
+        catalog. Everything else is an ordinary Kubernetes volume source and
+        is wired straight into the pod (_build_volume_wiring)."""
+        return {v["name"]: v for v in (volumes or [])
+                if isinstance(v, dict) and v.get("type") == "s3"}
+
+    @staticmethod
+    def _s3_proxy_name(volume: str, mode: str) -> str:
+        return f"whistler-s3-{volume}-{mode}"
+
+    def _s3_proxy_host(self, volume: str, mode: str) -> str:
+        return (f"{self._s3_proxy_name(volume, mode)}"
+                f".{self.namespace}.svc.cluster.local")
+
+    def _build_s3_proxy_manifests(self, *, volume, mode, definition, image,
+                                  auth_secret_name, resources=None):
+        """Deployment + Service for one (volume, mode) S3 proxy. Pure.
+
+        ``definition`` is the volume's catalog entry: ``bucket``, optional
+        ``prefix`` and ``endpoint``, and ``credentialsSecret`` naming a Secret
+        that holds the REAL bucket credential. That secret is mounted here and
+        nowhere else.
+
+        No ownerReferences: a proxy is per shared volume, not per session or
+        per user, and outlives all of them.
+        """
+        name = self._s3_proxy_name(volume, mode)
+        labels = {"app": "whistler-s3-proxy", "volume": volume, "mode": mode}
+        remote = f":s3:{definition['bucket']}"
+        prefix = (definition.get("prefix") or "").strip("/")
+        if prefix:
+            remote = f"{remote}/{prefix}"
+
+        args = [
+            "serve", "s3", "--addr", ":8080",
+            # Read the client key pair from the environment rather than argv:
+            # anything in argv is world-readable in the container's /proc.
+            "--auth-key", "$(WHISTLER_S3_AUTH_KEY)",
+            remote,
+        ]
+        if mode == "ro":
+            args.insert(2, "--read-only")
+
+        env = [
+            # The client-facing key pair Whistler generated for this proxy.
+            {"name": "WHISTLER_S3_AUTH_KEY", "valueFrom": {"secretKeyRef": {
+                "name": auth_secret_name, "key": "authKey"}}},
+            # The REAL bucket credential. rclone reads backend config from
+            # RCLONE_<BACKEND>_<OPTION>, so these configure the `:s3:` remote
+            # above without a config file on disk.
+            {"name": "RCLONE_S3_PROVIDER", "value":
+                definition.get("provider", "Other")},
+            {"name": "RCLONE_S3_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {
+                "name": definition["credentialsSecret"],
+                "key": "accessKeyId"}}},
+            {"name": "RCLONE_S3_SECRET_ACCESS_KEY", "valueFrom": {
+                "secretKeyRef": {"name": definition["credentialsSecret"],
+                                 "key": "secretAccessKey"}}},
+        ]
+        if definition.get("endpoint"):
+            env.append({"name": "RCLONE_S3_ENDPOINT",
+                        "value": definition["endpoint"]})
+        if definition.get("region"):
+            env.append({"name": "RCLONE_S3_REGION",
+                        "value": definition["region"]})
+
+        deployment = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": name, "labels": labels},
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": labels},
+                "template": {
+                    "metadata": {"labels": labels},
+                    "spec": {
+                        "containers": [{
+                            "name": "rclone",
+                            "image": image,
+                            "args": args,
+                            "env": env,
+                            "ports": [{"containerPort": 8080, "name": "s3"}],
+                            # Nothing here needs to be root, write to its own
+                            # filesystem, or gain privileges: it is a protocol
+                            # translator holding one credential.
+                            "securityContext": {
+                                "runAsNonRoot": True,
+                                "runAsUser": 1000,
+                                "allowPrivilegeEscalation": False,
+                                "readOnlyRootFilesystem": True,
+                                "capabilities": {"drop": ["ALL"]},
+                            },
+                            "readinessProbe": {
+                                "tcpSocket": {"port": 8080},
+                                "periodSeconds": 10,
+                            },
+                            "resources": resources or {},
+                        }],
+                    },
+                },
+            },
+        }
+        service = {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": name, "labels": labels},
+            "spec": {
+                "type": "ClusterIP",
+                "selector": labels,
+                "ports": [{"name": "s3", "port": 8080, "targetPort": 8080}],
+            },
+        }
+        return deployment, service
+
+    def _build_s3_proxy_network_policy(self, volume: str, mode: str,
+                                       permitted_users) -> Dict[str, Any]:
+        """Fencing (pure): only the session pods of users granted this volume
+        at this mode may reach this proxy, and only on its port.
+
+        This is the half of the boundary that Whistler can actually enforce.
+        The generated key is the other half, and the two compose as AND —
+        which is the whole reason the endpoint is cluster-internal: a leaked
+        key is inert without the reach, and reach is what zones control.
+
+        An EMPTY permitted-users list yields a policy with no `from`, which
+        NetworkPolicy reads as "deny all ingress". Fail closed: a volume
+        nobody is granted is a volume nobody can reach.
+        """
+        name = self._s3_proxy_name(volume, mode)
+        labels = {"app": "whistler-s3-proxy", "volume": volume, "mode": mode}
+        ingress: List[Dict[str, Any]] = []
+        users = sorted(permitted_users or [])
+        if users:
+            ingress.append({
+                "from": [{
+                    # Session pods live in per-user namespaces; select those
+                    # by the user label the namespace carries.
+                    "namespaceSelector": {"matchExpressions": [{
+                        "key": USER_NS_LABEL,
+                        "operator": "In",
+                        "values": users,
+                    }]},
+                }],
+                "ports": [{"port": 8080, "protocol": "TCP"}],
+            })
+        return {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": name, "labels": labels},
+            "spec": {
+                "podSelector": {"matchLabels": labels},
+                "policyTypes": ["Ingress"],
+                "ingress": ingress,
+            },
+        }
+
+    def _ensure_s3_auth_secret(self, volume: str, mode: str) -> Optional[str]:
+        """Ensure the client-facing key pair for one (volume, mode) proxy,
+        returning the Secret's name. Generated once and then stable — the
+        guests that already hold it must keep working.
+
+        This key is NOT the bucket credential. It only opens the proxy, which
+        is cluster-internal and fenced by NetworkPolicy, so it is the second
+        half of an AND rather than a standalone permission.
+        """
+        name = f"{self._s3_proxy_name(volume, mode)}-auth"
+        api = client.CoreV1Api()
+        try:
+            api.read_namespaced_secret(name, self.namespace)
+            return name
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to read S3 auth secret {name}: {e}")
+                return None
+        access = f"whistler-{volume}-{mode}"
+        secret = secrets.token_urlsafe(32)
+        body = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": name,
+                         "labels": {"app": "whistler-s3-proxy",
+                                    "volume": volume, "mode": mode}},
+            # rclone's --auth-key takes "access,secret" as one token.
+            "stringData": {"authKey": f"{access},{secret}",
+                           "accessKeyId": access,
+                           "secretAccessKey": secret},
+        }
+        try:
+            api.create_namespaced_secret(self.namespace, body)
+            return name
+        except ApiException as e:
+            if e.status == 409:
+                return name
+            logger.error(f"Failed to create S3 auth secret {name}: {e}")
+            return None
+
+    def s3_proxy_users(self, volume: str, mode: str) -> List[str]:
+        """Users whose grant on ``volume`` resolves to exactly ``mode``.
+
+        Drives the proxy's fencing policy, so it has to answer the same
+        question the mount does: get_user_volume_modes carries the group's
+        per-member rw/ro, and a volume the user may mount but which is named
+        nowhere in those grants is read-write (the pre-groups default)."""
+        out = []
+        for user in self.get_users() or []:
+            username = user.get("name") if isinstance(user, dict) else user
+            if not username:
+                continue
+            allowed = self.get_user_allowed_volumes(username)
+            # Empty means unrestricted, matching the composition rule
+            # everywhere else.
+            if allowed and volume not in allowed:
+                continue
+            if (self.get_user_volume_modes(username) or {}).get(
+                    volume, "rw") == mode:
+                out.append(username)
+        return out
+
+    def session_shared_datasets(self, username: str) -> List[Dict[str, Any]]:
+        """Resolve this user's S3 datasets into cloud-init descriptors,
+        ensuring each one's proxy on the way. Returns [] when the catalog has
+        no S3 volumes, which is the common case.
+
+        A failed proxy is skipped rather than failing the boot: a guest that
+        comes up without one dataset is far better than a guest that does not
+        come up. The unit retries, so the mount lands when the proxy does.
+        """
+        definitions = self.s3_volume_definitions(self.get_volumes())
+        if not definitions:
+            return []
+        allowed = self.get_user_allowed_volumes(username)
+        modes = self.get_user_volume_modes(username) or {}
+        core = client.CoreV1Api()
+        out = []
+        for name, definition in sorted(definitions.items()):
+            # Empty allow-list means unrestricted, as everywhere else.
+            if allowed and name not in allowed:
+                continue
+            mode = modes.get(name, "rw")
+            if not self.ensure_s3_proxy(name, mode, definition):
+                logger.error(
+                    f"S3 proxy for {name}/{mode} not ready; skipping mount")
+                continue
+            secret_name = f"{self._s3_proxy_name(name, mode)}-auth"
+            try:
+                sec = core.read_namespaced_secret(secret_name, self.namespace)
+                access = base64.b64decode(sec.data["accessKeyId"]).decode()
+                secret = base64.b64decode(
+                    sec.data["secretAccessKey"]).decode()
+            except (ApiException, KeyError, TypeError) as e:
+                logger.error(f"Could not read {secret_name}: {e}")
+                continue
+            out.append({
+                "name": name,
+                "mode": mode,
+                # The proxy, never the real S3 server. This is the address
+                # Whistler assigned and the zone rules name.
+                "endpoint": f"http://{self._s3_proxy_host(name, mode)}:8080",
+                "accessKeyId": access,
+                "secretAccessKey": secret,
+            })
+        return out
+
+    def ensure_s3_proxy(self, volume: str, mode: str, definition) -> bool:
+        """Ensure the (volume, mode) proxy matches its manifests — Deployment,
+        Service and fencing NetworkPolicy. Self-healing like
+        ensure_storage_gateway: every call reconciles all three, so a grant
+        change reaches a running proxy's policy. False on failure; callers
+        treat that as transient and retry."""
+        auth_secret = self._ensure_s3_auth_secret(volume, mode)
+        if not auth_secret:
+            return False
+        deployment, service = self._build_s3_proxy_manifests(
+            volume=volume, mode=mode, definition=definition,
+            image=self.s3_proxy_image,
+            auth_secret_name=auth_secret,
+            resources=self.s3_proxy_resources,
+        )
+        policy = self._build_s3_proxy_network_policy(
+            volume, mode, self.s3_proxy_users(volume, mode))
+        apps = client.AppsV1Api()
+        core = client.CoreV1Api()
+        net = client.NetworkingV1Api()
+        name = self._s3_proxy_name(volume, mode)
+        ok = self._ensure_object(
+            name, self.namespace, deployment,
+            create=apps.create_namespaced_deployment,
+            read=apps.read_namespaced_deployment,
+            replace=apps.replace_namespaced_deployment)
+        ok = self._ensure_object(
+            name, self.namespace, service,
+            create=core.create_namespaced_service,
+            read=core.read_namespaced_service,
+            replace=core.replace_namespaced_service,
+            preserve=self._preserve_cluster_ip) and ok
+        ok = self._ensure_object(
+            name, self.namespace, policy,
+            create=net.create_namespaced_network_policy,
+            read=net.read_namespaced_network_policy,
+            replace=net.replace_namespaced_network_policy) and ok
+        return ok
+
     @staticmethod
     def _preserve_cluster_ip(live, body: Dict[str, Any]) -> None:
         """Carry the API-server-assigned clusterIP onto a replacement Service
@@ -2998,7 +3354,8 @@ class KubeConfigManager(ConfigManager):
 
     def _create_vm(self, user_ns, full_name, session_name, username, uid,
                    template_spec, display_port, instancetype,
-                   preemptible, home_pvc=None, start=False,
+                   preemptible, home_pvc=None, shared_datasets=None,
+                   start=False,
                    viewer=None, user_details=None) -> bool:
         # Issued (or renewed) before the cloud-init Secret is written, since
         # that document carries it into the guest. Best-effort: a cluster with
@@ -3014,6 +3371,7 @@ class KubeConfigManager(ConfigManager):
             template_spec=template_spec,
             display_port=display_port,
             home_pvc=home_pvc,
+            shared_datasets=shared_datasets,
             instancetype=instancetype,
             preemptible=preemptible,
             user_details=user_details if user_details is not None else self.get_user(username),

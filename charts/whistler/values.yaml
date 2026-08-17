@@ -384,6 +384,27 @@ whistler:
     # permittedHostDevices.resourceName for the same PCI device.
     gpuVmResourceName: nvidia.com/gpu
 
+  # Named volumes users may mount, granted per user or per group.
+  #
+  # An entry is either an ordinary Kubernetes volume source (wired straight
+  # into the pod) or `type: s3` — a SHARED DATASET, which is a different thing
+  # and should be described to users as one.
+  #
+  # `type: s3` is how shared data works on VMs (design/storage.md). Sessions
+  # never talk to the S3 server: Whistler runs a proxy per (volume, mode), the
+  # zone egress rule names THAT — an address Whistler assigned and therefore
+  # knows — and the bucket credential stays in the proxy, never reaching a
+  # guest whose user has root. `ro` and `rw` get separate proxies because
+  # rclone's --read-only is server-wide, which is what finally makes a
+  # read-only grant a real boundary on a VM.
+  #
+  # DATASETS, NOT FILESYSTEMS. S3 through FUSE gives no byte-range locking
+  # (SQLite, dconf, editors, anything with a lockfile will misbehave), no
+  # atomic rename (it is copy-then-delete, and O(size)), no hardlinks, and
+  # concurrent writers resolve last-writer-wins SILENTLY. Grant `ro` unless
+  # a session genuinely needs to write, and treat `rw` as one-writer-at-a-time.
+  # If someone needs POSIX semantics on shared data, the answer is Ceph, not
+  # this. Guests need `rclone` and `fuse3` baked in — the images do.
   #volumes:
   #  - name: data
   #    persistentVolumeClaim:
@@ -392,6 +413,25 @@ whistler:
   #    subPath: training_data
   #    persistentVolumeClaim:
   #      claimName: large-dataset-pvc
+  #  - name: reference-data
+  #    type: s3
+  #    bucket: reference-data
+  #    prefix: ""                       # optional, serves a subtree
+  #    endpoint: https://s3.example.org # omit for AWS
+  #    region: us-east-1                # optional
+  #    provider: Minio                  # rclone S3 provider name
+  #    # Secret in the release namespace holding the REAL bucket credential,
+  #    # keys `accessKeyId` and `secretAccessKey`. Mounted into the proxy and
+  #    # nowhere else. Whistler never creates this — it is the one piece of
+  #    # this design that deliberately stays outside Whistler's control.
+  #    credentialsSecret: s3-reference-data
+
+  # The proxy that fronts every `type: s3` volume above.
+  s3Proxy:
+    # Needs rclone >= 1.65 for `serve s3`; the distro packages in the guests
+    # are older and only ever run `rclone mount`, which is ancient.
+    image: rclone/rclone:latest
+    resources: {}
 
 # Admin-curated catalog of system templates (Template CRs, user: system).
 #

@@ -185,9 +185,30 @@ the floor.
    which is what this whole document is trying to get out of.
 
 (1) is the smaller thing and preserves the tiering; (2) should only win if
-guest-side FUSE turns out to be a real operational problem. Also undecided:
-whether a proxy is per zone, per bucket, or per zone-and-bucket, and how it is
-kept available.
+guest-side FUSE turns out to be a real operational problem.
+
+**Built as (1), 2026-08-17.** `rclone serve s3` in Whistler's own namespace,
+**one Deployment per (volume, mode)** — a shared dataset cannot live in one
+user's namespace, and `--read-only` is a server-wide flag rather than a
+per-key one, so `ro` and `rw` cannot share a process. That separation is what
+makes a read-only grant a boundary on a VM rather than a suggestion.
+
+Two things enforce access, and they compose as AND:
+
+- **Reach** — each proxy's own NetworkPolicy admits only the namespaces of
+  users granted that volume at that mode, and an ungranted dataset yields an
+  empty ingress list, which NetworkPolicy reads as deny-all. The baseline
+  egress carve-out letting sessions reach the proxies is irrevocable by a zone
+  (allows are union'd), which is safe only because reaching a *proxy* is not
+  reaching a *dataset*.
+- **Credential** — a generated per-(volume, mode) key pair opens the proxy.
+  The real bucket credential comes from an admin-provided Secret mounted into
+  the proxy alone, so it never enters a guest whose user has root.
+
+Still open: a proxy is a single replica with no availability story; grant
+changes reach a proxy's policy on the next session reconcile rather than being
+pushed; and **datasets are VM-only** — a pod would need `/dev/fuse` to mount
+one, so container sessions currently see no S3 volume at all.
 
 ## Still open
 

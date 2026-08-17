@@ -63,6 +63,10 @@ spec:
               value: {{ .Values.whistler.storageGateway.resources | toJson | quote }}
             - name: WHISTLER_HOME_DISK_SIZE
               value: {{ .Values.whistler.homeDisk.size | quote }}
+            - name: WHISTLER_S3_PROXY_IMAGE
+              value: {{ .Values.whistler.s3Proxy.image | quote }}
+            - name: WHISTLER_S3_PROXY_RESOURCES
+              value: {{ .Values.whistler.s3Proxy.resources | toJson | quote }}
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
           # ensure_pod() runs here now, so the operator needs the same user and

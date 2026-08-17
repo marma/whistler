@@ -16,6 +16,7 @@ def _manager(zones):
     # zones dict for these pure methods.
     cm = KubeConfigManager.__new__(KubeConfigManager)
     cm.zones = zones
+    cm.namespace = "whistler"
     return cm
 
 
@@ -34,15 +35,40 @@ GATEWAY_RULE = {
     "ports": [{"port": 2049, "protocol": "TCP"}],
 }
 
+# The shared-dataset proxies live in Whistler's namespace, not the user's,
+# because a dataset is shared and its proxy cannot belong to one user.
+S3_PROXY_RULE = {
+    "to": [{
+        "namespaceSelector": {
+            "matchLabels": {"kubernetes.io/metadata.name": "whistler"}},
+        "podSelector": {"matchLabels": {"app": "whistler-s3-proxy"}},
+    }],
+    "ports": [{"port": 8080, "protocol": "TCP"}],
+}
+
 
 # --- baseline (all pods, zone-independent) --------------------------------- #
 
-def test_baseline_allows_only_the_storage_gateway():
+def test_baseline_allows_only_storage_reachability():
     # NetworkPolicy allows are union'd across policies, so anything in the
     # baseline is irrevocable by a zone — it must stay minimal. DNS in
     # particular must NOT be here, or a zone could never narrow it.
     rules = _manager({"default": {}})._build_baseline_egress_rules()
-    assert rules == [GATEWAY_RULE]
+    assert rules == [GATEWAY_RULE, S3_PROXY_RULE]
+
+
+def test_reaching_a_proxy_is_not_reaching_a_dataset():
+    # The S3 rule is irrevocable by a zone, which is only safe because the
+    # proxy's OWN policy decides who may actually talk to it — and fails
+    # closed for a dataset nobody is granted. Pinning both halves here so the
+    # baseline entry is never read as "any session can use any dataset".
+    cm = _manager({"default": {}})
+    denied = cm._build_s3_proxy_network_policy("refdata", "ro", [])
+    assert denied["spec"]["ingress"] == []
+    allowed = cm._build_s3_proxy_network_policy("refdata", "ro", ["alice"])
+    (rule,) = allowed["spec"]["ingress"]
+    (src,) = rule["from"]
+    assert src["namespaceSelector"]["matchExpressions"][0]["values"] == ["alice"]
 
 
 # --- per-zone rules --------------------------------------------------------- #

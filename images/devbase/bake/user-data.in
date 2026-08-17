@@ -75,6 +75,7 @@ write_files:
         git git-lfs curl wget rsync unzip zip xz-utils zstd jq \
         vim nano tmux htop less man-db manpages bash-completion \
         ca-certificates gnupg openssh-server nfs-common \
+        rclone fuse3 \
         sudo
 
       # --- pixi ------------------------------------------------------------

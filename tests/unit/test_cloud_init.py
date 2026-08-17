@@ -131,6 +131,53 @@ def test_without_a_home_disk_no_mount_machinery_is_emitted():
     assert user["uid"] == "1001"
 
 
+DATASET = {"name": "refdata", "mode": "ro",
+           "endpoint": "http://whistler-s3-refdata-ro.whistler.svc:8080",
+           "accessKeyId": "whistler-refdata-ro", "secretAccessKey": "sek"}
+
+
+def _dataset_unit(ds=DATASET):
+    return next(f for f in _doc(shared_datasets=[ds])["write_files"]
+                if f["path"].endswith(f"whistler-dataset@{ds['name']}.service")
+                )["content"]
+
+
+def test_datasets_point_at_the_proxy_never_the_real_server():
+    conf = next(f for f in _doc(shared_datasets=[DATASET])["write_files"]
+                if f["path"] == "/etc/whistler/rclone.conf")
+    # Root-only. The guest user has sudo so this is tidiness, not a boundary —
+    # the boundary is that this key only opens a cluster-internal proxy the
+    # zone must also permit, and that the bucket credential is not here at all.
+    assert conf["permissions"] == "0600"
+    assert "whistler-s3-refdata-ro" in conf["content"]
+    assert "s3.example.org" not in conf["content"]
+
+
+def test_read_only_grant_is_mirrored_client_side_but_is_not_the_boundary():
+    # The guest is root and can drop this flag; the real enforcement is that a
+    # ro grant gets its own proxy started with rclone's server-side
+    # --read-only. This just makes the failure honest and local.
+    assert "--read-only" in _dataset_unit()
+    rw = dict(DATASET, mode="rw")
+    assert "--read-only" not in _dataset_unit(rw)
+
+
+def test_dataset_mounts_land_under_shared_and_survive_reboot():
+    unit = _dataset_unit()
+    assert "/shared/refdata" in unit
+    assert "WantedBy=multi-user.target" in unit
+    cmds = _doc(shared_datasets=[DATASET])["runcmd"]
+    assert "systemctl enable whistler-dataset@refdata.service" in cmds
+    # --no-block: a slow proxy must not hold up the rest of first boot.
+    assert "systemctl start --no-block whistler-dataset@refdata.service" in cmds
+
+
+def test_no_datasets_emits_no_rclone_config():
+    paths = [f["path"] for f in _doc()["write_files"]]
+    assert "/etc/whistler/rclone.conf" not in paths
+    assert not any("whistler-dataset@" in p for p in paths)
+
+
 def test_bootcmd_kicks_mount_before_runcmd_stage():
     # runcmd sits behind multi-user.target (snapd.seeded holds it ~30s on
     # stock Ubuntu, well past the login prompt), so a detached bootcmd

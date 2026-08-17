@@ -71,10 +71,13 @@ STREAMER_ENV_PATH = "/etc/whistler/streamer.env"
 # alphanumeric — KubeVirt caps the serial and udev does not escape it.
 HOME_DISK_SERIAL = "whistlerhome"
 HOME_DISK_PATH = f"/dev/disk/by-id/virtio-{HOME_DISK_SERIAL}"
+# Root-only: it holds the keys that open this session's dataset proxies.
+RCLONE_CONF_PATH = "/etc/whistler/rclone.conf"
 
 
 def build_user_data(*, username: str, uid: int, ssh_keys: list,
                     hostname: str, home_disk: bool = True,
+                    shared_datasets: list = None,
                     gid: int = None,
                     autologin: bool = True, desktop: bool = False,
                     streamer_env: dict = None,
@@ -86,6 +89,15 @@ def build_user_data(*, username: str, uid: int, ssh_keys: list,
     format and mount. False for ephemeral sessions, whose home simply lives on
     the root disk — the mount script, its unit and its bootcmd poller are then
     not emitted at all.
+
+    ``shared_datasets`` are the S3 datasets this session may mount, each
+    ``{name, endpoint, accessKeyId, secretAccessKey, mode}`` where ``endpoint``
+    is the Whistler-run proxy, never the real S3 server (design/storage.md).
+    They are mounted with rclone at ``/shared/<name>``. **Datasets, not
+    filesystems**: no byte-range locking, no atomic rename, no hardlinks, and
+    concurrent writers resolve last-writer-wins silently — so `ro` is the
+    default and `rw` is a deliberate grant. The key here only opens the proxy;
+    the real bucket credential stays in the proxy and never reaches a guest.
 
     ``host_key``/``host_cert`` install a Whistler-CA-signed host certificate
     (see hostca.py) so clients verify the guest against one
@@ -245,6 +257,72 @@ exit 0
                 ),
             },
         ])
+    datasets = list(shared_datasets or [])
+    if datasets:
+        # One rclone remote per dataset, all pointing at Whistler-run proxies.
+        # 0600 root-only: the guest user has sudo, so this is tidiness rather
+        # than a boundary — the boundary is that these keys only open a
+        # cluster-internal proxy that the zone's NetworkPolicy must also
+        # permit, and that the real bucket credential is not here at all.
+        conf = ""
+        for ds in datasets:
+            conf += (
+                f"[{ds['name']}]\n"
+                "type = s3\n"
+                "provider = Other\n"
+                f"endpoint = {ds['endpoint']}\n"
+                f"access_key_id = {ds['accessKeyId']}\n"
+                f"secret_access_key = {ds['secretAccessKey']}\n"
+                # The proxy serves one bucket, so the remote is its root.
+                "force_path_style = true\n\n"
+            )
+        write_files.append({
+            "path": RCLONE_CONF_PATH,
+            "permissions": "0600",
+            "owner": "root:root",
+            "content": conf,
+        })
+        for ds in datasets:
+            name = ds["name"]
+            mount = f"/shared/{name}"
+            # --read-only mirrors the grant client-side. It is NOT the
+            # boundary — the guest has root and can drop it — which is why a
+            # `ro` grant gets its own proxy started with rclone's server-side
+            # --read-only. This flag just makes the failure honest and local.
+            ro = " --read-only" if ds.get("mode") == "ro" else ""
+            write_files.append({
+                "path": f"/etc/systemd/system/whistler-dataset@{name}.service",
+                "content": (
+                    "[Unit]\n"
+                    f"Description=Mount the Whistler shared dataset {name}\n"
+                    "Wants=network-online.target\n"
+                    "After=network-online.target\n"
+                    "\n"
+                    "[Service]\n"
+                    "Type=notify\n"
+                    f"ExecStartPre=/bin/mkdir -p {mount}\n"
+                    f"ExecStart=/usr/bin/rclone mount {name}: {mount}"
+                    f" --config {RCLONE_CONF_PATH}"
+                    # allow-other so the session user can read a mount root
+                    # made by the unit; uid/gid present it as theirs, since S3
+                    # carries no ownership of its own.
+                    " --allow-other"
+                    f" --uid {uid} --gid {gid} --dir-perms 0755"
+                    # `writes` caches whole files locally on open-for-write,
+                    # which is what makes ordinary open/modify/close work at
+                    # all against an object store. It does NOT make this a
+                    # filesystem: still no byte-range locks, no atomic rename.
+                    " --vfs-cache-mode writes"
+                    f"{ro}\n"
+                    f"ExecStop=/bin/fusermount3 -u {mount}\n"
+                    "Restart=on-failure\n"
+                    "RestartSec=10\n"
+                    "\n"
+                    "[Install]\n"
+                    "WantedBy=multi-user.target\n"
+                ),
+            })
+
     if host_key and host_cert:
         key_pem = host_key.decode() if isinstance(host_key, bytes) else host_key
         write_files.extend([
@@ -317,6 +395,13 @@ exit 0
             "systemctl enable whistler-home.service",
             "systemctl start --no-block whistler-home.service",
         ])
+    for ds in datasets:
+        # enable + start so persistent-root guests remount on later boots;
+        # --no-block because a proxy that is slow to answer must not hold up
+        # the rest of first boot.
+        unit = f"whistler-dataset@{ds['name']}.service"
+        doc["runcmd"].append(f"systemctl enable {unit}")
+        doc["runcmd"].append(f"systemctl start --no-block {unit}")
     if host_key and host_cert:
         # Normally redundant — write_files lands in the init stage, well
         # before sshd starts — but a guest whose sshd came up first would
