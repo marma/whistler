@@ -50,6 +50,7 @@ from functools import partial
 import aiohttp
 from aiohttp import web
 
+from whistler.config import CHANNEL_TERMINAL
 from whistler.portal import kubevirt, proxy, screenshots, terminal
 
 logger = logging.getLogger("whistler.portal")
@@ -389,6 +390,25 @@ def _render_vnc(user, session_id, console=False):
             .replace("__USER__", html.escape(user)))
 
 
+async def _channel_denied(request, user, name, channel):
+    """``None`` when ``user`` may use ``channel`` on session ``name``, else the
+    403 to return.
+
+    The portal is one of the doors the channel grant has to hold at — a grant
+    missed at one entry point leaks the whole identity half of the border
+    (design/security.md, "Closing the fourth axis"). Resolving costs a couple
+    of cluster reads, which is why this is called on the terminal handshake
+    and not on every asset request."""
+    channels = await _run(request, request.app["cm"].session_channels, user, name)
+    if channel in channels:
+        return None
+    logger.warning(f"{channel} denied for {user} on {name} "
+                   f"(granted: {sorted(channels)})")
+    return web.Response(
+        status=403, text=f"the {channel} channel is not available to you for "
+                         f"this session")
+
+
 def _resolve_target(instances, desktop_sessions, name):
     """Locate a Session by its short name across ssh instances and desktop
     sessions, returning a uniform dict for the terminal: what to attach to
@@ -558,6 +578,11 @@ async def term(request):
     the page finishes polling."""
     cm, user = request.app["cm"], request["user"]
     name = request.match_info["id"]
+    denied = await _channel_denied(request, user, name, CHANNEL_TERMINAL)
+    if denied is not None:
+        # Refuse before the reconcile nudge: a channel the user may not use is
+        # not a reason to boot their session.
+        return denied
     await _run(request, cm.trigger_instance_start, user, name)
     return web.Response(text=_render_term(user, name), content_type="text/html")
 
@@ -579,6 +604,12 @@ async def term_status(request):
 async def ws_term(request):
     cm, user = request.app["cm"], request["user"]
     name = request.match_info["id"]
+
+    # The boundary, not the page: the page is a convenience, this is the
+    # socket that carries bytes.
+    denied = await _channel_denied(request, user, name, CHANNEL_TERMINAL)
+    if denied is not None:
+        return denied
 
     instances, desktop_sessions = await asyncio.gather(
         _run(request, cm.get_user_instances, user),

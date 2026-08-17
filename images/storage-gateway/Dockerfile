@@ -18,6 +18,18 @@
 # ordinary pod per user works. It needs exactly two capabilities (see
 # _build_gateway_manifests): DAC_READ_SEARCH, because the VFS FSAL addresses
 # files by handle (open_by_handle_at), and SYS_RESOURCE for its fd limit.
+# There is a second, independent reason not to reach for knfsd if the backing
+# store ever becomes NFS: the kernel refuses locks on a re-exported NFS mount
+# outright ("clients are not allowed to get file locks or delegations from a
+# reexport server" — docs.kernel.org/filesystems/nfs/reexport.html), and no
+# byte-range locks is the nobrl situation that drove the move off SMB.
+#
+# NOTE the VFS FSAL below cannot export an NFS-backed PVC at all
+# (resolve_posix_filesystem -> ENOENT), and FSAL_PROXY_V4 -- the only shape
+# that does export one -- corrupts its own heap under a SQLite workload. So
+# there is currently no working way to run this gateway on an NFS-backed
+# storage class. Measured; see design/security.md and, for the crash itself,
+# proxy-v4-heap-bug.md next to this file.
 #
 # Identity is server-side, as it was under SMB: the guest is root and can
 # assert any uid it likes over AUTH_SYS, so the export squashes every request

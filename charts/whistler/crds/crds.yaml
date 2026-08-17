@@ -326,14 +326,21 @@ spec:
                     type: string
                   description: >-
                     Allow-list of gpuTypes this user may request on a template.
-                    Omitted/empty means no restriction.
+                    Omitted/empty means no restriction here; the effective
+                    list is the union with every Group this user belongs to,
+                    so an empty list still ends up bounded when a group
+                    defines one.
                 allowedVolumes:
                   type: array
                   items:
                     type: string
                   description: >-
                     Allow-list of the volumes catalog this user's templates may
-                    request. Omitted/empty means no restriction.
+                    request, all read-write. Omitted/empty means no restriction
+                    here; the effective list is the union with the volumes
+                    granted by every Group this user belongs to (which may
+                    grant read-only access — a name granted rw anywhere is
+                    mounted rw).
                 allowedZones:
                   type: array
                   items:
@@ -341,14 +348,28 @@ spec:
                   description: >-
                     Allow-list of network zones this user's sessions may
                     explicitly request (template-baked or via the zone
-                    override). Omitted/empty means no restriction; the
-                    implicit default zone is never gated.
+                    override). Omitted/empty means no restriction here; the
+                    effective list is the union with every Group this user
+                    belongs to. The implicit default zone is never gated.
+                channels:
+                  type: array
+                  items:
+                    type: string
+                    enum: ["ssh", "relay", "terminal", "clipboard", "screenshots"]
+                  description: >-
+                    Access channels granted to this user, narrowing the zone's
+                    ceiling (never widening it). Omitted/empty means no
+                    narrowing of the user's own — but the effective set is the
+                    UNION with every Group this user belongs to, so a group
+                    grant bounds a user who has none (see
+                    whistler/config.py get_user_channels).
                 overrides:
                   type: object
                   description: >-
                     Which template values this user may override per-session via
                     the session CR's spec.overrides (see
-                    whistler/config.py _apply_overrides).
+                    whistler/config.py _apply_overrides). Unioned with the
+                    grants of every Group this user belongs to.
                   properties:
                     resources:
                       type: boolean
@@ -371,6 +392,122 @@ spec:
     kind: User
     shortNames:
     - usr
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: groups.whistler.martinmalmsten.net
+spec:
+  group: whistler.martinmalmsten.net
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              description: >-
+                A set of users sharing a project's grants. Every field here is
+                unioned with the member's own User CR fields and with every
+                other group they belong to: empty everywhere still means
+                "no restriction", but a group with a list bounds a member who
+                had none. Membership lives here and only here — there is no
+                `groups` field on User — so a project is edited in one place.
+                See design/security.md, "Group".
+              properties:
+                description:
+                  type: string
+                members:
+                  type: array
+                  items:
+                    type: string
+                  description: >-
+                    User CR names. A name that matches no User is ignored (it
+                    grants nothing), so a group may be written before its
+                    members exist.
+                volumes:
+                  type: array
+                  description: >-
+                    Volumes from the catalog this group's members may mount,
+                    with the access mode each member gets. This is the field
+                    that carries weight: it is what a per-member NFS export
+                    set will be rendered from once shared volumes land.
+                  items:
+                    type: object
+                    required: ["name"]
+                    properties:
+                      name:
+                        type: string
+                      mode:
+                        type: string
+                        enum: ["rw", "ro", "none"]
+                        default: rw
+                        description: >-
+                          The access every member gets by default. `none`
+                          grants nothing to members at large — only the
+                          people named in `access` reach the volume.
+                      access:
+                        type: object
+                        additionalProperties:
+                          type: string
+                          enum: ["rw", "ro"]
+                        description: >-
+                          Per-member exceptions to `mode`, keyed by username.
+                          A member listed here need not also be in `members`
+                          — but a name in neither gets nothing.
+                allowedZones:
+                  type: array
+                  items:
+                    type: string
+                  description: Zones members may request (unioned, see above).
+                allowedGpuTypes:
+                  type: array
+                  items:
+                    type: string
+                  description: gpuTypes members may request (unioned).
+                channels:
+                  type: array
+                  items:
+                    type: string
+                    enum: ["ssh", "relay", "terminal", "clipboard", "screenshots"]
+                  description: >-
+                    Access channels granted to members, narrowing the zone's
+                    ceiling. This is the third axis: "lab staff" and "visiting
+                    researchers" meet in the same zone on the same instance
+                    and must not get the same doors. Omitted means no
+                    narrowing from this group; an empty list grants nothing
+                    beyond the desktop stream.
+                overrides:
+                  type: object
+                  description: >-
+                    Per-session override grants for members, OR'd with their
+                    own (see whistler/config.py _apply_overrides).
+                  properties:
+                    resources:
+                      type: boolean
+                    gpuType:
+                      type: boolean
+                    gpuCount:
+                      type: boolean
+                    uidGid:
+                      type: boolean
+                    securityContext:
+                      type: boolean
+                    volumes:
+                      type: boolean
+                    zone:
+                      type: boolean
+  scope: Namespaced
+  names:
+    plural: groups
+    singular: group
+    kind: Group
+    shortNames:
+    - grp
 
 ---
 apiVersion: apiextensions.k8s.io/v1
@@ -411,6 +548,21 @@ spec:
                     conjunction of the data, the channels, the user's trust
                     and the endpoint they sit at — see design/security.md,
                     "The border has four axes".
+                channels:
+                  type: array
+                  items:
+                    type: string
+                    enum: ["ssh", "relay", "terminal", "clipboard", "screenshots"]
+                  description: >-
+                    The zone's channel CEILING — the most any session here may
+                    use. A ceiling, not a setting: a User/Group `channels`
+                    grant narrows it and nothing widens it. Omitted means no
+                    ceiling beyond the legacy `ssh` field, which is folded in
+                    (direct -> ssh+relay, relay -> relay, none -> neither) so
+                    zones written before this field keep their meaning. An
+                    empty list is a real ceiling of nothing, not "unset" —
+                    the desktop stream alone. See design/security.md,
+                    "Access channels: the second axis".
                 egress:
                   type: object
                   properties:

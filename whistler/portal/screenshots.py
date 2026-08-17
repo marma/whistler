@@ -58,6 +58,10 @@ mechanism. Worth knowing before anyone concludes that turning screenshots off
 makes sessions unobservable.
 
 Only *desktop* sessions have an X display; ssh-mode instances are skipped.
+
+Since groups landed, the loop also skips a session whose owner is not granted
+the ``screenshots`` channel in that session's zone — checked before the grab,
+so those pixels never reach this process at all.
 """
 import asyncio
 import contextlib
@@ -67,6 +71,8 @@ import re
 import struct
 import time
 import zlib
+
+from whistler.config import CHANNEL_SCREENSHOTS
 
 logger = logging.getLogger("whistler.portal")
 
@@ -365,6 +371,17 @@ async def _capture_one(cm, store: ScreenshotStore, session: dict,
                        semaphore: asyncio.Semaphore) -> bool:
     user, name = session["user"], session["name"]
     loop = asyncio.get_running_loop()
+
+    # The channel grant is checked at *capture*, not at serve time, and that
+    # is the point: a session whose owner isn't granted the screenshots
+    # channel never has its display read at all, so the image never enters
+    # portal memory. Gating only the HTTP route would still have carried the
+    # pixels out of the zone (design/security.md, "Access channels").
+    channels = await loop.run_in_executor(None, cm.session_channels, user, name)
+    if CHANNEL_SCREENSHOTS not in channels:
+        logger.debug(f"screenshot {user}/{name}: screenshots channel not granted")
+        return False
+
     async with semaphore:
         try:
             if session.get("runtime") == "vm":

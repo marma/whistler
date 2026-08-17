@@ -552,15 +552,17 @@ up. Two different views, and `viewer: vnc` vs `websockets` picks.
 - **The zone SSH posture is enforced and the CRD field exists, but no zone
   sets it.** Default `direct` — today's behaviour. It is also one of five
   channels: `ssh: none` is not a contained session.
-- **Channel grants are per zone, not per user or group**, so neither the
-  internal-helper case nor the kiosk binding is expressible yet. **The
-  gateway is the second door**: a kiosk-bound user must be refused here as
-  well as in the portal, or the identity half of
+- ~~**Channel grants are per zone, not per user or group**~~ — **done**
+  (2026-08-14): `User`/`Group` `channels` narrow the zone's ceiling, and
+  `_jump_to_instance` decides on the intersection (`resolve_ssh_target`
+  returns it as `channels`), with the relay path checking `relay` the same
+  way. **The gateway is the second door**, and it now holds it: a user
+  refused `ssh` in the portal is refused here too, so the identity half of
   [the kiosk situation](security.md#closing-the-fourth-axis-the-kiosk-situation)
-  leaks and the network does all the work. It belongs next to the zone-posture
-  check in `_jump_to_instance` — same shape, intersecting the user's grant
-  with the zone's ceiling — and unlike the portal the gateway sees the real
-  peer address, so a source-network condition needs no header trust.
+  no longer leaks. What is still missing is the **source-address condition** —
+  "the desktop from anywhere, a shell only from the lab network". Unlike the
+  portal the gateway sees the real peer address, so it needs no header trust;
+  it just isn't wired to the grant yet.
 - **The portal still uses `known_hosts=None`.** The relay no longer does, and
   `relay.known_hosts_for` is the pattern to copy into `screenshots.py` and
   the web terminal.

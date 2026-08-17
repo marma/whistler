@@ -168,6 +168,25 @@ def test_zone_posture_can_forbid_direct_ssh(make_config, posture):
     assert srv.splicer.forwarded == []
 
 
+def test_a_channel_grant_closes_the_jump_the_zone_would_allow(make_config):
+    """The third axis: the zone permits direct SSH, this user is not granted
+    it. Same zone, same instance, different doors from the colleague who is
+    (design/security.md, "The border has four axes")."""
+    srv = _server(make_config, targets={"box": _target(
+        zone="restricted", sshPosture="direct", channels=["relay", "terminal"])})
+    with pytest.raises(asyncssh.ChannelOpenError) as e:
+        _jump(srv)
+    assert e.value.code == asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED
+    assert srv.splicer.forwarded == []
+
+
+def test_an_ssh_grant_still_jumps(make_config):
+    srv = _server(make_config, targets={"box": _target(channels=["ssh"])})
+    assert _jump(srv)
+    assert srv.splicer.forwarded == [
+        ("alice-box.whistler-alice.svc.cluster.local", 22)]
+
+
 # --------------------------------------------------------------------------- #
 # What it permits                                                              #
 # --------------------------------------------------------------------------- #

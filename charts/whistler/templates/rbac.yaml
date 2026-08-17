@@ -29,7 +29,7 @@ rules:
 
   # Application: watching & handling for the custom resources we declare.
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [sessions, templates, sessions/status, users, zones]
+    resources: [sessions, templates, sessions/status, users, zones, groups]
     verbs: [list, watch, patch, get, update, create, delete]
 
   # KubeVirt VM desktop backend. The CRDs may be absent in a given cluster;
@@ -105,7 +105,7 @@ rules:
 
   # Managing custom resources
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [sessions, templates, sessions/status, users, zones]
+    resources: [sessions, templates, sessions/status, users, zones, groups]
     verbs: [create, delete, get, list, patch, update, watch]
 
 ---
@@ -166,7 +166,7 @@ rules:
   # management UI's SSH template/instance CRUD + trigger) + users (admin user
   # management).
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [sessions, templates, sessions/status, users, zones]
+    resources: [sessions, templates, sessions/status, users, zones, groups]
     verbs: [get, list, create, update, patch, delete, watch]
 
   # add_desktop_session / _ensure_user_namespace.

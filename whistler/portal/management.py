@@ -24,7 +24,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from whistler.config import GPU_NODE_LABEL, OVERRIDE_GROUPS
+from whistler.config import (CHANNELS, ConfigWriteError, ENFORCED_CHANNELS,
+                             GPU_NODE_LABEL, OVERRIDE_GROUPS)
 
 logger = logging.getLogger("whistler.management")
 
@@ -760,6 +761,13 @@ async def admin_user_create(
 
 
 async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: str):
+    """The user's own grants (what the forms edit) *and* their effective ones
+    (own unioned with every group they belong to).
+
+    The distinction is the whole reason this page has two columns of truth:
+    the checkboxes must reflect and save the User CR's own fields only. Saving
+    the effective set would quietly copy a project's grants onto the user, and
+    they would keep them after leaving the group."""
     all_users = await request.app.state.run(cm.list_all_users)
     user_obj  = next((u for u in all_users if u.get("name") == username), None)
     if not user_obj:
@@ -772,13 +780,24 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
     user_overrides = await request.app.state.run(cm.get_user_overrides, username)
     zones = await request.app.state.run(cm.get_zones)
     allowed_zones = await request.app.state.run(cm.get_user_allowed_zones, username)
+    user_groups = await request.app.state.run(cm.get_user_groups, username)
+    volume_modes = await request.app.state.run(cm.get_user_volume_modes, username)
+    channel_grant = await request.app.state.run(cm.get_user_channels, username)
     return templates.TemplateResponse(
         request=request, name="admin/user_detail.html",
         context=_ctx(admin, is_admin=True, user_obj=user_obj, instances=instances,
                      volumes=volumes, allowed_volumes=allowed,
                      gpu_types=gpu_types, allowed_gpu_types=allowed_gpu_types,
                      user_overrides=user_overrides, override_groups=OVERRIDE_GROUPS,
-                     zones=zones, allowed_zones=allowed_zones),
+                     zones=zones, allowed_zones=allowed_zones,
+                     user_groups=user_groups, volume_modes=volume_modes,
+                     channels=CHANNELS, enforced_channels=ENFORCED_CHANNELS,
+                     own_channels=user_obj.get("channels"),
+                     channel_grant=sorted(channel_grant) if channel_grant is not None else None,
+                     own_volumes=user_obj.get("allowedVolumes") or [],
+                     own_zones=user_obj.get("allowedZones") or [],
+                     own_gpu_types=user_obj.get("allowedGpuTypes") or [],
+                     own_overrides=user_obj.get("overrides") or {}),
     )
 
 
@@ -836,6 +855,115 @@ async def admin_user_set_overrides(
     overrides = {g: g in checked for g in OVERRIDE_GROUPS}
     await request.app.state.run(cm.set_user_overrides, username, overrides)
     return _tr(f"/admin/users/{username}", admin)
+
+
+async def admin_user_set_channels(
+    request: Request, cm: CM, admin: Admin, username: str,
+    restrict:  Annotated[Optional[str], Form()] = None,
+    channels:  Annotated[Optional[list[str]], Form()] = None,
+):
+    """`restrict` unchecked clears the user's own grant (this user narrows
+    nothing); checked writes exactly the boxes ticked — including none of
+    them, which is a real grant of nothing and the reason the toggle exists."""
+    if not restrict:
+        await request.app.state.run(cm.set_user_channels, username, None)
+    else:
+        await request.app.state.run(
+            cm.set_user_channels, username,
+            [c for c in CHANNELS if c in set(channels or [])])
+    return _tr(f"/admin/users/{username}", admin)
+
+
+# --------------------------------------------------------------------------- #
+# Admin — groups (a project's shared grants; Group CRs)                        #
+# --------------------------------------------------------------------------- #
+
+async def admin_groups(request: Request, cm: CM, admin: Admin):
+    group_defs = await request.app.state.run(cm.get_group_definitions)
+    groups = [{"name": name, **(spec or {})}
+              for name, spec in sorted(group_defs.items())]
+    return templates.TemplateResponse(
+        request=request, name="admin/groups.html",
+        context=_ctx(admin, is_admin=True, groups=groups),
+    )
+
+
+async def _group_form_context(request, admin, group=None):
+    """Everything the group editor needs to render: the catalogs it grants
+    from, plus the group itself when editing."""
+    cm = request.app.state.cm
+    volumes, zones, gpu_types, all_users = await asyncio.gather(
+        request.app.state.run(cm.get_volumes),
+        request.app.state.run(cm.get_zones),
+        request.app.state.run(cm.get_gpu_types),
+        request.app.state.run(cm.list_all_users),
+    )
+    return _ctx(admin, is_admin=True, group=group, volumes=volumes, zones=zones,
+                gpu_types=gpu_types, all_users=all_users,
+                channels=CHANNELS, enforced_channels=ENFORCED_CHANNELS,
+                override_groups=OVERRIDE_GROUPS,
+                volume_grants=_volume_grants_by_name(group))
+
+
+async def admin_group_new(request: Request, cm: CM, admin: Admin):
+    return templates.TemplateResponse(
+        request=request, name="admin/group_form.html",
+        context=await _group_form_context(request, admin),
+    )
+
+
+async def admin_group_edit(request: Request, cm: CM, admin: Admin, name: str):
+    group_defs = await request.app.state.run(cm.get_group_definitions)
+    if name not in group_defs:
+        raise HTTPException(status_code=404, detail="Group not found.")
+    group = {"name": name, **(group_defs[name] or {})}
+    return templates.TemplateResponse(
+        request=request, name="admin/group_form.html",
+        context=await _group_form_context(request, admin, group=group),
+    )
+
+
+async def _save_group_or_400(request, verb: str, name: str, form):
+    """Run save_group and turn its two failure modes into HTTP.
+
+    A ConfigWriteError carries the cluster's own reason (most usefully "the
+    CRD is not installed") — showing it beats a flat "Failed to create group."
+    that sends an admin to the pod logs for a message the server already had.
+    """
+    try:
+        ok = await request.app.state.run(
+            request.app.state.cm.save_group, _build_group_data(name, form))
+    except ConfigWriteError as e:
+        raise HTTPException(status_code=500,
+                            detail=f"Failed to {verb} group: {e}") from e
+    if not ok:
+        raise HTTPException(status_code=400,
+                            detail=f"Failed to {verb} group: it needs a name.")
+
+
+async def admin_group_create(request: Request, cm: CM, admin: Admin):
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+    if not re.fullmatch(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?", name):
+        raise HTTPException(status_code=400,
+                            detail="Group name must be a DNS-1123 label "
+                                   "(lowercase alphanumerics and '-', max 63 chars).")
+    await _save_group_or_400(request, "create", name, form)
+    return _tr("/admin/groups", admin)
+
+
+async def admin_group_update(request: Request, cm: CM, admin: Admin, name: str):
+    await _save_group_or_400(request, "update", name, await request.form())
+    return _tr("/admin/groups", admin)
+
+
+async def admin_group_delete(request: Request, cm: CM, admin: Admin, name: str):
+    try:
+        await request.app.state.run(cm.delete_group, name)
+    except ConfigWriteError as e:
+        raise HTTPException(status_code=500,
+                            detail=f"Failed to delete group: {e}") from e
+    return _tr("/admin/groups", admin)
 
 
 # --------------------------------------------------------------------------- #
@@ -1104,6 +1232,109 @@ def _build_user_data(name, public_keys, run_as_user, run_as_group, fs_group,
     return data
 
 
+def _volume_grants_by_name(group) -> dict:
+    """``{volume: entry}`` from a Group's ``volumes`` list, so the editor can
+    render each catalog volume's current grant without scanning the list per
+    row. ``accessText`` is the per-member map in the form's flat notation."""
+    return {entry["name"]: {**entry,
+                            "accessText": _format_volume_access(entry.get("access"))}
+            for entry in ((group or {}).get("volumes") or [])
+            if isinstance(entry, dict) and entry.get("name")}
+
+
+def _parse_members(text) -> list:
+    """One username per line (blank lines and stray commas tolerated). A
+    textarea rather than a checkbox list of existing users on purpose: a group
+    may legitimately name a user who hasn't been created yet, which is how a
+    project is provisioned before its people arrive."""
+    members = []
+    for line in (text or "").replace(",", "\n").splitlines():
+        name = line.strip()
+        if name and name not in members:
+            members.append(name)
+    return members
+
+
+def _parse_volume_access(text) -> dict:
+    """``alice:ro, bob:rw`` -> ``{"alice": "ro", "bob": "rw"}`` — the
+    per-member exceptions to a volume's default mode."""
+    access = {}
+    for token in (text or "").replace("\n", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        member, _, mode = token.partition(":")
+        member, mode = member.strip(), mode.strip().lower()
+        if not member or mode not in ("rw", "ro"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid per-member access {token!r} "
+                       f"(expected <user>:rw or <user>:ro)")
+        access[member] = mode
+    return access
+
+
+def _format_volume_access(access) -> str:
+    """Inverse of _parse_volume_access, for re-rendering the edit form."""
+    return ", ".join(f"{member}:{mode}" for member, mode in sorted((access or {}).items()))
+
+
+def _build_group_data(name: str, form) -> dict:
+    """Build a Group spec from the editor's form.
+
+    Volume grants are read per catalog volume (``vol_mode_<name>`` /
+    ``vol_access_<name>``) because the set of volumes is dynamic, which is
+    also why this takes the raw form rather than typed parameters.
+
+    ``channels`` is omitted entirely unless the "restrict channels" box is
+    ticked: absent means "this group does not narrow the zone ceiling", while
+    an empty list means "nothing but the desktop stream". Collapsing the two
+    would make the second unwritable."""
+    data: dict = {
+        "name": name,
+        "description": (form.get("description") or "").strip(),
+        "members": _parse_members(form.get("members")),
+    }
+
+    volumes = []
+    for key in form.keys():
+        if not key.startswith("vol_mode_"):
+            continue
+        vol_name = key[len("vol_mode_"):]
+        mode = (form.get(key) or "").strip().lower()
+        access = _parse_volume_access(form.get(f"vol_access_{vol_name}"))
+        if mode not in ("rw", "ro"):
+            # "none": no default grant for members, but a per-member exception
+            # still stands on its own — one named person gets a look at a
+            # volume the rest of the project cannot see.
+            if access:
+                volumes.append({"name": vol_name, "mode": "none", "access": access})
+            continue
+        entry: dict = {"name": vol_name, "mode": mode}
+        if access:
+            entry["access"] = access
+        volumes.append(entry)
+    if volumes:
+        data["volumes"] = volumes
+
+    zones = [z.strip() for z in form.getlist("zone_names") if z.strip()]
+    if zones:
+        data["allowedZones"] = zones
+    gpu_types = [g.strip() for g in form.getlist("gpu_types") if g.strip()]
+    if gpu_types:
+        data["allowedGpuTypes"] = gpu_types
+
+    if form.get("restrict_channels"):
+        checked = set(form.getlist("channels"))
+        data["channels"] = [c for c in CHANNELS if c in checked]
+
+    checked_overrides = set(form.getlist("override_groups"))
+    overrides = {g: True for g in OVERRIDE_GROUPS if g in checked_overrides}
+    if overrides:
+        data["overrides"] = overrides
+    return data
+
+
 def _build_volume_data(name, pvc_name, sub_path) -> dict:
     vol: dict = {
         "name": name.strip(),
@@ -1259,6 +1490,13 @@ def build_management_app(config_manager):
     app.add_api_route("/admin/users/{username}/gpu-types",        admin_user_set_gpu_types, methods=["POST"])
     app.add_api_route("/admin/users/{username}/zones",            admin_user_set_zones, methods=["POST"])
     app.add_api_route("/admin/users/{username}/overrides",        admin_user_set_overrides, methods=["POST"])
+    app.add_api_route("/admin/users/{username}/channels",         admin_user_set_channels, methods=["POST"])
+    app.add_api_route("/admin/groups",                            admin_groups,           methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/admin/groups/new",                        admin_group_new,        methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/admin/groups",                            admin_group_create,     methods=["POST"])
+    app.add_api_route("/admin/groups/{name}/edit",                admin_group_edit,       methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/admin/groups/{name}",                     admin_group_update,     methods=["POST"])
+    app.add_api_route("/admin/groups/{name}/delete",              admin_group_delete,     methods=["POST"])
     app.add_api_route("/admin/volumes",                           admin_volumes,          methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/volumes/new",                       admin_volume_new,       methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/volumes",                           admin_volume_create,    methods=["POST"])

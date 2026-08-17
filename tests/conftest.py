@@ -8,7 +8,12 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from whistler.config import ConfigManager, OVERRIDE_GROUPS
+from whistler.config import (CHANNEL_CLIPBOARD, CHANNEL_SCREENSHOTS,
+                             CHANNEL_TERMINAL, ConfigManager, DEFAULT_ZONE,
+                             OVERRIDE_GROUPS, SSH_POSTURE_DIRECT,
+                             _POSTURE_CHANNELS, group_volume_grants,
+                             merge_allow_lists, merge_channel_grants,
+                             merge_override_grants)
 
 
 class FakeConfigManager(ConfigManager):
@@ -22,8 +27,11 @@ class FakeConfigManager(ConfigManager):
     def __init__(self, users=None, templates=None, instances=None,
                  desktop_templates=None, desktop_sessions=None, gpu_types=None,
                  zones=None, ssh_targets=None, ssh_domain_suffix=".w",
-                 ssh_ca_public_key=None, vm_access_keys=None):
+                 ssh_ca_public_key=None, vm_access_keys=None, groups=None):
         self.users: Dict[str, Dict[str, Any]] = users or {}
+        # {group name: spec} — resolved through the same pure helpers the real
+        # manager uses, so a test of the fake is a test of the rule.
+        self.groups: Dict[str, Dict[str, Any]] = groups or {}
         # {username: {name: {...resolve_ssh_target dict...}}} for jump routing.
         self._ssh_targets: Dict[str, Dict[str, Any]] = ssh_targets or {}
         self.ssh_domain_suffix = ssh_domain_suffix
@@ -238,8 +246,43 @@ class FakeConfigManager(ConfigManager):
     def delete_volume(self, volume_name):
         return True
 
+    def get_user_groups(self, username):
+        member_of = []
+        for name in sorted(self.groups):
+            spec = {**self.groups[name], "name": name}
+            if username in (spec.get("members") or []) or group_volume_grants(spec, username):
+                member_of.append(spec)
+        return member_of
+
+    def get_group_definitions(self):
+        return {name: dict(spec) for name, spec in self.groups.items()}
+
+    def save_group(self, group_data):
+        data = dict(group_data)
+        name = (data.pop("name", "") or "").strip()
+        if not name:
+            return False
+        self.groups[name] = data
+        return True
+
+    def delete_group(self, group_name):
+        self.groups.pop(group_name, None)
+        return True
+
     def get_user_allowed_volumes(self, username):
-        return (self.users.get(username) or {}).get("allowedVolumes", [])
+        own = (self.users.get(username) or {}).get("allowedVolumes", [])
+        return merge_allow_lists(own, *(list(group_volume_grants(g, username))
+                                        for g in self.get_user_groups(username)))
+
+    def get_user_volume_modes(self, username):
+        modes = {}
+        for group in self.get_user_groups(username):
+            for name, mode in group_volume_grants(group, username).items():
+                if modes.get(name) != "rw":
+                    modes[name] = mode
+        for name in (self.users.get(username) or {}).get("allowedVolumes", []) or []:
+            modes[name] = "rw"
+        return modes
 
     def set_user_allowed_volumes(self, username, volume_names):
         if username in self.users:
@@ -247,7 +290,9 @@ class FakeConfigManager(ConfigManager):
         return True
 
     def get_user_allowed_gpu_types(self, username):
-        return (self.users.get(username) or {}).get("allowedGpuTypes", [])
+        own = (self.users.get(username) or {}).get("allowedGpuTypes", [])
+        return merge_allow_lists(own, *(g.get("allowedGpuTypes")
+                                        for g in self.get_user_groups(username)))
 
     def set_user_allowed_gpu_types(self, username, gpu_types):
         if username in self.users:
@@ -255,16 +300,55 @@ class FakeConfigManager(ConfigManager):
         return True
 
     def get_user_allowed_zones(self, username):
-        return (self.users.get(username) or {}).get("allowedZones", [])
+        own = (self.users.get(username) or {}).get("allowedZones", [])
+        return merge_allow_lists(own, *(g.get("allowedZones")
+                                        for g in self.get_user_groups(username)))
 
     def set_user_allowed_zones(self, username, zones):
         if username in self.users:
             self.users[username]["allowedZones"] = zones
         return True
 
+    def set_user_channels(self, username, channels):
+        # None removes the field (narrows nothing); [] is a real empty grant,
+        # exactly as KubeConfigManager._save_user_spec treats it.
+        if username in self.users:
+            if channels is None:
+                self.users[username].pop("channels", None)
+            else:
+                self.users[username]["channels"] = list(channels)
+        return True
+
+    def get_user_channels(self, username):
+        own = (self.users.get(username) or {}).get("channels")
+        return merge_channel_grants(own, *(g.get("channels")
+                                           for g in self.get_user_groups(username)))
+
+    def zone_channel_ceiling(self, zone):
+        cfg = self._zones.get(zone) or {}
+        stated = cfg.get("channels")
+        if stated is not None:
+            return set(stated)
+        posture = cfg.get("ssh") or SSH_POSTURE_DIRECT
+        return set(_POSTURE_CHANNELS.get(posture, ())) | {
+            CHANNEL_TERMINAL, CHANNEL_CLIPBOARD, CHANNEL_SCREENSHOTS}
+
+    def effective_channels(self, username, zone):
+        ceiling = self.zone_channel_ceiling(zone)
+        grant = self.get_user_channels(username)
+        return ceiling if grant is None else (ceiling & grant)
+
+    def session_channels(self, username, name):
+        target = self.resolve_ssh_target(username, name)
+        if not target:
+            return set()
+        return self.effective_channels(username, target.get("zone") or DEFAULT_ZONE)
+
     def get_user_overrides(self, username):
-        overrides = (self.users.get(username) or {}).get("overrides", {}) or {}
-        return {g: bool(overrides.get(g, False)) for g in OVERRIDE_GROUPS}
+        own = (self.users.get(username) or {}).get("overrides", {}) or {}
+        merged = merge_override_grants(own, *(g.get("overrides")
+                                              for g in self.get_user_groups(username)))
+        return {g: bool(merged.get(g, False)) for g in OVERRIDE_GROUPS}
 
     def set_user_overrides(self, username, overrides):
         if username in self.users:

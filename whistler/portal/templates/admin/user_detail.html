@@ -49,6 +49,41 @@
     </div>
 
     <div class="ui segment">
+      <h4 class="ui header"><i class="users icon"></i> Groups</h4>
+      {% if user_groups %}
+      <p class="ui grey text">
+        Everything these grant is <strong>added to</strong> what is set below —
+        which is why the boxes on this page show only what this user holds in
+        their own right. Edit a project's grants in
+        <a href="/admin/groups?user={{ current_user }}">Groups</a>.
+      </p>
+      <table class="ui compact celled table">
+        <thead><tr><th>Group</th><th>Adds</th></tr></thead>
+        <tbody>
+          {% for g in user_groups %}
+          <tr>
+            <td><a href="/admin/groups/{{ g.name }}/edit?user={{ current_user }}">{{ g.name }}</a></td>
+            <td>
+              {% for v in g.volumes or [] %}
+                <div class="ui tiny label">{{ v.name }} <span class="detail">{{ v.get("mode", "rw") }}</span></div>
+              {% endfor %}
+              {% for z in g.allowedZones or [] %}<div class="ui tiny blue label">zone: {{ z }}</div>{% endfor %}
+              {% for gt in g.allowedGpuTypes or [] %}<div class="ui tiny purple label">gpu: {{ gt }}</div>{% endfor %}
+              {% for o in (g.overrides or {}) %}<div class="ui tiny olive label">override: {{ o }}</div>{% endfor %}
+              {% if g.channels is defined and g.channels is not none %}
+                <div class="ui tiny orange label">channels: {{ g.channels | join(", ") or "none" }}</div>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="ui grey text">Not a member of any group.</p>
+      {% endif %}
+    </div>
+
+    <div class="ui segment">
       <h4 class="ui header"><i class="database icon"></i> Volume Access</h4>
       <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/volumes?user={{ current_user }}">
         {% for vol in volumes %}
@@ -56,11 +91,14 @@
           <div class="ui checkbox">
             <input type="checkbox" name="volume_names" value="{{ vol.name }}"
                    id="vol-{{ vol.name }}"
-                   {% if vol.name in allowed_volumes %}checked{% endif %}>
+                   {% if vol.name in own_volumes %}checked{% endif %}>
             <label for="vol-{{ vol.name }}">
               {{ vol.name }}
               {% if vol.persistentVolumeClaim %}
                 <span class="ui grey mini label">{{ vol.persistentVolumeClaim.claimName }}</span>
+              {% endif %}
+              {% if vol.name not in own_volumes and vol.name in allowed_volumes %}
+                <span class="ui teal mini label">from group ({{ volume_modes.get(vol.name, "rw") }})</span>
               {% endif %}
             </label>
           </div>
@@ -83,8 +121,13 @@
           <div class="ui checkbox">
             <input type="checkbox" name="gpu_types" value="{{ gt }}"
                    id="gpu-{{ gt }}"
-                   {% if gt in allowed_gpu_types %}checked{% endif %}>
-            <label for="gpu-{{ gt }}">{{ gt }}</label>
+                   {% if gt in own_gpu_types %}checked{% endif %}>
+            <label for="gpu-{{ gt }}">
+              {{ gt }}
+              {% if gt not in own_gpu_types and gt in allowed_gpu_types %}
+                <span class="ui teal mini label">from group</span>
+              {% endif %}
+            </label>
           </div>
         </div>
         {% else %}
@@ -106,8 +149,13 @@
           <div class="ui checkbox">
             <input type="checkbox" name="zone_names" value="{{ z }}"
                    id="zone-{{ z }}"
-                   {% if z in allowed_zones %}checked{% endif %}>
-            <label for="zone-{{ z }}">{{ z }}</label>
+                   {% if z in own_zones %}checked{% endif %}>
+            <label for="zone-{{ z }}">
+              {{ z }}
+              {% if z not in own_zones and z in allowed_zones %}
+                <span class="ui teal mini label">from group</span>
+              {% endif %}
+            </label>
           </div>
         </div>
         {% endfor %}
@@ -126,13 +174,60 @@
           <div class="ui checkbox">
             <input type="checkbox" name="override_groups" value="{{ group }}"
                    id="override-{{ group }}"
-                   {% if user_overrides.get(group) %}checked{% endif %}>
-            <label for="override-{{ group }}">{{ group }}</label>
+                   {% if own_overrides.get(group) %}checked{% endif %}>
+            <label for="override-{{ group }}">
+              {{ group }}
+              {% if not own_overrides.get(group) and user_overrides.get(group) %}
+                <span class="ui teal mini label">from group</span>
+              {% endif %}
+            </label>
           </div>
         </div>
         {% endfor %}
         <div class="ui divider"></div>
         <button type="submit" class="ui teal button"><i class="save icon"></i> Save Overrides</button>
+      </form>
+    </div>
+
+    <div class="ui segment">
+      <h4 class="ui header"><i class="exchange icon"></i> Access Channels</h4>
+      <p class="ui grey text">
+        Which ways this user may move bytes in and out of a session. A grant
+        narrows the zone's ceiling and never widens it; the effective set is
+        this user's grant unioned with their groups', intersected with the
+        zone the session runs in.
+      </p>
+      <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/channels?user={{ current_user }}">
+        <div class="field">
+          <div class="ui checkbox">
+            <input type="checkbox" name="restrict" id="restrict-channels"
+                   {% if own_channels is not none %}checked{% endif %}>
+            <label for="restrict-channels">Restrict this user's channels</label>
+          </div>
+          <div class="ui pointing label">Unchecked: this user narrows nothing on their own. Checked with no boxes: nothing but the desktop stream.</div>
+        </div>
+        {% for c in channels %}
+        <div class="field">
+          <div class="ui checkbox">
+            <input type="checkbox" name="channels" value="{{ c }}" id="chan-{{ c }}"
+                   {% if own_channels and c in own_channels %}checked{% endif %}>
+            <label for="chan-{{ c }}">
+              {{ c }}
+              {% if c not in enforced_channels %}
+                <span class="ui yellow mini label" title="Recorded and displayed, but Whistler cannot close this channel server-side yet">not enforced</span>
+              {% endif %}
+            </label>
+          </div>
+        </div>
+        {% endfor %}
+        <div class="ui divider"></div>
+        <p class="ui grey text">
+          Effective grant (before the zone ceiling):
+          {% if channel_grant is none %}<em>no narrowing</em>
+          {% elif channel_grant %}{% for c in channel_grant %}<div class="ui tiny label">{{ c }}</div>{% endfor %}
+          {% else %}<span class="ui red text">none</span>{% endif %}
+        </p>
+        <button type="submit" class="ui teal button"><i class="save icon"></i> Save Channels</button>
       </form>
     </div>
   </div>

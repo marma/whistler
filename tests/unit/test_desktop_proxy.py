@@ -9,6 +9,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from whistler.config import CHANNELS, CHANNEL_TERMINAL
 from whistler.portal import kubevirt, screenshots
 from whistler.portal.app import build_app
 
@@ -88,9 +89,15 @@ class FakeCM:
     def __init__(self):
         self.sessions = {}
         self.admins = set()
+        # Channels granted per user; the default is everything, which is what
+        # an ungrouped user in an unrestricted zone gets.
+        self.channels = {}
 
     def is_user_admin(self, username):
         return username in self.admins
+
+    def session_channels(self, username, name):
+        return self.channels.get(username, set(CHANNELS))
 
     def get_user_desktop_sessions(self, username):
         return self.sessions.get(username, [])
@@ -419,6 +426,21 @@ async def test_ws_term_vm_uses_ssh_relay(portal, monkeypatch):
     await ws.close()
     assert seen == {"host": "10.42.0.99", "username": "alice",
                     "key": "FAKE-PRIVATE-KEY"}
+
+
+async def test_ws_term_is_refused_without_the_terminal_channel(portal, monkeypatch):
+    """The portal is one of the doors a channel grant has to hold at — a grant
+    missed at one entry point leaks the whole identity half of the border."""
+    portal.cm.channels["alice"] = {c for c in CHANNELS if c != CHANNEL_TERMINAL}
+
+    async def explode(*args, **kwargs):
+        raise AssertionError("the relay must not be reached")
+
+    monkeypatch.setattr(kubevirt, "relay_ssh", explode)
+    resp = await portal.get("/ws-term/v1", params={"user": "alice"})
+    assert resp.status == 403
+    # And the page that opens it refuses too, before nudging the session awake.
+    assert (await portal.get("/term/v1", params={"user": "alice"})).status == 403
 
 
 async def test_ws_term_vm_console_mode(portal, backend, monkeypatch):

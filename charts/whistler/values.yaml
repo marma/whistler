@@ -221,6 +221,52 @@ whistler:
     #   dns:
     #     clusterOnly: true
 
+  # Groups: a project's shared grants. Every field is UNIONED with the
+  # member's own User fields and with any other group they are in — empty
+  # everywhere still means "no restriction", but a group with a list bounds a
+  # member who had none. Membership lives on the group, not on the user, so a
+  # project is edited in one place.
+  #
+  # Groups defined here render as Group CRs (templates/groups.yaml) and are
+  # Helm-owned: an upgrade overwrites portal edits to them. Groups created in
+  # the portal's admin Groups section live only as CRs and survive upgrades.
+  # `kubectl get groups -n <release-ns>` shows the live catalog.
+  #
+  # Each group supports:
+  #   members:          usernames. A name with no User CR grants nothing.
+  #   volumes:          [{name, mode: rw|ro|none, access: {user: rw|ro}}] —
+  #                     what members may mount and how. `access` overrides
+  #                     `mode` per member; `mode: none` grants only to the
+  #                     people named in `access`. Read-only is a real
+  #                     read-only mount for container sessions; for VMs the
+  #                     guest has root, so it is not yet a boundary there
+  #                     (design/security.md).
+  #   allowedZones / allowedGpuTypes: added to each member's own allow-list.
+  #   channels:         which of the zone's permitted access channels members
+  #                     actually get: ssh, relay, terminal, clipboard,
+  #                     screenshots. Narrows the zone's ceiling, never widens
+  #                     it. OMIT to narrow nothing; an empty list grants
+  #                     nothing but the desktop stream. `clipboard` is
+  #                     recorded but NOT enforced yet — the toggle would have
+  #                     to live in the streamer.
+  #   overrides:        per-session override grants, OR'd with the member's.
+  groups: {}
+    # lab-staff:
+    #   description: Internal staff on the imaging project
+    #   members: [alice, bob]
+    #   volumes:
+    #     - name: project-data
+    #       mode: rw
+    #   allowedZones: [restricted]
+    # visiting-researchers:
+    #   description: External, same zone and instance as the staff above
+    #   members: [carol]
+    #   volumes:
+    #     - name: project-data
+    #       mode: ro
+    #   allowedZones: [restricted]
+    #   channels: [screenshots]   # no shell, no relay, no web terminal
+
   node_selectors:
     - name: Node name
       key: kubernetes.io/hostname

@@ -2,7 +2,7 @@
 import logging
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 from abc import ABC, abstractmethod
 from kubernetes import client, config as k8s_config
 from kubernetes.client import CoreV1Api, NetworkingV1Api
@@ -98,6 +98,7 @@ TEMPLATE_PLURAL = "templates"
 SESSION_PLURAL = "sessions"
 USER_PLURAL = "users"
 ZONE_PLURAL = "zones"
+GROUP_PLURAL = "groups"
 
 # Node label a template/override's gpuType is matched against, both as the
 # nodeSelector key that schedules onto a GPU of that type and as the node
@@ -138,6 +139,131 @@ OVERRIDE_GROUPS = (
     "zone",             # network zone (still gated by allowedZones)
 )
 
+# The ways a person can move bytes into and out of a session — the second of
+# the four axes in design/security.md. A Zone carries a *ceiling* (the most any
+# session there may use) and a User/Group `channels` grant narrows it; nothing
+# widens it. The desktop stream itself is not in the set: it is always on, it
+# is the point of a desktop, and pretending it were optional would make the
+# vocabulary lie.
+CHANNEL_SSH = "ssh"                  # end-to-end jump: scp/sftp/rsync/-L/-R
+CHANNEL_RELAY = "relay"              # gateway-mediated PTY (TUI connect)
+CHANNEL_TERMINAL = "terminal"        # portal web terminal
+CHANNEL_CLIPBOARD = "clipboard"      # desktop clipboard, bidirectional
+CHANNEL_SCREENSHOTS = "screenshots"  # portal thumbnails of a desktop
+CHANNELS = (CHANNEL_SSH, CHANNEL_RELAY, CHANNEL_TERMINAL,
+            CHANNEL_CLIPBOARD, CHANNEL_SCREENSHOTS)
+
+# Which channels Whistler can actually close server-side today. `clipboard`
+# is deliberately absent: the toggle would have to be in the streamer, and
+# Selkies 2.x exposes none that has been verified (design/security.md,
+# "Access channels"). A grant that excludes it is recorded and displayed, but
+# it is NOT enforced, and no code here may treat it as if it were.
+ENFORCED_CHANNELS = (CHANNEL_SSH, CHANNEL_RELAY, CHANNEL_TERMINAL,
+                     CHANNEL_SCREENSHOTS)
+
+# How a zone's legacy `ssh` posture reads as a channel set, so zones written
+# before Zone.spec.channels keep their exact meaning.
+_POSTURE_CHANNELS = {
+    SSH_POSTURE_DIRECT: (CHANNEL_SSH, CHANNEL_RELAY),
+    SSH_POSTURE_RELAY: (CHANNEL_RELAY,),
+    SSH_POSTURE_NONE: (),
+}
+
+
+def merge_allow_lists(*sources) -> List[str]:
+    """The effective allow-list from a user's own field and their groups'.
+
+    One rule for volumes, zones and gpuTypes: **empty everywhere means no
+    restriction; otherwise the union bounds you.** So an ungrouped user is
+    unaffected, a user with no list of their own is bounded by their group's,
+    and a user with a list of their own keeps it *and* gains the group's —
+    grants add up, which is what a grant means (design/security.md, "The
+    border has four axes", axis 3).
+
+    Order is the caller's: the user's own entries first, then each group's, so
+    the portal can show where a name came from without a second lookup.
+    """
+    merged = []
+    for source in sources:
+        for item in source or []:
+            if item not in merged:
+                merged.append(item)
+    return merged
+
+
+def merge_override_grants(*sources) -> Dict[str, bool]:
+    """Per-session override grants (User/Group `overrides`), OR'd across
+    sources. Only granted keys are returned — an explicit ``false`` in one
+    source does not veto a ``true`` in another, since these are grants, not
+    denials."""
+    merged = {}
+    for source in sources:
+        for key, granted in (source or {}).items():
+            if granted:
+                merged[key] = True
+    return merged
+
+
+def merge_channel_grants(*sources) -> Optional[Set[str]]:
+    """Union of the channel grants that are *present*, or None when no source
+    states one.
+
+    Unlike the allow-lists, absent and empty differ here: no `channels` field
+    at all means "this source does not narrow the zone's ceiling", while an
+    explicit empty list is a real grant of nothing (the desktop stream alone).
+    Collapsing the two would make an empty list unwritable."""
+    stated = [s for s in sources if s is not None]
+    if not stated:
+        return None
+    merged = set()
+    for source in stated:
+        merged.update(source)
+    return merged
+
+
+def target_channels(target: Dict[str, Any]) -> Set[str]:
+    """The channels a ``resolve_ssh_target`` result grants.
+
+    Falls back to the zone's ssh posture when `channels` is absent, so the
+    gateway's checks can never be skipped by a resolver that doesn't set the
+    field — a missing grant must read as the posture, not as "everything"."""
+    channels = target.get("channels")
+    if channels is not None:
+        return set(channels)
+    posture = target.get("sshPosture", SSH_POSTURE_DIRECT)
+    return set(_POSTURE_CHANNELS.get(posture, ()))
+
+
+def group_volume_grants(group_spec: Dict[str, Any], username: str) -> Dict[str, str]:
+    """What one group grants ``username`` on each volume: ``{name: "rw"|"ro"}``.
+
+    A member's mode is the per-member entry in ``access`` when present, else
+    the volume's ``mode`` (default ``rw``, and ``none`` for a volume only the
+    named exceptions reach). Someone named in ``access`` but not in
+    ``members`` still gets that volume — the CRD says so, and it is the
+    natural way to hand one outsider a read-only look at a project — while
+    someone in neither gets nothing from this entry."""
+    members = group_spec.get("members") or []
+    grants = {}
+    for entry in group_spec.get("volumes") or []:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not name:
+            continue
+        access = entry.get("access") or {}
+        if username in access:
+            mode = access[username]
+        elif username in members:
+            mode = entry.get("mode") or "rw"
+        else:
+            continue
+        mode = str(mode).strip().lower()
+        if mode == "none":
+            continue
+        grants[name] = "ro" if mode == "ro" else "rw"
+    return grants
+
 
 def _dig(obj, path):
     """Value at a nested dict path, or None if any level is missing."""
@@ -172,6 +298,27 @@ def _merge_patch_is_noop(current, patch) -> bool:
         elif cur != value:
             return False
     return True
+
+
+class ConfigWriteError(Exception):
+    """A cluster write failed, carrying the API server's own reason.
+
+    Raised instead of returning False where the caller has a user in front of
+    it: "Failed to create group." sends someone to the pod logs to find a line
+    the server already knew. The commonest cause is worth naming outright —
+    **`helm upgrade` never updates CRDs** (Helm only installs a chart's
+    `crds/` on first install), so a new kind 404s until someone runs
+    `kubectl apply -f charts/whistler/crds/crds.yaml`."""
+
+
+def crd_missing_hint(plural: str, error: ApiException) -> str:
+    """A message for an ApiException from a custom-resource call, naming the
+    missing-CRD case when the status says that is what happened."""
+    if error.status == 404:
+        return (f"the {plural}.whistler.martinmalmsten.net CRD is not "
+                f"installed in this cluster. `helm upgrade` does not update "
+                f"CRDs — run `kubectl apply -f charts/whistler/crds/crds.yaml`")
+    return f"{error.status} {error.reason}"
 
 
 class PolicyError(Exception):
@@ -369,7 +516,35 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
+    def get_user_groups(self, username: str) -> List[Dict[str, Any]]:
+        """The Groups this user belongs to (design/security.md, "Group").
+        Every get_user_* grant below already folds these in — this is for
+        showing *why*, not for a caller to resolve grants itself."""
+        pass
+
+    @abstractmethod
+    def get_group_definitions(self) -> Dict[str, Dict[str, Any]]:
+        """Full group catalog (name -> spec) for the admin Groups editor."""
+        pass
+
+    @abstractmethod
+    def save_group(self, group_data: Dict[str, Any]) -> bool:
+        pass
+
+    @abstractmethod
+    def delete_group(self, group_name: str) -> bool:
+        pass
+
+    @abstractmethod
     def get_user_allowed_volumes(self, username: str) -> List[str]:
+        """Volumes this user may mount: their own list unioned with every
+        group's. Empty means unrestricted."""
+        pass
+
+    @abstractmethod
+    def get_user_volume_modes(self, username: str) -> Dict[str, str]:
+        """``{volume: "rw"|"ro"}`` for group-granted volumes; anything absent
+        is read-write."""
         pass
 
     @abstractmethod
@@ -401,6 +576,30 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
+    def set_user_channels(self, username: str, channels: Optional[List[str]]) -> bool:
+        """Set this user's own access-channel grant (CHANNELS)."""
+        pass
+
+    @abstractmethod
+    def get_user_channels(self, username: str) -> Optional[Set[str]]:
+        """This user's channel grant — their own unioned with their groups' —
+        or None when nobody states one. Zone-independent; the ceiling is
+        applied by effective_channels."""
+        pass
+
+    @abstractmethod
+    def effective_channels(self, username: str, zone: str) -> Set[str]:
+        """Channels this user may use in this zone: the zone's ceiling
+        narrowed by their own and their groups' grants."""
+        pass
+
+    @abstractmethod
+    def session_channels(self, username: str, name: str) -> Set[str]:
+        """effective_channels for one of this user's sessions, resolved
+        through that session's zone."""
+        pass
+
+    @abstractmethod
     def stop_instance(self, username: str, instance_name: str) -> bool:
         """Delete the pod but keep the Session CR (stops compute, preserves state)."""
         pass
@@ -411,6 +610,14 @@ class ConfigManager(ABC):
         pass
 
 class KubeConfigManager(ConfigManager):
+    # Class-level so an instance built with __new__ (the unit tests do this to
+    # exercise the pure builders without a cluster — see _load_users) still has
+    # a catalog to read. Never mutated in place: _load_groups rebinds it.
+    groups: Dict[str, Dict[str, Any]] = {}
+    # One warning per process for a missing Group CRD, not one per policy
+    # evaluation — the catalog is re-read on every grant lookup.
+    _warned_no_group_crd: bool = False
+
     def __init__(self, kubeconfig: str = None):
         try:
             if kubeconfig:
@@ -437,6 +644,13 @@ class KubeConfigManager(ConfigManager):
 
         self.users = {}
         self._load_users()
+
+        # Projects: named sets of users sharing grants (design/security.md,
+        # "Group"). Loaded like users — refreshed on read, kept stale on API
+        # failure rather than wiped, since an empty catalog would silently
+        # widen every member back to their own (usually empty) allow-lists.
+        self.groups = {}
+        self._load_groups()
 
         # Initialize containers
         self.selectors = {} 
@@ -1647,10 +1861,19 @@ class KubeConfigManager(ConfigManager):
             return {}
 
     def _build_volume_wiring(self, *, pvc_name, personal_mount_path,
-                             requested_volumes, available_volumes):
+                             requested_volumes, available_volumes,
+                             volume_modes=None):
         """Build (pod_volumes, volume_mounts) for the home PVC plus any requested
         named volumes. Pure; the single source shared by every pod backend
-        (ssh / desktop, container / kata)."""
+        (ssh / desktop, container / kata).
+
+        ``volume_modes`` ({name: "rw"|"ro"}) carries the per-member access a
+        Group granted (KubeConfigManager.get_user_volume_modes); a volume not
+        named there is read-write, which is what every volume was before
+        groups existed. A read-only grant becomes ``readOnly`` on the mount —
+        a real control for a container that cannot remount it, and one the
+        NFS export set will have to take over for VMs, where the guest has
+        root (design/security.md)."""
         pod_volumes = [{
             "name": "data",
             "persistentVolumeClaim": {"claimName": pvc_name},
@@ -1678,6 +1901,8 @@ class KubeConfigManager(ConfigManager):
                 mount_def = {"name": vol_name, "mountPath": mount_path}
                 if sub_path:
                     mount_def["subPath"] = sub_path
+                if (volume_modes or {}).get(vol_name) == "ro":
+                    mount_def["readOnly"] = True
                 volume_mounts.append(mount_def)
 
         return pod_volumes, volume_mounts
@@ -1696,7 +1921,7 @@ class KubeConfigManager(ConfigManager):
 
     def _build_pod_spec(self, *, full_name, hostname, username, uid, mode, runtime,
                         template_spec, pvc_name, available_volumes, user_details,
-                        preemptible, display_port=None):
+                        preemptible, display_port=None, volume_modes=None):
         """Build the Pod manifest for a session from already-resolved inputs.
 
         Pure function of its arguments (no Kubernetes API calls) so it is
@@ -1730,6 +1955,7 @@ class KubeConfigManager(ConfigManager):
             personal_mount_path=personal_mount_path,
             requested_volumes=requested_volumes,
             available_volumes=available_volumes,
+            volume_modes=volume_modes,
         )
 
         container = {
@@ -2337,6 +2563,10 @@ class KubeConfigManager(ConfigManager):
             user_details=user_details if user_details is not None else self.get_user(username),
             preemptible=preemptible,
             display_port=display_port if mode == 'desktop' else None,
+            # Read-only where a Group granted this member only `ro`; resolved
+            # here (operator-side, at build time) rather than trusted from the
+            # template or the guest.
+            volume_modes=self.get_user_volume_modes(username),
         )
         logger.debug(f"Creating Pod:\n{yaml.safe_dump(pod_body)}")
         core_api = client.CoreV1Api()
@@ -3272,6 +3502,70 @@ class KubeConfigManager(ConfigManager):
             return SSH_POSTURE_NONE
         return posture
 
+    # ------------------------------------------------------------------ #
+    # Access channels (design/security.md, "Access channels")             #
+    # ------------------------------------------------------------------ #
+
+    def zone_channel_ceiling(self, zone: str) -> Set[str]:
+        """The most any session in this zone may use.
+
+        `Zone.spec.channels` when set — an unknown name is dropped with a
+        warning, the same fail-closed reading as an unknown ssh posture, and
+        an explicitly empty list is a ceiling of nothing. When the field is
+        absent the ceiling is derived from the legacy `ssh` posture so a zone
+        written before channels existed keeps its exact meaning: `direct`
+        ceilings nothing, `relay` closes the jump, `none` closes both, and
+        none of the three ever governed the other channels."""
+        cfg = self.zones.get(zone) or {}
+        stated = cfg.get("channels")
+        if stated is not None:
+            ceiling = set()
+            for channel in stated:
+                if channel in CHANNELS:
+                    ceiling.add(channel)
+                else:
+                    logger.warning(
+                        f"Zone {zone} lists unknown channel {channel!r}; ignoring")
+            return ceiling
+        posture = self.zone_ssh_posture(zone)
+        return set(_POSTURE_CHANNELS[posture]) | {
+            CHANNEL_TERMINAL, CHANNEL_CLIPBOARD, CHANNEL_SCREENSHOTS}
+
+    def get_user_channels(self, username: str) -> Optional[Set[str]]:
+        """This user's channel grant — their own unioned with every group's —
+        or None when nobody states one (no narrowing of the zone ceiling).
+
+        This is the third axis: the same zone, the same instance, different
+        doors for the internal helper and the external researcher."""
+        self._load_users()
+        own = self.users.get(username, {}).get("channels")
+        return merge_channel_grants(own, *(g.get("channels")
+                                           for g in self.get_user_groups(username)))
+
+    def effective_channels(self, username: str, zone: str) -> Set[str]:
+        """What ``username`` may actually use in ``zone``: the ceiling narrowed
+        by the grant. The grant never widens — a channel absent from the
+        ceiling stays absent however it was granted.
+
+        Reads the zone catalog as it stands rather than reloading it: the one
+        path that matters for freshness — session_channels, and the gateway's
+        resolve_ssh_target — already reloads before it gets here, and a second
+        list call per connection buys nothing."""
+        ceiling = self.zone_channel_ceiling(zone)
+        grant = self.get_user_channels(username)
+        return ceiling if grant is None else (ceiling & grant)
+
+    def session_channels(self, username: str, name: str) -> Set[str]:
+        """The channel set for one of this user's sessions, resolved through
+        the session's own zone. The portal's entry point — it holds a user and
+        a session name, not a zone. An unresolvable session gets the empty
+        set: refusing a channel to a session that does not exist is free, and
+        the caller is about to 404 anyway."""
+        target = self.resolve_ssh_target(username, name)
+        if not target:
+            return set()
+        return self.effective_channels(username, target.get("zone") or DEFAULT_ZONE)
+
     def resolve_ssh_target(self, username: str, name: str) -> Optional[Dict[str, Any]]:
         """Where an SSH jump for ``<name>`` should land, or None when this user
         has no session by that name.
@@ -3318,6 +3612,12 @@ class KubeConfigManager(ConfigManager):
             "port": SESSION_SSH_PORT,
             "zone": zone,
             "sshPosture": self.zone_ssh_posture(zone),
+            # The zone's ceiling narrowed by this user's (and their groups')
+            # channel grant — the set the gateway actually decides on. Kept
+            # alongside sshPosture rather than replacing it because the two
+            # answer different questions: the posture is the zone's stance,
+            # this is what *this person* gets there.
+            "channels": sorted(self.effective_channels(username, zone)),
             "phase": status.get("phase"),
             # Created on demand by the gateway and reapable once nothing is
             # connected (design/proxyjump.md).
@@ -3384,13 +3684,22 @@ class KubeConfigManager(ConfigManager):
         """Get-merge-replace-or-create a single User CR, mirroring
         save_system_template: only the keys in spec_updates are touched, so
         concurrent partial updates (e.g. set_user_overrides) don't clobber the
-        rest of the spec."""
+        rest of the spec.
+
+        A value of ``None`` **removes** its key rather than writing a null.
+        That is the only way to say "this user states nothing here", which for
+        `channels` is a different thing from an empty list (which grants
+        nothing) — see merge_channel_grants."""
+        writes = {k: v for k, v in spec_updates.items() if v is not None}
+        removals = [k for k, v in spec_updates.items() if v is None]
         try:
             try:
                 existing = self.api.get_namespaced_custom_object(
                     self.group, self.version, self.namespace, USER_PLURAL, username
                 )
-                merged = {**(existing.get("spec") or {}), **spec_updates}
+                merged = {**(existing.get("spec") or {}), **writes}
+                for key in removals:
+                    merged.pop(key, None)
                 body = {
                     "apiVersion": f"{self.group}/{self.version}",
                     "kind": "User",
@@ -3407,7 +3716,7 @@ class KubeConfigManager(ConfigManager):
                         "apiVersion": f"{self.group}/{self.version}",
                         "kind": "User",
                         "metadata": {"name": username, "namespace": self.namespace},
-                        "spec": spec_updates,
+                        "spec": writes,
                     }
                     self.api.create_namespaced_custom_object(
                         self.group, self.version, self.namespace, USER_PLURAL, body
@@ -3482,39 +3791,203 @@ class KubeConfigManager(ConfigManager):
             except ApiException as ce:
                 logger.error(f"Failed to create bootstrap admin '{name}': {ce}")
 
+    # ------------------------------------------------------------------ #
+    # Groups: a project's shared grants (design/security.md, "Group")      #
+    #                                                                      #
+    # Every get_user_* accessor below answers with the *effective* grant —  #
+    # the user's own field unioned with each group they belong to — so      #
+    # _apply_policy, _apply_overrides and the portal all see one resolved   #
+    # answer and no caller has to remember that groups exist.               #
+    # ------------------------------------------------------------------ #
+
+    def _load_groups(self):
+        """Load the Group catalog. Like _load_users: on API failure keep the
+        previous catalog rather than wiping it, since an empty catalog reads
+        as "nobody is in a project" and would widen every member back to
+        their own (usually empty, i.e. unrestricted) allow-lists.
+
+        A cluster without the CRD simply has no groups — the pre-Group
+        behaviour, and therefore silent — but it is silent in the *permissive*
+        direction, so it warns once rather than never. This is the state a
+        `helm upgrade` leaves behind, because Helm does not update CRDs."""
+        try:
+            resp = self.api.list_namespaced_custom_object(
+                self.group, self.version, self.namespace, GROUP_PLURAL
+            )
+        except (ApiException, AttributeError) as e:
+            if getattr(e, "status", None) == 404 and not self._warned_no_group_crd:
+                type(self)._warned_no_group_crd = True
+                logger.warning(
+                    "No Group CRD in this cluster, so no group grants apply "
+                    "and every user falls back to their own allow-lists. "
+                    "`helm upgrade` does not update CRDs — run "
+                    "`kubectl apply -f charts/whistler/crds/crds.yaml`")
+            else:
+                logger.debug(f"Failed to load groups ({e}); keeping previous catalog")
+            return
+        type(self)._warned_no_group_crd = False
+        self.groups = {
+            item["metadata"]["name"]: {**(item.get("spec") or {}),
+                                       "name": item["metadata"]["name"]}
+            for item in resp.get("items", [])
+        }
+
+    def get_user_groups(self, username: str) -> List[Dict[str, Any]]:
+        """The groups this user belongs to, by name. Membership is either
+        plain ``members`` or a per-member entry in a volume's ``access`` map —
+        both are ways of being granted something by the project."""
+        self._load_groups()
+        member_of = []
+        for name in sorted(self.groups):
+            # `name` re-stamped rather than trusted from the spec: callers
+            # (the portal's provenance table) key on it, and a catalog set
+            # directly — as the unit tests do — hasn't been through the loader.
+            spec = {**self.groups[name], "name": name}
+            if username in (spec.get("members") or []):
+                member_of.append(spec)
+            elif group_volume_grants(spec, username):
+                member_of.append(spec)
+        return member_of
+
     def get_user_allowed_volumes(self, username: str) -> List[str]:
         self._load_users()
-        user = self.users.get(username, {})
-        return user.get("allowedVolumes", [])
+        own = self.users.get(username, {}).get("allowedVolumes", [])
+        return merge_allow_lists(own, *(
+            list(group_volume_grants(g, username))
+            for g in self.get_user_groups(username)))
+
+    def get_user_volume_modes(self, username: str) -> Dict[str, str]:
+        """``{volume: "rw"|"ro"}`` for every volume a *group* grants this user.
+
+        Only group-granted volumes appear: a volume the user reaches through
+        their own allowedVolumes (or through an unrestricted empty list) is
+        read-write, which is what it has always been. Across groups the most
+        permissive grant wins — a user granted ``rw`` in one project does not
+        lose it by also being a read-only guest in another."""
+        modes: Dict[str, str] = {}
+        for group in self.get_user_groups(username):
+            for name, mode in group_volume_grants(group, username).items():
+                if modes.get(name) != "rw":
+                    modes[name] = mode
+        # A volume the user holds outright is theirs read-write, whatever a
+        # group says: the group grant adds access, it cannot take it away.
+        self._load_users()
+        for name in self.users.get(username, {}).get("allowedVolumes", []) or []:
+            modes[name] = "rw"
+        return modes
 
     def set_user_allowed_volumes(self, username: str, volume_names: List[str]) -> bool:
         return self._save_user_spec(username, {"allowedVolumes": volume_names})
 
     def get_user_allowed_gpu_types(self, username: str) -> List[str]:
         self._load_users()
-        user = self.users.get(username, {})
-        return user.get("allowedGpuTypes", [])
+        own = self.users.get(username, {}).get("allowedGpuTypes", [])
+        return merge_allow_lists(own, *(g.get("allowedGpuTypes")
+                                        for g in self.get_user_groups(username)))
 
     def set_user_allowed_gpu_types(self, username: str, gpu_types: List[str]) -> bool:
         return self._save_user_spec(username, {"allowedGpuTypes": gpu_types})
 
     def get_user_allowed_zones(self, username: str) -> List[str]:
         self._load_users()
-        user = self.users.get(username, {})
-        return user.get("allowedZones", [])
+        own = self.users.get(username, {}).get("allowedZones", [])
+        return merge_allow_lists(own, *(g.get("allowedZones")
+                                        for g in self.get_user_groups(username)))
 
     def set_user_allowed_zones(self, username: str, zones: List[str]) -> bool:
         return self._save_user_spec(username, {"allowedZones": zones})
 
     def get_user_overrides(self, username: str) -> Dict[str, bool]:
         self._load_users()
-        user = self.users.get(username, {})
-        overrides = user.get("overrides", {}) or {}
-        return {g: bool(overrides.get(g, False)) for g in OVERRIDE_GROUPS}
+        own = self.users.get(username, {}).get("overrides", {}) or {}
+        merged = merge_override_grants(own, *(g.get("overrides")
+                                              for g in self.get_user_groups(username)))
+        return {g: bool(merged.get(g, False)) for g in OVERRIDE_GROUPS}
 
     def set_user_overrides(self, username: str, overrides: Dict[str, bool]) -> bool:
         normalized = {g: bool(overrides.get(g, False)) for g in OVERRIDE_GROUPS}
         return self._save_user_spec(username, {"overrides": normalized})
+
+    def set_user_channels(self, username: str, channels: Optional[List[str]]) -> bool:
+        """Set this user's own channel grant, or clear it with ``None``.
+
+        Clearing *removes* the field (this user narrows nothing); passing an
+        empty list writes one (this user is granted nothing but the desktop
+        stream). The two are different answers and both have to be
+        expressible — see merge_channel_grants."""
+        return self._save_user_spec(
+            username, {"channels": None if channels is None else list(channels)})
+
+    # -- Groups: admin CRUD ------------------------------------------------ #
+
+    def get_group_definitions(self) -> Dict[str, Dict[str, Any]]:
+        """Full group catalog (name -> spec), freshly loaded — drives the
+        admin Groups editor."""
+        self._load_groups()
+        return {name: dict(spec) for name, spec in self.groups.items()}
+
+    def save_group(self, group_data: Dict[str, Any]) -> bool:
+        """Create or update a Group CR from the admin editor. Unlike
+        save_zone this needs no propagation step: a group grants nothing that
+        is materialized in the cluster — every field is read at policy time,
+        so an edit applies to the next session start (and, for channels, to
+        the next connection attempt).
+
+        Returns False for a request that is simply malformed (no name), and
+        raises ConfigWriteError when the cluster refuses the write — the
+        caller has an admin in front of it who deserves the reason."""
+        data = dict(group_data)
+        name = (data.pop("name", "") or "").strip()
+        if not name:
+            return False
+        spec = {k: v for k, v in data.items() if v not in (None, "")}
+        try:
+            try:
+                existing = self.api.get_namespaced_custom_object(
+                    self.group, self.version, self.namespace, GROUP_PLURAL, name
+                )
+                body = {
+                    "apiVersion": f"{self.group}/{self.version}",
+                    "kind": "Group",
+                    "metadata": {"name": name, "namespace": self.namespace,
+                                 "resourceVersion": existing["metadata"]["resourceVersion"]},
+                    "spec": spec,
+                }
+                self.api.replace_namespaced_custom_object(
+                    self.group, self.version, self.namespace, GROUP_PLURAL, name, body
+                )
+            except ApiException as e:
+                if e.status != 404:
+                    raise
+                body = {
+                    "apiVersion": f"{self.group}/{self.version}",
+                    "kind": "Group",
+                    "metadata": {"name": name, "namespace": self.namespace},
+                    "spec": spec,
+                }
+                self.api.create_namespaced_custom_object(
+                    self.group, self.version, self.namespace, GROUP_PLURAL, body
+                )
+        except ApiException as e:
+            logger.error(f"Failed to save group {name}: {e}")
+            raise ConfigWriteError(
+                f"could not save group {name!r}: "
+                f"{crd_missing_hint(GROUP_PLURAL, e)}") from e
+        self._load_groups()
+        return True
+
+    def delete_group(self, group_name: str) -> bool:
+        try:
+            self.api.delete_namespaced_custom_object(
+                self.group, self.version, self.namespace, GROUP_PLURAL, group_name
+            )
+        except ApiException as e:
+            logger.error(f"Failed to delete group {group_name}: {e}")
+            raise ConfigWriteError(
+                f"could not delete group {group_name!r}: "
+                f"{crd_missing_hint(GROUP_PLURAL, e)}") from e
+        self._load_groups()
+        return True
 
     def get_all_templates(self) -> List[Dict[str, Any]]:
         """List all Templates (ssh + desktop) across the system namespace."""

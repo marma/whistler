@@ -11,6 +11,7 @@ import zlib
 
 import pytest
 
+from whistler.config import CHANNELS, CHANNEL_SCREENSHOTS
 from whistler.portal import screenshots
 from whistler.portal.screenshots import ScreenshotError, ScreenshotStore
 
@@ -285,11 +286,17 @@ def test_store_prunes_vanished_sessions():
 class FakeCM:
     """Enough ConfigManager for the capture loop."""
 
-    def __init__(self, sessions):
+    def __init__(self, sessions, channels=None):
         self.sessions = sessions
+        # {(user, session): {channels}} — anything unlisted gets the full set,
+        # which is what an ungrouped user in an unrestricted zone has.
+        self.channels = channels or {}
 
     def list_all_desktop_sessions(self):
         return self.sessions
+
+    def session_channels(self, user, name):
+        return self.channels.get((user, name), set(CHANNELS))
 
     def get_vmi_address(self, user, name):
         return "10.42.0.9"
@@ -345,6 +352,18 @@ async def test_only_ready_sessions_are_grabbed(grabs):
                  _vm("stopped", phase="Stopped")])
     assert await screenshots.capture_all(cm, store, display=":0", max_width=64) == 1
     assert grabs["pod"] == [("alice-up", "whistler-alice", ":0")]
+
+
+async def test_a_session_without_the_screenshots_channel_is_never_grabbed(grabs):
+    """Gated at capture, not at serve: the point is that those pixels never
+    enter portal memory at all (design/security.md, "Access channels")."""
+    store = ScreenshotStore()
+    cm = FakeCM([_pod("watched"), _pod("private")],
+                channels={("alice", "private"):
+                          {c for c in CHANNELS if c != CHANNEL_SCREENSHOTS}})
+    assert await screenshots.capture_all(cm, store, display=":0", max_width=64) == 1
+    assert grabs["pod"] == [("alice-watched", "whistler-alice", ":0")]
+    assert store.get("alice", "private") is None
 
 
 async def test_a_failing_session_does_not_sink_the_pass(grabs, monkeypatch):

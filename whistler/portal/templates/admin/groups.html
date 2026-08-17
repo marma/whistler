@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Groups — Admin — Whistler{% endblock %}
+{% block content %}
+
+<div class="ui stackable grid">
+  <div class="twelve wide column">
+    <h2 class="ui header"><i class="users icon"></i> Groups</h2>
+  </div>
+  <div class="four wide column" style="text-align:right;padding-top:1.2rem">
+    <a href="/admin/groups/new?user={{ current_user }}" class="ui primary button">
+      <i class="plus icon"></i> New Group
+    </a>
+  </div>
+</div>
+
+<p class="ui grey text">
+  A project's shared grants. Everything a group grants is <strong>added to</strong>
+  what its members already have: empty everywhere still means no restriction, but
+  a group with a list bounds a member who had none. Volume, zone and GPU grants
+  apply at a session's next start; channel grants apply at the next connection.
+</p>
+
+{% if groups %}
+<table class="ui selectable celled table">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Description</th>
+      <th>Members</th>
+      <th>Volumes</th>
+      <th>Zones</th>
+      <th>Channels</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for g in groups %}
+    <tr>
+      <td><strong>{{ g.name }}</strong></td>
+      <td>{{ g.description or "—" }}</td>
+      <td>
+        {% if g.members %}
+          <div class="ui tiny label">{{ g.members | length }}</div>
+          <span class="ui grey text">{{ g.members | join(", ") }}</span>
+        {% else %}<span class="ui grey text">none</span>{% endif %}
+      </td>
+      <td>
+        {% for v in g.volumes or [] %}
+          <div class="ui tiny {{ 'blue' if v.get('mode', 'rw') == 'rw' else 'grey' }} label">
+            {{ v.name }} <span class="detail">{{ v.get("mode", "rw") }}</span>
+          </div>
+        {% else %}<span class="ui grey text">—</span>{% endfor %}
+      </td>
+      <td>
+        {% if g.allowedZones %}<code>{{ g.allowedZones | join(", ") }}</code>
+        {% else %}<span class="ui grey text">—</span>{% endif %}
+      </td>
+      <td>
+        {% if g.channels is defined and g.channels is not none %}
+          {% if g.channels %}
+            {% for c in g.channels %}<div class="ui tiny label">{{ c }}</div>{% endfor %}
+          {% else %}<span class="ui red text">none granted</span>{% endif %}
+        {% else %}<span class="ui grey text">no narrowing</span>{% endif %}
+      </td>
+      <td class="collapsing">
+        <a href="/admin/groups/{{ g.name }}/edit?user={{ current_user }}" class="ui tiny button">
+          <i class="edit icon"></i> Edit
+        </a>
+        <form method="post" action="/admin/groups/{{ g.name }}/delete?user={{ current_user }}"
+              style="display:inline"
+              onsubmit="return confirm('Delete group {{ g.name }}? Members lose every grant it gave them at their next session start.')">
+          <button class="ui red tiny button"><i class="trash icon"></i> Delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="ui grey text">No groups defined.</p>
+{% endif %}
+
+{% endblock %}

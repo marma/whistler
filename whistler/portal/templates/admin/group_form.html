@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% block title %}{% if group %}Edit Group{% else %}New Group{% endif %} — Admin — Whistler{% endblock %}
+{% block content %}
+
+<h2 class="ui header">
+  <i class="users icon"></i>
+  <div class="content">{% if group %}Edit Group: {{ group.name }}{% else %}New Group{% endif %}</div>
+</h2>
+
+<div class="ui segment" style="max-width:720px">
+  <form class="ui form" method="post"
+        action="{% if group %}/admin/groups/{{ group.name }}{% else %}/admin/groups{% endif %}?user={{ current_user }}">
+
+    {% if not group %}
+    <div class="field">
+      <label>Group Name</label>
+      <input name="name" type="text" required placeholder="lab-staff"
+             pattern="[a-z0-9]([\-a-z0-9]*[a-z0-9])?" maxlength="63">
+      <div class="ui pointing label">Lowercase alphanumerics and "-" (a Kubernetes object name). Cannot be renamed later.</div>
+    </div>
+    {% endif %}
+
+    <div class="field">
+      <label>Description <span class="ui grey tiny label">optional</span></label>
+      <input name="description" type="text" placeholder="Internal staff on the imaging project"
+             value="{{ group.description if group else '' }}">
+    </div>
+
+    <div class="field">
+      <label>Members <span class="ui grey tiny label">one username per line</span></label>
+      <textarea name="members" rows="5" placeholder="alice&#10;bob">{{ (group.members or []) | join("\n") if group else "" }}</textarea>
+      <div class="ui pointing label">
+        A name that matches no user grants nothing, so a group can be written before
+        its people exist.
+        {% if all_users %}Known users: {{ all_users | map(attribute="name") | join(", ") }}.{% endif %}
+      </div>
+    </div>
+
+    <div class="ui divider"></div>
+    <h4 class="ui header">Volumes</h4>
+    <p class="ui grey text">
+      What members may mount, and how. <strong>Read-only</strong> is enforced as a
+      read-only mount for container sessions; for VMs the guest has root, so it will
+      only become a real boundary when the per-member NFS export set lands
+      (design/security.md).
+    </p>
+
+    {% for vol in volumes %}
+    {% set grant = volume_grants.get(vol.name) %}
+    <div class="two fields">
+      <div class="field">
+        <label>{{ vol.name }}</label>
+        <select name="vol_mode_{{ vol.name }}" class="ui dropdown">
+          <option value="none" {% if not grant or grant.get("mode", "rw") == "none" %}selected{% endif %}>not granted</option>
+          <option value="rw" {% if grant and grant.get("mode", "rw") == "rw" %}selected{% endif %}>read-write</option>
+          <option value="ro" {% if grant and grant.get("mode") == "ro" %}selected{% endif %}>read-only</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Per-member exceptions <span class="ui grey tiny label">optional</span></label>
+        <input name="vol_access_{{ vol.name }}" type="text" placeholder="carol:ro, dan:rw"
+               value="{{ grant.accessText if grant else '' }}">
+      </div>
+    </div>
+    {% else %}
+    <p class="ui grey text">No volumes defined. <a href="/admin/volumes/new?user={{ current_user }}">Create one</a>.</p>
+    {% endfor %}
+
+    <div class="ui divider"></div>
+    <h4 class="ui header">Zones</h4>
+    {% for z in zones %}
+    <div class="field">
+      <div class="ui checkbox">
+        <input type="checkbox" name="zone_names" value="{{ z }}" id="gzone-{{ z }}"
+               {% if group and z in (group.allowedZones or []) %}checked{% endif %}>
+        <label for="gzone-{{ z }}">{{ z }}</label>
+      </div>
+    </div>
+    {% endfor %}
+    <div class="ui pointing label">Checked zones are added to each member's own list. Leaving all unchecked adds nothing (and restricts nothing).</div>
+
+    <div class="ui divider"></div>
+    <h4 class="ui header">GPU types</h4>
+    {% for gt in gpu_types %}
+    <div class="field">
+      <div class="ui checkbox">
+        <input type="checkbox" name="gpu_types" value="{{ gt }}" id="ggpu-{{ loop.index }}"
+               {% if group and gt in (group.allowedGpuTypes or []) %}checked{% endif %}>
+        <label for="ggpu-{{ loop.index }}">{{ gt }}</label>
+      </div>
+    </div>
+    {% else %}
+    <p class="ui grey text">No GPU types defined in whistler.gpuTypes.</p>
+    {% endfor %}
+
+    <div class="ui divider"></div>
+    <h4 class="ui header">Access channels</h4>
+    <p class="ui grey text">
+      Which ways members may move bytes in and out of a session. This narrows the
+      zone's ceiling and never widens it — two groups in the same zone, on the same
+      instance, can get different doors.
+    </p>
+    <div class="field">
+      <div class="ui checkbox">
+        <input type="checkbox" name="restrict_channels" id="restrict-channels"
+               {% if group and group.channels is defined and group.channels is not none %}checked{% endif %}>
+        <label for="restrict-channels">Restrict channels for members of this group</label>
+      </div>
+      <div class="ui pointing label">Unchecked: this group narrows nothing. Checked with no boxes below: members get nothing but the desktop stream.</div>
+    </div>
+    {% for c in channels %}
+    <div class="field">
+      <div class="ui checkbox">
+        <input type="checkbox" name="channels" value="{{ c }}" id="gchan-{{ c }}"
+               {% if group and group.channels and c in group.channels %}checked{% endif %}>
+        <label for="gchan-{{ c }}">
+          {{ c }}
+          {% if c not in enforced_channels %}
+          <span class="ui yellow mini label" title="Recorded and displayed, but Whistler cannot close this channel server-side yet">not enforced</span>
+          {% endif %}
+        </label>
+      </div>
+    </div>
+    {% endfor %}
+
+    <div class="ui divider"></div>
+    <h4 class="ui header">Session overrides</h4>
+    <p class="ui grey text">Granted to members on top of their own. gpuType/volumes/zone stay limited to the allow-lists above.</p>
+    {% for g in override_groups %}
+    <div class="field">
+      <div class="ui checkbox">
+        <input type="checkbox" name="override_groups" value="{{ g }}" id="govr-{{ g }}"
+               {% if group and (group.overrides or {}).get(g) %}checked{% endif %}>
+        <label for="govr-{{ g }}">{{ g }}</label>
+      </div>
+    </div>
+    {% endfor %}
+
+    <div class="ui divider"></div>
+    <button type="submit" class="ui primary button">
+      <i class="save icon"></i> {% if group %}Save Group{% else %}Create Group{% endif %}
+    </button>
+    <a href="/admin/groups?user={{ current_user }}" class="ui button">Cancel</a>
+  </form>
+</div>
+
+<script>
+  $(document).ready(function() {
+    $('.ui.checkbox').checkbox();
+  });
+</script>
+{% endblock %}

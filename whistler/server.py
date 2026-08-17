@@ -20,9 +20,9 @@ from whistler.logsetup import quiet_chatty_libraries
 
 import argparse
 from functools import partial
-from whistler.config import (ConfigManager, KubeConfigManager,
-                             SESSION_SSH_PORT, SSH_POSTURE_DIRECT,
-                             SSH_POSTURE_NONE)
+from whistler.config import (CHANNEL_RELAY, CHANNEL_SSH, ConfigManager,
+                             KubeConfigManager, SESSION_SSH_PORT,
+                             SSH_POSTURE_DIRECT, target_channels)
 from asyncio import Event
 
 logger = logging.getLogger("whistler.server")
@@ -500,14 +500,21 @@ class SSHServer(asyncssh.SSHServer):
                 asyncssh.OPEN_CONNECT_FAILED,
                 f"{self.username} has no instance named '{name}'")
 
-        posture = target.get("sshPosture", SSH_POSTURE_DIRECT)
-        if posture != SSH_POSTURE_DIRECT:
-            logger.warning(f"Jump to {name} denied: zone {target.get('zone')} "
-                           f"has ssh posture {posture}")
+        # The zone's ceiling already narrowed by this user's (and their
+        # groups') channel grant — the third axis, so two people in the same
+        # zone on the same instance can get different doors. `sshPosture` is
+        # kept in the message because it is the zone's half of the answer and
+        # the one an admin edits.
+        channels = target_channels(target)
+        if CHANNEL_SSH not in channels:
+            posture = target.get("sshPosture", SSH_POSTURE_DIRECT)
+            logger.warning(f"Jump to {name} denied for {self.username}: zone "
+                           f"{target.get('zone')} posture {posture}, granted "
+                           f"channels {sorted(channels)}")
             raise asyncssh.ChannelOpenError(
                 asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED,
-                f"Zone '{target.get('zone')}' does not allow direct SSH to "
-                f"'{name}' (posture: {posture})")
+                f"Direct SSH to '{name}' is not available to you in zone "
+                f"'{target.get('zone')}'")
 
         # Declare intent and let the operator do the work, exactly as the TUI
         # path does: bumping last-connect fires reconcile, which starts a
@@ -925,11 +932,13 @@ class WhistlerSession(asyncssh.SSHServerSession):
             self._fail(f"No instance named '{name}'.")
             return
 
-        # `relay` permits exactly this path and forbids the end-to-end jump;
-        # only `none` closes both.
-        if target.get("sshPosture") == SSH_POSTURE_NONE:
-            self._fail(f"Zone '{target.get('zone')}' does not allow SSH to "
-                       f"'{name}'.")
+        # The relay is its own channel: a zone posture of `relay` permits
+        # exactly this path and forbids the end-to-end jump, and a channel
+        # grant can close it for this user while leaving it open for the
+        # colleague on the same instance.
+        if CHANNEL_RELAY not in target_channels(target):
+            self._fail(f"Connecting to '{name}' is not available to you in "
+                       f"zone '{target.get('zone')}'.")
             return
 
         # Declare intent; the operator starts a stopped instance.

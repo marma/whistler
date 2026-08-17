@@ -1,10 +1,15 @@
 # Security model: users, volumes, zones, groups
 
-**Status: design sketch. None of this is implemented.** Zones exist today as
-egress postures ([`whistler/config.py`](../whistler/config.py), `Zone` CRs);
-volumes, taints, security levels and groups do not. This document records the
-model and, more importantly, *why* each piece is shaped the way it is, so the
-implementation doesn't quietly drop the parts that carry the guarantee.
+**Status: mostly design sketch.** Zones exist today as egress postures
+([`whistler/config.py`](../whistler/config.py), `Zone` CRs); **groups and the
+access-channel grant now exist too** ([Group](#group),
+[Access channels](#access-channels-the-second-axis), 2026-08-14). Volumes as a
+primitive, taints and security levels do not — so the core guarantee this
+document is named for is still unbuilt, and a group's read-only volume grant
+is a mount option rather than a boundary until the per-member export set
+lands. This document records the model and, more importantly, *why* each piece
+is shaped the way it is, so the implementation doesn't quietly drop the parts
+that carry the guarantee.
 
 Claims marked **verified** are a narrower thing: the *mechanism* was exercised
 against the real gateway image and behaved as described. That says the
@@ -121,7 +126,8 @@ confusion about what a zone promises comes from collapsing them.
    instance in the *same* zone may warrant different channels: a member of
    staff helping an external researcher needs a shell; the researcher does
    not get one. Enforced by per-user and per-group grants, the same shape as
-   `allowedZones` and the override grants today.
+   `allowedZones` and the override grants — and now built as exactly that
+   ([Group](#group)).
 4. **The endpoint.** The machine and software the person sits at. **Whistler
    can neither enforce nor observe this** — but it can be closed by pairing a
    server-side identity binding with a controlled network, which is what
@@ -245,12 +251,31 @@ The channels Whistler offers today, and where each would have to be closed:
 
 | Channel | Terminates in | Closed by | Status |
 | --- | --- | --- | --- |
-| End-to-end SSH (scp, sftp, rsync, `-L`/`-R`) | the guest's sshd | the gateway refusing the splice | implemented (`Zone.spec.ssh`) |
-| Relay / TUI handover (PTY) | the gateway | the gateway | designed, not built |
-| Portal web terminal | the guest / pod | the portal | not gated |
-| Desktop clipboard (bidirectional) | the streamer | streamer configuration | **not gated** |
-| Screenshots | the portal's memory, served over HTTP | the portal | globally tunable only |
+| End-to-end SSH (scp, sftp, rsync, `-L`/`-R`) | the guest's sshd | the gateway refusing the splice | implemented (`ssh`) |
+| Relay / TUI handover (PTY) | the gateway | the gateway | implemented (`relay`) |
+| Portal web terminal | the guest / pod | the portal | implemented (`terminal`) |
+| Desktop clipboard (bidirectional) | the streamer | streamer configuration | **declared, not enforced** (`clipboard`) |
+| Screenshots | the portal's memory, served over HTTP | the portal | implemented (`screenshots`) |
 | The desktop stream itself | the browser | — | always on; it is the point |
+
+**How it is wired** (2026-08-14). The five names above are the vocabulary:
+`Zone.spec.channels` is the ceiling, `User.spec.channels` and
+`Group.spec.channels` are grants that narrow it, and
+`KubeConfigManager.effective_channels` is the intersection every enforcement
+point asks. A zone with no `channels` field derives its ceiling from the
+legacy `Zone.spec.ssh` posture (`direct` → `ssh`+`relay`, `relay` → `relay`,
+`none` → neither) and leaves the other three open, so zones written before
+this keep their exact meaning. The checks live at the two gateway paths
+(`_jump_to_instance`, `_connect_to_instance`), the portal's terminal page and
+websocket, and — for screenshots — in the *capture* loop rather than the HTTP
+route, so an ungranted session's display is never read at all and the pixels
+never enter portal memory.
+
+`clipboard` is the honest exception and is labelled as such in the admin UI:
+closing it needs a toggle in the streamer, Selkies 2.x exposes none that has
+been verified, and a grant that silently did nothing would be worse than a
+grant that says it does nothing. `ENFORCED_CHANNELS` in `whistler/config.py`
+is the machine-readable form of that caveat.
 
 Two of those rows are the interesting ones, because they are the channels
 that survive turning off everything a shell can do.
@@ -375,9 +400,11 @@ two zones ends up with two home volumes not because a policy says "one home per
 zone" but because the taint rule makes a single shared home impossible. The
 mechanism is the same one that governs every other volume.
 
-Existing `User` fields (allowed zones, override grants) stay as they are. What
-a user may mount comes from the volume/zone rules and, later, from group
-membership.
+Existing `User` fields (allowed zones, override grants) stay as they are, and
+a `channels` grant joins them. What a user may mount comes from the
+volume/zone rules and from [group membership](#group), which is built: every
+`User` allow-list is now resolved as the union of the user's own field and
+their groups'.
 
 ### `sudo` rights
 
@@ -481,11 +508,11 @@ What this model adds to the `Zone` CR:
 - **A pinning requirement** — may this zone mount shareable volumes at all.
 - **A channel ceiling** — the most any session here may use
   ([Access channels](#access-channels-the-second-axis)). A ceiling, not a
-  setting: the per-user grant narrows it, and nothing widens it. Today this
-  exists only as `Zone.spec.ssh`, which names one of the five channels
-  because it is the one the gateway work needed
-  ([design/proxyjump.md](proxyjump.md)); it should become the full set before
-  anything depends on the narrow spelling.
+  setting: the per-user grant narrows it, and nothing widens it. **Done**:
+  `Zone.spec.channels` names the full set, and the older `Zone.spec.ssh` —
+  which named one of the five because it was the one the gateway work needed
+  ([design/proxyjump.md](proxyjump.md)) — is folded in as the fallback when
+  the new field is absent.
 - Possibly: permitted storage classes, and whether read-only cross-level mounts
   are allowed here.
 
@@ -507,15 +534,50 @@ a visible "this instance must restart".
 
 ## Group
 
-A `Group` CR holding users and shared settings — available volumes and zones,
-and the explicit cross-level mount override (`allowCrossMount` or similar)
-referenced in the Volume section.
+**Implemented** (2026-08-14). A `Group` CR (`grp`) holding users and shared
+settings — available volumes with per-member access modes, zones, GPU types,
+per-session override grants and the channel grant. Admin-managed in the
+portal's Groups section, or rendered from `whistler.groups` values as
+Helm-owned CRs, exactly like zones. Membership lives on the group and nowhere
+else — there is no `groups` field on `User` — so a project is edited in one
+place.
+
+**The composition rule is a union, and it is the same rule for every field:**
+empty everywhere means no restriction; otherwise the union of the user's own
+list and every group's bounds them. That single sentence carries both halves
+of what a group is for. A user with no list of their own is *restricted* by
+joining a group that has one — which is how a project fences its people in —
+while a user who already had a list *gains* the group's, because grants add
+up. Override grants OR together; nothing a group says can take away what a
+user holds in their own right. `KubeConfigManager.get_user_allowed_volumes`
+and its siblings answer with the resolved set, so `_apply_policy` and the
+portal never see the two sources separately (the admin UI reconstructs the
+provenance for display, and its checkboxes deliberately edit only the user's
+own fields — saving the resolved set would copy a project's grants onto a
+member who would then keep them after leaving).
 
 The field that carries weight is **membership with a per-volume access mode**:
-for each volume the group can reach, which members get `rw` and which get `ro`.
-That list is not merely a UI affordance — it renders directly to the gateway's
-export list, which is where the enforcement lives
+for each volume the group can reach, which members get `rw` and which get `ro`
+(`mode` for the default, `access: {user: rw|ro}` for exceptions, `mode: none`
+for a volume only the named exceptions reach). That list is not merely a UI
+affordance — it is what the gateway's export list will be rendered from, which
+is where the enforcement has to end up
 ([Shared instances](#shared-instances-and-shared-volumes)).
+
+**Where `ro` is enforced today, and where it is not.** It becomes `readOnly`
+on the volume mount: real for a container session, **advisory for a VM**,
+whose user has root and can remount. Read-only has to be
+[a server-side decision](#read-only-is-a-server-side-decision-or-it-is-nothing)
+to be a control at all, and that means rendering it into the export set — not
+built yet.
+
+**The `rw`-wins rule above is the single-user rule and does not generalise.**
+It is correct here because every grant belongs to one identity on a machine
+only that identity uses. On a shared project instance the rule inverts to the
+meet — any member's `ro` makes the volume `ro` for the whole instance — for
+reasons given in [The meet rule](#the-meet-rule-any-member-ro-means-ro). Two
+opposite rules, one principle: resolve to what is true of *the machine the
+volume is published to*.
 
 A group also carries the **channel grant** — which of the zone's permitted
 channels its members actually get. This is where the third axis lives, and it
@@ -526,7 +588,20 @@ doors. Two groups, one zone, different channel grants — no special case in
 code, and the grant can be conditioned on source network
 ([source address](#source-address-the-second-weaker-check)).
 
-Still to design: naming, nesting (probably none), and who may edit a group.
+Two encodings are load-bearing and easy to lose:
+
+- **Absent is not empty** for `channels`. No field means "this source narrows
+  nothing"; an empty list means "nothing but the desktop stream". Both have to
+  be writable, which is why the portal has a *restrict* toggle beside the
+  boxes and why `set_user_channels(None)` removes the field rather than
+  writing `[]`.
+- **A member named in a volume's `access` map need not be in `members`.** It
+  is the natural way to hand one outsider a read-only look at a project
+  without making them a member of it.
+
+Not done: nesting (deliberately — none), the cross-level mount override
+(`allowCrossMount`), which waits on taint and security levels existing at all,
+and any notion of who may edit a group beyond "an admin".
 
 ## Shared instances and shared volumes
 
@@ -540,7 +615,7 @@ strongest.
 This section is about **storage** and holds wherever members have their own
 logins. What it takes to give them those logins — separate desktops, on demand,
 on one machine — is
-[Project instances](#project-instances-several-members-one-machine-separate-desktops),
+[Project instances](#project-instances-several-members-one-machine-no-desktops),
 and none of it exists yet. The mechanisms here do **not** apply to a
 shared-screen session (one Selkies pipeline broadcast to many viewers), which
 runs as a single Unix user and therefore has a single identity by construction.
@@ -591,6 +666,65 @@ equivalent) putting that member's export at a fixed path. That is
 **convenience, not a boundary** — root can write through any of the mounts —
 and it must never be documented as if it were. It doesn't need to be a
 boundary: acting as another member is explicitly permitted.
+
+### Publishing and revoking exports while the gateway runs (measured)
+
+The export set is the access-control decision, so the question that decides
+whether it can carry policy at all is: **can it change without restarting the
+gateway, and without restarting the guests mounted on it?** Measured against
+the running per-user gateway (nfs-ganesha 6.5, Debian trixie), by driving the
+DBus interface the readiness probe already uses:
+
+| Operation | Result | Restart needed |
+| --- | --- | --- |
+| `AddExport` — second export of the *same* `Path`, new `Export_Id`/`Pseudo`/`Filesystem_Id` | `"1 exports added"` | none |
+| `UpdateExport` — flip `Access_Type` `RW` → `RO` on a live export | `"1 exports updated"` | none |
+| `RemoveExport` by id | ok; export list back to its prior state | none |
+
+So the mechanism is there and needs no new machinery in the image:
+`dbus-daemon` is already started by
+[`entrypoint.sh`](../images/storage-gateway/entrypoint.sh) — it exists for
+`gateway-ready`, and `org.ganesha.nfsd.exportmgr` exposes
+`AddExport`/`UpdateExport`/`RemoveExport`/`ShowExports`/`DisplayExport` on the
+same bus. What is missing is the *caller*: nothing in Whistler writes export
+fragments or drives that bus today.
+
+Two things the measurement does **not** settle, and they should not be
+asserted until they are:
+
+- **When a mounted client notices an `UpdateExport`.** The server applies it
+  to subsequent operations, but an NFS client has an attribute cache and may
+  hold open file handles, so an `RW` → `RO` flip is not instantaneous from
+  the guest's side and a write already in flight may still land. Fine for
+  "membership changed, tighten it", not a revocation primitive.
+- **`RemoveExport` under a live mount is disruptive by design.** The client's
+  filehandles go stale (`ESTALE`); there is no graceful "unpublish" for a
+  guest that is using it. So *revocation while running* is the hard case —
+  which is the same conclusion
+  [Membership changes](#membership-changes-on-a-running-instance) reaches from
+  the guest side.
+
+One gotcha, since it cost a failed attempt: **the VFS FSAL cannot export a
+path on overlayfs.** It addresses files by handle, and `name_to_handle_at` on
+overlayfs returns `EOPNOTSUPP` — ganesha reports `Could not get handle for
+path ..., error Operation not supported` and refuses the export. Exports must
+live on the PVC, never on the container's own filesystem.
+
+### Read-only is a server-side decision, or it is nothing
+
+A `readOnly` mount option chosen by the guest is worth exactly nothing when
+the guest's user has root — they remount it. This is not a subtle point and
+the model must not lean on it anywhere: **`ro` means `Access_Type = RO` on the
+export the write would go through**, enforced by the gateway, as the
+`/as/carol` row above shows.
+
+The consequence for [Group](#group) is concrete: a group's per-member `ro`
+grant is only a real control once it renders to an export. Whistler currently
+translates it into a `readOnly` volume mount, which *is* enforced for a
+container session (the kubelet mounts it read-only and an unprivileged
+container cannot remount it) and is **advisory for a VM**. Until the export
+set exists, a `ro` grant on a VM session is a statement of intent, and the
+admin UI says so rather than implying a boundary.
 
 ### One mountpoint, and ordinary POSIX modes inside it
 
@@ -720,24 +854,45 @@ which identities that instance may write as *and* whether each volume is `rw`
 or `ro` there. Rule 3 then needs no separate machinery: an instance that may
 only read a volume is simply published an `RO` export of it and no `RW` one.
 
-## Project instances: several members, one machine, separate desktops
+## Project instances: several members, one machine, no desktops
 
-**Status: further out than anything above, and not designed — this records what
-it would take.** The storage model in
+**Status: not built; the shape is decided (2026-08-15).** The storage model in
 [Shared instances](#shared-instances-and-shared-volumes) is the part that is
 worked out; everything here is the machinery around it.
 
-**The shape.** One VM. Several members, each with their own login, their own
-desktop session on their own display, and their own home — running at the same
-time. This is deliberately *not* the shared-screen case: Selkies broadcasts one
-pipeline to many clients with `controller`/`viewer` roles, which is a different
-feature (screen sharing) and is set aside. Here every member gets a real seat.
+**The shape**, and each clause is a constraint that removes work rather than
+adding it:
 
-Two constraints stated up front, because they shape the rest: **a member who is
-not using the instance should cost nothing.** No home mounted for someone who
-has not logged in, no Xvfb and no Selkies running for someone who has not
-opened a desktop. Provisioning all of it at boot would make a ten-member
-project instance pay ten times over to serve one person.
+- **Always a VM.** Not a container, not Kata. A project instance is a machine
+  with several real logins, systemd, sshd and root — which is what
+  [container_workloads.md](container_workloads.md) already says a VM is for.
+  There is no second runtime to design storage or identity for.
+- **Created with a member list**, which is the input everything else derives
+  from: the export set, the guest's users, the `authorized_keys` drop-ins, and
+  who the gateway will splice an SSH channel to.
+- **SSH and the web terminal only — no desktops.** This is the deliberate
+  simplification and it deletes most of the machinery below: no per-member
+  Xvfb, no per-member Selkies, no display or port allocation, no on-demand
+  streamer supervision. A member who wants a GUI gets their own single-user
+  desktop VM; the project instance is the shared *server*.
+- **One gateway, in the project's own namespace**, exporting the project's
+  storage only — including each member's *project-local* home. Personal home
+  PVCs stay on their own per-user gateway and are not mounted here
+  ([below](#the-gateway-topology-one-per-project-and-it-holds-only-project-storage)).
+- **Homes mounted at login, not at boot**, so a member who never logs in costs
+  nothing — no NFS session, no published export ([below](#mounting-homes-on-demand)).
+- **A volume is read-only for the instance if it is read-only for _any_
+  member** ([below](#the-meet-rule-any-member-ro-means-ro)).
+
+**The retired alternative — separate desktops on one machine — is kept below**
+because the analysis is sound and the case may come back: it is what a
+"virtual lab room" would need. What killed it is not that any single piece was
+infeasible, but the count: `whistler-streamer@<member>.service`, deterministic
+per-member display/port slots agreed between operator, guest and portal,
+cloud-init growing an N-user shape, on-demand start *and* idle stop for each
+streamer, and N GNOME sessions contending for one GPU. That is a large amount
+of new, stateful, in-guest machinery whose only purpose is to avoid telling
+someone to open their own desktop VM.
 
 ### What already fits
 
@@ -751,9 +906,374 @@ project instance pay ten times over to serve one person.
   key and drives SSH into running guests for screenshots, so there is a way to
   act inside a booted VM without inventing an agent.
 
+### The meet rule: any member `ro` means `ro`
+
+For a single user, grants **join** — the most permissive wins, because every
+grant belongs to the same identity and a user who is `rw` on a volume in one
+project does not lose that by being a read-only guest in another
+([Group](#group), `get_user_volume_modes`).
+
+On a project instance the rule **inverts**: a volume is published read-only if
+it is read-only for *any* member. Take the meet, not the join.
+
+The reason is that a project instance is one kernel with one root, and
+[Shared instances](#shared-instances-and-shared-volumes) is explicit that
+member-versus-member isolation is *not* claimed there — any member may act as
+any other. So publishing a volume `rw` because alice is allowed to write it
+hands write access to carol too, and carol's `ro` grant would be decoration.
+The only way "carol may not write this" survives on a shared machine is if
+nobody can write it *from that machine*.
+
+Two consequences worth stating, because they are the cost of the rule:
+
+- **A member's own single-user session is unaffected.** Alice still writes the
+  volume from her own VM; she just cannot from the project instance while
+  carol is a member of it. That is the correct place for the restriction to
+  bite, and it is visible rather than silent.
+- **Adding a read-only member downgrades the instance**, which is a surprising
+  thing to happen on an "add member" action. It has to be surfaced at the
+  moment of the edit — "adding carol makes /data read-only on this instance" —
+  and it is one more reason membership changes want a restart boundary rather
+  than a live `UpdateExport`.
+
+### Why the export set becomes per-instance
+
+Under the single-user model an export is a function of *the member*: alice's
+home, squashed to alice's uid. The meet rule breaks that. `Access_Type` now
+depends on **who else is on the machine the export is published to** — the
+same project volume is `RW` on an instance whose members are all `rw`, and
+`RO` on one that also has carol — so the same (member, volume) pair needs two
+different exports at once. The export is therefore keyed by **(instance,
+member, volume)**, and the gateway's export list becomes a projection of the
+running instances rather than of the user list.
+
+### The gateway topology: one per project, and it holds only project storage
+
+**Decided (2026-08-16).** A project instance gets **its own gateway**, in the
+project's own namespace, and that gateway exports **only the project's
+storage** — never a member's personal home PVC.
+
+**Why its own gateway.** Not primarily for simpler networking: because it
+keeps the fence exactly the shape it already has.
+[`_build_gateway_network_policy`](../whistler/config.py) admits
+`podSelector: {app: whistler-desktop}` with **no `namespaceSelector`**, which
+in NetworkPolicy means *pods in the policy's own namespace*. The per-user
+boundary is therefore really the per-user namespace. Give a project its own
+namespace holding its instance and its gateway, and that policy applies
+verbatim, with no cross-namespace rule anywhere. The alternative — the project
+instance dialling each member's per-user gateway — needs ingress from a
+namespace that is not that user's, on *every member's* gateway, which widens
+the one control that is the entire boundary on AUTH_SYS
+([Substrate](#substrate-the-move-to-nfs-done)). One project gateway is the
+narrower arrangement, not merely the tidier one.
+
+**Why not personal homes on it.** The obvious extension — let the project
+gateway mount each member's home PVC too, so the instance talks to one server
+for everything — breaks the invariant that
+[concurrent home mounts](#a-home-mounted-in-several-instances-at-once) rest
+on: *"every consumer goes through one gateway, so byte-range locks are
+coherent across instances — because it is the same server."* NFSv4 lock state
+lives in the server. Two ganesha processes exporting the same directory tree
+are two independent lock domains that cannot see each other, so a member with
+their own VM up *and* a project instance up would have `$HOME` writable
+through two servers with no shared locking — which is precisely the corruption
+`nobrl` caused and the reason NFS replaced SMB. **Many exports over one
+server is the design; many servers over one tree is not.**
+
+It is also blocked in practice today: the home PVC binds `ReadWriteOnce` on
+`local-path`, whose PV carries a `nodeAffinity` to the node that holds the
+directory (verified on the dev cluster: `whistler-data-marma` → `wkstn`). A
+second gateway pod must be co-scheduled to that node or stay `Pending`. RWX
+storage would remove that obstacle and would **not** remove the locking one.
+
+**So project instances get project-local homes.** Each member's home *on a
+project instance* lives on the project's own storage, served by the project's
+own gateway with that member's squash identity. Their personal home stays on
+their personal gateway, mounted by their own single-user sessions, and moves
+in and out over the SSH they already have (`scp`, `rsync`) — the login-node
+arrangement, and normal for a shared server.
+
+Three things fall out, and the third is the one worth having:
+
+- One PVC is never mounted by two gateways, so lock coherence holds by
+  construction rather than by scheduling luck.
+- The project namespace is self-contained: instance, gateway, storage, one
+  fencing policy of the existing shape.
+- **A personal home never enters a project machine, so it is never imprinted
+  with the project's zone.** Under the mount-the-real-home version, joining a
+  restricted project would taint a member's personal home and lock it out of
+  their own open-zone sessions ([rule 1](#core-model-taint-plus-security-level)) —
+  a surprising, hard-to-explain consequence that this arrangement simply does
+  not have.
+
+The cost is honest and small: dotfiles and environment do not follow a member
+onto a project instance. Seeding a project home from a dotfiles repo at
+creation is the obvious mitigation, and it is a convenience feature rather
+than part of the model.
+
+#### The rule holds for every storage class (measured)
+
+The hypothesis worth testing was **transitivity**: if each layer honours
+locks, a stack of NFS layers should too, so an NFS-backed PVC would move the
+lock domain down to the backing NAS and let several gateways share one tree.
+Measured on 2026-08-16 against a three-layer rig — ganesha as a stand-in NAS,
+an in-tree `nfs:` PV so the kubelet performs the mount, a second ganesha as
+the gateway, and clients reaching one file by both paths. **Transitivity does
+not hold**, and two findings came out of it. The second is the one that
+decides the design; the first decides whether the design can run at all.
+
+**1. The VFS FSAL cannot export an NFS-backed PVC.** With the PVC mounted at
+`/shares/home` as `nfs4` (`vers=4.1`, `local_lock=none`, readable, healthy),
+ganesha refuses to build the export:
+
+```
+vfs_create_export :FSAL :CRIT :resolve_posix_filesystem(/shares/home)
+                                returned No such file or directory (2)
+```
+
+It is not the handle problem overlayfs had — it is that an NFS filesystem
+never enters ganesha's POSIX filesystem table at all. **This is a production
+blocker, not a project-instance concern**: `csi-driver-nfs` mounts the share
+on the node and bind-mounts it into the pod exactly this way, so the storage
+gateway as it exists today cannot run on an NFS-backed storage class. Note
+the failure is *quiet in the worst way* — ganesha still binds 2049 and logs
+`NFS SERVER INITIALIZED`, which is precisely the case
+[`gateway-ready`](../images/storage-gateway/gateway-ready.sh) was written to
+catch. It catches it. Nothing else would.
+
+**`FSAL_PROXY_V4` looked like the working shape and is not.**
+`nfs-ganesha-proxy-v4` is packaged (the image installs only
+`nfs-ganesha-vfs`); pointed at the backing server with `Srv_Addr` it exports,
+mounts, serves I/O, preserves the squash identity (a root client writing
+through the proxy produced a file owned `1000:1000` on the backing store) and
+enforces byte-range locks among its own clients — **including past-EOF locks
+at SQLite's `PENDING_BYTE` (0x40000000), the exact pattern cifs answered
+`EACCES` to.** Every one of those passed.
+
+Then a real SQLite workload put it on the floor:
+
+```
+Fatal glibc error: malloc.c:2601 (sysmalloc): assertion failed:
+  (old_top == initial_top (av) && old_size == 0) || ...
+```
+
+**Heap corruption in the FSAL, crash-looping the server.** The visible
+symptoms came first and were misleading — `sqlite3.DatabaseError: database
+disk image is malformed` on a freshly created database, then a hang, then a
+pod that would not terminate because its `hard` mount pointed at a server
+that kept dying. Plain file I/O through the same path is *correct*
+(sequential 1 MiB write/read, 50 random 4K read-modify-write cycles with
+`fsync`, mmap read/write, and read-after-write across descriptors all verify),
+and the identical SQLite test against plain ganesha VFS-over-`local-path` —
+today's production shape — passes with `integrity_check: ok`. Same guest,
+same mount options, same ganesha 6.5. Only the FSAL differs.
+
+**Root-caused 2026-08-16 under valgrind:** PROXY_V4 `memmove`s a READ reply
+from the backing server into the buffer `fsal_read2` allocated for the
+client's request **without clamping the copy to that buffer**, landing `0
+bytes after a block of size 8,192`. The glibc assertion above is the delayed
+detection in an unrelated thread, not the fault. It also explains why the
+checks above passed: they were all large, `rsize`-aligned reads where reply
+length equalled request length, and the overflow needs those to diverge —
+**a gateway can pass a block-I/O smoke test and still be unusable.** Full
+analysis, and a runnable rig, in
+[`images/storage-gateway/proxy-v4-heap-bug.md`](../images/storage-gateway/proxy-v4-heap-bug.md).
+
+**A second finding there is a confidentiality problem in its own right**, and
+it would survive a fix to the crash: on every OPEN, PROXY_V4 sends
+**uninitialised heap bytes** to the backing server (valgrind: `Syscall param
+write(buf) points to uninitialised byte(s)` in `proxyv4_compoundv4_execute`,
+out of a 2 MB per-export buffer `malloc`'d and never zeroed). Since AUTH_SYS
+is unencrypted and the backing NAS is outside this cluster's trust boundary,
+that leaks gateway process memory — belonging to *whichever* user's gateway it
+is — onto the storage network. Any future adoption of PROXY_V4 has to clear
+this, not just the crash.
+
+So `FSAL_PROXY_V4` in ganesha 6.5 (Debian trixie) is **not production
+viable**: it corrupts its own heap under an ordinary database workload, which
+is what a home directory is full of.
+
+**A newer ganesha is not the way out, and 2026-08-16 settled that too.** The
+offending `memcpy` is byte-identical in **6.5, 9.14 and 14.1** — the last
+released 2026-08-05, i.e. current upstream. Worse, the newest is the one to
+avoid: 6.5 and 9.14 crash, while **14.1 usually survives and silently returns
+bytes that are not the file** (RPC framing from the proxy's own receive
+buffer, with the backing store's copy provably intact). A crash-looping
+gateway announces itself; a lying one does not. Any future attempt to revisit
+this must re-run the read-back check in
+[`proxy-v4-repro/`](../images/storage-gateway/proxy-v4-repro/) rather than
+trusting a version bump — and must not treat "no crashes" as evidence.
+
+**The conclusion is therefore a hard one: there is currently no working way to
+run the storage gateway on an NFS-backed storage class.** VFS will not export
+one; PROXY_V4 exports it and then returns the wrong data, crashing or not.
+Anything that depends on `csi-driver-nfs` homes — `sharedHomeStorageClass`
+included — needs a different FSAL, a fix landed upstream, or a substrate that
+is not NFS underneath. **The home-as-virtual-disk arrangement below needs none
+of them**, which is what makes it the answer rather than a workaround.
+
+**2. Ganesha terminates locks; it does not forward them.** Measured for
+`FSAL_PROXY_V4` — the VFS-over-NFS path could not be measured because, per
+finding 1, its export does not build. With a holder holding an exclusive
+`fcntl` byte-range lock through the proxy gateway:
+
+| Client | Path to the file | Result |
+| --- | --- | --- |
+| control | same gateway as the holder | **REFUSED** (`EAGAIN`) |
+| test | straight to the backing NAS | **ACQUIRED** |
+
+The control is what makes the test mean anything: conflicts *are* detected,
+ganesha enforces locks among its own clients — and the lock never reached the
+backing server. So each ganesha is its own lock domain **whatever is behind
+it**. The transitive argument fails not because a layer dishonours locks but
+because ganesha does not pass them down; it answers them.
+
+**3. This is not a Ganesha quirk — it is what re-export means.** The kernel's
+own [NFS re-export
+documentation](https://docs.kernel.org/filesystems/nfs/reexport.html) is
+blunter about the same limit, for `knfsd`:
+
+> Clients are not allowed to get file locks or delegations from a reexport
+> server, any attempts will fail with operation not supported.
+
+So the in-kernel server does not fare better; it fares *stricter*. Ganesha
+grants a lock that is real among its own clients and meaningless outside
+them; knfsd refuses to grant one at all. **The kernel's behaviour is the
+safer of the two and would be catastrophic here** — no byte-range locks is
+the `nobrl` situation that drove the move off SMB in the first place
+([Substrate](#substrate-the-move-to-nfs-done)), so "just use knfsd" trades a
+silent hazard for a loud regression. Neither implementation makes stacked NFS
+lock-coherent, because nothing can: state lives in the server a client is
+talking to.
+
+The same page states the general form of the hazard, beyond locks:
+
+> Open DENY bits are not enforced between clients accessing different reexport
+> servers
+
+**The rule, stated exactly.** The previous draft of this section said "one
+server per tree, for every storage class", which is broader than what was
+measured. Precisely:
+
+- **Stacking NFS on NFS never preserves lock state.** Measured for
+  `FSAL_PROXY_V4`, documented for `knfsd`. This is the rule that matters,
+  because it is the arrangement an NFS-backed storage class produces.
+- **One gateway per tree is therefore required whenever the tree can be
+  reached by two servers** — which is every multi-gateway design discussed in
+  this document.
+- **Coherence, when it exists, comes from a shared filesystem below the
+  servers, never from stacking them.** Two ganeshas on one node over one local
+  mount would conflict correctly, because the VFS FSAL takes ordinary `fcntl`
+  locks and the kernel arbitrates. The distributed form of that is
+  `FSAL_CEPH` over CephFS, where Ceph's client library carries cluster-wide
+  locking — the mainstream active/active ganesha deployment, and the only
+  shape in which several gateways over one tree is a supported idea rather
+  than a hopeful one.
+
+Three further constraints from the same page, none of which Whistler pays
+today but all of which arrive with a re-export substrate:
+
+- **`fsid=` becomes mandatory** on any re-export, with a distinct UUID per
+  export.
+- **Filehandles grow by 22 bytes** (plus padding) per level of re-export,
+  against NFSv4's 128-byte ceiling. One level is comfortable; the constraint
+  is worth knowing before anyone nests a second.
+- **Reboot recovery does not compose**: "the NFS protocol's normal reboot
+  recovery mechanisms don't work for the case when the reexport server reboots
+  because the source server has not rebooted, and so it is not in grace."
+  Whistler restarts gateway pods routinely — the tuned `Lease_Lifetime` /
+  `Grace_Period` in
+  [`ganesha.conf.template`](../images/storage-gateway/ganesha.conf.template)
+  exists for exactly that — so if `FSAL_PROXY_V4` is adopted, what a gateway
+  restart costs a client holding locks needs re-measuring rather than
+  inheriting the 9s stall measured on the local-PVC setup.
+
+#### Node pinning puts the gateway's NIC in every session's I/O path
+
+A per-node PV pins its gateway: `local-path` binds `WaitForFirstConsumer`, so
+the volume is created wherever the first consumer lands and its `nodeAffinity`
+holds it there for good (verified: `whistler-data-marma` → `wkstn`). The
+gateway pod must then run on that node forever.
+
+The cost is **bandwidth, not scheduling**. A VM never mounts the PVC — it
+mounts NFS — so the guest is scheduled freely and the GPU node stays
+available. But every byte it reads or writes crosses the *gateway's* network
+interface. A gateway pinned to a 10G node serves a session on a 100G node at
+10G, and no amount of free scheduling on the compute side changes that: the
+storage path is only ever as wide as the narrowest link in it, and the pin
+decides which link that is. Where the first instance happened to start
+therefore sets the storage bandwidth of every later one. (*Pod* sessions
+mount the PVC directly and are pinned outright — the existing single-user
+constraint, unchanged.)
+
+This is not new with project instances; the per-user gateway has it today.
+What is new is that it is now the deciding argument for the gateway's
+lifecycle.
+
+#### Gateway per instance: the bandwidth answer, and what it costs
+
+If a gateway serves exactly one instance it can be **placed with that
+instance** — same node, so NFS traffic never leaves the box, which beats
+"a fast link" outright. Overhead is one small ganesha pod per running
+instance, and the normal case is a user with one or a few instances at a time.
+
+It also *simplifies* three things that the per-project shape made awkward:
+
+- **The export set stops needing an instance key.** [Why the export set
+  becomes per-instance](#why-the-export-set-becomes-per-instance) had exports
+  keyed by (instance, member, volume) because `Access_Type` depends on the
+  co-tenants. With one gateway per instance the instance is implied by *which
+  server you are talking to*, and each gateway's export list is just its own
+  members. The meet rule becomes a local calculation.
+- **Fencing becomes 1:1** — the tightest form the NetworkPolicy can take, one
+  instance to its own gateway, instead of today's "any session pod in this
+  namespace".
+- **Lifecycle becomes ownership.** The gateway is created and reaped with the
+  session CR through `ownerReferences`, rather than being a long-lived
+  per-user Deployment nothing tears down.
+
+Two conditions and two costs, and the first condition is decisive:
+
+1. **It requires network-backed storage to deliver anything.** With
+   `local-path` the PVC's `nodeAffinity` pins the gateway regardless of how
+   many gateways there are, so per-instance gateways buy exactly nothing —
+   they all land on the same node anyway. The bandwidth argument only cashes
+   out once the volume can be mounted from any node.
+2. **It cannot serve a home that two instances may mount — measured.** A user
+   running two instances against one home is [normal, not
+   exceptional](#a-home-mounted-in-several-instances-at-once), and per-instance
+   gateways make that two servers over one tree. The hope was that an
+   NFS-backed store would resolve the locks underneath; it does not
+   ([above](#the-rule-holds-for-every-storage-class-measured)) — ganesha
+   answers locks itself and never forwards them, so two gateways are two lock
+   domains whatever is behind them. **The failure mode is quiet**: it needs
+   two concurrent sessions with something SQLite-backed open in both, so it
+   will not show up in testing and will show up as a corrupted profile later.
+   This makes the fallback below the *default* arrangement rather than a
+   contingency.
+3. **Scheduling order inverts.** To co-locate, the gateway must learn the
+   instance's node, so compute is placed first and storage follows it
+   (`nodeSelector` from the VMI's node) — the reverse of today, where storage
+   pins and compute is free. The guest then races its own gateway at boot;
+   `hard` mounts and cloud-init's retry cover it, but it is a real ordering
+   problem rather than a detail.
+4. **Cold start grows.** Every instance start waits for a fresh ganesha to pass
+   its readiness gate, where today the per-user gateway is already warm.
+
+**Step 2 did fail, so this is the arrangement**: per-instance gateways for
+*project and scratch* volumes — single-instance by nature, and the bulk
+traffic, so they get the co-location and the bandwidth — with the home on the
+one per-user gateway that owns its lock domain. A session then talks to two
+servers: its own instance gateway for project data, its user gateway for
+`$HOME`. That is one more NetworkPolicy rule and no new correctness question,
+and it puts the wide traffic on the path that can be placed for it.
+
 ### What is single-tenant today
 
-Each of these is a concrete artifact that assumes exactly one user per session.
+**Retired with the no-desktops decision above** — kept because it is the
+inventory a future "several desktops on one machine" would have to work
+through. Each of these is a concrete artifact that assumes exactly one user
+per session; the SSH-and-terminal shape needs none of them touched.
 
 - **The streamer.** `whistler-streamer.service` is a plain unit, baked enabled,
   `WantedBy=multi-user.target`, one Xvfb on `DISPLAY=:0`, one `SELKIES_PORT`
@@ -804,12 +1324,33 @@ member's home at instance start — is safe and defeats the purpose. This also
 sharpens rule 4: "currently mounted" should be read as "currently published to
 a running instance", which is the operator's own state.
 
+**Lazy publication is now known to be possible**: `AddExport` over DBus works
+on a running gateway with no restart of the gateway or the guest
+([measured](#publishing-and-revoking-exports-while-the-gateway-runs-measured)).
+The sequence for a member's first login is therefore: operator publishes the
+export and imprints the taint → the guest's automount unit fires on first
+access → the member has their home. Both halves are lazy and the observable
+one (publication) is the one carrying the rule.
+
+Two design notes fall out of the protocol:
+
+- **Mount the pseudo-root once, not each export.** NFSv4 has a single
+  pseudo-filesystem per server, so a guest that mounts `/` sees exports appear
+  as subtrees under their `Pseudo` paths as they are published — no new mount
+  command per member, and nothing to re-run when the set changes. The
+  single-user gateway mounts `<gw>:/home` specifically, which is right for one
+  export and wrong for a set that grows at runtime.
+- **`x-systemd.automount` still earns its place** for the idle-timeout half:
+  dropping an idle member's mount is what keeps a logged-out member from
+  holding an NFS session open.
+
 ### Starting streamers on demand
 
-An Xvfb plus a Selkies per member is the expensive part, especially with GNOME
-on llvmpipe or a single passed-through GPU, so a streamer should start when its
-member first opens the desktop. Three ways, in descending order of how much
-they need to be proven:
+**Moot under the no-desktops decision** — recorded with the rest of the
+retired desktop analysis. An Xvfb plus a Selkies per member is the expensive
+part, especially with GNOME on llvmpipe or a single passed-through GPU, so a
+streamer should start when its member first opens the desktop. Three ways, in
+descending order of how much they need to be proven:
 
 1. **systemd socket activation** on the member's port. The clean answer on
    paper, and it puts the trigger exactly where the first connection lands. It
@@ -837,6 +1378,13 @@ next boot**, which is exactly how zone membership already behaves. Adding a
 guest-side agent to do it live is the alternative, and it should be a deliberate
 decision rather than something that arrives by accident.
 
+The storage half no longer forces the decision either way: exports can be
+added, tightened and removed live
+([measured](#publishing-and-revoking-exports-while-the-gateway-runs-measured)).
+That makes the *guest* half the whole constraint — the user account, the
+`authorized_keys` drop-in and the mount unit — which is a much smaller thing
+to build an agent for later, and a good reason not to build one now.
+
 Removal is the sharper case and does *not* decompose the same way. Revoking a
 member has one part that is immediate and server-side — withdrawing their
 export, which stops writes as that identity at once — and one part that is not:
@@ -850,7 +1398,9 @@ desktop and no storage, which is a confusing failure rather than a safe one.
   root gives them every other member's data on that box. The per-user,
   per-instance grant in [`sudo` rights](#sudo-rights) cannot mean on a project
   instance what it means on a single-user one. Either no member gets it, or
-  every member is told plainly that all of them effectively have it.
+  every member is told plainly that all of them effectively have it. Note this
+  is *why* the meet rule exists: root on the box is reachable, so the only
+  durable statement about a volume is one that holds for the whole machine.
 - **The guest kernel becomes a boundary**, for the first time in this document,
   and [Assumptions](#assumptions) says it is not one. Members are separated by
   uid inside a single kernel, so a local privilege escalation is a cross-member
@@ -873,7 +1423,206 @@ Worth stating, because each is a plausible-sounding detour:
   so buying cryptographic identity for it would be spending in the wrong place.
 - **No new taint machinery.** One instance sits in one zone, so rules 1–4 apply
   unchanged; only the "published, not mounted" reading above is a refinement.
-- **Not RWX storage.** The gateway remains the only mounter of each PVC.
+- **Not RWX storage.** The gateway remains the only mounter of each PVC — an
+  invariant the [one-gateway-per-project decision](#the-gateway-topology-one-per-project-and-it-holds-only-project-storage)
+  preserves rather than strains. Worth being precise about why RWX is not the
+  missing piece: it would let two gateways mount one PVC, and two gateways
+  over one tree are two lock domains. The obstacle is NFSv4 lock state, not
+  Kubernetes access modes, so buying RWX would buy the wrong thing.
+
+## When the only storage class is NFS
+
+**The constraint (2026-08-16): `csi-driver-nfs` is the only production storage
+class available, so Whistler has to work on it.** The findings above say the
+gateway cannot. The way out is to notice that the blocker is far narrower than
+"storage is broken":
+
+- **Container and Kata sessions are unaffected.** They mount the home PVC
+  directly (`_build_volume_wiring`), and mounting a `csi-driver-nfs` PVC into
+  a pod is exactly what that driver does. No gateway is involved and nothing
+  changes.
+- **Only *VM homes* are blocked**, because a VM cannot mount a PVC — which is
+  the sole reason the storage gateway exists at all.
+
+**virtiofs is still not the answer**, and the rejection recorded in the
+gateway image is not stale: kubevirt#13028 is closed as *not supported*.
+PVC-backed virtiofs needs a **root container** in `virt-launcher`, and the
+maintainer's summary is that *"virtiofs requires extra privileges in order to
+change the uid/gid inside the fs"*, with rootless PVC virtiofs waiting on
+enhancements (kubevirt/community#313). The qemu uid is hardcoded to 107.
+
+### The home as a virtual disk
+
+> **Adopted 2026-08-17, with one amendment: the image is per *instance*, not
+> per user** — a home that follows a user is a channel between zones. The
+> decision, the S3 tier for shared data, and the reach-versus-identity rule
+> that governs both now live in **[storage.md](storage.md)**. The rest of this
+> section is the reasoning that led there.
+
+The arrangement that works on `csi-driver-nfs` today, with no new component
+and no upstream dependency: give a VM its home as a **second virtio-blk disk**
+backed by an ordinary PVC — `volumeMode: Filesystem` on the NFS share puts a
+`disk.img` there — and let the guest format it and mount it at `$HOME`.
+
+This is not exotic: **it is the mechanism the VM root disk already uses**, and
+`_build_vm_spec` already emits `disks`/`volumes` and already attaches a
+PVC-backed root via `dataVolumeTemplates`. The docstring's "the user's home
+PVC is NOT attached" is the line that changes.
+
+What it deletes is most of this document's storage difficulty:
+
+- **No ganesha on the VM path** — no NFS-on-NFS, no FSAL to crash, no
+  `resolve_posix_filesystem` refusal.
+- **No identity problem.** A block device is opaque to the host and owned
+  exclusively by one VM, so there is nothing to squash and no AUTH_SYS
+  credential to forge. The uid question disappears rather than being contained.
+- **No 2049 fencing surface on the VM path.** Today that NetworkPolicy is
+  "the entire boundary" for storage; here isolation comes from the PVC binding
+  and the hypervisor, which is a stronger boundary, not a weaker one.
+- **Locking becomes ordinary local kernel locking** on ext4. Every question in
+  this section — lock domains, re-export, `local_lock`, SQLite — stops
+  applying.
+
+The costs, stated plainly:
+
+- **A home stops being one object across session types.** Today `Squash` lands
+  VM writes on the PVC as the user's real uid, "consistent with pod sessions
+  mounting the same PVC directly"; with a disk image a pod session sees an
+  opaque file. The honest resolution is that **the VM's home is the home**,
+  and container sessions — already described as throwaway workspaces — get
+  their own volume. That is closer to the stated runtime split than the
+  current shared-PVC arrangement is.
+- **No shared homes**, because a block device cannot be safely multi-attached.
+  Shared *volumes* on VMs still need a file-level share, so they still need
+  either a working gateway or virtiofs — but that is a later feature and does
+  not block single-user VMs now.
+- **Admin loses file-level inspection and backup** of a home; it is an image.
+- **Resizing** needs a guest-side step after the PVC grows.
+
+If the gateway is wanted back later, two avenues remain and both are
+uncertain: root-causing ganesha's refusal to put an NFS mount in its
+filesystem table, or a ganesha newer than Debian trixie's 6.5 in which the
+`FSAL_PROXY_V4` heap corruption may be fixed. Neither is on the critical path
+for a deployment that takes the disk-image route.
+
+## Shared homes as a deployment option
+
+**Proposed 2026-08-16.** Rather than Whistler guaranteeing that a shared home
+works, make it an **option the deployment enables and owns**: `allowSharedHome`
+in values.yaml gates whether the option appears at all, and
+`sharedHomeStorageClass` names the class it is backed by. Sharing a home is
+then a deployment's decision with a deployment's storage behind it, and the
+advisories that go with it — what may be run against a shared home, what
+co-ordination users are expected to observe — belong to onboarding rather
+than to code. **Shared homes stay explicitly denied on project instances**,
+consistent with [the meet rule](#the-meet-rule-any-member-ro-means-ro).
+
+Three things this has to reckon with:
+
+- **A shared home and a per-instance gateway are in direct conflict.** If
+  every instance has its own gateway, two instances mounting one shared home
+  is two servers over one tree — the arrangement
+  [measured broken](#the-rule-holds-for-every-storage-class-measured). No
+  storage class fixes it, because the fault is the stacking, not the backing.
+  The resolution is to make the gateway **per *tree*, not per instance**: a
+  private home gets a gateway co-located with its instance (the bandwidth
+  win), and a *shared* tree gets exactly one gateway that every consumer of
+  it mounts. An instance then mounts several gateways — one per tree it can
+  see — which costs a NetworkPolicy rule per tree and keeps every tree
+  single-served.
+- **"Non-home shared volumes don't have the locking problem" is true of
+  exposure, not of mechanism.** Two gateways over a shared *project* volume
+  are as incoherent as two over a home; what differs is that project data is
+  usually files people co-ordinate on socially, while a home is full of
+  SQLite that corrupts quietly. Worth writing in the advisory that way, so
+  nobody later reads "project volumes are fine" as a property of the storage
+  rather than of the workload.
+- **Sidecar is the wrong word for a VM.** KubeVirt does not let an arbitrary
+  container be added to the `virt-launcher` pod (the `hooks.kubevirt.io`
+  sidecar mechanism is for domain-XML mutation, not for running services), so
+  a per-instance gateway is a *separate pod* co-scheduled with `podAffinity`
+  toward the VMI — which also means compute is placed first and the gateway
+  follows.
+
+And the blocker above applies directly: `sharedHomeStorageClass` pointing at
+`csi-driver-nfs` does not work today, in either FSAL.
+
+### Local locking is not an option here, and is not needed
+
+The tempting shortcut is to mount with `local_lock=all` — keep every lock
+inside the guest, let cross-instance coordination be the user's problem, and
+buy shared homes with advisories. **It is not available.** `local_lock` and
+`nolock` live in the *"Options for NFS versions 2 and 3 only"* section of
+`nfs(5)` and are defined in terms of the **NLM sideband protocol**, which
+NFSv4 does not have — locking is integral to the v4 protocol. Requesting it
+on a v4.1 mount is silently ignored: a mount asking for `local_lock=all` comes
+up reporting `local_lock=none` (verified).
+
+Getting it would mean going back to NFSv3, which gives up the reasons v4 was
+chosen in the first place
+([`ganesha.conf.template`](../images/storage-gateway/ganesha.conf.template)):
+NLM and statd mean rpcbind and a set of sideband ports, where v4 has "exactly
+one port to fence" — and on AUTH_SYS that fencing NetworkPolicy *is* the
+boundary. It would also lose the v4.1 backchannel property that lets the
+fencing stay ingress-only. A convenience feature is not worth widening the one
+control the storage model rests on.
+
+**It is also unnecessary**, because server-side locking through a single
+gateway already delivers what local locking was wanted for, and more:
+
+- *within* an instance, locks work — measured, including SQLite's past-EOF
+  `PENDING_BYTE` pattern;
+- *across* instances that share a tree **through the same gateway**, locks
+  also work — that was the control in the experiment above.
+
+What local locking would have bought is tolerance for *several gateways over
+one tree* — and it would not have bought that either: two guests locking
+locally have no coordination at all, which is precisely the corruption the
+arrangement was trying to permit. So the answer is the same one the rest of
+this section reaches: **one gateway per tree**, and a shared home is a tree
+with one gateway that all its consumers mount.
+
+The advisories still have a job, just a smaller and more honest one: they
+cover what locking cannot fix in any configuration — `~/.config/dconf/user`
+coordinating through a machine-local flag file, `XDG_CACHE_HOME` on shared
+storage, two desktops against one home
+([Session state](#session-state-cache-config-state)). And "don't start two
+instances at once, even though you technically can" is worth *enforcing*
+rather than advising: refusing to start a second instance against a
+shared-home tree is a rule the operator can actually keep, and a rule beats
+a sentence in an onboarding document.
+
+## The storage-class experiment (done, 2026-08-16)
+
+Run, with results in
+[The rule holds for every storage class](#the-rule-holds-for-every-storage-class-measured).
+Recorded here because the rig is worth rebuilding whenever the storage
+substrate changes, and it needs **no privileged pod**: an in-tree `nfs:`
+PersistentVolume makes the *kubelet* perform every mount, and the existing
+[`images/storage-gateway/`](../images/storage-gateway/) image serves as the
+stand-in NAS. Three layers, all namespaced:
+
+1. **backing** — the image, exporting a `local-path` PVC. Stands in for the NAS.
+2. **gateway** — the image again, consuming an in-tree `nfs:` PV pointed at
+   *backing*. This is the `csi-driver-nfs` shape exactly: kubelet mounts NFS,
+   pod sees it at `/shares/home`.
+3. **clients** — `python:3-slim` pods with in-tree `nfs:` PVs, one per path
+   under test, taking `fcntl` byte-range locks.
+
+Two lessons about the method, both learned the hard way:
+
+- **Always run the positive control.** "The conflicting lock succeeded" and
+  "this rig cannot detect conflicts at all" look identical. A second client on
+  the *same* gateway is the control, and it must come back `REFUSED` before
+  the cross-path result means anything.
+- **Verify the lock is still held when the test runs.** A holder that has
+  already released turns the whole experiment into a measurement of nothing;
+  the first run here did exactly that and had to be discarded.
+- **Tear the clients down before their servers.** A force-deleted pod skips
+  the unmount and strands a `hard` NFS mount on the node whose server no
+  longer exists, which then blocks the namespace and the PVs from finalising.
+  Delete client pods gracefully first, or expect to revive the server address
+  to let the unmount complete.
 
 ## Open questions
 

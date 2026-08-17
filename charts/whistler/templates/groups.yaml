@@ -1,0 +1,18 @@
+{{- /*
+Groups from whistler.groups, rendered as Group CRs — the operator/server/portal
+read them live (whistler/config.py _load_groups), and admins manage them in the
+portal's Groups section. Helm owns the groups defined here: portal edits to a
+values-defined group are overwritten on the next upgrade, same as chart-defined
+templates and zones. Groups are optional; a deployment with none behaves exactly
+as it did before the primitive existed.
+*/ -}}
+{{- range $name, $group := .Values.whistler.groups }}
+---
+apiVersion: whistler.martinmalmsten.net/v1
+kind: Group
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+{{ toYaml (default dict $group) | indent 2 }}
+{{- end }}
