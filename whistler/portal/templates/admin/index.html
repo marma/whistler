@@ -56,11 +56,29 @@
   </div>
   <div class="card">
     <div class="content">
-      <div class="header"><i class="database icon"></i> Volumes</div>
-      <div class="description">Define PVC-backed volumes available to users</div>
+      <div class="header"><i class="calculator icon"></i> Computed access</div>
+      <div class="description">What each user's access resolves to, user + groups combined</div>
     </div>
     <div class="extra content">
-      <a href="/admin/volumes?user={{ current_user }}" class="ui primary fluid button">Manage Volumes</a>
+      <a href="/admin/computed-access?user={{ current_user }}" class="ui primary fluid button">Computed Access</a>
+    </div>
+  </div>
+  <div class="card">
+    <div class="content">
+      <div class="header"><i class="hdd icon"></i> Home volumes</div>
+      <div class="description">Every user's home disks, their zones and what is holding them</div>
+    </div>
+    <div class="extra content">
+      <a href="/admin/homevolumes?user={{ current_user }}" class="ui primary fluid button">View Home Volumes</a>
+    </div>
+  </div>
+  <div class="card">
+    <div class="content">
+      <div class="header"><i class="cloud icon"></i> Datasets</div>
+      <div class="description">Shared S3 data, mounted read-mostly in VM sessions</div>
+    </div>
+    <div class="extra content">
+      <a href="/admin/datasets?user={{ current_user }}" class="ui primary fluid button">Manage Datasets</a>
     </div>
   </div>
   <div class="card">

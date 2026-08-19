@@ -143,6 +143,27 @@
     {% endif %}
 
     <div class="field">
+      <label>Home volume</label>
+      <select name="home_volume" class="ui dropdown">
+        <option value="" {% if not current_home_volume %}selected{% endif %}>New home for this instance</option>
+        {% for hv in home_volumes %}
+        <option value="{{ hv.name }}" {% if current_home_volume == hv.name %}selected{% endif %}>
+          {{ hv.name }}{% if hv.size %} ({{ hv.size }}){% endif %}{% if hv.description %} — {{ hv.description }}{% endif %}
+        </option>
+        {% endfor %}
+      </select>
+      <div class="ui pointing label">
+        The disk mounted at <code>$HOME</code>. The default gives this instance
+        its own, which is what every instance had before volumes were named.
+        Reusing one lets a home follow you between instances — but only
+        <strong>one running instance at a time</strong> may hold it, since a
+        home carries an ext4 filesystem. Manage them under
+        <a href="/homes?user={{ current_user }}">Home volumes</a>.
+        VM sessions only.
+      </div>
+    </div>
+
+    <div class="field">
       <div class="ui checkbox">
         <input type="checkbox" name="preemptible" value="on" id="preemptible">
         <label for="preemptible">Preemptible (lower priority, may be evicted)</label>

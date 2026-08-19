@@ -1,0 +1,28 @@
+{# Shared by every screen that renders the access grid. #}
+<style>
+  .access-matrix th.access-zone,
+  .access-matrix td.access-zone { width: 1px; white-space: nowrap; text-align: center; }
+  .access-matrix th.access-buffer,
+  .access-matrix td.access-buffer {
+    width: auto;
+    border-left: none !important;
+    border-right: none !important;
+    background: transparent;
+  }
+  .access-matrix tr.access-section td { background: #f9fafb; }
+  .access-cell {
+    background: none; border: none; cursor: pointer;
+    padding: 0.2rem 0.4rem; line-height: 1; font-size: 1.15em;
+  }
+  .access-cell:focus { outline: 2px solid #2185d0; border-radius: 3px; }
+  .access-legend i { margin-left: 0.75rem; }
+</style>
+<div class="ui small basic segment access-legend" style="padding:0.4rem 0">
+  <span class="ui grey text">
+    <i class="red window close icon"></i> no access
+    <i class="yellow eye icon"></i> read-only
+    <i class="green check circle icon"></i> read-write
+    &nbsp;— click a cell to cycle. <strong>No access is a state, not an
+    oversight</strong>: this table has no defaults.
+  </span>
+</div>

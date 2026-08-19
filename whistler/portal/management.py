@@ -24,7 +24,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from whistler.config import (CHANNELS, ConfigWriteError, ENFORCED_CHANNELS,
+from whistler.config import (ACCESS_MODES, CHANNELS, ConfigWriteError,
+                             ENFORCED_ACCESS_KINDS, ENFORCED_CHANNELS,
                              GPU_NODE_LABEL, OVERRIDE_GROUPS)
 
 logger = logging.getLogger("whistler.management")
@@ -271,7 +272,7 @@ async def user_index(request: Request, cm: CM, user: User, is_admin: IsAdmin):
 
 async def instance_create_form(request: Request, cm: CM, user: User, is_admin: IsAdmin):
     (ssh_tpls, desk_tpls, volumes, allowed, gpu_types, allowed_gpu_types,
-     overrides, zones, allowed_zones) = \
+     overrides, zones, allowed_zones, home_volumes_) = \
         await asyncio.gather(
             request.app.state.run(cm.get_user_templates, user),
             request.app.state.run(cm.get_user_desktop_templates, user),
@@ -282,6 +283,7 @@ async def instance_create_form(request: Request, cm: CM, user: User, is_admin: I
             request.app.state.run(cm.get_user_overrides, user),
             request.app.state.run(cm.get_zones),
             request.app.state.run(cm.get_user_allowed_zones, user),
+            request.app.state.run(cm.get_home_volumes, user),
         )
     # The zone picker offers only what _apply_policy would accept: an empty
     # allowedZones means every defined zone.
@@ -291,7 +293,8 @@ async def instance_create_form(request: Request, cm: CM, user: User, is_admin: I
         context=_ctx(user, is_admin=is_admin, tpls=ssh_tpls + desk_tpls, volumes=volumes,
                      allowed_volumes=allowed, gpu_types=gpu_types,
                      allowed_gpu_types=allowed_gpu_types, overrides=overrides,
-                     zones=selectable_zones),
+                     zones=selectable_zones, home_volumes=home_volumes_,
+                     current_home_volume=None),
     )
 
 
@@ -300,6 +303,7 @@ async def instance_create(
     template_name: Annotated[str, Form()],
     instance_name: Annotated[str, Form()],
     preemptible:   Annotated[Optional[str], Form()] = None,
+    home_volume:   Annotated[Optional[str], Form()] = None,
     volume_names:  Annotated[Optional[list[str]], Form()] = None,
     override_cpu:          Annotated[Optional[str], Form()] = None,
     override_memory:       Annotated[Optional[str], Form()] = None,
@@ -352,7 +356,8 @@ async def instance_create(
         return _tr("/", user)
 
     ok = await request.app.state.run(
-        cm.add_instance, user, template_name, name, preemptible == "on", overrides,
+        cm.add_instance, user, template_name, name, preemptible == "on",
+        overrides, False, (home_volume or "").strip() or None,
     )
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to create instance.")
@@ -361,7 +366,7 @@ async def instance_create(
 
 async def instance_edit_form(request: Request, cm: CM, user: User, is_admin: IsAdmin, name: str):
     (instances, desktop_sessions, ssh_tpls, desk_tpls, volumes, allowed, gpu_types,
-     allowed_gpu_types, overrides, zones, allowed_zones, cur) = \
+     allowed_gpu_types, overrides, zones, allowed_zones, cur, home_volumes_) = \
         await asyncio.gather(
             request.app.state.run(cm.get_user_instances, user),
             request.app.state.run(cm.get_user_desktop_sessions, user),
@@ -375,6 +380,7 @@ async def instance_edit_form(request: Request, cm: CM, user: User, is_admin: IsA
             request.app.state.run(cm.get_zones),
             request.app.state.run(cm.get_user_allowed_zones, user),
             request.app.state.run(cm.get_instance_config, user, name),
+            request.app.state.run(cm.get_home_volumes, user),
         )
     # ssh instances and desktop/VM sessions are both Session CRs with an editable
     # spec.overrides — resolve either (desktop phase normalises to "status").
@@ -398,13 +404,15 @@ async def instance_edit_form(request: Request, cm: CM, user: User, is_admin: IsA
                      tpls=ssh_tpls + desk_tpls, volumes=volumes,
                      allowed_volumes=allowed, gpu_types=gpu_types,
                      allowed_gpu_types=allowed_gpu_types, overrides=overrides,
-                     zones=selectable_zones),
+                     zones=selectable_zones, home_volumes=home_volumes_,
+                     current_home_volume=cur.get("homeVolume")),
     )
 
 
 async def instance_update(
     request: Request, cm: CM, user: User, name: str,
     preemptible:   Annotated[Optional[str], Form()] = None,
+    home_volume:   Annotated[Optional[str], Form()] = None,
     volume_names:  Annotated[Optional[list[str]], Form()] = None,
     override_cpu:          Annotated[Optional[str], Form()] = None,
     override_memory:       Annotated[Optional[str], Form()] = None,
@@ -436,6 +444,7 @@ async def instance_update(
     )
     ok = await request.app.state.run(
         cm.update_instance, user, name, preemptible == "on", overrides,
+        (home_volume or "").strip() or None,
     )
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to update instance.")
@@ -614,6 +623,108 @@ async def admin_index(request: Request, cm: CM, admin: Admin):
 
 
 # --------------------------------------------------------------------------- #
+# Home volumes (the user's own; design/security.md)                            #
+# --------------------------------------------------------------------------- #
+#
+# A home is a named disk the user owns and an instance selects, not something
+# created and destroyed with the instance. So these are user-facing routes,
+# not admin ones: it is their data.
+
+async def _home_volume_rows(request: Request, cm, username: str):
+    """Each volume plus the running instance holding it, if any. The holder is
+    what makes the one-live-attach rule legible instead of a surprise at
+    start."""
+    volumes = await request.app.state.run(cm.get_home_volumes, username)
+    rows = []
+    for vol in volumes:
+        holder = await request.app.state.run(
+            cm.home_volume_holder, username, vol)
+        rows.append({**vol,
+                     "pvcName": cm.home_volume_pvc_name(vol),
+                     "inUseBy": holder})
+    return rows
+
+
+async def home_volumes(request: Request, cm: CM, user: User, is_admin: IsAdmin):
+    # Only zones the user may already enter. Creating a home in one of those
+    # is not an escalation — they could already start an instance there with a
+    # fresh home — which is what makes this self-service instead of a ticket.
+    zones, allowed_zones, access = await asyncio.gather(
+        request.app.state.run(cm.get_zones),
+        request.app.state.run(cm.get_user_allowed_zones, user),
+        request.app.state.run(cm.get_user_volume_access, user),
+    )
+    return templates.TemplateResponse(
+        request=request, name="user/home_volumes.html",
+        context=_ctx(user, is_admin=is_admin,
+                     volumes=await _home_volume_rows(request, cm, user),
+                     zones=[z for z in zones
+                            if not allowed_zones or z in allowed_zones],
+                     access=access),
+    )
+
+
+async def home_volume_create(
+    request: Request, cm: CM, user: User,
+    name:        Annotated[str, Form()],
+    zone:        Annotated[str, Form()],
+    size:        Annotated[Optional[str], Form()] = None,
+    description: Annotated[Optional[str], Form()] = None,
+):
+    name = name.strip()
+    if not re.fullmatch(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?", name):
+        raise HTTPException(
+            status_code=400,
+            detail="Home volume name must be a DNS-1123 label (lowercase "
+                   "alphanumerics and '-', max 63 chars).")
+    # The zone must be one the user already holds, checked server-side: the
+    # form only offers those, but the form is not the boundary. Granting
+    # themselves a zone they cannot enter would be a real escalation, since
+    # the cell outlives whatever their allowedZones say later.
+    zone = zone.strip()
+    zones, allowed_zones = await asyncio.gather(
+        request.app.state.run(cm.get_zones),
+        request.app.state.run(cm.get_user_allowed_zones, user),
+    )
+    if zone not in zones or (allowed_zones and zone not in allowed_zones):
+        raise HTTPException(
+            status_code=400,
+            detail=f"You do not have access to zone '{zone}'.")
+    ok = await request.app.state.run(cm.save_home_volume, user, {
+        "name": name,
+        "size": (size or "").strip() or None,
+        "description": (description or "").strip() or None,
+    })
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to create home volume.")
+    # The volume is useless without a cell: the matrix has no defaults. This
+    # is the one entry a user writes themselves, and only for a zone they
+    # already hold — every other cell is an administrator's decision.
+    if not await request.app.state.run(
+            cm.grant_own_volume_access, user, zone, name):
+        raise HTTPException(
+            status_code=500,
+            detail="Created the volume but could not grant it in that zone. "
+                   "An administrator can add the entry in the access matrix.")
+    return _tr("/homes", user)
+
+
+async def home_volume_delete(
+    request: Request, cm: CM, user: User, name: str,
+    delete_data: Annotated[Optional[str], Form()] = None,
+):
+    ok = await request.app.state.run(
+        cm.delete_home_volume, user, name, delete_data == "on")
+    if not ok:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not delete that home volume. A volume attached to a "
+                   "running instance must be released first — stop the "
+                   "instance and try again.")
+    return _tr("/homes", user)
+
+
+# --------------------------------------------------------------------------- #
 # Admin — templates                                                            #
 # --------------------------------------------------------------------------- #
 
@@ -773,7 +884,7 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
     if not user_obj:
         raise HTTPException(status_code=404, detail="User not found.")
     instances = await request.app.state.run(cm.get_user_instances, username)
-    volumes   = await request.app.state.run(cm.get_volumes)
+    volumes   = await _grantable_volumes(request, cm)
     allowed   = await request.app.state.run(cm.get_user_allowed_volumes, username)
     gpu_types = await request.app.state.run(cm.get_gpu_types)
     allowed_gpu_types = await request.app.state.run(cm.get_user_allowed_gpu_types, username)
@@ -782,6 +893,12 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
     allowed_zones = await request.app.state.run(cm.get_user_allowed_zones, username)
     user_groups = await request.app.state.run(cm.get_user_groups, username)
     volume_modes = await request.app.state.run(cm.get_user_volume_modes, username)
+    own_access = (user_obj.get("volumeAccess") or {})
+    effective_access = await request.app.state.run(
+        cm.get_user_volume_access, username)
+    access_sections = _sections_with_values(
+        await _matrix_sections(request, cm, username),
+        zones, own_access, effective_access)
     channel_grant = await request.app.state.run(cm.get_user_channels, username)
     return templates.TemplateResponse(
         request=request, name="admin/user_detail.html",
@@ -794,6 +911,7 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
                      channels=CHANNELS, enforced_channels=ENFORCED_CHANNELS,
                      own_channels=user_obj.get("channels"),
                      channel_grant=sorted(channel_grant) if channel_grant is not None else None,
+                     access_sections=access_sections,
                      own_volumes=user_obj.get("allowedVolumes") or [],
                      own_zones=user_obj.get("allowedZones") or [],
                      own_gpu_types=user_obj.get("allowedGpuTypes") or [],
@@ -888,20 +1006,52 @@ async def admin_groups(request: Request, cm: CM, admin: Admin):
     )
 
 
+async def _grantable_volumes(request, cm):
+    """The datasets a grant may name.
+
+    This is the OLD grant path and it is still the one that enforces dataset
+    access — `session_shared_datasets` reads allowedVolumes and the group
+    volume modes, not the access matrix. It stays until fencing moves, and the
+    matrix rows for datasets are labelled "not enforced yet" so the two are
+    not mistaken for each other.
+
+    PVC volumes are deliberately absent: the primitive remains in the code,
+    but it is not something to hand out from the UI.
+    """
+    dataset_defs = await request.app.state.run(cm.get_dataset_definitions)
+    dataset_defs = dataset_defs or {}
+    # PVC volumes are no longer offered in the UI (the primitive stays in the
+    # code). What remains here is datasets, and this list is still what
+    # ENFORCES dataset access until fencing moves to the access matrix.
+    rows = []
+    for name, spec in sorted(dataset_defs.items()):
+        spec = spec or {}
+        rows.append({"name": name, "isDataset": True,
+                     "description": spec.get("description"),
+                     "readOnly": bool(spec.get("readOnly"))})
+    return rows
+
+
 async def _group_form_context(request, admin, group=None):
     """Everything the group editor needs to render: the catalogs it grants
     from, plus the group itself when editing."""
     cm = request.app.state.cm
-    volumes, zones, gpu_types, all_users = await asyncio.gather(
-        request.app.state.run(cm.get_volumes),
-        request.app.state.run(cm.get_zones),
-        request.app.state.run(cm.get_gpu_types),
-        request.app.state.run(cm.list_all_users),
+    volumes, (zones, gpu_types, all_users) = await asyncio.gather(
+        _grantable_volumes(request, cm),
+        asyncio.gather(
+            request.app.state.run(cm.get_zones),
+            request.app.state.run(cm.get_gpu_types),
+            request.app.state.run(cm.list_all_users),
+        ),
     )
+    own_access = ((group or {}).get("volumeAccess") or {})
+    access_sections = _sections_with_values(
+        await _matrix_sections(request, cm), zones, own_access, own_access)
     return _ctx(admin, is_admin=True, group=group, volumes=volumes, zones=zones,
                 gpu_types=gpu_types, all_users=all_users,
                 channels=CHANNELS, enforced_channels=ENFORCED_CHANNELS,
                 override_groups=OVERRIDE_GROUPS,
+                access_sections=access_sections,
                 volume_grants=_volume_grants_by_name(group))
 
 
@@ -969,39 +1119,6 @@ async def admin_group_delete(request: Request, cm: CM, admin: Admin, name: str):
 # --------------------------------------------------------------------------- #
 # Admin — volumes                                                              #
 # --------------------------------------------------------------------------- #
-
-async def admin_volumes(request: Request, cm: CM, admin: Admin):
-    volumes = await request.app.state.run(cm.get_volumes)
-    return templates.TemplateResponse(
-        request=request, name="admin/volumes.html",
-        context=_ctx(admin, is_admin=True, volumes=volumes),
-    )
-
-
-async def admin_volume_new(request: Request, cm: CM, admin: Admin):
-    return templates.TemplateResponse(
-        request=request, name="admin/volume_form.html",
-        context=_ctx(admin, is_admin=True, vol=None),
-    )
-
-
-async def admin_volume_create(
-    request: Request, cm: CM, admin: Admin,
-    name:     Annotated[str, Form()],
-    pvc_name: Annotated[str, Form()],
-    sub_path: Annotated[Optional[str], Form()] = None,
-):
-    vol_data = _build_volume_data(name, pvc_name, sub_path)
-    ok = await request.app.state.run(cm.save_volume, vol_data)
-    if not ok:
-        raise HTTPException(status_code=500, detail="Failed to create volume.")
-    return _tr("/admin/volumes", admin)
-
-
-async def admin_volume_delete(request: Request, cm: CM, admin: Admin, name: str):
-    await request.app.state.run(cm.delete_volume, name)
-    return _tr("/admin/volumes", admin)
-
 
 # --------------------------------------------------------------------------- #
 # Admin — zones (network postures; Zone CRs)                                    #
@@ -1085,6 +1202,344 @@ async def admin_zone_delete(request: Request, cm: CM, admin: Admin, name: str):
             status_code=400,
             detail="Failed to delete zone. The default zone cannot be deleted.")
     return _tr("/admin/zones", admin)
+
+
+# --------------------------------------------------------------------------- #
+# Admin — home volumes (every user's) and the access matrix                    #
+# --------------------------------------------------------------------------- #
+
+async def admin_home_volumes(request: Request, cm: CM, admin: Admin):
+    """Every home volume in the cluster: who owns it, how big, which instance
+    is holding it. The question this answers that the per-user page cannot is
+    "where has the storage gone", so it is deliberately a flat list rather
+    than a per-user drill-down."""
+    users = await request.app.state.run(cm.list_all_users)
+    rows = []
+    for user in users:
+        username = user.get("name")
+        if not username:
+            continue
+        for vol in await request.app.state.run(cm.get_home_volumes, username):
+            holder = await request.app.state.run(
+                cm.home_volume_holder, username, vol)
+            access = await request.app.state.run(
+                cm.get_user_volume_access, username)
+            rows.append({
+                **vol,
+                "user": username,
+                "pvcName": cm.home_volume_pvc_name(vol),
+                "inUseBy": holder,
+                # Which zones this volume is actually usable in, straight from
+                # the matrix — there is nowhere else it could come from.
+                "zones": sorted(z for z, cells in access.items()
+                                if vol.get("name") in (cells or {})),
+            })
+    rows.sort(key=lambda r: (r["user"], r.get("name") or ""))
+    return templates.TemplateResponse(
+        request=request, name="admin/home_volumes.html",
+        context=_ctx(admin, is_admin=True, volumes=rows),
+    )
+
+
+async def admin_home_volume_delete(request: Request, cm: CM, admin: Admin,
+                                   username: str, name: str,
+                                   delete_data: Annotated[Optional[str], Form()] = None):
+    ok = await request.app.state.run(
+        cm.delete_home_volume, username, name, delete_data == "on")
+    if not ok:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not delete that home volume. One attached to a "
+                   "running instance must be released first.")
+    return _tr("/admin/homevolumes", admin)
+
+
+async def _matrix_sections(request: Request, cm, username: str = None):
+    """Rows of the access grid, grouped by kind.
+
+    ``username`` set     -> that user's home volumes + every dataset.
+    ``username`` None    -> datasets only (the group grid).
+
+    A group grid has no home volumes on purpose: a home's name only resolves
+    in its owner's own namespace, so a group granting one could never be
+    honoured by any member. Groups grant shared data, which is what datasets
+    are. PVC volumes are no longer offered anywhere — the primitive stays in
+    the code, but it is not something to hand out from this screen.
+    """
+    datasets = await request.app.state.run(cm.get_dataset_definitions)
+    sections = []
+    if username:
+        homes = await request.app.state.run(cm.get_home_volumes, username)
+        sections.append({
+            "kind": "home", "title": "Home volumes", "enforced": True,
+            "note": "Enforced: a session is refused if its home is not "
+                    "granted in the zone it runs in.",
+            "rows": [{"key": v["name"], "label": v["name"],
+                      "description": v.get("description")} for v in homes],
+        })
+    sections.append({
+        "kind": "dataset", "title": "Datasets", "enforced": False,
+        "note": "Recorded, not yet enforced — dataset access is still decided "
+                "by the grants below until fencing moves to this table.",
+        "rows": [{"key": n, "label": n,
+                  "description": (spec or {}).get("description")}
+                 for n, spec in sorted((datasets or {}).items())],
+    })
+    return sections
+
+
+def _sections_with_values(sections, zones, own, effective):
+    """Decorate rows with their own/effective cell per zone, for rendering."""
+    out = []
+    for section in sections:
+        rows = []
+        for row in section["rows"]:
+            rows.append({**row,
+                         "own": {z: (own.get(z) or {}).get(row["key"])
+                                 for z in zones},
+                         "effective": {z: (effective.get(z) or {}).get(row["key"])
+                                       for z in zones}})
+        out.append({**section, "rows": rows})
+    return out
+
+
+def _parse_matrix_form(form, zones, sections) -> dict:
+    """Read the grid back as ``{zone: {volume: mode}}``.
+
+    A straight replace of the subject's matrix is correct because the grid
+    renders every row the subject could be granted, blanks included — so a
+    cell absent from the form is one the admin saw and left empty.
+    """
+    matrix = {}
+    for section in sections:
+        for row in section["rows"]:
+            for zone in zones:
+                mode = (form.get(f"access__{zone}__{row['key']}") or "").strip()
+                if mode in ACCESS_MODES:
+                    matrix.setdefault(zone, {})[row["key"]] = mode
+    return matrix
+
+
+async def admin_user_set_access(request: Request, cm: CM, admin: Admin,
+                                username: str):
+    form = await request.form()
+    zones = await request.app.state.run(cm.get_zones)
+    sections = await _matrix_sections(request, cm, username)
+    ok = await request.app.state.run(
+        cm.set_user_volume_access, username,
+        _parse_matrix_form(form, zones, sections))
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to save access.")
+    return _tr(f"/admin/users/{username}", admin)
+
+
+async def admin_computed_access(request: Request, cm: CM, admin: Admin,
+                                name: str = None):
+    """What a user's access actually resolves to, and where each cell came
+    from. Read-only by construction: it is a *derived* view, and offering an
+    edit control on it would mean guessing whether the admin meant to change
+    the user or the group that granted it.
+    """
+    users = await request.app.state.run(cm.list_all_users)
+    usernames = sorted(u["name"] for u in users if u.get("name"))
+    if not name:
+        name = usernames[0] if usernames else None
+    zones = await request.app.state.run(cm.get_zones)
+    sections, groups, effective = [], [], {}
+    if name:
+        own = next((u.get("volumeAccess") or {}
+                    for u in users if u.get("name") == name), {})
+        groups = await request.app.state.run(cm.get_user_groups, name)
+        effective = await request.app.state.run(cm.get_user_volume_access, name)
+        raw = await _matrix_sections(request, cm, name)
+        sections = []
+        for section in raw:
+            rows = []
+            for row in section["rows"]:
+                cells = {}
+                for zone in zones:
+                    value = (effective.get(zone) or {}).get(row["key"])
+                    # Provenance: the winning value is the most permissive of
+                    # the user's own and every group's, so name every source
+                    # that actually holds it rather than guessing one.
+                    sources = []
+                    if (own.get(zone) or {}).get(row["key"]) == value and value:
+                        sources.append("own")
+                    for group in groups:
+                        cell = ((group.get("volumeAccess") or {}).get(zone)
+                                or {}).get(row["key"])
+                        if cell == value and value:
+                            sources.append(group.get("name") or "group")
+                    cells[zone] = {"value": value, "sources": sources}
+                rows.append({**row, "cells": cells})
+            sections.append({**section, "rows": rows})
+    return templates.TemplateResponse(
+        request=request, name="admin/computed_access.html",
+        context=_ctx(admin, is_admin=True, subject=name, usernames=usernames,
+                     zones=zones, sections=sections,
+                     groups=[g.get("name") for g in groups]),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Admin — datasets (shared S3 data; Dataset CRs)                               #
+# --------------------------------------------------------------------------- #
+#
+# A dataset is NOT a volume, and is deliberately edited somewhere else: every
+# entry in the volume catalog is a Kubernetes volume source copied straight
+# into a pod spec, which an S3 definition is not. Datasets are granted (in the
+# user/group editors) and mounted by cloud-init at boot — never picked as an
+# instance mount. See design/storage.md.
+
+def _build_dataset_data(name, description, endpoint, bucket, prefix, region,
+                        provider, credentials_secret, read_only):
+    return {
+        "name": name.strip(),
+        "description": (description or "").strip() or None,
+        "endpoint": (endpoint or "").strip() or None,
+        "bucket": (bucket or "").strip() or None,
+        "prefix": (prefix or "").strip().strip("/") or None,
+        "region": (region or "").strip() or None,
+        "provider": (provider or "").strip() or None,
+        "credentialsSecret": (credentials_secret or "").strip() or None,
+        # False must survive as an explicit value, not be dropped as empty:
+        # unticking "read-only" is how an admin grants write access.
+        "readOnly": bool(read_only),
+    }
+
+
+async def _dataset_rows(request: Request, cm):
+    defs = await request.app.state.run(cm.get_dataset_definitions)
+    rows = []
+    for name, spec in sorted(defs.items()):
+        has_creds = await request.app.state.run(cm.has_dataset_credentials, name)
+        rows.append({"name": name, **(spec or {}), "hasCredentials": has_creds})
+    return rows
+
+
+async def admin_datasets(request: Request, cm: CM, admin: Admin):
+    return templates.TemplateResponse(
+        request=request, name="admin/datasets.html",
+        context=_ctx(admin, is_admin=True,
+                     datasets=await _dataset_rows(request, cm)),
+    )
+
+
+async def admin_dataset_new(request: Request, cm: CM, admin: Admin):
+    return templates.TemplateResponse(
+        request=request, name="admin/dataset_form.html",
+        context=_ctx(admin, is_admin=True, dataset=None, has_credentials=False),
+    )
+
+
+async def admin_dataset_create(
+    request: Request, cm: CM, admin: Admin,
+    name:               Annotated[str, Form()],
+    bucket:             Annotated[str, Form()],
+    description:        Annotated[Optional[str], Form()] = None,
+    endpoint:           Annotated[Optional[str], Form()] = None,
+    prefix:             Annotated[Optional[str], Form()] = None,
+    region:             Annotated[Optional[str], Form()] = None,
+    provider:           Annotated[Optional[str], Form()] = None,
+    credentials_secret: Annotated[Optional[str], Form()] = None,
+    read_only:          Annotated[Optional[str], Form()] = None,
+    access_key_id:      Annotated[Optional[str], Form()] = None,
+    secret_access_key:  Annotated[Optional[str], Form()] = None,
+):
+    name = name.strip()
+    if not re.fullmatch(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?", name):
+        raise HTTPException(
+            status_code=400,
+            detail="Dataset name must be a DNS-1123 label (lowercase "
+                   "alphanumerics and '-', max 63 chars).")
+    return await _save_dataset(request, cm, admin, name, description, endpoint,
+                               bucket, prefix, region, provider,
+                               credentials_secret, read_only, access_key_id,
+                               secret_access_key)
+
+
+async def admin_dataset_edit(request: Request, cm: CM, admin: Admin, name: str):
+    defs = await request.app.state.run(cm.get_dataset_definitions)
+    if name not in defs:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    has_creds = await request.app.state.run(cm.has_dataset_credentials, name)
+    return templates.TemplateResponse(
+        request=request, name="admin/dataset_form.html",
+        context=_ctx(admin, is_admin=True,
+                     dataset={"name": name, **(defs[name] or {})},
+                     has_credentials=has_creds),
+    )
+
+
+async def admin_dataset_update(
+    request: Request, cm: CM, admin: Admin, name: str,
+    bucket:             Annotated[str, Form()],
+    description:        Annotated[Optional[str], Form()] = None,
+    endpoint:           Annotated[Optional[str], Form()] = None,
+    prefix:             Annotated[Optional[str], Form()] = None,
+    region:             Annotated[Optional[str], Form()] = None,
+    provider:           Annotated[Optional[str], Form()] = None,
+    credentials_secret: Annotated[Optional[str], Form()] = None,
+    read_only:          Annotated[Optional[str], Form()] = None,
+    access_key_id:      Annotated[Optional[str], Form()] = None,
+    secret_access_key:  Annotated[Optional[str], Form()] = None,
+):
+    return await _save_dataset(request, cm, admin, name, description, endpoint,
+                               bucket, prefix, region, provider,
+                               credentials_secret, read_only, access_key_id,
+                               secret_access_key)
+
+
+async def _save_dataset(request, cm, admin, name, description, endpoint,
+                        bucket, prefix, region, provider, credentials_secret,
+                        read_only, access_key_id, secret_access_key):
+    """Shared by create and update.
+
+    The credential is written FIRST and separately: blank credential fields
+    mean "leave it alone", so an edit that only changes the bucket must not
+    wipe the key. Nothing here ever reads a credential back — an admin can
+    replace one but not retrieve it.
+    """
+    access_key_id = (access_key_id or "").strip()
+    secret_access_key = (secret_access_key or "").strip()
+    credentials_secret = (credentials_secret or "").strip()
+    if access_key_id and secret_access_key:
+        ok = await request.app.state.run(
+            cm.save_dataset_credentials, name, access_key_id,
+            secret_access_key)
+        if not ok:
+            raise HTTPException(status_code=500,
+                                detail="Failed to store dataset credentials.")
+        # Whistler manages this Secret, so point the dataset at it unless the
+        # admin named one of their own.
+        credentials_secret = (credentials_secret
+                              or cm.dataset_credentials_secret_name(name))
+    elif access_key_id or secret_access_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Give both the access key and the secret, or neither "
+                   "(neither leaves the stored credential unchanged).")
+    elif not credentials_secret:
+        # Blank everything means "leave the credential alone" — including the
+        # LINK to it. Dropping the reference while keeping the Secret leaves a
+        # dataset that looks configured and cannot authenticate, which is what
+        # an edit that only changed the description used to do.
+        existing = await request.app.state.run(cm.get_dataset_definitions)
+        credentials_secret = (existing.get(name) or {}).get("credentialsSecret")
+
+    data = _build_dataset_data(name, description, endpoint, bucket, prefix,
+                              region, provider, credentials_secret, read_only)
+    ok = await request.app.state.run(cm.save_dataset, data)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to save dataset.")
+    return _tr("/admin/datasets", admin)
+
+
+async def admin_dataset_delete(request: Request, cm: CM, admin: Admin, name: str):
+    ok = await request.app.state.run(cm.delete_dataset, name)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to delete dataset.")
+    return _tr("/admin/datasets", admin)
 
 
 # --------------------------------------------------------------------------- #
@@ -1317,6 +1772,22 @@ def _build_group_data(name: str, form) -> dict:
     if volumes:
         data["volumes"] = volumes
 
+    # The access matrix, read the same way the user grid is. Absent means the
+    # group grants nothing there — no defaults, as everywhere in this table.
+    matrix: dict = {}
+    for key in form.keys():
+        if not key.startswith("access__"):
+            continue
+        try:
+            _, zone, volume = key.split("__", 2)
+        except ValueError:
+            continue
+        mode = (form.get(key) or "").strip()
+        if mode in ACCESS_MODES:
+            matrix.setdefault(zone, {})[volume] = mode
+    if matrix:
+        data["volumeAccess"] = matrix
+
     zones = [z.strip() for z in form.getlist("zone_names") if z.strip()]
     if zones:
         data["allowedZones"] = zones
@@ -1335,14 +1806,6 @@ def _build_group_data(name: str, form) -> dict:
     return data
 
 
-def _build_volume_data(name, pvc_name, sub_path) -> dict:
-    vol: dict = {
-        "name": name.strip(),
-        "persistentVolumeClaim": {"claimName": pvc_name.strip()},
-    }
-    if sub_path and sub_path.strip():
-        vol["subPath"] = sub_path.strip()
-    return vol
 
 
 def _parse_block_cidrs(text) -> list:
@@ -1497,16 +1960,25 @@ def build_management_app(config_manager):
     app.add_api_route("/admin/groups/{name}/edit",                admin_group_edit,       methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/groups/{name}",                     admin_group_update,     methods=["POST"])
     app.add_api_route("/admin/groups/{name}/delete",              admin_group_delete,     methods=["POST"])
-    app.add_api_route("/admin/volumes",                           admin_volumes,          methods=["GET"],  response_class=HTMLResponse)
-    app.add_api_route("/admin/volumes/new",                       admin_volume_new,       methods=["GET"],  response_class=HTMLResponse)
-    app.add_api_route("/admin/volumes",                           admin_volume_create,    methods=["POST"])
-    app.add_api_route("/admin/volumes/{name}/delete",             admin_volume_delete,    methods=["POST"])
     app.add_api_route("/admin/zones",                             admin_zones,            methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/zones/new",                         admin_zone_new,         methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/zones",                             admin_zone_create,      methods=["POST"])
     app.add_api_route("/admin/zones/{name}/edit",                 admin_zone_edit,        methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/zones/{name}",                      admin_zone_update,      methods=["POST"])
     app.add_api_route("/admin/zones/{name}/delete",               admin_zone_delete,      methods=["POST"])
+    app.add_api_route("/homes",                                   home_volumes,           methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/homes",                                   home_volume_create,     methods=["POST"])
+    app.add_api_route("/homes/{name}/delete",                     home_volume_delete,     methods=["POST"])
+    app.add_api_route("/admin/computed-access",                   admin_computed_access,  methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/admin/users/{username}/access",           admin_user_set_access,  methods=["POST"])
+    app.add_api_route("/admin/homevolumes",                       admin_home_volumes,     methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/admin/homevolumes/{username}/{name}/delete", admin_home_volume_delete, methods=["POST"])
+    app.add_api_route("/admin/datasets",                          admin_datasets,         methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/admin/datasets/new",                      admin_dataset_new,      methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/admin/datasets",                          admin_dataset_create,   methods=["POST"])
+    app.add_api_route("/admin/datasets/{name}/edit",              admin_dataset_edit,     methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/admin/datasets/{name}",                   admin_dataset_update,   methods=["POST"])
+    app.add_api_route("/admin/datasets/{name}/delete",            admin_dataset_delete,   methods=["POST"])
     app.add_api_route("/admin/sessions",                          admin_sessions,         methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/sessions/{username}/{name}/stop",   admin_session_stop,     methods=["POST"])
     app.add_api_route("/admin/sessions/{username}/{name}/delete", admin_session_delete,   methods=["POST"])

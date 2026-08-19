@@ -73,6 +73,31 @@ HOME_DISK_SERIAL = "whistlerhome"
 HOME_DISK_PATH = f"/dev/disk/by-id/virtio-{HOME_DISK_SERIAL}"
 # Root-only: it holds the keys that open this session's dataset proxies.
 RCLONE_CONF_PATH = "/etc/whistler/rclone.conf"
+# Where datasets are really mounted, and the friendly path symlinked to it.
+#
+# NOT /shared directly, and this is not cosmetic: Ubuntu's AppArmor profile
+# for fusermount3 (/etc/apparmor.d/fusermount3) permits FUSE mounts only under
+# @{HOME}, /mnt, /media, /tmp, @{run}/user/@{uid} and /cvmfs. A mount at
+# /shared/<name> is denied — "failed mntpnt match", surfacing only as
+# `fusermount: mount failed: Permission denied`, with the real reason in
+# dmesg. Measured on Ubuntu 26.04, 2026-08-17. The profile carries no
+# `include if exists <local/...>` hook, so the alternative is editing a
+# packaged conffile from cloud-init, which is worse than moving the mount.
+DATASET_MOUNT_ROOT = "/mnt/shared"
+DATASET_MOUNT_LINK = "/shared"
+# The single bucket every dataset proxy serves, and therefore the bucket the
+# guest mounts (`<dataset>:<S3_PROXY_BUCKET>`). Both sides must agree:
+# _build_s3_proxy_manifests names it in the proxy's `combine` upstream.
+#
+# It exists because `rclone serve s3 :s3:<bucket>` promotes the served
+# directory's *subdirectories* to buckets, which silently loses every file at
+# the dataset's top level — S3 cannot address an object that has no bucket, so
+# such a dataset mounts EMPTY with no error. Wrapping the backend in a
+# `combine` remote puts exactly one directory at the served root, so the
+# dataset appears verbatim underneath it. Fixed rather than named after the
+# volume because S3 bucket naming is far narrower than Whistler volume naming
+# (no uppercase, no underscores, 3-63 chars).
+S3_PROXY_BUCKET = "data"
 
 
 def build_user_data(*, username: str, uid: int, ssh_keys: list,
@@ -284,7 +309,7 @@ exit 0
         })
         for ds in datasets:
             name = ds["name"]
-            mount = f"/shared/{name}"
+            mount = f"{DATASET_MOUNT_ROOT}/{name}"
             # --read-only mirrors the grant client-side. It is NOT the
             # boundary — the guest has root and can drop it — which is why a
             # `ro` grant gets its own proxy started with rclone's server-side
@@ -301,7 +326,8 @@ exit 0
                     "[Service]\n"
                     "Type=notify\n"
                     f"ExecStartPre=/bin/mkdir -p {mount}\n"
-                    f"ExecStart=/usr/bin/rclone mount {name}: {mount}"
+                    f"ExecStart=/usr/bin/rclone mount"
+                    f" {name}:{S3_PROXY_BUCKET} {mount}"
                     f" --config {RCLONE_CONF_PATH}"
                     # allow-other so the session user can read a mount root
                     # made by the unit; uid/gid present it as theirs, since S3
@@ -395,6 +421,15 @@ exit 0
             "systemctl enable whistler-home.service",
             "systemctl start --no-block whistler-home.service",
         ])
+    if datasets:
+        # /shared is the documented path and stays the one users see; the
+        # mounts themselves live under DATASET_MOUNT_ROOT because AppArmor
+        # will not allow a FUSE mount anywhere else. A symlink is not subject
+        # to the mount rule, so both facts hold at once. Ordered before the
+        # units so the friendly path is never briefly missing.
+        doc["runcmd"].append(f"mkdir -p {DATASET_MOUNT_ROOT}")
+        doc["runcmd"].append(
+            f"ln -sfn {DATASET_MOUNT_ROOT} {DATASET_MOUNT_LINK}")
     for ds in datasets:
         # enable + start so persistent-root guests remount on later boots;
         # --no-block because a proxy that is slow to answer must not hold up

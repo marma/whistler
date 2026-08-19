@@ -1,0 +1,93 @@
+{#
+  The access grid, shared by the User and Group editors.
+
+  Expects: sections (from _sections_with_values), zones, and `show_group_mark`
+  — true on the user grid, where a cell may be granted by a group and the
+  control still edits the user's OWN value. On the group grid there is no
+  second source, so the marker would be meaningless.
+
+  Icons rather than dropdowns: an icon is narrower than any zone name, so the
+  zone columns trim to their heading instead of stretching. The value lives in
+  a hidden input, so an untouched cell posts what it was rendered with.
+#}
+<table class="ui celled compact table access-matrix">
+  <thead>
+    <tr>
+      <th class="collapsing">Volume</th>
+      <th class="access-buffer"></th>
+      {% for z in zones %}<th class="access-zone">{{ z }}</th>{% endfor %}
+    </tr>
+  </thead>
+  <tbody>
+    {% for section in sections %}
+    <tr class="access-section">
+      <td colspan="{{ zones|length + 2 }}">
+        <strong>{{ section.title }}</strong>
+        {% if not section.enforced %}
+          <div class="ui tiny orange basic label">not enforced yet</div>
+        {% endif %}
+        <div class="ui grey text" style="font-size:0.85em">{{ section.note }}</div>
+      </td>
+    </tr>
+    {% for row in section.rows %}
+    <tr>
+      <td class="collapsing">
+        {{ row.label }}
+        {% if row.description %}
+          <div class="ui grey text" style="font-size:0.85em">{{ row.description }}</div>
+        {% endif %}
+      </td>
+      <td class="access-buffer"></td>
+      {% for z in zones %}
+      <td class="access-zone">
+        <input type="hidden" name="access__{{ z }}__{{ row.key }}"
+               value="{{ row.own[z] or '' }}">
+        <button type="button" class="access-cell"
+                aria-label="{{ row.label }} in {{ z }}">
+          <i class="icon"></i>
+        </button>
+        {% if show_group_mark and row.effective[z] and not row.own[z] %}
+          <i class="teal users icon"
+             title="Granted by a group ({{ row.effective[z] }}). Edit that on the group."></i>
+        {% endif %}
+      </td>
+      {% endfor %}
+    </tr>
+    {% else %}
+    <tr>
+      <td colspan="{{ zones|length + 2 }}">
+        <span class="ui grey text">None defined.</span>
+      </td>
+    </tr>
+    {% endfor %}
+    {% endfor %}
+  </tbody>
+</table>
+
+<script>
+  // Three states, cycled least- to most-permissive.
+  if (!window.__accessCellsWired) {
+    window.__accessCellsWired = true;
+    const ACCESS_STATES = [
+      {value: "",          icon: "red window close icon",   title: "No access"},
+      {value: "read-only", icon: "yellow eye icon",         title: "Read-only"},
+      {value: "allowed",   icon: "green check circle icon", title: "Read-write (allowed)"}
+    ];
+    document.querySelectorAll(".access-cell").forEach(function (btn) {
+      const input = btn.parentElement.querySelector("input[type=hidden]");
+      const icon = btn.querySelector("i");
+      function paint() {
+        const state = ACCESS_STATES.find(s => s.value === input.value)
+                      || ACCESS_STATES[0];
+        icon.className = state.icon;
+        btn.title = state.title;
+      }
+      btn.addEventListener("click", function () {
+        const i = ACCESS_STATES.findIndex(s => s.value === input.value);
+        input.value = ACCESS_STATES[(i + 1) % ACCESS_STATES.length].value;
+        paint();
+      });
+      paint();
+    });
+  }
+</script>

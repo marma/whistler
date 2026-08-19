@@ -17,8 +17,8 @@ import os
 import secrets
 import yaml
 
-from whistler.cloudinit import (HOME_DISK_SERIAL, build_user_data,
-                                resolve_uid, resolve_gid)
+from whistler.cloudinit import (HOME_DISK_SERIAL, S3_PROXY_BUCKET,
+                                build_user_data, resolve_uid, resolve_gid)
 from whistler import hostca
 
 logger = logging.getLogger(__name__)
@@ -101,6 +101,8 @@ SESSION_PLURAL = "sessions"
 USER_PLURAL = "users"
 ZONE_PLURAL = "zones"
 GROUP_PLURAL = "groups"
+DATASET_PLURAL = "datasets"
+HOME_VOLUME_PLURAL = "homevolumes"
 
 # Node label a template/override's gpuType is matched against, both as the
 # nodeSelector key that schedules onto a GPU of that type and as the node
@@ -174,6 +176,46 @@ _POSTURE_CHANNELS = {
     SSH_POSTURE_RELAY: (CHANNEL_RELAY,),
     SSH_POSTURE_NONE: (),
 }
+
+
+#: Ordered most permissive first. Absent (None) is no access at all, which is
+#: why it is not in the list — it is the absence of an entry, not a value.
+ACCESS_MODES = ("allowed", "read-only")
+#: Which volume kinds the access matrix actually governs today. Everything
+#: else is recorded and displayed but still decided by allowedVolumes and the
+#: group volume grants, exactly the way `clipboard` sits in CHANNELS but not
+#: ENFORCED_CHANNELS. Widening this is a deliberate migration, not a tweak:
+#: the matrix has no defaults, so anything moved into it stops working the
+#: moment a grant is missing.
+ENFORCED_ACCESS_KINDS = ("home",)
+
+
+def merge_volume_access(*sources) -> Dict[str, Dict[str, str]]:
+    """Merge access matrices, most permissive per cell.
+
+    ``{zone: {volume: mode}}``. Unlike merge_allow_lists this has **no
+    "empty means unrestricted" case**: an absent cell is no access, full stop.
+    That inversion is the point of the matrix, and the two must never be
+    made to look alike (design/security.md, "Every allow is explicit").
+
+    Most-permissive-wins because joining a group is a deliberate act whose
+    purpose is to confer access; a user who already held something does not
+    lose it by joining a project. The hazard that needs watching is not this
+    one — it is one member's access reaching another member, which requires a
+    shared instance and is why a project instance must carry its own subject
+    entry rather than the union of its members'.
+    """
+    merged: Dict[str, Dict[str, str]] = {}
+    for source in sources:
+        for zone, volumes in (source or {}).items():
+            row = merged.setdefault(zone, {})
+            for volume, mode in (volumes or {}).items():
+                if mode not in ACCESS_MODES:
+                    continue
+                # "allowed" beats "read-only"; anything beats absent.
+                if row.get(volume) != "allowed":
+                    row[volume] = mode
+    return merged
 
 
 def merge_allow_lists(*sources) -> List[str]:
@@ -353,7 +395,71 @@ class ConfigManager(ABC):
     @abstractmethod
     def add_instance(self, username: str, template_name: str, instance_name: str,
                      preemptible: bool = False,
-                     overrides: Optional[Dict[str, Any]] = None) -> bool:
+                     overrides: Optional[Dict[str, Any]] = None,
+                     home_volume: Optional[str] = None) -> bool:
+        pass
+
+    # --- home volumes (design/security.md) --------------------------------- #
+
+    @staticmethod
+    def home_volume_pvc_name(volume: Dict[str, Any]) -> str:
+        """The claim backing a home volume. Normally derived from the name;
+        adopted volumes carry an explicit `pvcName` because their claim is
+        named after the session that created it and a bound PVC cannot be
+        renamed. Concrete on the ABC: both sides of the wire must agree."""
+        return (volume.get("pvcName")
+                or f"whistler-home-{volume.get('name')}")
+
+    @abstractmethod
+    def get_user_volume_access(self, username: str) -> Dict[str, Dict[str, str]]:
+        """The access matrix ``{zone: {volume: mode}}``, own merged with every
+        group's. An absent cell is no access — there is no default."""
+        pass
+
+    @abstractmethod
+    def set_user_volume_access(self, username: str,
+                               matrix: Dict[str, Dict[str, str]]) -> bool:
+        """Replace the user's OWN matrix (never the merged view)."""
+        pass
+
+
+    @abstractmethod
+    def grant_own_volume_access(self, username: str, zone: str, volume: str,
+                                mode: str = "allowed") -> bool:
+        """Add one cell to the user's own matrix. Self-service creation of a
+        home volume in a zone the user already holds uses this."""
+        pass
+
+    def volume_access(self, username: str, zone: str,
+                      volume: str) -> Optional[str]:
+        """One cell of the merged matrix. Concrete: every implementation must
+        answer this the same way, since it is the enforcement point."""
+        return (self.get_user_volume_access(username).get(zone) or {}).get(volume)
+
+    @abstractmethod
+    def get_home_volumes(self, username: str) -> List[Dict[str, Any]]:
+        """The user's named home volumes. Empty is normal — an instance with
+        no named volume gets one dedicated to itself."""
+        pass
+
+    @abstractmethod
+    def save_home_volume(self, username: str, volume: Dict[str, Any]) -> bool:
+        pass
+
+    @abstractmethod
+    def delete_home_volume(self, username: str, name: str,
+                           delete_data: bool = False) -> bool:
+        """Remove the volume. The data is KEPT unless ``delete_data`` — this
+        is the user's home directory, and a dropdown must not be able to
+        destroy it."""
+        pass
+
+    @abstractmethod
+    def home_volume_holder(self, username: str, volume: Dict[str, Any],
+                           ignore_instance: str = None) -> Optional[str]:
+        """The RUNNING instance holding this volume, or None. One live attach:
+        a home carries an ext4 filesystem, which cannot be attached to two
+        running guests at once."""
         pass
 
     @abstractmethod
@@ -367,8 +473,10 @@ class ConfigManager(ABC):
     @abstractmethod
     def update_instance(self, username: str, instance_name: str,
                         preemptible: bool = False,
-                        overrides: Optional[Dict[str, Any]] = None) -> bool:
-        """Replace a Session CR's editable spec fields (preemptible, overrides).
+                        overrides: Optional[Dict[str, Any]] = None,
+                        home_volume: Optional[str] = None) -> bool:
+        """Replace a Session CR's editable spec fields (preemptible, overrides,
+        homeVolume).
         Changes take effect on the next start/reboot, so this is only meant for
         non-running instances."""
         pass
@@ -623,6 +731,12 @@ class KubeConfigManager(ConfigManager):
     # One warning per process for a missing Group CRD, not one per policy
     # evaluation — the catalog is re-read on every grant lookup.
     _warned_no_group_crd: bool = False
+    # Shared datasets (Dataset CRs). None rather than {} so _load_datasets can
+    # tell "never loaded" from "loaded and genuinely empty" — the difference
+    # decides whether a failed load may fall back to the legacy catalog.
+    datasets: Optional[Dict[str, Dict[str, Any]]] = None
+    _warned_no_dataset_crd: bool = False
+    _warned_no_home_volume_crd: bool = False
 
     def __init__(self, kubeconfig: str = None):
         try:
@@ -665,6 +779,10 @@ class KubeConfigManager(ConfigManager):
         self.volumes = []
         self.volume_definitions = {}
         self._load_volumes()
+
+        # Shared S3 datasets (design/storage.md). After volumes: the legacy
+        # fallback reads `type: s3` entries out of the volume catalog.
+        self._load_datasets()
 
         # Named network zones (whistler.zones); "default" always exists. The
         # legacy networkpolicy.yaml egress config seeds the default zone when
@@ -1064,7 +1182,8 @@ class KubeConfigManager(ConfigManager):
     def add_instance(self, username: str, template_name: str, instance_name: str,
                      preemptible: bool = False,
                      overrides: Optional[Dict[str, Any]] = None,
-                     ephemeral: bool = False) -> bool:
+                     ephemeral: bool = False,
+                     home_volume: Optional[str] = None) -> bool:
         user_ns = self._ensure_user_namespace(username)
 
         spec = {
@@ -1072,6 +1191,12 @@ class KubeConfigManager(ConfigManager):
             "user": username,
             "preemptible": preemptible,
         }
+        # Absent means "a home named after this instance", which is exactly
+        # the pre-named-volumes behaviour — so the field stays unset rather
+        # than being filled in with the default, and the default keeps working
+        # for instances created before it existed.
+        if home_volume:
+            spec["homeVolume"] = home_volume
         if overrides:
             spec["overrides"] = overrides
 
@@ -1115,12 +1240,14 @@ class KubeConfigManager(ConfigManager):
         return {
             "templateRef": spec.get("templateRef"),
             "preemptible": spec.get("preemptible", False),
+            "homeVolume": spec.get("homeVolume"),
             "overrides": spec.get("overrides") or {},
         }
 
     def update_instance(self, username: str, instance_name: str,
                         preemptible: bool = False,
-                        overrides: Optional[Dict[str, Any]] = None) -> bool:
+                        overrides: Optional[Dict[str, Any]] = None,
+                        home_volume: Optional[str] = None) -> bool:
         user_ns = self._get_user_namespace(username)
         full_name = f"{username}-{instance_name}"
         try:
@@ -1133,6 +1260,13 @@ class KubeConfigManager(ConfigManager):
 
         spec = cr.setdefault("spec", {})
         spec["preemptible"] = preemptible
+        # Changing this swaps which disk becomes $HOME on the next start —
+        # it does not move data. Cleared means the default (a home named after
+        # the instance), same as at creation.
+        if home_volume:
+            spec["homeVolume"] = home_volume
+        else:
+            spec.pop("homeVolume", None)
         # Replace the overrides wholesale (a merge patch would leave stale nested
         # keys behind when a group is cleared), so drop the key entirely when the
         # form supplied no overrides.
@@ -1886,62 +2020,288 @@ class KubeConfigManager(ConfigManager):
             if logger: logger.error(f"Failed to create PVC: {e}")
             raise
 
-    def _ensure_home_disk_pvc(self, session_name, namespace, uid, size=None,
-                              logger=None):
-        """Ensure the per-INSTANCE home-disk PVC exists, returning its name.
+    # ------------------------------------------------------------------ #
+    # Home volumes (design/security.md, "Core model: the access matrix")  #
+    #                                                                     #
+    # A home is a `disk.img` on a PVC attached as a virtio-blk disk. It   #
+    # used to be created per instance and owner-referenced to the Session #
+    # so GC reaped the two together; it is now a NAMED object a user owns #
+    # and an instance selects, because per-instance homes closed the      #
+    # cross-zone hole by removing the choice — which also forbade the     #
+    # cases a lab actually needs (one home per zone, the open one         #
+    # readable from the restricted instance).                             #
+    #                                                                     #
+    # The default preserves the old behaviour exactly: an instance with   #
+    # no `homeVolume` gets one named after itself.                        #
+    # ------------------------------------------------------------------ #
 
-        A VM cannot mount a PVC, so its home is a `disk.img` on this claim
-        attached as a virtio-blk disk and formatted ext4 by the guest
-        (see design/storage.md, and cloudinit.build_user_data for the guest
-        side). `volumeMode: Filesystem` is deliberate and is what puts a
-        `disk.img` on the share — it is also the only mode `csi-driver-nfs`
-        can serve.
+    def get_home_volumes(self, username: str) -> List[Dict[str, Any]]:
+        """This user's home volumes, newest API state, sorted by name."""
+        user_ns = self._get_user_namespace(username)
+        try:
+            resp = self.api.list_namespaced_custom_object(
+                self.group, self.version, user_ns, HOME_VOLUME_PLURAL
+            )
+        except ApiException as e:
+            if e.status == 404 and not self._warned_no_home_volume_crd:
+                type(self)._warned_no_home_volume_crd = True
+                logger.warning(
+                    "No HomeVolume CRD in this cluster, so instances fall "
+                    "back to a home named after themselves. `helm upgrade` "
+                    "does not update CRDs — run "
+                    "`kubectl apply -f charts/whistler/crds/crds.yaml`")
+            else:
+                logger.error(f"Failed to list home volumes for {username}: {e}")
+            return []
+        except AttributeError:
+            return []
+        type(self)._warned_no_home_volume_crd = False
+        out = [{**(item.get("spec") or {}),
+                "name": item["metadata"]["name"]}
+               for item in resp.get("items", [])]
+        return sorted(out, key=lambda v: v.get("name") or "")
 
-        Per instance, not per user: a home that followed a *user* would carry
-        data between zones, because zone membership changes on reboot and the
-        disk would follow. Owner-referenced to the Session so Kubernetes GC
-        reaps it with the instance — which is also why ephemeral sessions
-        simply don't call this (their home stays on the root disk).
+    def get_home_volume(self, username: str, name: str) -> Optional[Dict[str, Any]]:
+        for vol in self.get_home_volumes(username):
+            if vol.get("name") == name:
+                return vol
+        return None
+
+    def save_home_volume(self, username: str, volume: Dict[str, Any]) -> bool:
+        """Create or update a HomeVolume CR. The backing PVC is NOT created
+        here — it is created on first attach, so a volume that is never used
+        costs nothing and a storage class that cannot bind fails where the
+        user can see it."""
+        data = dict(volume)
+        name = (data.pop("name", "") or "").strip()
+        if not name:
+            return False
+        user_ns = self._ensure_user_namespace(username)
+        spec = {k: v for k, v in data.items() if v not in (None, "")}
+        spec["user"] = username
+        body = {"apiVersion": f"{self.group}/{self.version}",
+                "kind": "HomeVolume",
+                "metadata": {"name": name, "namespace": user_ns},
+                "spec": spec}
+        try:
+            try:
+                existing = self.api.get_namespaced_custom_object(
+                    self.group, self.version, user_ns, HOME_VOLUME_PLURAL, name)
+                body["metadata"]["resourceVersion"] = \
+                    existing["metadata"]["resourceVersion"]
+                # Carry the claim forward: it is the identity of the data, and
+                # losing it would silently hand the user an empty home.
+                if existing.get("spec", {}).get("pvcName") and \
+                        "pvcName" not in spec:
+                    spec["pvcName"] = existing["spec"]["pvcName"]
+                self.api.replace_namespaced_custom_object(
+                    self.group, self.version, user_ns, HOME_VOLUME_PLURAL,
+                    name, body)
+            except ApiException as e:
+                if e.status != 404:
+                    raise
+                self.api.create_namespaced_custom_object(
+                    self.group, self.version, user_ns, HOME_VOLUME_PLURAL, body)
+        except ApiException as e:
+            logger.error(f"Failed to save home volume {name!r}: "
+                         f"{crd_missing_hint(HOME_VOLUME_PLURAL, e)}")
+            return False
+        return True
+
+    def delete_home_volume(self, username: str, name: str,
+                           delete_data: bool = False) -> bool:
+        """Delete a HomeVolume. The PVC is kept unless ``delete_data``.
+
+        Keeping it is the default because this is the user's home directory
+        and a dropdown should not be able to destroy it; the claim is left
+        behind, still adoptable by recreating a volume with the same
+        `pvcName`. Refuses while the volume is attached to a running
+        instance."""
+        user_ns = self._get_user_namespace(username)
+        volume = self.get_home_volume(username, name)
+        if not volume:
+            return False
+        holder = self.home_volume_holder(username, volume)
+        if holder:
+            logger.warning(
+                f"Refusing to delete home volume {name!r}: in use by {holder}")
+            return False
+        try:
+            self.api.delete_namespaced_custom_object(
+                self.group, self.version, user_ns, HOME_VOLUME_PLURAL, name)
+        except ApiException as e:
+            logger.error(f"Failed to delete home volume {name!r}: {e}")
+            return False
+        # Drop its cells so the grid does not accumulate rows for volumes
+        # that no longer exist. Best-effort: a stale row grants access to a
+        # name nothing resolves, which is inert.
+        try:
+            self.revoke_own_volume_access(username, name)
+        except Exception as e:
+            logger.warning(f"Could not clear access rows for {name!r}: {e}")
+        if delete_data:
+            pvc = self.home_volume_pvc_name(volume)
+            try:
+                client.CoreV1Api().delete_namespaced_persistent_volume_claim(
+                    pvc, user_ns)
+                logger.info(f"Deleted home volume claim {pvc}")
+            except ApiException as e:
+                if e.status != 404:
+                    logger.error(f"Failed to delete claim {pvc}: {e}")
+                    return False
+        return True
+
+    def home_volume_holder(self, username: str,
+                           volume: Dict[str, Any],
+                           ignore_instance: str = None) -> Optional[str]:
+        """The RUNNING instance currently holding this volume, or None.
+
+        Derived from the cluster rather than stored on the CR, for the same
+        reason session phase is: a stored attachment goes stale the moment
+        anything happens out of band, and a stale one either blocks a start
+        that should succeed or permits one that should not.
+
+        "Running" means a VMI exists. A stopped VM still *references* the
+        claim in its spec and that is fine — the rule is one live attach, not
+        one reference.
         """
-        pvc_name = f"whistler-home-{session_name}"
+        user_ns = self._get_user_namespace(username)
+        pvc_name = self.home_volume_pvc_name(volume)
+        try:
+            vmis = self.api.list_namespaced_custom_object(
+                KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns, "virtualmachineinstances")
+            running = {i["metadata"]["name"] for i in vmis.get("items", [])}
+            if not running:
+                return None
+            vms = self.api.list_namespaced_custom_object(
+                KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns, KUBEVIRT_VM_PLURAL)
+        except (ApiException, AttributeError) as e:
+            # Fail OPEN here, deliberately: this check exists to prevent
+            # filesystem incoherence, not to enforce a security boundary, and
+            # an API blip that blocked every start would be worse than the
+            # rare double attach it would prevent. The security rule that must
+            # fail closed is the access matrix, not this.
+            logger.warning(f"Could not determine home volume holders: {e}")
+            return None
+        for vm in vms.get("items", []):
+            name = vm["metadata"]["name"]
+            if name not in running or name == ignore_instance:
+                continue
+            for vol in ((vm.get("spec", {}).get("template", {})
+                         .get("spec", {}).get("volumes")) or []):
+                claim = (vol.get("persistentVolumeClaim") or {}).get("claimName")
+                if claim == pvc_name:
+                    return name
+        return None
+
+    def resolve_session_home_volume(self, username: str, full_name: str,
+                                    requested: str = None,
+                                    default_size: str = None,
+                                    zone: str = None,
+                                    logger=None) -> Dict[str, Any]:
+        """The home volume an instance should attach, creating the default one
+        if needed. Raises PolicyError when the request cannot be honoured.
+
+        Two cases:
+        - A named request must already exist. Silently creating one would turn
+          a typo into a brand-new empty home, which looks exactly like data
+          loss to the person it happens to.
+        - No request means the pre-named-volumes behaviour: a volume named
+          after the instance, created on demand.
+        """
+        if requested:
+            volume = self.get_home_volume(username, requested)
+            if not volume:
+                raise PolicyError(
+                    f"Home volume '{requested}' does not exist for user "
+                    f"{username}. Create it first, or leave the field empty "
+                    f"for a home dedicated to this instance.")
+            return volume
+        volume = self.get_home_volume(username, full_name)
+        if volume:
+            return volume
+        # The default home for this instance. Named after the instance and
+        # carrying its legacy claim name, so an instance that predates named
+        # volumes keeps the disk it already has.
+        spec = {"name": full_name,
+                "description": f"Home for instance {full_name}",
+                "pvcName": f"whistler-home-{full_name}"}
+        if default_size:
+            spec["size"] = default_size
+        if not self.save_home_volume(username, spec):
+            raise PolicyError(
+                f"Could not create the default home volume for {full_name}.")
+        # Grant it in the zone this instance runs in. Not a widening: the
+        # instance is already permitted there, and before named volumes it
+        # would simply have been handed this disk with no grant at all.
+        # Without this the matrix refuses every default home — which is every
+        # instance that has not chosen one.
+        if zone:
+            self.grant_own_volume_access(username, zone, full_name)
+        if logger:
+            logger.info(f"Created default home volume {full_name} "
+                        f"(granted in zone {zone or 'none'})")
+        return {**spec, "user": username}
+
+    def ensure_home_volume_pvc(self, username: str, volume: Dict[str, Any],
+                               fallback_size: str = None,
+                               logger=None) -> str:
+        """Ensure a home volume's claim exists, returning its name.
+
+        A VM cannot mount a PVC, so the home is a `disk.img` on this claim
+        attached as a virtio-blk disk and formatted ext4 by the guest (see
+        design/storage.md, and cloudinit.build_user_data for the guest side).
+        `volumeMode: Filesystem` is deliberate and is what puts a `disk.img`
+        on the share — it is also the only mode `csi-driver-nfs` can serve.
+
+        **No ownerReference.** The claim outlives any one Session now; that is
+        the whole point of naming it. Deleting an instance no longer deletes
+        the user's home.
+        """
+        user_ns = self._get_user_namespace(username)
+        pvc_name = self.home_volume_pvc_name(volume)
         api = client.CoreV1Api()
         try:
-            api.read_namespaced_persistent_volume_claim(pvc_name, namespace)
+            api.read_namespaced_persistent_volume_claim(pvc_name, user_ns)
             return pvc_name
         except ApiException as e:
             if e.status != 404:
                 raise
 
         if logger:
-            logger.info(f"Creating home disk PVC {pvc_name}")
+            logger.info(f"Creating home volume claim {pvc_name}")
+        spec = {
+            # RWO: exactly one VM attaches this disk. Sharing a block device
+            # between writers corrupts it, and nothing here would notice —
+            # see design/storage.md on why shared homes need a file-level
+            # share instead. home_volume_holder is what actually prevents it;
+            # RWO is per-node and would not.
+            "accessModes": ["ReadWriteOnce"],
+            "volumeMode": "Filesystem",
+            "resources": {"requests": {
+                "storage": (volume.get("size") or fallback_size
+                            or self.home_disk_size)}},
+        }
+        if volume.get("storageClassName"):
+            spec["storageClassName"] = volume["storageClassName"]
         pvc_body = {
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
             "metadata": {
                 "name": pvc_name,
-                "labels": {"app": "whistler", "session": session_name},
-                "ownerReferences": [
-                    self._session_owner_reference(session_name, uid)],
+                "labels": {"app": "whistler",
+                           "whistler-home-volume": volume.get("name", "")[:63]},
             },
-            "spec": {
-                # RWO: exactly one VM attaches this disk. Sharing a block
-                # device between writers corrupts it, and nothing here would
-                # notice — see design/storage.md on why shared homes need a
-                # file-level share instead.
-                "accessModes": ["ReadWriteOnce"],
-                "volumeMode": "Filesystem",
-                "resources": {"requests": {
-                    "storage": size or self.home_disk_size}},
-            },
+            "spec": spec,
         }
         try:
-            api.create_namespaced_persistent_volume_claim(namespace, pvc_body)
+            api.create_namespaced_persistent_volume_claim(user_ns, pvc_body)
             return pvc_name
         except ApiException as e:
             if e.status == 409:
                 return pvc_name
             if logger:
-                logger.error(f"Failed to create home disk PVC: {e}")
+                logger.error(f"Failed to create home volume claim: {e}")
             raise
 
     def _load_volume_definitions_from_file(self):
@@ -2596,25 +2956,67 @@ class KubeConfigManager(ConfigManager):
             cr['metadata'].get('annotations') or {})
 
         if effective_runtime == 'vm':
-            # The home is a per-INSTANCE disk, not a share (design/storage.md).
+            # The home is a named volume the instance selects, not a share
+            # (design/storage.md, design/security.md).
             #
             # EVERY VM gets one, deliberately not gated on `persistence`.
             # That field describes whether the *instance* is reaped, not
             # whether the user's data is disposable: the desktop templates
             # are `persistence: ephemeral` and their sessions live for weeks.
             # Gating on it silently gave those guests no home at all, which is
-            # how this was found. The lifetime is already right without a
-            # gate, because the claim is owner-referenced to the Session — if
-            # the Session is reaped the PVC goes with it, and if it lives the
-            # home lives.
+            # how this was found.
             #
             # Ensured BEFORE the VM: a guest that boots with no disk to mount
             # comes up with a root-owned empty home, so a failure here is
             # transient (the operator retries), not a degraded boot.
+            # PolicyError propagates: the operator turns it into
+            # status.policyFailed + statusMessage, which is the only path that
+            # reaches the user. Returning ok=False instead would be retried
+            # silently forever, and the operator overwrites policyFailed on
+            # every successful call, so setting it in the result would be
+            # discarded.
+            home_volume = self.resolve_session_home_volume(
+                username, full_name,
+                requested=(cr.get('spec') or {}).get('homeVolume'),
+                default_size=template_spec.get('homeDiskSize'),
+                zone=template_spec.get('zone') or DEFAULT_ZONE,
+                logger=logger)
+
+            # The access matrix decides whether this home may be mounted in
+            # THIS zone. Absent is a refusal with nothing below it — the whole
+            # point of the table (design/security.md). Checked at start, like
+            # the attach rule: a stopped instance mounts nothing, and refusing
+            # at creation would stop an admin from setting the grant after the
+            # fact.
+            if wants_start:
+                zone = template_spec.get('zone') or DEFAULT_ZONE
+                access = self.volume_access(
+                    username, zone, home_volume.get("name"))
+                if access is None:
+                    raise PolicyError(
+                        f"Home volume '{home_volume.get('name')}' is not "
+                        f"granted in zone '{zone}'. An administrator grants "
+                        f"this in the user's access matrix; creating a home "
+                        f"volume grants it only in the zone it was made for.")
+
+            # One live attach. Checked only when this reconcile would START
+            # the guest: a created-but-stopped instance holds nothing, and
+            # refusing to *create* it would make the volume picker unusable.
+            if wants_start:
+                holder = self.home_volume_holder(
+                    username, home_volume, ignore_instance=full_name)
+                if holder:
+                    raise PolicyError(
+                        f"Home volume '{home_volume.get('name')}' is in use "
+                        f"by the running instance '{holder}'. Stop that "
+                        f"instance first — a home disk carries an ext4 "
+                        f"filesystem, which cannot be attached to two running "
+                        f"guests at once.")
+
             try:
-                home_pvc = self._ensure_home_disk_pvc(
-                    full_name, user_ns, uid,
-                    size=template_spec.get('homeDiskSize'),
+                home_pvc = self.ensure_home_volume_pvc(
+                    username, home_volume,
+                    fallback_size=template_spec.get('homeDiskSize'),
                     logger=logger)
             except Exception:
                 return result
@@ -2944,11 +3346,223 @@ class KubeConfigManager(ConfigManager):
 
     @staticmethod
     def s3_volume_definitions(volumes) -> Dict[str, Dict[str, Any]]:
-        """``{name: definition}`` for the S3-backed entries of a volume
-        catalog. Everything else is an ordinary Kubernetes volume source and
-        is wired straight into the pod (_build_volume_wiring)."""
+        """``{name: definition}`` for LEGACY S3 entries in a volume catalog
+        (``type: s3`` in whistler.volumes), which is where datasets lived
+        before they became their own kind.
+
+        Kept as a fallback only. Datasets do not belong in the volume catalog:
+        every other entry there is a Kubernetes volume source that
+        _build_volume_wiring copies straight into a pod spec, and an S3
+        definition copied there is not a valid one. Use Dataset CRs.
+        """
         return {v["name"]: v for v in (volumes or [])
                 if isinstance(v, dict) and v.get("type") == "s3"}
+
+    def _load_datasets(self):
+        """Load the dataset catalog from Dataset CRs — live and
+        admin-editable in the portal, exactly like zones (the chart renders
+        whistler.datasets values as Dataset CRs).
+
+        Falls back to legacy ``type: s3`` entries in the volume catalog so
+        values written before the Dataset kind keep working, and past that
+        keeps the previous catalog rather than wiping it: an empty catalog
+        would silently unmount every dataset on the next session build.
+        """
+        try:
+            resp = self.api.list_namespaced_custom_object(
+                self.group, self.version, self.namespace, DATASET_PLURAL
+            )
+            datasets = {
+                item["metadata"]["name"]: {**(item.get("spec") or {}),
+                                           "name": item["metadata"]["name"]}
+                for item in resp.get("items", [])
+            }
+        except (ApiException, AttributeError) as e:
+            if getattr(e, "status", None) == 404 and not self._warned_no_dataset_crd:
+                type(self)._warned_no_dataset_crd = True
+                logger.warning(
+                    "No Dataset CRD in this cluster, so only legacy `type: s3` "
+                    "volume entries are datasets. `helm upgrade` does not "
+                    "update CRDs — run "
+                    "`kubectl apply -f charts/whistler/crds/crds.yaml`")
+            else:
+                logger.debug(
+                    f"Dataset CRs unavailable ({e}); keeping previous catalog")
+            try:
+                legacy = self.s3_volume_definitions(self.get_volumes())
+            except Exception:  # no volume catalog either; nothing to fall to
+                legacy = {}
+            # Keep a catalog we already have when the fallback is empty: an
+            # empty one would silently unmount every dataset.
+            if legacy or self.datasets is None:
+                self.datasets = legacy
+            return
+        type(self)._warned_no_dataset_crd = False
+        # Legacy entries stay visible, but a Dataset CR of the same name wins:
+        # the CR is the editable one, so it must be what an admin sees change.
+        merged = self.s3_volume_definitions(self.get_volumes())
+        merged.update(datasets)
+        self.datasets = merged
+
+    def get_dataset_definitions(self) -> Dict[str, Dict[str, Any]]:
+        """Full dataset catalog (name -> spec), freshly loaded — drives the
+        admin datasets editor and every grant picker."""
+        self._load_datasets()
+        return {name: dict(spec or {})
+                for name, spec in (self.datasets or {}).items()}
+
+    def get_dataset_names(self) -> List[str]:
+        """Dataset names, for the grant pickers. Separate from get_volumes()
+        on purpose: a dataset is granted, never chosen as an instance mount,
+        and it is not a Kubernetes volume source."""
+        return sorted(self.get_dataset_definitions())
+
+    @staticmethod
+    def dataset_mode(definition: Dict[str, Any], granted: str) -> str:
+        """The mode a dataset is actually served at.
+
+        ``readOnly`` on the Dataset is a CEILING: it wins over any rw grant,
+        and it is the whole reason the field exists. Without it a dataset is
+        writable by everyone granted it — which, because an empty allow-list
+        means unrestricted everywhere in Whistler, is every user who has no
+        list at all. Shared data is read-mostly and S3 resolves concurrent
+        writers as a silent last-writer-wins, so the ceiling is the posture to
+        prefer (design/storage.md).
+        """
+        if (definition or {}).get("readOnly"):
+            return "ro"
+        return "ro" if granted == "ro" else "rw"
+
+    def dataset_credentials_secret_name(self, name: str) -> str:
+        """The Secret this dataset's credential lives in when Whistler manages
+        it. A dataset may instead point `credentialsSecret` at a Secret the
+        admin created, which is the way to keep the credential out of
+        Whistler's hands entirely."""
+        return f"whistler-dataset-{name}-creds"
+
+    def save_dataset_credentials(self, name: str, access_key: str,
+                                 secret_key: str) -> bool:
+        """Create or update the Secret holding a dataset's REAL bucket
+        credential. Only the dataset's proxies mount it.
+
+        Called from the admin editor when the credential fields are filled in;
+        blank fields there mean "leave the existing credential alone", which
+        is why this is separate from save_dataset. The value is never read
+        back out for display — an admin can replace a credential but not
+        retrieve one."""
+        secret_name = self.dataset_credentials_secret_name(name)
+        body = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": secret_name,
+                         "labels": {"app": "whistler-dataset",
+                                    "dataset": name}},
+            "stringData": {"accessKeyId": access_key,
+                           "secretAccessKey": secret_key},
+        }
+        api = client.CoreV1Api()
+        try:
+            api.create_namespaced_secret(self.namespace, body)
+            return True
+        except ApiException as e:
+            if e.status != 409:
+                logger.error(f"Failed to create dataset secret {secret_name}: {e}")
+                return False
+        try:
+            api.replace_namespaced_secret(secret_name, self.namespace, body)
+            return True
+        except ApiException as e:
+            logger.error(f"Failed to update dataset secret {secret_name}: {e}")
+            return False
+
+    def has_dataset_credentials(self, name: str) -> bool:
+        """Whether this dataset has a usable credential — the editor shows
+        this instead of the credential itself.
+
+        Answers the same question ensure_s3_proxy asks, deliberately: the
+        dataset must REFERENCE a Secret, and that Secret must exist. A
+        managed Secret left over from an earlier credential does not count
+        while nothing points at it, or the list would show a tick beside a
+        dataset whose proxy refuses to start.
+        """
+        definition = self.get_dataset_definitions().get(name) or {}
+        secret_name = definition.get("credentialsSecret")
+        if not secret_name:
+            return False
+        try:
+            client.CoreV1Api().read_namespaced_secret(secret_name, self.namespace)
+            return True
+        except ApiException:
+            return False
+
+    def save_dataset(self, dataset_data: Dict[str, Any]) -> bool:
+        """Create or update a Dataset CR from the admin editor.
+
+        Unlike save_zone this does NOT push anything to running sessions: a
+        dataset is mounted by cloud-init at boot, so an endpoint or bucket
+        change reaches a guest on its next start. What it does do is re-fence
+        the existing proxies, because `readOnly` can revoke write access and
+        that must not wait for someone else's session to reconcile.
+        """
+        data = dict(dataset_data)
+        name = (data.pop("name", "") or "").strip()
+        if not name:
+            return False
+        spec = {k: v for k, v in data.items() if v not in (None, "")}
+        body_meta = {"name": name, "namespace": self.namespace}
+        try:
+            try:
+                existing = self.api.get_namespaced_custom_object(
+                    self.group, self.version, self.namespace,
+                    DATASET_PLURAL, name
+                )
+                self.api.replace_namespaced_custom_object(
+                    self.group, self.version, self.namespace,
+                    DATASET_PLURAL, name,
+                    {"apiVersion": f"{self.group}/{self.version}",
+                     "kind": "Dataset",
+                     # Replace, not merge: the form carries the whole spec and
+                     # a cleared field must actually clear.
+                     "metadata": {**body_meta,
+                                  "resourceVersion":
+                                      existing["metadata"]["resourceVersion"]},
+                     "spec": spec})
+            except ApiException as e:
+                if e.status != 404:
+                    raise
+                self.api.create_namespaced_custom_object(
+                    self.group, self.version, self.namespace, DATASET_PLURAL,
+                    {"apiVersion": f"{self.group}/{self.version}",
+                     "kind": "Dataset",
+                     "metadata": body_meta,
+                     "spec": spec})
+        except ApiException as e:
+            logger.error(f"Failed to save dataset {name!r}: "
+                         f"{crd_missing_hint(DATASET_PLURAL, e)}")
+            return False
+        self._load_datasets()
+        self._refresh_s3_proxy_policies(name)
+        return True
+
+    def delete_dataset(self, name: str) -> bool:
+        """Delete a Dataset CR and fence its proxies to nobody.
+
+        The proxy Deployments are left running rather than deleted: fencing
+        them is what makes them unreachable, and a delete that raced a session
+        build would just see the proxy recreated. Sessions holding a mount
+        keep it until they stop — the CR is the catalog, not the data path.
+        """
+        try:
+            self.api.delete_namespaced_custom_object(
+                self.group, self.version, self.namespace, DATASET_PLURAL, name
+            )
+        except ApiException as e:
+            logger.error(f"Failed to delete dataset {name!r}: {e}")
+            return False
+        self._load_datasets()
+        # After the reload, so s3_proxy_users no longer resolves anyone to it.
+        self._refresh_s3_proxy_policies(name)
+        return True
 
     @staticmethod
     def _s3_proxy_name(volume: str, mode: str) -> str:
@@ -2972,16 +3586,30 @@ class KubeConfigManager(ConfigManager):
         """
         name = self._s3_proxy_name(volume, mode)
         labels = {"app": "whistler-s3-proxy", "volume": volume, "mode": mode}
-        remote = f":s3:{definition['bucket']}"
+        backend = f":s3:{definition['bucket']}"
         prefix = (definition.get("prefix") or "").strip("/")
         if prefix:
-            remote = f"{remote}/{prefix}"
+            backend = f"{backend}/{prefix}"
+        # Serve the backend wrapped in a `combine` remote rather than directly.
+        # `rclone serve s3 :s3:<bucket>` promotes the served directory's
+        # SUBDIRECTORIES to buckets, so every file at the dataset's top level
+        # becomes unaddressable and the dataset mounts EMPTY with no error
+        # (measured against versitygw, 2026-08-17). Combine puts exactly one
+        # directory — S3_PROXY_BUCKET — at the served root, so the dataset
+        # appears under it verbatim, loose files included.
+        remote = f':combine,upstreams="{S3_PROXY_BUCKET}={backend}":'
 
         args = [
             "serve", "s3", "--addr", ":8080",
-            # Read the client key pair from the environment rather than argv:
-            # anything in argv is world-readable in the container's /proc.
+            # Kubernetes expands $(VAR) in args from the container's own env,
+            # so the key stays out of the Deployment spec. It does land in
+            # this container's argv, which only rclone itself can read.
             "--auth-key", "$(WHISTLER_S3_AUTH_KEY)",
+            # A dataset changed by another writer stays stale in the proxy's
+            # VFS listing cache for this long. Default is 5m; datasets are
+            # read-mostly but "my colleague's file isn't there" is a bad
+            # first impression.
+            "--dir-cache-time", "1m",
             remote,
         ]
         if mode == "ro":
@@ -3145,10 +3773,13 @@ class KubeConfigManager(ConfigManager):
 
         Drives the proxy's fencing policy, so it has to answer the same
         question the mount does: get_user_volume_modes carries the group's
-        per-member rw/ro, and a volume the user may mount but which is named
-        nowhere in those grants is read-write (the pre-groups default)."""
+        per-member rw/ro, a volume named nowhere in those grants is
+        read-write (the pre-groups default), and the dataset's own
+        ``readOnly`` is a ceiling over both — so a read-only dataset resolves
+        every user to ro and leaves its rw proxy admitting nobody."""
+        definition = self.get_dataset_definitions().get(volume) or {}
         out = []
-        for user in self.get_users() or []:
+        for user in self.list_all_users() or []:
             username = user.get("name") if isinstance(user, dict) else user
             if not username:
                 continue
@@ -3157,33 +3788,52 @@ class KubeConfigManager(ConfigManager):
             # everywhere else.
             if allowed and volume not in allowed:
                 continue
-            if (self.get_user_volume_modes(username) or {}).get(
-                    volume, "rw") == mode:
+            granted = (self.get_user_volume_modes(username) or {}).get(
+                volume, "rw")
+            if self.dataset_mode(definition, granted) == mode:
                 out.append(username)
         return out
 
     def session_shared_datasets(self, username: str) -> List[Dict[str, Any]]:
         """Resolve this user's S3 datasets into cloud-init descriptors,
-        ensuring each one's proxy on the way. Returns [] when the catalog has
-        no S3 volumes, which is the common case.
+        ensuring each one's proxy on the way. Returns [] when no datasets
+        are defined, which is the common case.
 
         A failed proxy is skipped rather than failing the boot: a guest that
         comes up without one dataset is far better than a guest that does not
         come up. The unit retries, so the mount lands when the proxy does.
         """
-        definitions = self.s3_volume_definitions(self.get_volumes())
+        definitions = self.get_dataset_definitions()
         if not definitions:
             return []
         allowed = self.get_user_allowed_volumes(username)
         modes = self.get_user_volume_modes(username) or {}
         core = client.CoreV1Api()
         out = []
+        for name in sorted(definitions):
+            # Re-fence EVERY dataset's proxies, including ones this user is
+            # not granted: a grant change only reaches a proxy through some
+            # session's reconcile, and it is the proxies the user is losing
+            # that matter most. Never fatal, for the same reason as below.
+            try:
+                self._refresh_s3_proxy_policies(name)
+            except Exception as e:
+                logger.error(f"Could not re-fence dataset {name!r}: {e}")
         for name, definition in sorted(definitions.items()):
             # Empty allow-list means unrestricted, as everywhere else.
             if allowed and name not in allowed:
                 continue
-            mode = modes.get(name, "rw")
-            if not self.ensure_s3_proxy(name, mode, definition):
+            # The dataset's readOnly ceiling wins over the grant.
+            mode = self.dataset_mode(definition, modes.get(name, "rw"))
+            try:
+                ready = self.ensure_s3_proxy(name, mode, definition)
+            except Exception as e:
+                # Broad on purpose. Datasets are admin-editable, so a
+                # malformed one is an ordinary occurrence, and the cost of
+                # letting it escape is that NO session anywhere can start.
+                logger.error(f"Dataset {name!r} could not be prepared: {e}")
+                continue
+            if not ready:
                 logger.error(
                     f"S3 proxy for {name}/{mode} not ready; skipping mount")
                 continue
@@ -3207,12 +3857,52 @@ class KubeConfigManager(ConfigManager):
             })
         return out
 
+    def _refresh_s3_proxy_policies(self, volume: str) -> None:
+        """Re-fence every EXISTING proxy for ``volume``, in both modes.
+
+        ensure_s3_proxy only runs for the mode a session actually mounts, so
+        downgrading a user from rw to ro would otherwise leave the rw proxy's
+        policy still naming them — and they are root in their own guest, so
+        they keep that proxy's key from the previous session's rclone.conf.
+        The downgrade would then change nothing at all. Measured, 2026-08-17.
+
+        Only touches proxies that already exist: fencing the other mode must
+        never be the thing that conjures it into being.
+        """
+        net = client.NetworkingV1Api()
+        for mode in ("ro", "rw"):
+            name = self._s3_proxy_name(volume, mode)
+            try:
+                net.read_namespaced_network_policy(name, self.namespace)
+            except ApiException as e:
+                if e.status != 404:
+                    logger.error(f"Could not read policy for {name}: {e}")
+                continue
+            self._ensure_object(
+                name, self.namespace,
+                self._build_s3_proxy_network_policy(
+                    volume, mode, self.s3_proxy_users(volume, mode)),
+                create=net.create_namespaced_network_policy,
+                read=net.read_namespaced_network_policy,
+                replace=net.replace_namespaced_network_policy)
+
     def ensure_s3_proxy(self, volume: str, mode: str, definition) -> bool:
         """Ensure the (volume, mode) proxy matches its manifests — Deployment,
         Service and fencing NetworkPolicy. Self-healing like
         ensure_storage_gateway: every call reconciles all three, so a grant
         change reaches a running proxy's policy. False on failure; callers
         treat that as transient and retry."""
+        if not (definition or {}).get("credentialsSecret"):
+            # No credential means no working proxy. Refuse here, where the
+            # caller already knows to skip this dataset, rather than building
+            # a Deployment that cannot authenticate — and NEVER raise: one
+            # malformed dataset must not stop every VM in the cluster from
+            # starting (measured 2026-08-18, a KeyError here did exactly
+            # that, retrying forever).
+            logger.error(
+                f"Dataset {volume!r} has no credentialsSecret; not starting a "
+                f"proxy for it. Set one in the portal's Datasets editor.")
+            return False
         auth_secret = self._ensure_s3_auth_secret(volume, mode)
         if not auth_secret:
             return False
@@ -4213,6 +4903,131 @@ class KubeConfigManager(ConfigManager):
         self._load_users()
         return bool(self.users.get(username, {}).get("admin", False))
 
+    def _has_any_access_cell(self, username: str, volume: str) -> bool:
+        """Whether the user's OWN matrix mentions this volume in any zone.
+        Own, not merged: a group grant is somebody else's decision and must
+        not suppress the backfill of the user's own home."""
+        self._load_users()
+        own = self.users.get(username, {}).get("volumeAccess") or {}
+        return any(volume in (cells or {}) for cells in own.values())
+
+    def _instance_zone(self, user_ns: str, instance: str) -> str:
+        """The zone an existing VM was built in, read from the label the
+        operator stamps at build time. Falls back to the default zone, which
+        is where an unzoned template lands anyway."""
+        try:
+            vm = self.api.get_namespaced_custom_object(
+                KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns,
+                KUBEVIRT_VM_PLURAL, instance)
+        except (ApiException, AttributeError):
+            return DEFAULT_ZONE
+        labels = (((vm.get("spec") or {}).get("template") or {})
+                  .get("metadata") or {}).get("labels") or {}
+        return labels.get(ZONE_LABEL) or DEFAULT_ZONE
+
+    def adopt_legacy_home_disks(self) -> int:
+        """One-shot migration: turn per-instance home PVCs into named
+        HomeVolumes, and cut them loose from their Session.
+
+        Before named volumes a home was `whistler-home-<instance>`, owner-
+        referenced to the Session so Kubernetes GC reaped the two together.
+        That reference is now wrong in the most damaging possible way: it
+        would delete a user's home the moment the instance that happened to
+        create it was removed. So this both records the volume and REMOVES the
+        ownerReference.
+
+        Idempotent, and safe to run on every operator start: a claim with no
+        ownerReference and a matching HomeVolume is already adopted and is
+        skipped. Returns the number of claims adopted, for the log.
+        """
+        adopted = 0
+        core = client.CoreV1Api()
+        try:
+            namespaces = core.list_namespace(
+                label_selector=f"{USER_NS_LABEL}").items
+        except ApiException as e:
+            logger.error(f"Could not list user namespaces to adopt homes: {e}")
+            return 0
+        for ns in namespaces:
+            username = (ns.metadata.labels or {}).get(USER_NS_LABEL)
+            ns_name = ns.metadata.name
+            if not username:
+                continue
+            try:
+                claims = core.list_namespaced_persistent_volume_claim(
+                    ns_name, label_selector="app=whistler").items
+            except ApiException as e:
+                logger.error(f"Could not list claims in {ns_name}: {e}")
+                continue
+            existing = {v.get("name") for v in self.get_home_volumes(username)}
+            for claim in claims:
+                name = claim.metadata.name
+                if not name.startswith("whistler-home-"):
+                    continue
+                instance = name[len("whistler-home-"):]
+                owners = claim.metadata.owner_references or []
+                is_owned = any(o.kind == "Session" for o in owners)
+                # Fully done means all three: recorded, released, and granted
+                # somewhere. Anything less falls through and is completed —
+                # which is what lets a volume adopted before the access matrix
+                # existed pick up its cell on a later run.
+                if (instance in existing and not is_owned
+                        and self._has_any_access_cell(username, instance)):
+                    continue
+                if instance not in existing:
+                    if not self.save_home_volume(username, {
+                            "name": instance,
+                            "description": f"Home for instance {instance} "
+                                           f"(adopted)",
+                            "pvcName": name,
+                            "size": (claim.spec.resources.requests or {}).get(
+                                "storage") if claim.spec.resources else None}):
+                        continue
+                # Backfill a missing access cell, whether the volume was
+                # adopted just now or on an earlier run. Not inside the branch
+                # above: adoption is idempotent, so a volume adopted BEFORE
+                # the matrix existed would otherwise never get a cell — and
+                # the matrix has no defaults, so its owner's instances would
+                # all be refused at their next start. Granted where the
+                # instance already runs, which changes nothing about what that
+                # instance could already do.
+                if not self._has_any_access_cell(username, instance):
+                    zone = self._instance_zone(ns_name, instance)
+                    self.grant_own_volume_access(username, zone, instance)
+                    logger.info(f"Granted adopted home {instance!r} in zone "
+                                f"{zone} for {username}")
+                if is_owned:
+                    keep = [o for o in owners if o.kind != "Session"]
+                    try:
+                        if keep:
+                            # Read-modify-write: ownerReferences merges by uid,
+                            # so a merge patch cannot REMOVE one entry from a
+                            # list while keeping others.
+                            live = core.read_namespaced_persistent_volume_claim(
+                                name, ns_name)
+                            live.metadata.owner_references = keep
+                            core.replace_namespaced_persistent_volume_claim(
+                                name, ns_name, live)
+                        else:
+                            # null deletes the key. An empty LIST would be a
+                            # silent no-op — ownerReferences has a merge patch
+                            # strategy, so merging [] into it changes nothing,
+                            # and the home would still be reaped with its
+                            # Session while looking adopted. Measured
+                            # 2026-08-18; same trap as _ensure_object's
+                            # "Replace, not patch".
+                            core.patch_namespaced_persistent_volume_claim(
+                                name, ns_name,
+                                {"metadata": {"ownerReferences": None}})
+                    except ApiException as e:
+                        logger.error(
+                            f"Could not release {name} from its Session: {e}")
+                        continue
+                adopted += 1
+                logger.info(f"Adopted home {name} in {ns_name} as home volume "
+                            f"{instance!r} for {username}")
+        return adopted
+
     def ensure_bootstrap_admin(self):
         """Create-if-absent seed of the first admin User CR from
         whistler.bootstrapAdmin (values.yaml). Called once by the operator at
@@ -4307,6 +5122,71 @@ class KubeConfigManager(ConfigManager):
             elif group_volume_grants(spec, username):
                 member_of.append(spec)
         return member_of
+
+    def get_user_volume_access(self, username: str) -> Dict[str, Dict[str, str]]:
+        """The user's effective access matrix: ``{zone: {volume: mode}}``,
+        their own table merged with every group's. Absent means no access."""
+        self._load_users()
+        own = self.users.get(username, {}).get("volumeAccess") or {}
+        return merge_volume_access(own, *(
+            (g.get("volumeAccess") or {})
+            for g in self.get_user_groups(username)))
+
+    def volume_access(self, username: str, zone: str,
+                      volume: str) -> Optional[str]:
+        """``"allowed"`` / ``"read-only"`` / ``None`` for one cell. None is a
+        refusal, not a default — there is nothing below it to fall back to."""
+        return (self.get_user_volume_access(username).get(zone) or {}).get(volume)
+
+    def set_user_volume_access(self, username: str,
+                               matrix: Dict[str, Dict[str, str]]) -> bool:
+        """Replace the user's OWN matrix. Group-derived cells are not written
+        here — saving the merged view would copy a project's grants onto a
+        member permanently, the same trap the volume allow-list editor
+        already avoids."""
+        pruned = {zone: {v: m for v, m in (cells or {}).items()
+                         if m in ACCESS_MODES}
+                  for zone, cells in (matrix or {}).items()}
+        pruned = {z: cells for z, cells in pruned.items() if cells}
+        # None removes the key: "this user states nothing" rather than an
+        # empty object, so the CR stays clean when every cell is cleared.
+        return self._save_user_spec(username, {"volumeAccess": pruned or None})
+
+    def grant_own_volume_access(self, username: str, zone: str, volume: str,
+                                mode: str = "allowed") -> bool:
+        """Add a single cell to the user's own matrix, leaving the rest alone.
+
+        This is what makes home volumes self-service: a user creating a volume
+        in a zone they may already enter is not gaining anything — they could
+        already start an instance there with a fresh home — so the grant is
+        written without an admin. Anything else (another zone, another user)
+        stays an admin's decision.
+        """
+        if mode not in ACCESS_MODES:
+            return False
+        self._load_users()
+        own = dict(self.users.get(username, {}).get("volumeAccess") or {})
+        row = dict(own.get(zone) or {})
+        row[volume] = mode
+        own[zone] = row
+        return self._save_user_spec(username, {"volumeAccess": own})
+
+    def revoke_own_volume_access(self, username: str, volume: str) -> bool:
+        """Drop a volume from every zone of the user's own matrix — used when
+        the volume itself is deleted, so the grid does not accumulate rows for
+        things that no longer exist."""
+        self._load_users()
+        own = dict(self.users.get(username, {}).get("volumeAccess") or {})
+        changed = False
+        for zone in list(own):
+            if volume in (own[zone] or {}):
+                own[zone] = {v: m for v, m in own[zone].items() if v != volume}
+                changed = True
+            if not own[zone]:
+                own.pop(zone)
+        if not changed:
+            return True
+        return self._save_user_spec(username, {"volumeAccess": own or None})
 
     def get_user_allowed_volumes(self, username: str) -> List[str]:
         self._load_users()

@@ -31,7 +31,18 @@ data:
     providers:
       file:
         filename: /config/dynamic.yml
-        watch: true
+        # watch: false deliberately. The dynamic config is mounted with
+        # subPath, and kubelet never updates a subPath ConfigMap mount in
+        # place, so there is nothing for a watcher to see; config changes
+        # reach the proxy by rolling the pod (checksum/config annotation in
+        # portal-proxy.yaml). Watching only added a failure mode: inotify
+        # instances are a per-uid host limit (fs.inotify.max_user_instances,
+        # default 128) shared by every root container on the node, and when
+        # it is exhausted the file provider dies at startup with "error
+        # creating file watcher: too many open files" — leaving Traefik up
+        # with ZERO routers, i.e. a 404 on every portal path while the portal
+        # itself is perfectly healthy.
+        watch: false
     log:
       level: {{ .Values.portal.logLevel | default "INFO" }}
   dynamic.yml: |

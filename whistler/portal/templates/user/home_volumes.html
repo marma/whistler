@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}Home volumes — Whistler{% endblock %}
+{% block content %}
+
+<h2 class="ui header"><i class="hdd icon"></i> Home volumes</h2>
+
+<p class="ui grey text">
+  The disks mounted at <code>$HOME</code> in your VM sessions. Each instance
+  gets its own by default; naming one lets a home follow you between instances.
+  A volume is attached to <strong>one running instance at a time</strong> — a
+  home carries an ext4 filesystem, which cannot be attached to two running
+  guests at once — so stop one instance before starting another that uses the
+  same home.
+</p>
+
+{% if volumes %}
+<table class="ui selectable celled table">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Description</th>
+      <th>Zones</th>
+      <th>Size</th>
+      <th>In use by</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for v in volumes %}
+    <tr>
+      <td><strong>{{ v.name }}</strong><br>
+          <span class="ui grey text" style="font-size:0.85em">{{ v.pvcName }}</span></td>
+      <td>{{ v.description or "—" }}</td>
+      <td>
+        {% set zs = [] %}
+        {% for z, cells in (access or {}).items() %}
+          {% if v.name in (cells or {}) %}{% set _ = zs.append(z) %}{% endif %}
+        {% endfor %}
+        {% for z in zs|sort %}<div class="ui tiny blue label">{{ z }}</div>{% endfor %}
+        {% if not zs %}<div class="ui tiny red label">no zone</div>{% endif %}
+      </td>
+      <td>{{ v.size or "default" }}</td>
+      <td>
+        {% if v.inUseBy %}
+          <div class="ui tiny yellow label"><i class="lock icon"></i> {{ v.inUseBy }}</div>
+        {% else %}
+          <span class="ui grey text">free</span>
+        {% endif %}
+      </td>
+      <td class="collapsing">
+        <form method="post" action="/homes/{{ v.name }}/delete?user={{ current_user }}"
+              style="display:inline"
+              onsubmit="return confirm('Remove home volume {{ v.name }}?\n\nBy default the disk and its data are KEPT and only the name is removed. Tick \'delete the data too\' first if you really want the files gone — that cannot be undone.')">
+          <div class="ui checkbox" style="margin-right:0.5rem">
+            <input type="checkbox" name="delete_data" value="on" id="del-{{ v.name }}">
+            <label for="del-{{ v.name }}" style="font-size:0.85em">delete the data too</label>
+          </div>
+          <button class="ui red tiny button" {% if v.inUseBy %}disabled{% endif %}>
+            <i class="trash icon"></i> Remove
+          </button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="ui placeholder segment">
+  <div class="ui icon header">
+    <i class="hdd icon"></i>
+    No named home volumes yet — each instance is using its own.
+  </div>
+</div>
+{% endif %}
+
+<div class="ui segment" style="max-width:560px">
+  <h4 class="ui header">New home volume</h4>
+  <form class="ui form" method="post" action="/homes?user={{ current_user }}">
+    <div class="field required">
+      <label>Name</label>
+      <input name="name" type="text" required placeholder="research"
+             pattern="[a-z0-9]([\-a-z0-9]*[a-z0-9])?" maxlength="63">
+      <div class="ui pointing label">Lowercase alphanumerics and "-". Cannot be renamed later.</div>
+    </div>
+    <div class="field required">
+      <label>Zone</label>
+      <select name="zone" class="ui dropdown" required>
+        {% for z in zones %}<option value="{{ z }}">{{ z }}</option>{% endfor %}
+      </select>
+      <div class="ui pointing label">
+        The zone this home is for. Only zones you can already use are listed —
+        making a home in one of those grants you nothing new, since you could
+        already start an instance there with a fresh home. Using it in
+        <em>another</em> zone is an administrator's decision.
+      </div>
+    </div>
+    <div class="two fields">
+      <div class="field">
+        <label>Size <span class="ui grey tiny label">optional</span></label>
+        <input name="size" type="text" placeholder="20Gi">
+        <div class="ui pointing label">Fixed when the disk is first created; growing it later is a manual step.</div>
+      </div>
+      <div class="field">
+        <label>Description <span class="ui grey tiny label">optional</span></label>
+        <input name="description" type="text" placeholder="Work that follows me between instances">
+      </div>
+    </div>
+    <button type="submit" class="ui primary button">
+      <i class="plus icon"></i> Create
+    </button>
+  </form>
+  <p class="ui grey text" style="margin-top:1rem">
+    The disk itself is created the first time an instance uses this volume, so
+    an unused one costs nothing.
+  </p>
+</div>
+
+{% endblock %}

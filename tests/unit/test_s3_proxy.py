@@ -6,6 +6,7 @@ Sessions never talk to the real S3 server — Whistler runs a proxy per
 and so the bucket credential never enters a guest whose user has root. See
 design/storage.md; the guest side is in tests/unit/test_cloud_init.py.
 """
+from whistler.cloudinit import S3_PROXY_BUCKET
 from whistler.config import KubeConfigManager, USER_NS_LABEL
 
 
@@ -56,10 +57,24 @@ def test_one_proxy_per_volume_and_mode():
 
 
 def test_bucket_and_optional_prefix_become_the_remote():
-    assert _args("ro")[-1] == ":s3:reference-data"
+    assert _args("ro")[-1] == ':combine,upstreams="data=:s3:reference-data":'
     with_prefix = dict(DEFINITION, prefix="/subset/")
     assert _args("ro", definition=with_prefix)[-1] == \
-        ":s3:reference-data/subset"
+        ':combine,upstreams="data=:s3:reference-data/subset":'
+
+
+def test_backend_is_wrapped_so_top_level_files_stay_addressable():
+    # Regression, measured 2026-08-17. `rclone serve s3 :s3:<bucket>` promotes
+    # the served directory's SUBDIRECTORIES to buckets, so a file at the
+    # dataset's top level has no bucket to live in and simply disappears — the
+    # dataset mounts empty and nothing errors. The combine wrapper puts
+    # exactly one directory at the served root, so the dataset hangs under it
+    # verbatim. The guest mounts that same bucket name (cloudinit.py).
+    remote = _args("ro")[-1]
+    assert remote.startswith(":combine,")
+    assert f'upstreams="{S3_PROXY_BUCKET}=' in remote
+    # Serving the bare backend is exactly the bug.
+    assert remote != ":s3:reference-data"
 
 
 def test_bucket_credential_comes_from_a_secret_and_only_lives_here():
@@ -151,3 +166,103 @@ def test_only_type_s3_entries_are_datasets():
     assert list(KubeConfigManager.s3_volume_definitions(volumes)) == ["refdata"]
     assert KubeConfigManager.s3_volume_definitions([]) == {}
     assert KubeConfigManager.s3_volume_definitions(None) == {}
+
+
+# --- who a proxy admits ----------------------------------------------------- #
+#
+# s3_proxy_users is what turns grants into the policy's `from` list, so it has
+# to answer the same question the mount does. These run the REAL user/group
+# resolution (only the API loaders are bypassed, by constructing via __new__
+# and setting the catalogs directly, which both loaders tolerate) — a version
+# of this calling a method that does not exist shipped once precisely because
+# the list was only ever passed in by hand.
+
+def _granted(users, groups=None):
+    cm = _manager()
+    cm.users = users
+    cm.groups = groups or {}
+    return cm
+
+
+def test_proxy_admits_exactly_the_users_granted_that_mode():
+    cm = _granted(
+        {"alice": {"name": "alice"}, "bob": {"name": "bob"},
+         "carol": {"name": "carol"}},
+        {"proj": {"members": ["alice", "bob", "carol"],
+                  "volumes": [{"name": "refdata", "mode": "ro",
+                               "access": {"bob": "rw"}}]}},
+    )
+    # The group grants ro, except bob who is named rw. Each lands on the
+    # proxy that enforces its own mode, and on no other.
+    assert cm.s3_proxy_users("refdata", "ro") == ["alice", "carol"]
+    assert cm.s3_proxy_users("refdata", "rw") == ["bob"]
+
+
+def test_a_user_restricted_to_other_volumes_reaches_neither_proxy():
+    cm = _granted(
+        {"alice": {"name": "alice"}, "mallory": {"name": "mallory"}},
+        {"proj": {"members": ["alice"],
+                  "volumes": [{"name": "refdata", "mode": "rw"}]},
+         "other": {"members": ["mallory"],
+                   "volumes": [{"name": "scratch", "mode": "rw"}]}},
+    )
+    # What excludes mallory is being restricted TO something else: her group
+    # gives her an allow-list, and refdata is not on it.
+    assert cm.s3_proxy_users("refdata", "rw") == ["alice"]
+
+
+def test_a_user_with_no_grants_at_all_still_reaches_every_dataset():
+    # Consequence of the composition rule, pinned because it is easy to read
+    # a dataset's fencing as opt-IN when it is opt-OUT: empty everywhere means
+    # UNRESTRICTED, so a user in no group is granted every volume in the
+    # catalog, an S3 dataset included. Adding a dataset therefore hands it to
+    # everyone who has no allow-list, which is the same posture PVC volumes
+    # have always had — consistent, not a new hole, but not "nobody by
+    # default" either. Restricting it means giving those users a list.
+    cm = _granted({"alice": {"name": "alice"}, "mallory": {"name": "mallory"}})
+    assert cm.s3_proxy_users("refdata", "rw") == ["alice", "mallory"]
+
+
+def test_unrestricted_user_defaults_to_read_write():
+    # No allow-list anywhere means no restriction, and a volume named in no
+    # grant is rw — the pre-groups default. The ro proxy must not admit them.
+    cm = _granted({"alice": {"name": "alice"}})
+    assert cm.s3_proxy_users("refdata", "rw") == ["alice"]
+    assert cm.s3_proxy_users("refdata", "ro") == []
+
+
+def test_downgrading_a_user_re_fences_the_mode_they_lost():
+    # The proxy they are losing is the one that matters: a guest is root, so
+    # the old mode's key is still in their hands from the previous session's
+    # rclone.conf. If only the newly-granted mode is reconciled, the downgrade
+    # changes nothing. Measured on a live cluster, 2026-08-17.
+    cm = _granted(
+        {"alice": {"name": "alice"}},
+        {"proj": {"members": ["alice"],
+                  "volumes": [{"name": "refdata", "mode": "ro"}]}},
+    )
+    seen = {}
+    cm.namespace = "whistler"
+    cm._ensure_object = lambda name, ns, body, **kw: seen.update(
+        {name: body["spec"]["ingress"]}) or True
+
+    class _Net:
+        # Both proxies already exist, which is the situation after a
+        # downgrade: the rw one is left over from the earlier grant.
+        def read_namespaced_network_policy(self, name, ns):
+            return object()
+        create_namespaced_network_policy = None
+        replace_namespaced_network_policy = None
+
+    import whistler.config as cfg
+    real = cfg.client.NetworkingV1Api
+    cfg.client.NetworkingV1Api = _Net
+    try:
+        cm._refresh_s3_proxy_policies("refdata")
+    finally:
+        cfg.client.NetworkingV1Api = real
+
+    # ro keeps her; rw — the mode she lost — is fenced to nobody.
+    assert seen["whistler-s3-refdata-ro"][0]["from"][0][
+        "namespaceSelector"]["matchExpressions"][0]["values"] == ["alice"]
+    assert seen["whistler-s3-refdata-rw"] == []

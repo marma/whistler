@@ -18,9 +18,10 @@
   </div>
 </div>
 
-<div class="ui stackable two column grid">
+<div class="ui stackable one column grid">
 
-  {# ---- Left: profile + volume access ---- #}
+  {# One column throughout: the access grid is as wide as the zone count and
+     was unreadable squeezed into half the page. #}
   <div class="column">
     <div class="ui segment">
       <h4 class="ui header"><i class="info icon"></i> Profile</h4>
@@ -84,7 +85,28 @@
     </div>
 
     <div class="ui segment">
-      <h4 class="ui header"><i class="database icon"></i> Volume Access</h4>
+      <h4 class="ui header"><i class="th icon"></i> Access</h4>
+      <p class="ui grey text">
+        Which volumes this user may mount, and in which zone. This is the
+        user's <strong>own</strong> grant; what they end up with is this
+        unioned with every group they belong to — see
+        <a href="/admin/computed-access?name={{ user_obj.name }}&amp;user={{ current_user }}">Computed access</a>.
+        A cell carrying <i class="teal users icon"></i> comes from a group and
+        is edited there, not here: saving the union would copy a project's
+        grants onto this user permanently.
+      </p>
+      {% include "admin/_access_styles.html" %}
+      <form class="ui form" method="post"
+            action="/admin/users/{{ user_obj.name }}/access?user={{ current_user }}">
+        {% with sections = access_sections, show_group_mark = True %}
+          {% include "admin/_access_grid.html" %}
+        {% endwith %}
+        <button type="submit" class="ui teal button"><i class="save icon"></i> Save Access</button>
+      </form>
+    </div>
+
+    <div class="ui segment">
+      <h4 class="ui header"><i class="database icon"></i> Volume &amp; Dataset Access</h4>
       <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/volumes?user={{ current_user }}">
         {% for vol in volumes %}
         <div class="field">
@@ -94,7 +116,10 @@
                    {% if vol.name in own_volumes %}checked{% endif %}>
             <label for="vol-{{ vol.name }}">
               {{ vol.name }}
-              {% if vol.persistentVolumeClaim %}
+              {% if vol.isDataset %}
+                <span class="ui blue mini label"><i class="cloud icon"></i> dataset</span>
+                {% if vol.readOnly %}<span class="ui green mini label">read-only</span>{% endif %}
+              {% elif vol.persistentVolumeClaim %}
                 <span class="ui grey mini label">{{ vol.persistentVolumeClaim.claimName }}</span>
               {% endif %}
               {% if vol.name not in own_volumes and vol.name in allowed_volumes %}
@@ -104,11 +129,11 @@
           </div>
         </div>
         {% else %}
-        <p class="ui grey text">No volumes defined. <a href="/admin/volumes/new?user={{ current_user }}">Create one</a>.</p>
+        <p class="ui grey text">Nothing to grant yet. Create a <a href="/admin/volumes/new?user={{ current_user }}">volume</a> or a <a href="/admin/datasets/new?user={{ current_user }}">dataset</a>.</p>
         {% endfor %}
         {% if volumes %}
         <div class="ui divider"></div>
-        <button type="submit" class="ui teal button"><i class="save icon"></i> Save Volume Access</button>
+        <button type="submit" class="ui teal button"><i class="save icon"></i> Save Volume &amp; Dataset Access</button>
         {% endif %}
       </form>
     </div>
@@ -232,7 +257,7 @@
     </div>
   </div>
 
-  {# ---- Right: instances + edit profile ---- #}
+  {# ---- Instances + edit profile ---- #}
   <div class="column">
     <div class="ui segment">
       <h4 class="ui header"><i class="server icon"></i> Instances</h4>

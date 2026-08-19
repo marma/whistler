@@ -37,24 +37,34 @@
     </div>
 
     <div class="ui divider"></div>
-    <h4 class="ui header">Volumes</h4>
+    <h4 class="ui header">Volumes &amp; Datasets</h4>
     <p class="ui grey text">
-      What members may mount, and how. <strong>Read-only</strong> is enforced as a
-      read-only mount for container sessions; for VMs the guest has root, so it will
-      only become a real boundary when the per-member NFS export set lands
-      (design/security.md).
+      What members may mount, and how. What <strong>read-only</strong> is worth
+      depends on which kind it is: for a <em>dataset</em> it is enforced by the
+      proxy, so it holds even in a VM where the user is root. For a PVC volume it
+      is a real read-only mount in a container session, but on a VM it is still
+      only a mount flag that root can drop (design/security.md, design/storage.md).
     </p>
 
     {% for vol in volumes %}
     {% set grant = volume_grants.get(vol.name) %}
     <div class="two fields">
       <div class="field">
-        <label>{{ vol.name }}</label>
+        <label>
+          {{ vol.name }}
+          {% if vol.isDataset %}
+            <span class="ui blue mini label"><i class="cloud icon"></i> dataset</span>
+            {% if vol.readOnly %}<span class="ui green mini label">read-only</span>{% endif %}
+          {% endif %}
+        </label>
         <select name="vol_mode_{{ vol.name }}" class="ui dropdown">
           <option value="none" {% if not grant or grant.get("mode", "rw") == "none" %}selected{% endif %}>not granted</option>
           <option value="rw" {% if grant and grant.get("mode", "rw") == "rw" %}selected{% endif %}>read-write</option>
           <option value="ro" {% if grant and grant.get("mode") == "ro" %}selected{% endif %}>read-only</option>
         </select>
+        {% if vol.isDataset and vol.readOnly %}
+        <div class="ui pointing label">This dataset is read-only for everyone, so a read-write grant here still resolves to read-only.</div>
+        {% endif %}
       </div>
       <div class="field">
         <label>Per-member exceptions <span class="ui grey tiny label">optional</span></label>
@@ -63,8 +73,24 @@
       </div>
     </div>
     {% else %}
-    <p class="ui grey text">No volumes defined. <a href="/admin/volumes/new?user={{ current_user }}">Create one</a>.</p>
+    <p class="ui grey text">Nothing to grant yet. Create a <a href="/admin/volumes/new?user={{ current_user }}">volume</a> or a <a href="/admin/datasets/new?user={{ current_user }}">dataset</a>.</p>
     {% endfor %}
+
+    <div class="ui divider"></div>
+    <h4 class="ui header">Access</h4>
+    <p class="ui grey text">
+      Which datasets this group's members may mount, and in which zone. A
+      member's effective access is this unioned with their own, most
+      permissive per cell — joining a project confers access, it never takes
+      any away.
+      <strong>Home volumes are not here on purpose</strong>: a home's name only
+      resolves in its owner's own namespace, so a group could never grant one
+      to anybody. Groups grant shared data.
+    </p>
+    {% include "admin/_access_styles.html" %}
+    {% with sections = access_sections, show_group_mark = False %}
+      {% include "admin/_access_grid.html" %}
+    {% endwith %}
 
     <div class="ui divider"></div>
     <h4 class="ui header">Zones</h4>

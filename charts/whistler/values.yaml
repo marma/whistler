@@ -237,10 +237,13 @@ whistler:
   #   volumes:          [{name, mode: rw|ro|none, access: {user: rw|ro}}] —
   #                     what members may mount and how. `access` overrides
   #                     `mode` per member; `mode: none` grants only to the
-  #                     people named in `access`. Read-only is a real
-  #                     read-only mount for container sessions; for VMs the
-  #                     guest has root, so it is not yet a boundary there
-  #                     (design/security.md).
+  #                     people named in `access`. What `ro` is worth depends
+  #                     on the volume: a real read-only mount for container
+  #                     sessions; for an S3 DATASET it is enforced by the
+  #                     proxy, which runs --read-only server-side, so it holds
+  #                     even against root in a VM (verified 2026-08-17). For a
+  #                     PVC on a VM it is still only a mount flag the guest's
+  #                     root can drop (design/security.md, design/storage.md).
   #   allowedZones / allowedGpuTypes: added to each member's own allow-list.
   #   channels:         which of the zone's permitted access channels members
   #                     actually get: ssh, relay, terminal, clipboard,
@@ -384,49 +387,66 @@ whistler:
     # permittedHostDevices.resourceName for the same PCI device.
     gpuVmResourceName: nvidia.com/gpu
 
-  # Named volumes users may mount, granted per user or per group.
+  # Named volumes users may mount, granted per user or per group. Every entry
+  # is an ordinary Kubernetes volume source, wired straight into the pod.
   #
-  # An entry is either an ordinary Kubernetes volume source (wired straight
-  # into the pod) or `type: s3` — a SHARED DATASET, which is a different thing
-  # and should be described to users as one.
-  #
-  # `type: s3` is how shared data works on VMs (design/storage.md). Sessions
-  # never talk to the S3 server: Whistler runs a proxy per (volume, mode), the
-  # zone egress rule names THAT — an address Whistler assigned and therefore
-  # knows — and the bucket credential stays in the proxy, never reaching a
-  # guest whose user has root. `ro` and `rw` get separate proxies because
-  # rclone's --read-only is server-wide, which is what finally makes a
-  # read-only grant a real boundary on a VM.
-  #
-  # DATASETS, NOT FILESYSTEMS. S3 through FUSE gives no byte-range locking
-  # (SQLite, dconf, editors, anything with a lockfile will misbehave), no
-  # atomic rename (it is copy-then-delete, and O(size)), no hardlinks, and
-  # concurrent writers resolve last-writer-wins SILENTLY. Grant `ro` unless
-  # a session genuinely needs to write, and treat `rw` as one-writer-at-a-time.
-  # If someone needs POSIX semantics on shared data, the answer is Ceph, not
-  # this. Guests need `rclone` and `fuse3` baked in — the images do.
+  # SHARED S3 DATA IS NOT HERE — see whistler.datasets below. It used to be,
+  # as `type: s3`, and that still works so existing values keep running, but
+  # the two do not belong in one list: everything else here is copied into a
+  # pod spec verbatim, which an S3 definition cannot be.
   #volumes:
   #  - name: data
   #    persistentVolumeClaim:
   #      claimName: data-pvc
-  #  - name: dataset
+  #  - name: training-data
   #    subPath: training_data
   #    persistentVolumeClaim:
   #      claimName: large-dataset-pvc
-  #  - name: reference-data
-  #    type: s3
-  #    bucket: reference-data
-  #    prefix: ""                       # optional, serves a subtree
-  #    endpoint: https://s3.example.org # omit for AWS
-  #    region: us-east-1                # optional
-  #    provider: Minio                  # rclone S3 provider name
-  #    # Secret in the release namespace holding the REAL bucket credential,
-  #    # keys `accessKeyId` and `secretAccessKey`. Mounted into the proxy and
-  #    # nowhere else. Whistler never creates this — it is the one piece of
-  #    # this design that deliberately stays outside Whistler's control.
-  #    credentialsSecret: s3-reference-data
 
-  # The proxy that fronts every `type: s3` volume above.
+  # Shared S3 datasets, rendered as Dataset CRs (templates/datasets.yaml).
+  # Admins create and edit further ones in the portal's Datasets section, so
+  # this file is for the ones you want Helm to own — anything defined here is
+  # restored on the next upgrade, overwriting portal edits.
+  #
+  # How it works (design/storage.md): sessions never talk to the S3 server.
+  # Whistler runs a proxy per (dataset, mode), the zone egress rule names THAT
+  # — an address Whistler assigned and therefore knows — and the bucket
+  # credential stays in the proxy, never reaching a guest whose user has root.
+  # `ro` and `rw` get separate proxies because rclone's --read-only is
+  # server-wide, which is what makes a read-only grant a real boundary on a VM.
+  # Mounted at /shared/<name>, VM sessions only (a pod would need /dev/fuse).
+  #
+  # DATASETS, NOT FILESYSTEMS. S3 through FUSE gives no byte-range locking
+  # (SQLite, dconf, editors, anything with a lockfile will misbehave), no
+  # atomic rename (it is copy-then-delete, and O(size)), no hardlinks, and
+  # concurrent writers resolve last-writer-wins SILENTLY. Prefer `readOnly`
+  # and treat write access as one-writer-at-a-time. If someone needs POSIX
+  # semantics on shared data, the answer is Ceph, not this. Guests need
+  # `rclone` and `fuse3` baked in — the images do.
+  #
+  # A dataset is granted by NAME, the same way a volume is (whistler.groups
+  # or a user's allowedVolumes). Note the composition rule cuts the usual way:
+  # an empty allow-list means UNRESTRICTED, so a dataset without `readOnly` is
+  # writable by every user who has no allow-list at all.
+  datasets: {}
+    # reference-data:
+    #   description: Imaging corpus
+    #   bucket: reference-data
+    #   prefix: ""                       # optional, serves a subtree as root
+    #   endpoint: https://s3.example.org # omit for AWS S3 proper
+    #   region: us-east-1                # optional
+    #   provider: Minio                  # rclone S3 provider name (default Other)
+    #   # CEILING, not a default: read-only for everyone regardless of grants,
+    #   # and only the read-only proxy is started. Prefer it.
+    #   readOnly: true
+    #   # Secret in the release namespace holding the REAL bucket credential,
+    #   # keys `accessKeyId` and `secretAccessKey`. Mounted into the proxy and
+    #   # nowhere else. Do NOT put the credential in this file — values end up
+    #   # in `helm get values`, release Secrets and version control. (The
+    #   # portal can manage this Secret for datasets created there.)
+    #   credentialsSecret: s3-reference-data
+
+  # The proxy that fronts every dataset above.
   s3Proxy:
     # Needs rclone >= 1.65 for `serve s3`; the distro packages in the guests
     # are older and only ever run `rclone mount`, which is ancient.

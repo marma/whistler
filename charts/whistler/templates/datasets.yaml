@@ -1,0 +1,23 @@
+{{- /*
+Shared S3 datasets from whistler.datasets, rendered as Dataset CRs — the
+operator/server read the catalog live from these (whistler/config.py
+_load_datasets), and admins manage them in the portal's Datasets section.
+Helm owns the datasets defined here: portal edits to a values-defined dataset
+are overwritten on the next upgrade, same as chart-defined zones and
+templates.
+
+The bucket credential is NOT here and must not be: put it in a Secret and
+name it with `credentialsSecret`, or let the portal manage one for datasets
+created there. Values files end up in `helm get values`, release Secrets and
+version control.
+*/ -}}
+{{- range $name, $dataset := .Values.whistler.datasets }}
+---
+apiVersion: whistler.martinmalmsten.net/v1
+kind: Dataset
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+{{ toYaml (default dict $dataset) | indent 2 }}
+{{- end }}

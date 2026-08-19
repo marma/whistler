@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}Home volumes — Admin — Whistler{% endblock %}
+{% block content %}
+
+<h2 class="ui header"><i class="hdd icon"></i> Home volumes (all users)</h2>
+
+<p class="ui grey text">
+  Every named home across the cluster. Each is a disk image on its own claim,
+  mounted at <code>$HOME</code> in a VM session. A volume is attached to
+  <strong>one running instance at a time</strong> — a home carries an ext4
+  filesystem, which cannot be attached to two running guests at once.
+  <strong>Zones</strong> comes straight from each user's access matrix: it is
+  where the volume may actually be mounted, and nowhere else records it.
+</p>
+
+{% if volumes %}
+<table class="ui selectable celled table">
+  <thead>
+    <tr>
+      <th>User</th>
+      <th>Name</th>
+      <th>Zones</th>
+      <th>Size</th>
+      <th>Claim</th>
+      <th>In use by</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for v in volumes %}
+    <tr>
+      <td><a href="/admin/users/{{ v.user }}?user={{ current_user }}">{{ v.user }}</a></td>
+      <td><strong>{{ v.name }}</strong>
+        {% if v.description %}<br><span class="ui grey text" style="font-size:0.85em">{{ v.description }}</span>{% endif %}
+      </td>
+      <td>
+        {% for z in v.zones %}<div class="ui tiny blue label">{{ z }}</div>{% endfor %}
+        {% if not v.zones %}<div class="ui tiny red label">no zone</div>{% endif %}
+      </td>
+      <td>{{ v.size or "default" }}</td>
+      <td><code style="font-size:0.85em">{{ v.pvcName }}</code></td>
+      <td>
+        {% if v.inUseBy %}
+          <div class="ui tiny yellow label"><i class="lock icon"></i> {{ v.inUseBy }}</div>
+        {% else %}
+          <span class="ui grey text">free</span>
+        {% endif %}
+      </td>
+      <td class="collapsing">
+        <form method="post" action="/admin/homevolumes/{{ v.user }}/{{ v.name }}/delete?user={{ current_user }}"
+              style="display:inline"
+              onsubmit="return confirm('Remove {{ v.user }}/{{ v.name }}?\n\nThis is somebody else\'s home directory. By default the disk and its data are KEPT and only the name is removed; tick \'delete the data too\' first if you really mean to destroy the files. That cannot be undone.')">
+          <div class="ui checkbox" style="margin-right:0.5rem">
+            <input type="checkbox" name="delete_data" value="on" id="adel-{{ v.user }}-{{ v.name }}">
+            <label for="adel-{{ v.user }}-{{ v.name }}" style="font-size:0.85em">delete the data too</label>
+          </div>
+          <button class="ui red tiny button" {% if v.inUseBy %}disabled{% endif %}>
+            <i class="trash icon"></i> Remove
+          </button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div class="ui small info message">
+  A volume with <strong>no zone</strong> cannot be mounted anywhere: the access
+  matrix has no defaults, so an absent entry is a refusal. Grant one on the
+  owner's page.
+</div>
+{% else %}
+<div class="ui placeholder segment">
+  <div class="ui icon header">
+    <i class="hdd icon"></i>
+    No named home volumes yet — every instance is using its own.
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

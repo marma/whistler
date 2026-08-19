@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% block title %}{% if dataset %}Edit Dataset{% else %}New Dataset{% endif %} — Admin — Whistler{% endblock %}
+{% block content %}
+
+<h2 class="ui header">
+  <i class="database icon"></i>
+  <div class="content">{% if dataset %}Edit Dataset: {{ dataset.name }}{% else %}New Dataset{% endif %}</div>
+</h2>
+
+<div class="ui segment" style="max-width:640px">
+  <form class="ui form" method="post"
+        action="{% if dataset %}/admin/datasets/{{ dataset.name }}{% else %}/admin/datasets{% endif %}?user={{ current_user }}">
+
+    {% if not dataset %}
+    <div class="field">
+      <label>Dataset Name</label>
+      <input name="name" type="text" required placeholder="reference-data"
+             pattern="[a-z0-9]([\-a-z0-9]*[a-z0-9])?" maxlength="63">
+      <div class="ui pointing label">Lowercase alphanumerics and "-". This is the name granted in groups and the mount point at <code>/shared/&lt;name&gt;</code>. Cannot be renamed later.</div>
+    </div>
+    {% endif %}
+
+    <div class="field">
+      <label>Description <span class="ui grey tiny label">optional</span></label>
+      <input name="description" type="text" placeholder="Imaging corpus, read-only"
+             value="{{ dataset.description if dataset else '' }}">
+    </div>
+
+    <div class="ui divider"></div>
+    <h4 class="ui header">Where the data is</h4>
+    <p class="ui grey text">This is the <em>real</em> S3 server. Only Whistler's proxy
+      ever talks to it — sessions are given the proxy's in-cluster address and never
+      learn this one.</p>
+
+    <div class="field required">
+      <label>Bucket</label>
+      <input name="bucket" type="text" required placeholder="reference-data"
+             value="{{ dataset.bucket if dataset else '' }}">
+    </div>
+
+    <div class="field">
+      <label>Endpoint <span class="ui grey tiny label">optional</span></label>
+      <input name="endpoint" type="text" placeholder="https://s3.example.org"
+             value="{{ dataset.endpoint if dataset else '' }}">
+      <div class="ui pointing label">Leave blank for AWS S3 proper. Any S3-compatible server otherwise.</div>
+    </div>
+
+    <div class="two fields">
+      <div class="field">
+        <label>Prefix <span class="ui grey tiny label">optional</span></label>
+        <input name="prefix" type="text" placeholder="subset/"
+               value="{{ dataset.prefix if dataset else '' }}">
+        <div class="ui pointing label">Serves this subtree as the root, so one bucket can hold several datasets.</div>
+      </div>
+      <div class="field">
+        <label>Region <span class="ui grey tiny label">optional</span></label>
+        <input name="region" type="text" placeholder="us-east-1"
+               value="{{ dataset.region if dataset else '' }}">
+      </div>
+    </div>
+
+    <div class="field">
+      <label>Provider <span class="ui grey tiny label">optional</span></label>
+      <input name="provider" type="text" placeholder="Other"
+             value="{{ dataset.provider if dataset else '' }}">
+      <div class="ui pointing label">rclone's provider name (<code>AWS</code>, <code>Minio</code>, <code>Ceph</code>, …). Defaults to <code>Other</code>, which suits most S3-compatible servers.</div>
+    </div>
+
+    <div class="ui divider"></div>
+    <h4 class="ui header">Access</h4>
+
+    <div class="field">
+      <div class="ui checkbox">
+        <input type="checkbox" name="read_only" id="read-only"
+               {% if not dataset or dataset.readOnly %}checked{% endif %}>
+        <label for="read-only">Read-only for everyone</label>
+      </div>
+      <div class="ui pointing label">
+        A ceiling, not a default: no grant can write to this dataset while it is
+        set, and it is enforced by the proxy — so it holds even in a VM, where
+        the user is root. Unticking it makes the dataset writable by
+        <em>everyone granted it</em>, and a user with no allow-list at all is
+        granted everything.
+      </div>
+    </div>
+
+    <div class="ui divider"></div>
+    <h4 class="ui header">Credential</h4>
+    <p class="ui grey text">
+      The bucket's real access key. It is stored in a Secret, mounted only into
+      this dataset's proxies, and never reaches a session.
+      {% if has_credentials %}
+      <strong>A credential is already stored</strong> — leave these blank to keep it.
+      Credentials cannot be displayed, only replaced.
+      {% endif %}
+    </p>
+
+    <div class="two fields">
+      <div class="field">
+        <label>Access Key ID</label>
+        <input name="access_key_id" type="text" autocomplete="off"
+               placeholder="{% if has_credentials %}unchanged{% else %}AKIA…{% endif %}">
+      </div>
+      <div class="field">
+        <label>Secret Access Key</label>
+        <input name="secret_access_key" type="password" autocomplete="new-password"
+               placeholder="{% if has_credentials %}unchanged{% else %}required{% endif %}">
+      </div>
+    </div>
+
+    <div class="field">
+      <label>Existing Secret <span class="ui grey tiny label">optional</span></label>
+      <input name="credentials_secret" type="text" placeholder="my-own-s3-secret"
+             value="{{ dataset.credentialsSecret if dataset else '' }}">
+      <div class="ui pointing label">
+        Point at a Secret you created yourself (keys <code>accessKeyId</code> and
+        <code>secretAccessKey</code>) to keep the credential out of Whistler's
+        hands entirely. Filling in the fields above manages one for you.
+      </div>
+    </div>
+
+    <div class="ui divider"></div>
+    <button type="submit" class="ui primary button">
+      <i class="save icon"></i> {% if dataset %}Save Changes{% else %}Create Dataset{% endif %}
+    </button>
+    <a href="/admin/datasets?user={{ current_user }}" class="ui button">Cancel</a>
+  </form>
+</div>
+
+<div class="ui info message" style="max-width:640px">
+  <div class="header">How changes apply</div>
+  <p>Access changes take effect at once: saving re-fences this dataset's proxies,
+  so revoking write access does not wait for anyone's session to restart. The
+  <em>mount itself</em> is set up by cloud-init at boot, so a changed bucket,
+  endpoint or prefix reaches a running session only when it next starts.</p>
+</div>
+
+{% endblock %}

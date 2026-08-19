@@ -265,4 +265,4 @@ def test_user_detail_shows_group_provenance():
     # and none of the checkboxes is ticked, because the user holds nothing in
     # their own right.
     assert html.count("from group") == 4
-    assert "checked" not in html.split("Volume Access")[1].split("Groups")[0]
+    assert "checked" not in html.split("Dataset Access")[1].split("Groups")[0]

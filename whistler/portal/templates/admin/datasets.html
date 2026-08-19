@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block title %}Datasets — Admin — Whistler{% endblock %}
+{% block content %}
+
+<div class="ui stackable grid">
+  <div class="twelve wide column">
+    <h2 class="ui header"><i class="database icon"></i> Shared Datasets</h2>
+  </div>
+  <div class="four wide column" style="text-align:right;padding-top:1.2rem">
+    <a href="/admin/datasets/new?user={{ current_user }}" class="ui primary button">
+      <i class="plus icon"></i> New Dataset
+    </a>
+  </div>
+</div>
+
+<p class="ui grey text">
+  Shared data held in S3 and mounted in VM sessions at <code>/shared/&lt;name&gt;</code>.
+  Sessions never reach the S3 server itself — Whistler runs a proxy per dataset
+  and mode, holds the bucket credential there, and fences it so only granted
+  users can reach it. Grant a dataset in the <a href="/admin/groups?user={{ current_user }}">Groups</a>
+  or user editors, the same way as a volume.
+</p>
+
+<div class="ui small warning message">
+  <i class="exclamation triangle icon"></i>
+  <strong>Datasets, not filesystems.</strong> S3 through FUSE has no byte-range
+  locking, no atomic rename and no hardlinks, and concurrent writers resolve as
+  a silent last-writer-wins. Good for read-mostly data — corpora, model
+  weights, media. Not a place to put a database, a git repo or a home
+  directory. Prefer <em>read-only</em> unless one session at a time owns the
+  writes. Mounts are VM-only; container sessions see no dataset.
+</div>
+
+{% if datasets %}
+<table class="ui selectable celled table">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Description</th>
+      <th>Bucket</th>
+      <th>Endpoint</th>
+      <th>Access</th>
+      <th>Credential</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for d in datasets %}
+    <tr>
+      <td><strong>{{ d.name }}</strong></td>
+      <td>{{ d.description or "—" }}</td>
+      <td>
+        <code>{{ d.bucket or "—" }}</code>
+        {% if d.prefix %}<br><span class="ui grey text">/{{ d.prefix }}</span>{% endif %}
+      </td>
+      <td>
+        {% if d.endpoint %}<code>{{ d.endpoint }}</code>
+        {% else %}<span class="ui grey text">AWS S3</span>{% endif %}
+      </td>
+      <td>
+        {% if d.readOnly %}
+          <div class="ui tiny green label"><i class="lock icon"></i> read-only</div>
+        {% else %}
+          <div class="ui tiny yellow label">writable if granted</div>
+        {% endif %}
+      </td>
+      <td>
+        {% if d.hasCredentials %}
+          <i class="green check icon"></i>
+          <span class="ui grey text">{{ d.credentialsSecret or "—" }}</span>
+        {% else %}
+          <div class="ui tiny red label">missing</div>
+        {% endif %}
+      </td>
+      <td class="collapsing">
+        <a href="/admin/datasets/{{ d.name }}/edit?user={{ current_user }}" class="ui tiny button">
+          <i class="edit icon"></i> Edit
+        </a>
+        <form method="post" action="/admin/datasets/{{ d.name }}/delete?user={{ current_user }}"
+              style="display:inline"
+              onsubmit="return confirm('Delete dataset {{ d.name }}? Its proxies are fenced to nobody immediately; sessions holding a mount keep it until they stop. The data in the bucket is not touched.')">
+          <button class="ui red tiny button"><i class="trash icon"></i> Delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="ui placeholder segment">
+  <div class="ui icon header">
+    <i class="database icon"></i>
+    No datasets defined yet.
+  </div>
+  <a href="/admin/datasets/new?user={{ current_user }}" class="ui primary button">Add one</a>
+</div>
+{% endif %}
+
+{% endblock %}

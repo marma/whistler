@@ -185,6 +185,18 @@ spec:
                   type: string
                 preemptible:
                   type: boolean
+                homeVolume:
+                  type: string
+                  description: >-
+                    Which of the user's HomeVolumes to attach as $HOME
+                    (runtime: vm only). Omit for the default: a home named
+                    after this instance, created on first start, which is
+                    exactly the pre-named-volumes behaviour. A volume is
+                    attached to at most one RUNNING instance at a time —
+                    ext4 is not a cluster filesystem — so starting a second
+                    instance holding the same volume is refused with a
+                    PolicyError naming the instance that has it. See
+                    design/security.md, "Core model: the access matrix".
                 overrides:
                   type: object
                   description: >-
@@ -341,6 +353,29 @@ spec:
                     list is the union with every Group this user belongs to,
                     so an empty list still ends up bounded when a group
                     defines one.
+                volumeAccess:
+                  type: object
+                  description: >-
+                    The access matrix: which volumes may be mounted in which
+                    zones, and how. Keyed zone -> volume -> mode. An ABSENT
+                    entry is NO ACCESS — this field has no defaults, which
+                    deliberately inverts the convention every other allow-list
+                    here follows (where empty means unrestricted). It is
+                    therefore not an allow-list and must not be read as one.
+                    A user's effective access is the most permissive entry
+                    across their own table and every group's, ordered
+                    allowed > read-only > absent; joining a group is a
+                    deliberate act that confers access. See
+                    design/security.md, "Core model: the access matrix".
+                    ENFORCED TODAY FOR HOME VOLUMES ONLY — dataset and
+                    PVC-volume rows are recorded and shown but still governed
+                    by allowedVolumes and the group volume grants, the same
+                    way `clipboard` is a declared-but-unenforced channel.
+                  additionalProperties:
+                    type: object
+                    additionalProperties:
+                      type: string
+                      enum: ["allowed", "read-only"]
                 allowedVolumes:
                   type: array
                   items:
@@ -440,6 +475,29 @@ spec:
                     User CR names. A name that matches no User is ignored (it
                     grants nothing), so a group may be written before its
                     members exist.
+                volumeAccess:
+                  type: object
+                  description: >-
+                    The access matrix: which volumes may be mounted in which
+                    zones, and how. Keyed zone -> volume -> mode. An ABSENT
+                    entry is NO ACCESS — this field has no defaults, which
+                    deliberately inverts the convention every other allow-list
+                    here follows (where empty means unrestricted). It is
+                    therefore not an allow-list and must not be read as one.
+                    A user's effective access is the most permissive entry
+                    across their own table and every group's, ordered
+                    allowed > read-only > absent; joining a group is a
+                    deliberate act that confers access. See
+                    design/security.md, "Core model: the access matrix".
+                    ENFORCED TODAY FOR HOME VOLUMES ONLY — dataset and
+                    PVC-volume rows are recorded and shown but still governed
+                    by allowedVolumes and the group volume grants, the same
+                    way `clipboard` is a declared-but-unenforced channel.
+                  additionalProperties:
+                    type: object
+                    additionalProperties:
+                      type: string
+                      enum: ["allowed", "read-only"]
                 volumes:
                   type: array
                   description: >-
@@ -632,3 +690,142 @@ spec:
     kind: Zone
     shortNames:
     - zn
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: datasets.whistler.martinmalmsten.net
+spec:
+  group: whistler.martinmalmsten.net
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: ["bucket"]
+              properties:
+                description:
+                  type: string
+                endpoint:
+                  type: string
+                  description: >-
+                    The REAL S3 server, which only Whistler's proxy ever
+                    talks to. Sessions are given the proxy's in-cluster
+                    address instead and never learn this one. Omit for AWS
+                    S3 proper. See design/storage.md, "Whistler runs the S3
+                    proxy": a zone rule must bind to an address Whistler
+                    owns, or it silently means something else when the
+                    server moves.
+                bucket:
+                  type: string
+                  description: The bucket on that endpoint. Required.
+                prefix:
+                  type: string
+                  description: >-
+                    Optional key prefix, so one bucket can carry several
+                    datasets. The session sees the prefix as the root.
+                region:
+                  type: string
+                provider:
+                  type: string
+                  description: >-
+                    rclone's S3 provider name (AWS, Minio, Ceph, Other, ...).
+                    Defaults to Other, which is right for most S3-compatible
+                    servers.
+                credentialsSecret:
+                  type: string
+                  description: >-
+                    Secret holding the real bucket credential as
+                    `accessKeyId` / `secretAccessKey`. Mounted into this
+                    dataset's proxies and nowhere else, so it never reaches
+                    a guest whose user has root. The portal creates and
+                    updates this Secret for datasets made there; point it at
+                    your own Secret to keep the credential out of Whistler's
+                    hands entirely.
+                readOnly:
+                  type: boolean
+                  description: >-
+                    Ceiling, not a default: when true this dataset is
+                    read-only for EVERYONE regardless of any rw grant, and
+                    only its read-only proxy is ever started. Shared data is
+                    read-mostly and S3 resolves concurrent writers as a
+                    silent last-writer-wins, so this is the posture to
+                    prefer. Without it, a dataset is writable by anyone
+                    granted it — including every user with no allow-list at
+                    all, since empty means unrestricted everywhere in
+                    Whistler.
+  scope: Namespaced
+  names:
+    plural: datasets
+    singular: dataset
+    kind: Dataset
+    shortNames:
+    - dset
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: homevolumes.whistler.martinmalmsten.net
+spec:
+  group: whistler.martinmalmsten.net
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                user:
+                  type: string
+                  description: >-
+                    The owning user. A HomeVolume lives in that user's
+                    namespace, beside the PVC it describes.
+                size:
+                  type: string
+                  description: >-
+                    Requested size, e.g. "20Gi". Applied when the backing PVC
+                    is created and not afterwards — growing a home needs the
+                    PVC expanded and then the filesystem grown inside the
+                    guest, which is not automated.
+                storageClassName:
+                  type: string
+                  description: >-
+                    Optional. Must be a class that can back a block image;
+                    the default class is used when omitted.
+                description:
+                  type: string
+                pvcName:
+                  type: string
+                  description: >-
+                    The backing claim. Normally derived as
+                    "whistler-home-<name>" and left unset; it is written
+                    explicitly when an existing per-instance home is adopted
+                    into a named volume, because those claims are named after
+                    the session that created them and renaming a bound PVC is
+                    not possible.
+      additionalPrinterColumns:
+        - name: User
+          type: string
+          jsonPath: .spec.user
+        - name: Size
+          type: string
+          jsonPath: .spec.size
+        - name: Claim
+          type: string
+          jsonPath: .spec.pvcName
+  scope: Namespaced
+  names:
+    plural: homevolumes
+    singular: homevolume
+    kind: HomeVolume
+    shortNames:
+    - hvol

@@ -1,0 +1,105 @@
+# A real S3 endpoint for exercising the shared-dataset tier (design/storage.md).
+#
+# versitygw serves S3 from a POSIX directory, which is why it is here rather
+# than an object store: it is the shape a site without one actually has, and
+# it can sit on the same storage class Whistler is stuck with. This is a TEST
+# RIG — one replica, credentials in plaintext below, no TLS. It stands in for
+# whatever the site's real S3 is.
+#
+# It is deliberately NOT in the whistler namespace: the point of the exercise
+# is that the proxy Whistler runs is the only thing sessions can reach, and
+# the real endpoint is somewhere else entirely.
+#
+#   kubectl apply -f manifests/s3-rig/versitygw.yaml
+#
+# Then create the credential Whistler hands its proxy (and nothing else):
+#
+#   kubectl -n whistler create secret generic s3-refdata-creds \
+#     --from-literal=accessKeyId=rigroot \
+#     --from-literal=secretAccessKey=rigsecret
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: s3-rig
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: versitygw-data
+  namespace: s3-rig
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: versitygw
+  namespace: s3-rig
+  labels:
+    app: versitygw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: versitygw
+  template:
+    metadata:
+      labels:
+        app: versitygw
+    spec:
+      # Seed a bucket with content that distinguishes the two failure modes
+      # this rig exists to catch: a file at the TOP LEVEL of the bucket (lost
+      # entirely if the proxy serves the backend unwrapped — see
+      # _build_s3_proxy_manifests) and one in a subdirectory (which survives
+      # either way, so on its own it would have hidden the bug).
+      initContainers:
+        - name: seed
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              set -eux
+              mkdir -p /data/reference-data/subset
+              echo "top-level file: visible only if the proxy wraps the backend" \
+                > /data/reference-data/hello.txt
+              echo "nested file" > /data/reference-data/subset/nested.txt
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: versitygw
+          image: ghcr.io/versity/versitygw:latest
+          args: ["--port", ":7070", "posix", "/data"]
+          env:
+            - name: ROOT_ACCESS_KEY_ID
+              value: rigroot
+            - name: ROOT_SECRET_ACCESS_KEY
+              value: rigsecret
+          ports:
+            - containerPort: 7070
+              name: s3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: versitygw-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: versitygw
+  namespace: s3-rig
+spec:
+  selector:
+    app: versitygw
+  ports:
+    - name: s3
+      port: 7070
+      targetPort: 7070

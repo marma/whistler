@@ -7,7 +7,8 @@ import yaml
 
 from whistler.cloudinit import (
     build_user_data, resolve_uid, resolve_gid, HOME_DISK_PATH,
-    HOME_DISK_SERIAL,
+    HOME_DISK_SERIAL, S3_PROXY_BUCKET, DATASET_MOUNT_ROOT,
+    DATASET_MOUNT_LINK,
 )
 
 MOUNT_SCRIPT = "/usr/local/sbin/whistler-mount-home"
@@ -162,9 +163,41 @@ def test_read_only_grant_is_mirrored_client_side_but_is_not_the_boundary():
     assert "--read-only" not in _dataset_unit(rw)
 
 
+def test_guest_mounts_the_proxys_bucket_not_its_root():
+    # The proxy serves one bucket (S3_PROXY_BUCKET) holding the dataset, so
+    # the guest must mount `<dataset>:<bucket>`. Mounting `<dataset>:` would
+    # get the proxy's bucket LIST — one directory named "data" — putting every
+    # file one level deeper than /shared/<name> promises, and it is the shape
+    # that silently loses top-level files (see test_s3_proxy.py).
+    unit = _dataset_unit()
+    assert (f"rclone mount refdata:{S3_PROXY_BUCKET} "
+            f"{DATASET_MOUNT_ROOT}/refdata") in unit
+
+
+def test_mounts_go_where_apparmor_allows_fuse_with_shared_symlinked_to_it():
+    # Regression, measured on Ubuntu 26.04 2026-08-17. Ubuntu's fusermount3
+    # AppArmor profile permits FUSE mounts only under @{HOME}, /mnt, /media,
+    # /tmp, @{run}/user/@{uid} and /cvmfs. Mounting at /shared/<name> is
+    # denied, and the only visible symptom is "fusermount: mount failed:
+    # Permission denied" — the mntpnt mismatch is in dmesg. So the mount goes
+    # under /mnt and /shared becomes a symlink to it: a symlink is not subject
+    # to the mount rule, so the documented path survives.
+    unit = _dataset_unit()
+    assert DATASET_MOUNT_ROOT.startswith("/mnt/")
+    assert f"{DATASET_MOUNT_ROOT}/refdata" in unit
+    # Mounting directly on the friendly path is exactly the bug.
+    assert "rclone mount refdata:data /shared/" not in unit
+    cmds = _doc(shared_datasets=[DATASET])["runcmd"]
+    link = f"ln -sfn {DATASET_MOUNT_ROOT} {DATASET_MOUNT_LINK}"
+    assert link in cmds
+    # Before the units, so /shared is never briefly absent.
+    assert cmds.index(link) < cmds.index(
+        "systemctl start --no-block whistler-dataset@refdata.service")
+
+
 def test_dataset_mounts_land_under_shared_and_survive_reboot():
     unit = _dataset_unit()
-    assert "/shared/refdata" in unit
+    assert f"{DATASET_MOUNT_ROOT}/refdata" in unit
     assert "WantedBy=multi-user.target" in unit
     cmds = _doc(shared_datasets=[DATASET])["runcmd"]
     assert "systemctl enable whistler-dataset@refdata.service" in cmds

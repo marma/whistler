@@ -27,7 +27,8 @@ class FakeConfigManager(ConfigManager):
     def __init__(self, users=None, templates=None, instances=None,
                  desktop_templates=None, desktop_sessions=None, gpu_types=None,
                  zones=None, ssh_targets=None, ssh_domain_suffix=".w",
-                 ssh_ca_public_key=None, vm_access_keys=None, groups=None):
+                 ssh_ca_public_key=None, vm_access_keys=None, groups=None,
+                 home_volumes=None, home_volume_holders=None):
         self.users: Dict[str, Dict[str, Any]] = users or {}
         # {group name: spec} — resolved through the same pure helpers the real
         # manager uses, so a test of the fake is a test of the rule.
@@ -42,6 +43,10 @@ class FakeConfigManager(ConfigManager):
         self.vm_access_keys: Dict[str, str] = vm_access_keys or {}
         self._templates: Dict[str, List[Dict[str, Any]]] = templates or {}
         self._instances: Dict[str, List[Dict[str, Any]]] = instances or {}
+        # {username: [volume dicts]} and {volume name: holding instance}.
+        self._home_volumes: Dict[str, List[Dict[str, Any]]] = home_volumes or {}
+        self._home_volume_holders: Dict[str, str] = home_volume_holders or {}
+        self.deleted_home_data: List[tuple] = []
         self._desktop_templates: Dict[str, List[Dict[str, Any]]] = desktop_templates or {}
         self._desktop_sessions: Dict[str, List[Dict[str, Any]]] = desktop_sessions or {}
         self._gpu_types: List[str] = gpu_types or []
@@ -63,7 +68,7 @@ class FakeConfigManager(ConfigManager):
         return list(self._instances.get(username, []))
 
     def add_instance(self, username, template_name, instance_name, preemptible=False,
-                     overrides=None, ephemeral=False):
+                     overrides=None, ephemeral=False, home_volume=None):
         self._instances.setdefault(username, []).append({
             "name": instance_name,
             "template": template_name,
@@ -72,9 +77,54 @@ class FakeConfigManager(ConfigManager):
             "preemptible": preemptible,
             "overrides": overrides,
             "ephemeral": ephemeral,
+            "homeVolume": home_volume,
         })
         self.created.append((username, template_name, instance_name, ephemeral))
         return True
+
+    def get_user_volume_access(self, username):
+        from whistler.config import merge_volume_access
+        own = self.users.get(username, {}).get("volumeAccess") or {}
+        return merge_volume_access(own, *(
+            (g.get("volumeAccess") or {})
+            for g in self.get_user_groups(username)))
+
+    def set_user_volume_access(self, username, matrix):
+        self.users.setdefault(username, {})["volumeAccess"] = matrix
+        return True
+
+    def grant_own_volume_access(self, username, zone, volume, mode="allowed"):
+        own = self.users.setdefault(username, {}).setdefault("volumeAccess", {})
+        own.setdefault(zone, {})[volume] = mode
+        return True
+
+    def get_home_volumes(self, username):
+        return sorted(self._home_volumes.get(username, []),
+                      key=lambda v: v.get("name") or "")
+
+    def save_home_volume(self, username, volume):
+        vols = self._home_volumes.setdefault(username, [])
+        for i, existing in enumerate(vols):
+            if existing.get("name") == volume.get("name"):
+                vols[i] = {**existing, **volume}
+                return True
+        vols.append(dict(volume))
+        return True
+
+    def delete_home_volume(self, username, name, delete_data=False):
+        vols = self._home_volumes.get(username, [])
+        for i, v in enumerate(vols):
+            if v.get("name") == name:
+                if self.home_volume_holder(username, v):
+                    return False
+                vols.pop(i)
+                self.deleted_home_data.append((username, name, delete_data))
+                return True
+        return False
+
+    def home_volume_holder(self, username, volume, ignore_instance=None):
+        holder = self._home_volume_holders.get(volume.get("name"))
+        return None if holder == ignore_instance else holder
 
     def get_instance_config(self, username, instance_name):
         for inst in self._instances.get(username, []):
@@ -82,16 +132,18 @@ class FakeConfigManager(ConfigManager):
                 return {
                     "templateRef": inst.get("template"),
                     "preemptible": inst.get("preemptible", False),
+                    "homeVolume": inst.get("homeVolume"),
                     "overrides": inst.get("overrides") or {},
                 }
         return None
 
     def update_instance(self, username, instance_name, preemptible=False,
-                        overrides=None):
+                        overrides=None, home_volume=None):
         for inst in self._instances.get(username, []):
             if inst["name"] == instance_name:
                 inst["preemptible"] = preemptible
                 inst["overrides"] = overrides
+                inst["homeVolume"] = home_volume
                 return True
         return False
 

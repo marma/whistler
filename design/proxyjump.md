@@ -288,10 +288,10 @@ known `kubectl`-client DEBUG logging that dumps raw Secret bodies to stdout
 ### The on-demand path is a policy decision
 
 `ssh marma@ubuntu.w` creates and starts an instance. Under security.md,
-**instance start** is where the zone gradient (rule 1) and the concurrency
-invariant (rule 4) are evaluated and where volume taint is imprinted — not
-instance creation. So the on-demand path must run the same gate as any other
-start, and a refusal has to reach the user.
+**instance start** is where the access matrix is evaluated and where the
+one-live-attach rule is claimed — not instance creation, since a stopped
+instance holds no volume. So the on-demand path must run the same gate as any
+other start, and a refusal has to reach the user.
 
 The plumbing for this already exists and should be used rather than
 duplicated: `ensure_session` raises `PolicyError`, and the operator records

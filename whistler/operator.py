@@ -55,6 +55,17 @@ def configure(settings: kopf.OperatorSettings, **_):
     # exist yet. Only the operator does this, to avoid server/portal racing
     # to create the same object.
     cm.ensure_bootstrap_admin()
+    # Adopt pre-named-volumes home disks: record each as a HomeVolume and cut
+    # its ownerReference to the Session, which would otherwise delete a user's
+    # home along with the instance that happened to create it. Idempotent.
+    try:
+        adopted = cm.adopt_legacy_home_disks()
+        if adopted:
+            logger.info(f"Adopted {adopted} legacy home disk(s) as home volumes")
+    except Exception as e:
+        # Never fail startup for this: the operator not running is worse than
+        # a home still carrying an ownerReference, which the next start retries.
+        logger.error(f"Home-disk adoption failed (will retry next start): {e}")
 
 
 # --------------------------------------------------------------------------- #

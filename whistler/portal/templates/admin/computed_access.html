@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Computed access — Admin — Whistler{% endblock %}
+{% block content %}
+<style>
+  .computed th.access-zone,
+  .computed td.access-zone { width: 1px; white-space: nowrap; text-align: center; }
+  .computed th.access-buffer,
+  .computed td.access-buffer {
+    width: auto; border-left: none !important; border-right: none !important;
+    background: transparent;
+  }
+  .computed tr.access-section td { background: #f9fafb; }
+  .computed td.access-zone i { font-size: 1.15em; }
+</style>
+
+<h2 class="ui header"><i class="calculator icon"></i> Computed access</h2>
+
+<p class="ui grey text">
+  What this user's access actually resolves to: their own matrix unioned with
+  every group they belong to, taking the <strong>most permissive</strong> cell
+  — no access &lt; read-only &lt; read-write. <strong>This view is derived and
+  cannot be edited.</strong> Change the user on their own page, or the group on
+  its; an edit control here would have to guess which you meant.
+</p>
+
+<div class="ui segment">
+  <form class="ui form" method="get" action="/admin/computed-access">
+    <input type="hidden" name="user" value="{{ current_user }}">
+    <div class="inline fields" style="margin-bottom:0">
+      <div class="field"><label>User</label></div>
+      <div class="field">
+        <select name="name" class="ui dropdown" onchange="this.form.submit()">
+          {% for u in usernames %}
+          <option value="{{ u }}" {% if subject == u %}selected{% endif %}>{{ u }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <noscript><button class="ui button" type="submit">Show</button></noscript>
+      </div>
+      <div class="field">
+        <span class="ui grey text">
+          <i class="red window close icon"></i> no access
+          <i class="yellow eye icon"></i> read-only
+          <i class="green check circle icon"></i> read-write
+        </span>
+      </div>
+    </div>
+  </form>
+  <p class="ui grey text" style="margin-top:0.6rem">
+    {% if groups %}Groups: {% for g in groups %}<span class="ui tiny teal label">{{ g }}</span> {% endfor %}
+    {% else %}In no groups — this is exactly their own matrix.{% endif %}
+  </p>
+</div>
+
+{% if sections %}
+<table class="ui celled compact table computed">
+  <thead>
+    <tr>
+      <th class="collapsing">Volume</th>
+      <th class="access-buffer"></th>
+      {% for z in zones %}<th class="access-zone">{{ z }}</th>{% endfor %}
+    </tr>
+  </thead>
+  <tbody>
+    {% for section in sections %}
+    <tr class="access-section">
+      <td colspan="{{ zones|length + 2 }}">
+        <strong>{{ section.title }}</strong>
+        {% if not section.enforced %}
+          <div class="ui tiny orange basic label">not enforced yet</div>
+        {% endif %}
+      </td>
+    </tr>
+    {% for row in section.rows %}
+    <tr>
+      <td class="collapsing">{{ row.label }}</td>
+      <td class="access-buffer"></td>
+      {% for z in zones %}
+      {% set cell = row.cells[z] %}
+      <td class="access-zone"
+          title="{% if cell.value %}{{ cell.value }} — from {{ cell.sources|join(', ') }}{% else %}no access{% endif %}">
+        {% if cell.value == "allowed" %}<i class="green check circle icon"></i>
+        {% elif cell.value == "read-only" %}<i class="yellow eye icon"></i>
+        {% else %}<i class="red window close icon"></i>{% endif %}
+        {% if cell.sources and cell.sources != ["own"] %}
+          <div class="ui grey text" style="font-size:0.75em">{{ cell.sources|join(", ") }}</div>
+        {% endif %}
+      </td>
+      {% endfor %}
+    </tr>
+    {% endfor %}
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="ui placeholder segment">
+  <div class="ui icon header"><i class="calculator icon"></i> Nothing to show yet.</div>
+</div>
+{% endif %}
+
+{% endblock %}

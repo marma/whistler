@@ -29,7 +29,7 @@ it shows.
 
 | | Now | After Ceph/Rook |
 | --- | --- | --- |
-| **Home** | one disk image per instance, on a PV | CephFS or RBD |
+| **Home** | one disk image per home volume, on a PV | CephFS or RBD |
 | **Shared data** | S3, read-mostly datasets | same, backed by RGW |
 | **Shared POSIX filesystem** | **not offered** | CephFS |
 
@@ -37,7 +37,7 @@ Nothing here is thrown away at the Ceph transition. Rook ships RGW, which
 speaks S3, so the S3 tier survives a change of endpoint; CephFS then covers
 the case S3 cannot. Each stage removes a workaround instead of adding one.
 
-## Home: one disk image per instance
+## Home: one disk image per instance (interim; named home volumes next)
 
 A home is an ordinary PVC (`volumeMode: Filesystem`, so the NFS share holds a
 `disk.img`) attached to the VM as a **second virtio-blk disk**. The guest
@@ -47,15 +47,27 @@ mechanism the VM root disk already uses, and `_build_vm_spec`
 `volumes` and `dataVolumeTemplates`. The docstring's *"the user's home PVC is
 NOT attached"* is the line that changes.
 
-**Per instance, not per user.** This is the part that is a decision rather
-than a mechanism, and the reason is zone integrity. A home that follows a
-*user* is a channel between zones: boot an instance in a restricted zone,
-write to home, reboot into a permissive one — zone membership changes on
-reboot, the disk follows the user, and the data is out. Per-instance homes
-cannot do that, because the image belongs to an instance and the instance is
-pinned to its zone.
+**Per instance, not per user — as built, and now an interim.** The reason was
+zone integrity. A home that follows a *user* is a channel between zones: boot
+an instance in a restricted zone, write to home, reboot into a permissive one
+— zone membership changes on reboot, the disk follows the user, and the data
+is out. A per-instance home cannot do that, because the image belongs to an
+instance and the instance is pinned to its zone.
 
-What that costs, stated plainly:
+That closes the hole by removing the choice, which is the right thing to build
+first and the wrong thing to stop at: it also forbids the cases a lab actually
+needs, such as one home per zone with the open one readable from the
+restricted instance. **The direction (decided 2026-08-19) is named home
+volumes**, chosen at instance creation, with the
+[access matrix](security.md#core-model-the-access-matrix) deciding which zones
+each may be mounted in and the one-live-attach rule keeping a volume in one
+running instance at a time. The per-instance home then becomes the *default*
+— a new instance gets a new home named after it — rather than the only
+possibility. Existing `whistler-home-<session>` PVCs are adopted as named
+volumes and lose their Session `ownerReference`, so nothing is deleted by the
+change.
+
+Until that lands, what the per-instance home costs, stated plainly:
 
 - **A user with several instances has several homes.** There is no single
   `$HOME` following someone around. Dotfiles, keys and toolchains are
@@ -137,9 +149,17 @@ no zone story at all, and no policy language will give it one.
 **The honest residual:** zones stop a *session* from reaching the network.
 They do not stop a *person* from carrying data. A user with instances in two
 zones can move files between them through their own client — the SSH plane is
-that channel, not storage. Per-instance homes close the storage channel, which
-is the one Whistler was silently providing; the human channel is out of scope
-and should be named as such rather than left to be discovered.
+that channel, not storage. What Whistler closes is the *storage* channel, the
+one it would otherwise provide silently by handing the same volume to two
+zones; the human channel is out of scope and should be named as such rather
+than left to be discovered.
+
+This is also why the
+[access matrix](security.md#core-model-the-access-matrix) does not pretend to
+be containment. It becomes a real boundary exactly when the user has no shell
+in one of the two zones, because only then is storage the only path — and
+Whistler can tell an admin when a cross-zone grant exceeds the channels that
+user already holds.
 
 ## Whistler runs the S3 proxy
 
@@ -164,8 +184,10 @@ credential, the guest never has one. A root user cannot exfiltrate what it
 never received, and revocation becomes real instead of theoretical. It also
 makes `mode: ro` meaningful on a VM for the first time — the proxy holds a
 read-only credential, and no amount of root in the guest changes what the
-proxy will do. Compare today, where a `ro` grant "is not yet a boundary" for
-VMs precisely because the guest has root.
+proxy will do. Compare a PVC, where a `ro` grant is still "not yet a boundary"
+for VMs precisely because the guest has root. Verified against a root guest
+that dropped the client-side flag and went at the proxy directly — see the run
+notes below.
 
 What it costs: a component to run and keep available, a bandwidth chokepoint,
 and Whistler back in the data path after this document just took it out of the
@@ -209,6 +231,90 @@ Still open: a proxy is a single replica with no availability story; grant
 changes reach a proxy's policy on the next session reconcile rather than being
 pushed; and **datasets are VM-only** — a pod would need `/dev/fuse` to mount
 one, so container sessions currently see no S3 volume at all.
+
+### Datasets are their own kind, 2026-08-18
+
+A dataset started life as a `type: s3` entry in the volume catalog. That was
+wrong in two ways, and both showed up in practice:
+
+- **A dataset is not a Kubernetes volume source.** Every other entry in that
+  catalog is copied straight into a pod spec by `_build_volume_wiring`. An S3
+  definition copied there is not a valid volume, so a container session that
+  requested one would have produced a pod the API server rejects.
+- **It could only be defined in `values.yaml`**, which meant a Helm upgrade to
+  add a bucket.
+
+So there is now a `Dataset` CR (`dset`), managed in the portal's Datasets
+section exactly the way zones are: the chart renders `whistler.datasets` as
+Helm-owned CRs, and admins create further ones in the UI. Legacy `type: s3`
+volume entries still resolve, and a Dataset CR of the same name wins.
+
+Two things the move made possible rather than just tidier:
+
+- **`readOnly` on the dataset is a ceiling**, and it is the only way to say
+  "nobody writes this". It was needed because the composition rule cuts the
+  surprising way: an empty allow-list means *unrestricted*, so before this a
+  dataset was writable by every user who had no allow-list at all. The ceiling
+  is enforced where it counts — a read-only dataset resolves every grant to
+  `ro` and leaves its rw proxy admitting nobody, so it holds against root in a
+  guest. Verified end to end: a dataset granted `rw` by a group, refusing a
+  root write.
+- **The portal can hold the bucket credential.** Typed into the editor, stored
+  in a Secret, mounted into that dataset's proxies and never rendered back —
+  an admin can replace a credential but not retrieve one. Naming your own
+  Secret instead still works and keeps the credential out of Whistler's hands,
+  which is the posture this document originally assumed. Writing Secrets is a
+  namespaced Role, deliberately not part of the portal's ClusterRole; deleting
+  that Role leaves the editor working with admin-provided Secrets only.
+
+**One malformed dataset used to stop every VM in the cluster.** A dataset
+saved without a credential raised `KeyError` inside the session reconcile,
+which kopf retried forever, so no session anywhere could start. Datasets are
+admin-editable, so a malformed one is an ordinary event, not an exceptional
+one: preparing a dataset now degrades to "that dataset does not mount" and the
+session comes up with the ones that work.
+
+### What the first end-to-end run cost, 2026-08-17
+
+Verified on k3s-metal against a real S3 server (versitygw over a PVC,
+`manifests/s3-rig/`), guest to backing store. Four things only the cluster
+could have told us, three of which were silent:
+
+- **`rclone serve s3 :s3:<bucket>` loses every file at the dataset's top
+  level.** It promotes the served directory's *subdirectories* to buckets, and
+  S3 cannot address an object with no bucket — so a dataset of loose files
+  mounts **empty, with no error**. Fixed by serving the backend wrapped in a
+  `combine` remote, which puts exactly one bucket at the root. The rig's seed
+  data now contains a top-level file for precisely this reason.
+- **AppArmor forbids the mount point.** Ubuntu's `fusermount3` profile permits
+  FUSE mounts only under `@{HOME}`, `/mnt`, `/media`, `/tmp`,
+  `@{run}/user/@{uid}` and `/cvmfs`. `/shared/<name>` is denied, reported only
+  as `fusermount: mount failed: Permission denied` with the real reason in
+  `dmesg`. The profile has no `local/` include, so the mounts moved to
+  `/mnt/shared/<name>` with `/shared` symlinked to it — a symlink is not
+  subject to the mount rule.
+- **A downgrade from `rw` to `ro` did nothing.** Proxies were reconciled only
+  for the mode a session actually mounts, so the `rw` proxy kept a policy
+  naming the user — and the user is root in their own guest, so they still had
+  that proxy's key from the previous session's `rclone.conf`. Every dataset's
+  proxies are now re-fenced on each session build, including modes the user is
+  losing, which is the case that matters.
+- **`s3_proxy_users` called a method that does not exist**, and would have
+  failed every VM boot the moment anyone was actually granted a dataset. It
+  had no test, because only the pure policy builder did — the list was always
+  passed in by hand.
+
+Confirmed working: reads and writes through the whole chain; a `ro` grant
+refusing a write from **root** in the guest bypassing the mount entirely, with
+the backing store unchanged; and a valid credential from an ungranted
+namespace refused at the network, which is the AND composing as designed.
+
+Two rough edges left as-is. The read-only proxy answers a refused write with
+**HTTP 500 InternalError** rather than 403, and rclone retries it three times
+over ~45s — the boundary holds, the diagnosis is poor. And the proxy's VFS
+listing cache (now `--dir-cache-time 1m`) means a dataset changed by another
+writer appears stale for up to that long, which is the read-mostly assumption
+showing through.
 
 ## Still open
 

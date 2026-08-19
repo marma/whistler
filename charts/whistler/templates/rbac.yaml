@@ -29,7 +29,7 @@ rules:
 
   # Application: watching & handling for the custom resources we declare.
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [sessions, templates, sessions/status, users, zones, groups]
+    resources: [sessions, templates, sessions/status, users, zones, groups, datasets, homevolumes]
     verbs: [list, watch, patch, get, update, create, delete]
 
   # KubeVirt VM desktop backend. The CRDs may be absent in a given cluster;
@@ -105,7 +105,7 @@ rules:
 
   # Managing custom resources
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [sessions, templates, sessions/status, users, zones, groups]
+    resources: [sessions, templates, sessions/status, users, zones, groups, datasets, homevolumes]
     verbs: [create, delete, get, list, patch, update, watch]
 
 ---
@@ -166,7 +166,7 @@ rules:
   # management UI's SSH template/instance CRUD + trigger) + users (admin user
   # management).
   - apiGroups: [whistler.martinmalmsten.net]
-    resources: [sessions, templates, sessions/status, users, zones, groups]
+    resources: [sessions, templates, sessions/status, users, zones, groups, datasets, homevolumes]
     verbs: [get, list, create, update, patch, delete, watch]
 
   # add_desktop_session / _ensure_user_namespace.
@@ -232,6 +232,45 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: {{ .Release.Name }}-portal
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-portal
+    namespace: {{ .Release.Namespace }}
+
+---
+# Writing Secrets is deliberately NOT in the ClusterRole above: it is scoped to
+# this one namespace, and exists for exactly one thing — the bucket credential
+# an admin types into the Datasets editor, which Whistler stores so a dataset
+# can be defined without a kubectl round-trip.
+#
+# Narrow on purpose. RBAC cannot restrict `create` by name (and has no prefix
+# matching), so this does allow the portal to write any Secret in the release
+# namespace, the host CA and SSH host key included. It is a smaller step than
+# it looks: the ClusterRole already grants get/list on Secrets cluster-wide, so
+# the portal can already READ those. This adds integrity exposure in one
+# namespace, not confidentiality. An admin who would rather not have it can
+# delete this Role — the editor still works, it just requires naming a Secret
+# you created yourself (design/storage.md).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-portal-secrets
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create, update, patch]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-portal-secrets
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-portal-secrets
 subjects:
   - kind: ServiceAccount
     name: {{ .Release.Name }}-portal

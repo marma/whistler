@@ -4,10 +4,13 @@
 ([`whistler/config.py`](../whistler/config.py), `Zone` CRs); **groups and the
 access-channel grant now exist too** ([Group](#group),
 [Access channels](#access-channels-the-second-axis), 2026-08-14). Volumes as a
-primitive, taints and security levels do not — so the core guarantee this
-document is named for is still unbuilt, and a group's read-only volume grant
-is a mount option rather than a boundary until the per-member export set
-lands. This document records the model and, more importantly, *why* each piece
+primitive and the [access matrix](#core-model-the-access-matrix) do not — so
+the core guarantee this document is named for is still unbuilt, and a group's
+read-only volume grant is a mount option rather than a boundary on a VM (it is
+already real for [datasets](storage.md), where the proxy enforces it).
+**Taint and security levels were the earlier form of that guarantee and were
+dropped on 2026-08-19**; passages below that argue from them are marked where
+they have not been rewritten. This document records the model and, more importantly, *why* each piece
 is shaped the way it is, so the implementation doesn't quietly drop the parts
 that carry the guarantee.
 
@@ -27,11 +30,15 @@ material and must never again be mounted somewhere with internet access.
 The requirement is therefore about **history as well as concurrency**.
 Forbidding two sessions from sharing a directory *at the same time* does not
 close it: the same user can mount the same home in the open zone an hour
-later, so whatever enforces this has to remember where a volume has been. But
-the converse is equally true and was missing from an earlier draft of this
-document, which treated history as sufficient — it is not. A volume live in
-two zones at once is a live bridge between them, and no amount of remembering
-closes that while it is happening. Both invariants are needed; see rules 1–4.
+later. An earlier draft answered this with history — remember where a volume
+has been, and forbid it moving down — and that answer was
+[dropped](#what-this-replaces-and-why-taint-was-dropped): it recorded
+potential rather than fact, and obstructed legitimate copying. What survives
+from it is the observation that history alone was never sufficient anyway. A
+volume live in two zones at once is a live bridge between them, and no amount
+of remembering closes that while it is happening. The
+[access matrix](#core-model-the-access-matrix) states which zones may hold a
+volume at all, and the one-live-attach rule keeps it in one place at a time.
 
 The secondary scenario is data-science staff who legitimately need both the
 internet and the restricted data. That must be expressible as policy, not as a
@@ -116,7 +123,8 @@ confusion about what a zone promises comes from collapsing them.
 
 1. **The data.** Which volumes a session can reach, in which direction, and
    where they have been. Enforced server-side by the published export set and
-   the taint rules. This is the axis the rest of this document is about.
+   the [access matrix](#core-model-the-access-matrix). This is the axis the
+   rest of this document is about.
 2. **The channel.** Which mechanisms the person is given for moving bytes in
    and out of a session — SSH and its file transfers, the relay, the web
    terminal, the desktop clipboard, screenshots. Enforced by the gateway, the
@@ -309,79 +317,170 @@ internal helper and the external researcher meet in the same zone, on the
 same instance, and must not get the same channels. A maximally restricted
 zone sets its ceiling to the desktop stream alone, and no grant can widen it.
 
-## Core model: taint plus security level
+## Core model: the access matrix
 
-Two fields carry the whole guarantee.
+Access to data is one table, and the table is the whole model.
 
-- A **volume** carries a **taint**: the set of zones it has been mounted in
-  writable.
-- A **zone** carries a **security level**, `0`–`100`, expressing how restricted
-  it is.
+> **(subject, zone, volume) → `allowed` | `read-only`**
+>
+> An absent entry is **no access**. There are no defaults.
 
-From which:
+`subject` is a user or a group. `volume` is any volume kind — a home volume, a
+shared volume, a dataset. `zone` is the zone the instance runs in. A user's
+effective access to a volume in a zone is the most permissive entry across
+their own table and the tables of every group they belong to, ordered
+`allowed` > `read-only` > absent.
 
-1. Mounting volume `V` into a session in zone `Z` is **forbidden** when
-   `Z.securityLevel < max(level(z) for z in V.taint)` — i.e. you may not carry
-   a volume down the gradient.
-2. A **writable** mount imprints: `V.taint ∪= {Z}`.
-3. A **read-only** mount does **not** imprint. Restricted data cannot flow
-   *into* a volume that can't be written, so it cannot become a carrier.
-4. **Concurrency invariant.** At any instant, over the zones `V` is *currently*
-   mounted in: `min(level(z) for z in mounted) >= max(level(z) for z in
-   mounted-writable)`. In words: a volume may not be readable somewhere lower
-   than it is writable, *right now*. Read "mounted" as **published to a running
-   instance** — an actual mount happens inside a guest, where the operator
-   cannot see it, and a rule enforced against something unobservable is not a
-   rule (see
-   [Mounting homes on demand](#mounting-homes-on-demand)).
+That is the entire rule. What follows is why each part is shaped that way.
 
-**Rules 1–3 alone leave a live hole, and it is not a subtle one.** Start an
-instance in the open zone: `V.taint = {open}`. Now start a second instance in
-the restricted zone: rule 1 permits it (`100 >= 0`), and rule 2 sets
-`V.taint = {open, restricted}`. The volume is now mounted writable in both at
-once. Restricted material written in the second instance is readable, this
-second, from the first — which has internet egress. Rule 1 will refuse the
-*next* open-zone mount, so the model self-corrects on reboot; it does nothing
-about the window, and by then the data has left.
+### Every allow is explicit, and that inverts the house convention
 
-Rule 4 closes it, and closes it at the right end: the mount that *creates* the
-conflict is refused, rather than tearing a mount out from under a session that
-was already running and did nothing wrong. It also leaves the onboarding case
-(consequence 2 below) intact — writable in open, read-only in restricted gives
-`min(0, 100) = 0 >= max(0) = 0`, which passes.
+Everywhere else in Whistler an empty allow-list means *no restriction*: the
+admin has expressed no opinion, so the user is unrestricted. Here an empty
+cell means the admin has not said yes, so the answer is no.
 
-Rule 4 is **evaluated at instance start, not at instance creation**. A created
-but stopped instance holds no mount and must neither imprint nor constrain
-anything; taint is recorded when the volume is actually attached. Evaluating it
-at creation is what produced the hole above.
+The inversion is deliberate and it is the reason this is a table rather than
+another allow-list. The two conventions must therefore never be made to look
+alike: this field is not called an allow-list, and the UI renders **the whole
+grid including its empty cells**, because a policy visible only through its
+exceptions is one nobody audits.
 
-Three consequences worth stating explicitly, because they are the reason to
-prefer this shape over a set of rules about homes and migrations:
+What it costs: a subject's table is zones × volumes, and a new zone or a new
+volume starts closed everywhere until someone opens it. Accepted knowingly.
+The failure mode of a permissive default is data leaving a restricted zone
+quietly; the failure mode of this one is a user who cannot mount something and
+says so within the minute.
 
-- **The one-way property is free.** There is no "migrate" verb and no
-  `migrated: true` flag to get wrong. An admin moves an instance from open to
-  restricted; the next boot mounts its volumes there; they are imprinted; they
-  are now permanently ineligible for the open zone. The ratchet *is* the
-  monotonic label.
-- **Onboarding works without a hole.** Rule 3 lets a researcher's open-zone
-  home be mounted read-only inside the restricted zone — bring your notes in,
-  don't take anything out — and it stays usable in the open zone afterwards.
-  This must be a read-only *share*, enforced by the gateway; a read-only mount
-  option chosen by a guest with root is worth nothing.
-- **The data-science case is just a zone.** A zone that permits internet egress
-  and still carries a high security level lets staff keep one home and reach
-  both. What they lose is the ability to take that home back down to open —
-  which is correct, and falls out of rule 1 without a special case.
+### Why groups compose as a union
 
-**Clearing a taint is an explicit, audited operation**, not a configuration
-option. A flag that permits crossing gets set once and forgotten; a
-declassification action leaves a record and stays rare. That is the intended
-balance between enforcing the rule and letting an administrator override it.
+A user's grants are unioned with every group's, most-permissive-per-cell. This
+is the same direction as every other allow-list in Whistler, and here it is
+also simply what an admin means: joining a group is a deliberate act whose
+purpose is to confer access, and a user who already held access does not lose
+it by joining a project.
 
-**Zones must stay behaviour-free in code.** The level is a number and the
-policy is data; no zone name may acquire meaning in the implementation. Whether
-a deployment calls its zones open/restricted/internal is the deployment's
-business.
+The hazard worth naming is a different one. It is not that a user gains access
+by joining; it is that **one member's access reaches another member**. That
+needs an object several members share, and today none exists — every instance
+belongs to exactly one user, so a member's grants only ever apply to their own
+sessions.
+
+**Tripwire for [project instances](#project-instances-several-members-one-machine-no-desktops).**
+A shared instance must not resolve its access as the union of its members'
+tables; that is exactly the leak above, and it would arrive silently as a
+consequence of the composition rule rather than as a decision anyone made. A
+project instance needs its own subject entry in the matrix — the project's
+access, not its members'. The model is safe today only because the feature is
+absent, which is a reason to write the constraint down now rather than
+rediscover it then.
+
+### One live attach
+
+A volume is attached to at most one **running** instance at a time, whatever
+the mode.
+
+The reason is not security, and saying so matters because a rule believed to
+be a boundary gets relied on as one. A home is an ext4 image on a block
+device, and ext4 is not a cluster filesystem: mounted read-write by one guest
+and read-only by another at the same moment, the reader sees inconsistent
+metadata — stale directory entries, failed mounts, kernel errors. Hypervisor
+read-only (KubeVirt's `disk.readonly`, confirmed present in the deployed
+version) stops the reader *corrupting* the image; it does nothing to make the
+reader's view *coherent*.
+
+Evaluated at **start, not creation**. A created-but-stopped instance holds no
+attachment and must neither claim one nor block one. This is the same
+placement the taint model needed for its own reasons, and the on-demand SSH
+path must run the same gate as any other start
+([proxyjump.md](proxyjump.md#the-on-demand-path-is-a-policy-decision)).
+
+The consequence for the two-zone user is worth stating in the concrete: they
+may have an instance in each zone, each with its own home volume, and may
+mount the open home read-only inside the restricted instance — **but not while
+the open instance is running**. Stop it, and the read-only mount is available.
+
+### What `read-only` is worth, per volume kind
+
+It means something different in each case, and one of them is not a boundary
+at all:
+
+| Volume kind | Mechanism | Holds against root in the guest? |
+| --- | --- | --- |
+| Dataset (S3) | The proxy runs `--read-only`; `ro` and `rw` are separate proxies with separate fencing | **Yes** |
+| Home volume / block disk on a VM | KubeVirt `disk.readonly` — enforced by the hypervisor | **Yes** |
+| PVC volume in a container session | `readOnly` mount, kernel-enforced | **Yes** |
+| PVC volume on a VM | A mount option the guest chooses | **No** |
+
+The last row must be labelled wherever it appears, the way `clipboard` is
+labelled in `ENFORCED_CHANNELS`: recorded, not enforced. A read-only grant a
+root user can drop is a statement of intent, and presenting it as a control is
+worse than not offering it.
+
+### What this replaces, and why taint was dropped
+
+An earlier version of this model gave each volume a **taint** (the set of
+zones it had been mounted in writable) and each zone a **security level**,
+forbidding a volume from moving down the gradient. It is recorded here as
+rejected, with the argument, so it is not reinvented.
+
+- **Taint records potential, not fact.** That a volume was attached writable
+  in a restricted zone is not evidence that restricted data was written to it.
+  The label is a proxy for a thing nobody observed.
+- **It obstructs legitimate work.** Copying validated data out of a restricted
+  volume is a normal administrative act, and under taint it required clearing
+  a label first.
+- **It is not a boundary against the person it constrains.** Anyone who can
+  read both sides can `scp` through an intermediate host. The label stops the
+  convenient path, not the capable one.
+- **A control that is routinely overridden trains people to override it.** An
+  uncleared taint that everyone has learned to work around is worse than no
+  taint, because it still looks like a boundary to whoever reads the schema.
+
+**What is lost, stated plainly:** the matrix has no memory. If restricted data
+has been written into a volume and an admin later marks that volume `allowed`
+in an open zone, nothing objects. Under taint that flip demanded an explicit
+declassification. The matrix's answer is that this is an administrative act in
+both models — the difference is only whether the system pretends to have
+checked something. It should be visible in the audit trail of who changed
+which cell, not dressed up as an automatic rule.
+
+### What this model does not claim
+
+It is **not** a containment boundary against a person holding shells in two
+zones. Such a person can carry data between them through their own client
+regardless of what the table says, and
+[Zones fence the network, not the data](storage.md#zones-fence-the-network-not-the-data)
+already says so about zones. The matrix closes the *storage* channel — the one
+Whistler would otherwise provide silently by handing the same volume to two
+zones — and closes nothing else.
+
+It becomes a real boundary in exactly one case: when the user does **not**
+have a shell in one of the two zones, because then no other channel exists to
+carry the data. Which gives a rule the implementation can actually check:
+
+> A cross-zone volume grant should not exceed the channels the user already
+> holds across those zones.
+
+When it does, the grant is opening a path that was closed. Whistler can
+compute that from [access channels](#access-channels-the-second-axis) and warn
+at the point of granting; it should not refuse, because an admin may mean it.
+
+### How it subsumes today's grants
+
+The matrix replaces `allowedVolumes` and the group volume `mode`/`access`
+grants rather than layering over them. Two mechanisms with opposite defaults
+governing the same question is the confusion this model exists to remove.
+
+A dataset's `readOnly` field stays what it is — a **ceiling** on the volume
+itself, not a cell — and composes as the more restrictive of the two, so a
+read-only dataset cannot be widened by a matrix cell that says `allowed`.
+
+**Migration.** Existing grants are rendered into the matrix on upgrade: for
+each volume a user may mount, an entry at the granted mode in each zone that
+user may enter. That reproduces today's access exactly, which is the point —
+nobody is locked out by an upgrade — and it should be said out loud that the
+result is as permissive as today, so the seeded grid is a starting point to
+tighten, not a policy anyone chose.
 
 ## User
 
@@ -395,10 +494,12 @@ implicitly. Under this model a home is an ordinary volume that happens to be
 bound to a user and mounted at `$HOME`, and a user may own several. Instance
 creation chooses which one to use as the home.
 
-That single change removes the need for a rule about homes: a user working in
+That single change removes the need for a rule about homes. A user working in
 two zones ends up with two home volumes not because a policy says "one home per
-zone" but because the taint rule makes a single shared home impossible. The
-mechanism is the same one that governs every other volume.
+zone", but because a single shared home would need an `allowed` cell in both —
+which an admin can grant, and which the matrix then shows them they have
+granted. The mechanism is the same one that governs every other volume, and
+the choice is visible rather than implied.
 
 Existing `User` fields (allowed zones, override grants) stay as they are, and
 a `channels` grant joins them. What a user may mount comes from the
@@ -431,26 +532,28 @@ A new primitive, and the place the guarantee actually lives.
 - **Created explicitly** in the admin interface, backed by a PVC, with an
   optional explicit storage class.
 - **Owned** by a user or (later) a group.
-- **Fields**, at least: name, owner, size, storage class, `taint[]`, access
-  mode, and a pinning/shareability property (below).
-- **Taint lives on the `Volume` CR**, not as an annotation on the PVC: it has to
-  outlive any particular PVC, and it is policy, not implementation detail.
-- **Taint is recorded by the operator at mount time**, before the session
-  starts — not by anything in the guest.
+- **Fields**, at least: name, owner, size, storage class, access mode, and a
+  pinning/shareability property (below).
+- **Which volume a session gets is chosen at instance creation** and fixed for
+  that instance; a user may own several, and homes are ordinary volumes that
+  happen to be mounted at `$HOME`.
+- **Attachment is recorded by the operator**, before the session starts, and
+  is what the one-live-attach rule is evaluated against — not anything in the
+  guest.
 
-**Every volume mounted in a session is imprinted, not just the home.** Omitting
-this makes the scratch-volume copy-out the trivial bypass: mount a clean
-volume in the restricted zone, copy, remount it in the open zone.
+**The matrix governs every volume a session mounts, not just the home.**
+Exempting scratch volumes would make the copy-out trivial: mount a clean
+volume in the restricted zone, copy into it, mount it in the open zone.
 
-**Pinned vs shareable.** Distinct from taint, and the thing "no shared home
+**Pinned vs shareable.** Distinct from the matrix, and the thing "no shared home
 directories" was reaching for: a volume may be *pinned* to a single instance, or
 be of a kind that can be attached to several. A zone can require that everything
 mounted in it be pinned. This is a property of the volume's kind — "can this be
 shared at all" — not a statement about two sessions running at once.
 
-**Enforcement.** A `taint` field the operator consults is defeated by anyone who
-can reach a gateway from another zone, since the guest has root. The label is
-the policy; the mechanism has to be one of:
+**Enforcement.** A matrix the operator consults is defeated by anyone who can
+reach a gateway from another zone, since the guest has root. The table is the
+policy; the mechanism has to be one of:
 
 - per-boundary **gateway pod**, with the zone's NetworkPolicy making the others
   unroutable — the only one of these still available now that the substrate is
@@ -467,7 +570,7 @@ Neither the field nor the mechanism works alone.
 ### Session state: cache, config, state
 
 Per-session desktop state is where volume layout, the concurrency hazards and
-the taint model all meet. The split:
+the access rules all meet. The split:
 
 - **`XDG_CACHE_HOME` never goes on a shared volume.** It is discardable by
   definition, it is where most of the concurrency hazard lives (SQLite indexes,
@@ -486,7 +589,7 @@ the taint model all meet. The split:
   selective-export version is possible but puts the isolation back in the
   gateway's path handling, which
   [Assumptions](#assumptions) says is not a boundary. A separate volume gets the
-  same taint logic as everything else for free, and one fewer special case.
+  same access rules as everything else for free, and one fewer special case.
 
 The move to NFS removed the need for `nobrl` and with it the cross-host locking
 hole — SQLite-backed state (browser profiles, keyrings) stopped being a
@@ -504,7 +607,6 @@ All of that stays.
 
 What this model adds to the `Zone` CR:
 
-- **`securityLevel`** (`0`–`100`) — the gradient in rule 1.
 - **A pinning requirement** — may this zone mount shareable volumes at all.
 - **A channel ceiling** — the most any session here may use
   ([Access channels](#access-channels-the-second-axis)). A ceiling, not a
@@ -524,13 +626,14 @@ apart.
 
 **Live edits.** The current split — an edited zone re-fences running sessions in
 place, while zone *membership* changes need a restart — is worth preserving as
-is; instant re-fencing is a feature. A change to `securityLevel` is the awkward
-case, since it can retroactively invalidate a mount that is already live, but it
-does **not** have to take effect instantly: flag the affected running instances
-as needing a reboot (and surface a warning at edit time), then let the rule
-apply at next boot. A level change that killed live sessions would be worse than
-the exposure it closes, and an unreadable "why did my session die" is worse than
-a visible "this instance must restart".
+is; instant re-fencing is a feature. Revoking a matrix cell is the awkward
+case, since it can retroactively invalidate a mount that is already live, but
+it does **not** have to take effect instantly: flag the affected running
+instances as needing a reboot (and surface a warning at edit time), then let
+the rule apply at next boot. A revocation that killed live sessions would be
+worse than the exposure it closes, and an unreadable "why did my session die"
+is worse than a visible "this instance must restart". Note this is the one
+place the model is knowingly not fail-closed, and the trade is deliberate.
 
 ## Group
 
@@ -599,9 +702,9 @@ Two encodings are load-bearing and easy to lose:
   is the natural way to hand one outsider a read-only look at a project
   without making them a member of it.
 
-Not done: nesting (deliberately — none), the cross-level mount override
-(`allowCrossMount`), which waits on taint and security levels existing at all,
-and any notion of who may edit a group beyond "an admin".
+Not done: nesting (deliberately — none), a group's rows in the
+[access matrix](#core-model-the-access-matrix), which wait on the matrix
+existing at all, and any notion of who may edit a group beyond "an admin".
 
 ## Shared instances and shared volumes
 
@@ -842,11 +945,17 @@ instance, since root can read another member's credential cache.
   writes as that identity; their existing files stay theirs. This interacts
   with declassification, where "who wrote this" now has several answers.
 
-### Interaction with taint
+### Interaction with the access matrix
 
-Taint is unaffected: it ranges over **zones, not users**, so a volume several
-members can reach imprints exactly as any other volume does, at mount time, by
-the operator. Multi-member changes nothing about rules 1–3.
+The matrix is unaffected by multi-member export sets, because its `zone`
+dimension is orthogonal to identity: a volume several members can reach is
+still a volume in exactly one zone at a time, and the cell that governs it is
+the same cell. What multi-member access changes is *who* may write, which the
+export set decides — not *where the data may go*, which the matrix decides.
+
+The one place the two must be read together is the
+[tripwire](#why-groups-compose-as-a-union): a shared instance must take its
+access from its own subject entry, never from the union of its members'.
 
 The general statement the export-set model licenses is that **the set of
 exports published to an instance is the access-control decision** — it encodes
@@ -999,12 +1108,12 @@ Three things fall out, and the third is the one worth having:
   construction rather than by scheduling luck.
 - The project namespace is self-contained: instance, gateway, storage, one
   fencing policy of the existing shape.
-- **A personal home never enters a project machine, so it is never imprinted
-  with the project's zone.** Under the mount-the-real-home version, joining a
-  restricted project would taint a member's personal home and lock it out of
-  their own open-zone sessions ([rule 1](#core-model-taint-plus-security-level)) —
-  a surprising, hard-to-explain consequence that this arrangement simply does
-  not have.
+- **A personal home never enters a project machine.** Under the
+  mount-the-real-home version it would have to be granted in the project's
+  zone, which — with the project restricted and the member's own work open —
+  is the cross-zone grant the
+  [matrix](#core-model-the-access-matrix) exists to make deliberate and
+  visible. This arrangement never raises the question.
 
 The cost is honest and small: dotfiles and environment do not follow a member
 onto a project instance. Seeding a project home from a dotfiles repo at
@@ -1318,17 +1427,18 @@ something it cannot see is not a rule. What the operator does control is which
 exports it publishes to an instance.
 
 So lazy mounting is only honest if **publication is lazy too**: the operator
-adds the member's export when that member first connects, and imprints the
-taint at that moment. The conservative alternative — publish and imprint every
+adds the member's export when that member first connects, and records the
+attachment at that moment. The conservative alternative — publish every
 member's home at instance start — is safe and defeats the purpose. This also
-sharpens rule 4: "currently mounted" should be read as "currently published to
-a running instance", which is the operator's own state.
+sharpens the one-live-attach rule: "currently attached" should be read as
+"currently published to a running instance", which is the operator's own
+state, rather than as anything happening inside a guest.
 
 **Lazy publication is now known to be possible**: `AddExport` over DBus works
 on a running gateway with no restart of the gateway or the guest
 ([measured](#publishing-and-revoking-exports-while-the-gateway-runs-measured)).
 The sequence for a member's first login is therefore: operator publishes the
-export and imprints the taint → the guest's automount unit fires on first
+export and records the attachment → the guest's automount unit fires on first
 access → the member has their home. Both halves are lazy and the observable
 one (publication) is the one carrying the rule.
 
@@ -1411,8 +1521,8 @@ desktop and no storage, which is a confusing failure rather than a safe one.
 - **Resource contention is a security-adjacent concern.** N desktops share CPU,
   RAM and one GPU, so a single member can starve the rest. Per-member cgroup
   limits, or an admission rule relating member count to instance size.
-- **Attribution gets weaker.** Audit and declassification now have N candidate
-  writers per volume ([Interaction with taint](#interaction-with-taint)).
+- **Attribution gets weaker.** Audit now has N candidate writers per volume
+  ([Interaction with the access matrix](#interaction-with-the-access-matrix)).
 
 ### What this does *not* need
 
@@ -1421,8 +1531,9 @@ Worth stating, because each is a plausible-sounding detour:
 - **Not Kerberos.** Per-member exports still give identity containment, and the
   members already share a kernel — the storage layer is not the weak link here,
   so buying cryptographic identity for it would be spending in the wrong place.
-- **No new taint machinery.** One instance sits in one zone, so rules 1–4 apply
-  unchanged; only the "published, not mounted" reading above is a refinement.
+- **No new access machinery.** One instance sits in one zone, so the
+  [matrix](#core-model-the-access-matrix) applies unchanged; only the
+  "published, not attached" reading above is a refinement.
 - **Not RWX storage.** The gateway remains the only mounter of each PVC — an
   invariant the [one-gateway-per-project decision](#the-gateway-topology-one-per-project-and-it-holds-only-project-storage)
   preserves rather than strains. Worth being precise about why RWX is not the
@@ -1643,10 +1754,14 @@ Two lessons about the method, both learned the hard way:
   in the cluster.
 - **Channel grants conditioned on source network** — worth having, worth
   being honest that it correlates with the endpoint rather than proving it.
-- Audit trail and UI for declassification.
-- What `securityLevel` values mean in practice, and whether an unordered taint
-  *set* is ever needed instead of a total order (two restricted collections
-  that must not mix are not expressible as levels).
+- **Audit trail and UI for the matrix.** Who changed which cell, and when. It
+  carries more weight now than under taint: opening a cell is the whole
+  declassification story, so the record of it is the only thing left that says
+  a deliberate act took place.
+- **Two restricted collections that must not mix.** The matrix expresses this
+  naturally where a gradient could not — they are simply different volumes
+  with no shared `allowed` zone — which is one of the reasons it replaced the
+  levels. Worth confirming against a real case before claiming it is solved.
 - **Kerberos, and the three things that would make it necessary.** Per-member
   exports cover the identity containment this model actually requires, so
   `sec=krb5` is not on the critical path. It becomes the answer — and the only
@@ -1676,9 +1791,10 @@ Two lessons about the method, both learned the hard way:
   all and how that is enforced (the SSH/console path, not the gateway), and
   what happens to a running project instance when membership changes.
 
-**Resolved and folded in:** taint lives on the `Volume` CR; no migration path
-for existing homes is needed (nothing is in production); zone level changes flag
-instances for reboot rather than applying live; read-only enforcement is a
+**Resolved and folded in:** the access matrix replaces taint and security
+levels (2026-08-19); no migration path for existing homes is needed (nothing is
+in production); revoking access flags instances for reboot rather than applying
+live; read-only enforcement is a
 server-side `Access_Type = RO` export and needs no separate mechanism, since
 the published export set already encodes it; multi-user and project-wide
 instances are no longer deferred wholesale — their storage model is
