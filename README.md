@@ -18,23 +18,366 @@ Whistler has the following features:
 
 ![Whistler](img/screenshot_1.png "Whistler")
 
-## Install
+# Install
 
-### Installation through Helm Chart
+Whistler needs a cluster, and — for anything beyond throwaway container
+sessions — KubeVirt. The rest of this section is in install order: the two
+things that go in *before* Whistler (KubeVirt, and optionally an S3 endpoint
+for shared datasets), then the chart itself, then the two optional pieces that
+only matter if you are building your own VM images.
+
+## Prerequisites
+
+- Kubernetes 1.28+ and `kubectl`, with a default StorageClass.
+- Helm 3.8+ (OCI registry support).
+- For VM sessions: nodes with `/dev/kvm`. Without it KubeVirt can be told to
+  emulate, which works and is slow.
+- For GPU passthrough: the host driver, IOMMU and the NVIDIA GPU Operator in
+  `sandboxWorkloads` mode. Out of scope here; see
+  [scripts/metal_k3s_create.sh](scripts/metal_k3s_create.sh), which sets up a
+  single-node k3s host end to end.
+
+A note on storage: a home volume is a `disk.img` on a PVC attached to the VM as
+a virtio-blk disk, so an NFS-backed StorageClass is fine for homes. It is *not*
+fine for the (now optional) NFS storage gateway — see
+[design/storage.md](design/storage.md).
+
+## 1. KubeVirt
+
+Required for `runtime: vm` templates, which is every desktop and every SSH-
+reachable session today. Container sessions work without it, but are reachable
+only through the portal's web terminal.
+
+The scripted path installs KubeVirt, CDI and `virtctl` against whatever cluster
+your current `KUBECONFIG` points at:
 
 ```bash
-helm install whistler oci://ghcr.io/marma/charts/whistler
+scripts/install_kubevirt.sh
 ```
 
-Example `values.yaml`:
+Knobs (all env vars): `KUBEVIRT_VERSION` (default: latest stable),
+`KUBEVIRT_USE_EMULATION=1` for nodes with no `/dev/kvm`,
+`KUBEVIRT_INSTALL_CDI=0` to skip CDI, `CDI_VERSION`.
+
+By hand, if you would rather see every step:
+
+```bash
+VERSION=$(curl -sfL https://storage.googleapis.com/kubevirt-prow/release/kubevirt/kubevirt/stable.txt)
+BASE=https://github.com/kubevirt/kubevirt/releases/download/${VERSION}
+
+kubectl apply -f ${BASE}/kubevirt-operator.yaml
+kubectl apply -f ${BASE}/kubevirt-cr.yaml          # retry until the CRD registers
+kubectl -n kubevirt wait kubevirt kubevirt --for=condition=Available --timeout=15m
+```
+
+CDI is only needed for templates that boot from an `imageURL` (an HTTP qcow2
+imported into a persistent root disk) rather than a containerDisk:
+
+```bash
+CDI=$(curl -sfL https://api.github.com/repos/kubevirt/containerized-data-importer/releases/latest \
+        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+CDI_BASE=https://github.com/kubevirt/containerized-data-importer/releases/download/${CDI}
+
+kubectl apply -f ${CDI_BASE}/cdi-operator.yaml
+kubectl apply -f ${CDI_BASE}/cdi-cr.yaml
+kubectl wait cdi cdi --for=condition=Available --timeout=10m
+```
+
+No libvirt is needed on the host or the nodes — KubeVirt bundles libvirt and
+qemu inside its `virt-launcher` pods.
+
+## 2. VersityGW (optional — an S3 endpoint for shared datasets)
+
+Shared data in Whistler is **S3 datasets, not filesystems**
+([design/storage.md](design/storage.md)). If the site already has an S3
+endpoint, use that and skip to step 3. If it does not, VersityGW serves S3 from
+an ordinary POSIX directory, which means it runs on the same StorageClass
+everything else does.
+
+Install it into **its own namespace**, not Whistler's. That separation is the
+point of the design: sessions never reach the S3 server, they reach a proxy
+Whistler runs, and the zone egress rule names an address Whistler owns.
+
+```bash
+kubectl create namespace s3
+
+# The root credential, kept out of `helm get values` and the release history.
+kubectl -n s3 create secret generic versitygw-root \
+  --from-literal=rootAccessKeyId=CHANGEME \
+  --from-literal=rootSecretAccessKey=CHANGEME-SECRET
+
+helm install s3 oci://ghcr.io/versity/versitygw/charts/versitygw \
+  --namespace s3 \
+  --set auth.existingSecret=versitygw-root \
+  --set gateway.backend.type=posix \
+  --set gateway.backend.args=/mnt/data \
+  --set persistence.enabled=true \
+  --set persistence.size=100Gi
+```
+
+That yields a `s3-versitygw` Service on port 7070 in namespace `s3`, i.e.
+`http://s3-versitygw.s3.svc.cluster.local:7070` from inside the cluster. A
+bucket is a top-level directory under the backend path:
+
+```bash
+kubectl -n s3 exec deploy/s3-versitygw -- mkdir -p /mnt/data/reference-data
+```
+
+Then create the credential **Whistler** hands its dataset proxy — note the key
+names differ from the chart's own secret:
+
+```bash
+kubectl -n whistler create secret generic s3-reference-data \
+  --from-literal=accessKeyId=CHANGEME \
+  --from-literal=secretAccessKey=CHANGEME-SECRET
+```
+
+and reference it from `whistler.datasets` in the values below. The credential
+lives in the proxy and nowhere else — it never enters a guest whose user has
+root.
+
+**Keep the endpoint cluster-internal.** A bearer token has no zone, so an S3
+endpoint reachable from outside the cluster is reachable from every zone at
+once. Leave `ingress.enabled=false`.
+
+For a throwaway rig with a pre-seeded bucket and plaintext credentials, there
+is also [manifests/s3-rig/versitygw.yaml](manifests/s3-rig/versitygw.yaml).
+
+## 3. An example `values.yaml`
 
 ```yaml
+image:
+  repository: ghcr.io/marma/whistler
+  tag: "dev"
+
+server:
+  service:
+    type: NodePort
+    nodePort: 30022          # ssh here
+
+portal:
+  enabled: true
+  service:
+    type: NodePort
+    nodePort: 30080
+  auth:
+    adminUsers: "alice"
+  screenshots:
+    intervalSeconds: 300     # 0 disables; maxWidth is the whole policy
+    maxWidth: 320
+
 whistler:
-  users:
-    - name: someuser
-      publicKeys:
-        - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC6...
+  # Seeded once, at operator startup. Never overwritten afterwards — manage
+  # the account in the portal from then on.
+  bootstrapAdmin:
+    name: alice
+    publicKeys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@laptop
+
+  ssh:
+    domainSuffix: ".w"       # client-side convention; nothing resolves it
+
+  # Named egress postures. A session picks one via its template and changes
+  # zone only on reboot. "default" exists whether or not you define it.
+  zones:
+    default:
+      egress:
+        allowCIDRs: []       # deny-all except DNS
+    green:
+      egress:
+        blockCIDRs:          # internet yes, internal no
+          - 10.0.0.0/8
+          - 172.16.0.0/12
+          - 192.168.0.0/16
+      dns:
+        clusterOnly: true
+
+  # Boot sources a `runtime: vm` template may use. ENFORCED — a template
+  # naming anything not listed here fails closed at reconcile time.
+  images:
+    vm:
+      - quay.io/containerdisks/ubuntu:24.04
+      - localhost:5000/whistler-devbase:latest
+
+  homeDisk:
+    size: 20Gi
+
+  # Shared S3 datasets, mounted at /shared/<name> on VM sessions. The
+  # credential named here stays in the proxy Whistler starts.
+  datasets:
+    reference-data:
+      description: Imaging corpus
+      bucket: reference-data
+      endpoint: http://s3-versitygw.s3.svc.cluster.local:7070
+      provider: Other
+      readOnly: true         # a ceiling, not a default — prefer it
+      credentialsSecret: s3-reference-data
+
+  # A project's shared grants. Membership lives here, not on the user.
+  groups:
+    lab-staff:
+      description: Internal staff on the imaging project
+      members: [alice, bob]
+      volumes:
+        - name: reference-data
+          mode: ro
+      allowedZones: [green]
+
+templates:
+  small:
+    description: "Small SSH container (web terminal only)"
+    mode: ssh
+    runtime: container
+    image: "ubuntu:latest"
+    resources:
+      cpu: 500m
+      memory: 2Gi
+
+  devbase:
+    description: "Ubuntu 26.04 dev server (SSH)"
+    mode: ssh
+    runtime: vm
+    image: "localhost:5000/whistler-devbase:latest"
+    persistence: persistent
+    resources:
+      cpu: "4"
+      memory: 8Gi
+
+userVolume:
+  accessMode: ReadWriteMany
+  size: 10Gi
 ```
+
+A fuller, commented reference is
+[charts/whistler/values.yaml](charts/whistler/values.yaml); the VM template
+catalog used in development is
+[charts/whistler/values-dev-vm.yaml](charts/whistler/values-dev-vm.yaml).
+
+## 4. Whistler
+
+From the published chart (pushed on `v*` tags):
+
+```bash
+helm install whistler oci://ghcr.io/marma/charts/whistler \
+  --namespace whistler --create-namespace \
+  -f values.yaml
+```
+
+or from a checkout, which is what you want while Whistler is still in active
+development:
+
+```bash
+helm install whistler charts/whistler \
+  --namespace whistler --create-namespace \
+  -f values.yaml
+```
+
+Helm installs the CRDs on first install only. **`helm upgrade` never updates
+them**, and both failure modes are quiet — a new kind 404s, and a new field on
+an existing kind is silently pruned by the API server so it round-trips as if
+you never set it. After pulling a version that changes
+[charts/whistler/crds/crds.yaml](charts/whistler/crds/crds.yaml), apply it by
+hand:
+
+```bash
+kubectl apply -f charts/whistler/crds/crds.yaml
+helm upgrade whistler charts/whistler -n whistler -f values.yaml
+```
+
+Check it came up, then connect as the bootstrap admin:
+
+```bash
+kubectl -n whistler get pods
+kubectl -n whistler get zones,groups,templates
+
+ssh alice@<node> -p 30022          # the launcher TUI
+open http://<node>:30080           # the portal
+```
+
+## 5. Optional: an image registry in the cluster
+
+Only needed if you build your own VM images (step 6) and have nowhere to push
+them. The dev arrangement is `registry:2` with `hostNetwork`, so the *same*
+address — `localhost:5000` — works for the host's Docker daemon pushing and
+for the node's containerd pulling. No TLS, no auth: this is a dev registry on a
+single-node cluster, not something to expose.
+
+[scripts/metal_k3s_create.sh](scripts/metal_k3s_create.sh) sets this up as part
+of creating the cluster (`METAL_REGISTRY=0` to skip, `REGISTRY_PORT` to move
+it). On an existing k3s host the two pieces are:
+
+```bash
+# 1. containerd: a plain-HTTP endpoint for localhost:5000 image refs.
+sudo tee /etc/rancher/k3s/registries.yaml >/dev/null <<'EOF'
+mirrors:
+  "localhost:5000":
+    endpoint:
+      - "http://localhost:5000"
+EOF
+sudo systemctl restart k3s
+
+# 2. the registry itself — see scripts/metal_k3s_create.sh for the manifest
+#    (hostNetwork, REGISTRY_HTTP_ADDR=127.0.0.1:5000, a local-path PVC).
+```
+
+Then point skaffold at it, if you use skaffold:
+
+```bash
+skaffold config set --kube-context <context> default-repo localhost:5000
+```
+
+Every image tag a template references must also appear in
+`whistler.images.vm`, or the session fails closed.
+
+## 6. Optional: building and pushing base/desktop images
+
+The stock `quay.io/containerdisks/ubuntu:24.04` boots and is enough to try
+Whistler out. The images in this repo are the real ones: a dev server reached
+over SSH, and two baked desktops.
+
+All three use the same pipeline — boot the Ubuntu cloud image once under
+qemu/KVM inside a container, let cloud-init install everything, then wrap the
+resulting qcow2 as a KubeVirt containerDisk. The host needs `docker`, `curl`
+and access to `/dev/kvm`; the bake takes tens of minutes. **amd64 only** — the
+guest runs under KVM, so producing arm64 needs an arm64 host.
+
+```bash
+# Dev server: Ubuntu 26.04, clang 21, Python 3.14, pixi. SSH, no desktop.
+make devbase-image                          # -> localhost:5000/whistler-devbase:latest
+make devbase-image VARIANT=cuda PUSH=1      # + the NVIDIA driver (GPU runtime, no nvcc)
+make devbase-image VARIANT=cuda-dev PUSH=1  # + the CUDA SDK (nvcc, ~4.6GB)
+
+# Desktops: XFCE or GNOME Shell with Selkies baked into the guest.
+make vm-desktop-image PUSH=1                # -> localhost:5000/whistler-vm-xfce-selkies:latest
+make vm-desktop-image CUDA=1 PUSH=1         # -> ...-vm-xfce-selkies-cuda:latest
+make vm-gnome-desktop-image PUSH=1          # -> localhost:5000/whistler-vm-gnome-selkies:latest
+make vm-gnome-desktop-image CUDA=1 PUSH=1   # -> ...-vm-gnome-selkies-cuda:latest
+```
+
+Knobs, on every build script: `IMAGE`, `TAG`, `PUSH=1`, `DISK_SIZE`,
+`QEMU_MEM`, `QEMU_SMP`, `BASE_IMAGE_URL`, `CACHE_DIR`, `BAKE_TIMEOUT`.
+
+Two things about naming, both deliberate:
+
+- **The variant rides in the image *name*, never the tag.** Kubernetes (and
+  KubeVirt, for containerDisks) defaults only the exact tag `:latest` to
+  `imagePullPolicy: Always`. A mutable dev tag must literally be `:latest`, or
+  nodes keep booting a stale cached qcow2 after every rebuild —
+  `:latest-cuda` would not match. Production uses immutable versioned tags,
+  which correctly default to `IfNotPresent`.
+- Everything is **baked, not installed at session time**, because the default
+  zone blocks package mirrors. A session gets what its image has.
+
+Verify a devbase build before pointing templates at it — this boots the disk
+with the real per-session cloud-init and asserts the toolchain over SSH:
+
+```bash
+images/devbase/test.sh
+```
+
+Then add the tags to `whistler.images.vm` and write templates against them; see
+[images/devbase/README.md](images/devbase/README.md) and
+[design/creating_desktops.md](design/creating_desktops.md).
 
 # Design
 
