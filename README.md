@@ -18,6 +18,19 @@ Whistler has the following features:
 
 ![Whistler](img/screenshot_1.png "Whistler")
 
+# Design
+
+Whistler is implemented as a Kubernetes Operator that uses the Gateway API and AsyncSSH to expose SSH sessions and an administrative interface to users. Interactive sessions are either connected to using the interface, or through simply ssh:ing to the service which will then create a pod on-the-fly. 
+
+Whistler will on install also create number of CRDs to keep track of instances and templates. There is, by design, no database used to store data, rather state is stored in the cluster as CRs.
+
+It uses the following CRDs:
+
+- `WhistlerTemplate`: A template for creating instances
+- `WhistlerInstance`: An instance of a template
+
+One PV, through a PVC, is created for each user to store their home directory, unless specified otherwise in the template or instance. Other volumes can be mounted as needed.
+
 # Install
 
 Whistler needs a cluster, and — for anything beyond throwaway container
@@ -55,9 +68,45 @@ your current `KUBECONFIG` points at:
 scripts/install_kubevirt.sh
 ```
 
+It is safe to re-run. Against a cluster that already has KubeVirt it
+reconciles configuration and `virtctl` and then stops — it will **not** change
+the version unless you ask, because the default version is "whatever
+`stable.txt` says today" and a re-run months later would otherwise move the
+cluster silently:
+
+```bash
+$ scripts/install_kubevirt.sh
+==> KubeVirt v1.8.4 is already installed (target: v1.9.0)
+ERROR: KubeVirt is installed at v1.8.4; this run targets v1.9.0.
+       Not upgrading by default. Re-run with KUBEVIRT_UPGRADE=1 to upgrade, or
+       pin this run to the installed version with KUBEVIRT_VERSION=v1.8.4.
+
+$ KUBEVIRT_UPGRADE=1 scripts/install_kubevirt.sh      # actually upgrade
+```
+
+KubeVirt supports one minor release at a time (N-1 → N) and no downgrades, and
+CDI is the same; a jump that breaks that rule is refused even with
+`KUBEVIRT_UPGRADE=1`. Upgrades wait on `status.observedKubeVirtVersion`
+reaching the requested version with `phase: Deployed` — not on
+`condition=Available`, which is already true on an existing install and stays
+true while virt-operator rolls the components — and report any running VM
+workloads still on the old virt-launcher, which pick up the new version on
+their next restart.
+
 Knobs (all env vars): `KUBEVIRT_VERSION` (default: latest stable),
-`KUBEVIRT_USE_EMULATION=1` for nodes with no `/dev/kvm`,
+`KUBEVIRT_UPGRADE=1` to allow changing the version of an existing install,
+`KUBEVIRT_FORCE=1` to allow an unsupported version jump,
+`KUBEVIRT_USE_EMULATION=1` for nodes with no `/dev/kvm` (`=0` turns it back
+off; leave it unset to keep whatever is configured),
 `KUBEVIRT_INSTALL_CDI=0` to skip CDI, `CDI_VERSION`.
+
+Note that there is **no official KubeVirt Helm chart** — the request
+([kubevirt#8347](https://github.com/kubevirt/kubevirt/issues/8347)) is still
+open. It is not much of a loss: virt-operator creates the workload CRDs
+(`VirtualMachine`, `VirtualMachineInstance`, …) at runtime, so a chart would
+own only the operator Deployment and the `KubeVirt` CR while everything that
+matters is made by a controller Helm cannot see — leaving it nothing correct
+to wait on during an upgrade, and orphaned CRDs after `helm uninstall`.
 
 By hand, if you would rather see every step:
 
@@ -378,19 +427,6 @@ images/devbase/test.sh
 Then add the tags to `whistler.images.vm` and write templates against them; see
 [images/devbase/README.md](images/devbase/README.md) and
 [design/creating_desktops.md](design/creating_desktops.md).
-
-# Design
-
-Whistler is implemented as a Kubernetes Operator that uses the Gateway API and AsyncSSH to expose SSH sessions and an administrative interface to users. Interactive sessions are either connected to using the interface, or through simply ssh:ing to the service which will then create a pod on-the-fly. 
-
-Whistler will on install also create number of CRDs to keep track of instances and templates. There is, by design, no database used to store data, rather state is stored in the cluster as CRs.
-
-It uses the following CRDs:
-
-- `WhistlerTemplate`: A template for creating instances
-- `WhistlerInstance`: An instance of a template
-
-One PV, through a PVC, is created for each user to store their home directory, unless specified otherwise in the template or instance. Other volumes can be mounted as needed.
 
 # Usage
 
