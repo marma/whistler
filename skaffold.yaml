@@ -52,20 +52,13 @@ deploy:
           # Seed the initial admin account for local dev.
           whistler.bootstrapAdmin.name: marma
           whistler.bootstrapAdmin.publicKeys[0]: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMNj07CelG2QAh7IogB+vlS4tRjuxOTr3mt0z3fX8jlX marma"
-          # Dummy GPU types for exercising the picker UI (TUI + portal) and the
-          # per-user allowedGpuTypes checkboxes without real GPU hardware — k3d
-          # has no nodes labeled nvidia.com/gpu.product, so nothing here
-          # actually schedules.
-          whistler.gpuTypes[0]: dummy-gpu-small
-          whistler.gpuTypes[1]: dummy-gpu-large
-          whistler.gpuTypes[2]: NVIDIA-GeForce-RTX-4090
-          # k3s-metal only: the real RTX 4090's KubeVirt passthrough resource
-          # name, as advertised by the NVIDIA GPU Operator's kubevirt sandbox
-          # device plugin (sandboxWorkloads/vm-passthrough mode) — derived
-          # from the card's PCI codename, not the generic pod-mode
-          # nvidia.com/gpu. No-op on k3d (no such resource there, VM GPU
-          # templates just stay unschedulable).
-          whistler.security.gpuVmResourceName: nvidia.com/AD102_GEFORCE_RTX_4090
+          # GPU types are discovered from the cluster (node gpu.product labels
+          # + KubeVirt permittedHostDevices), so there is nothing to seed here.
+          # To exercise the GPU-type picker UI on k3d without hardware, label
+          # a node by hand:
+          #   kubectl label node k3d-whistler-dev-server-0 \
+          #     nvidia.com/gpu.product=dummy-gpu-small
+          # (nothing schedules on it — the picker just gets an entry).
           # Sample zones for exercising the zone picker and per-zone
           # NetworkPolicies: green = internet-but-not-internal, red =
           # cluster-only DNS and no other egress. default stays deny-all+DNS.

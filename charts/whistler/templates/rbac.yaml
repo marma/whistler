@@ -37,6 +37,15 @@ rules:
   - apiGroups: [kubevirt.io]
     resources: [virtualmachines, virtualmachineinstances]
     verbs: [create, delete, get, list, watch, patch, update]
+  # GPU-type catalog (config.py get_gpu_catalog): node labels/allocatable
+  # plus the KubeVirt CR's permittedHostDevices resolve a VM template's GPU
+  # request to the per-type passthrough resource name at build time.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list]
+  - apiGroups: [kubevirt.io]
+    resources: [kubevirts]
+    verbs: [get, list]
   # CDI root-disk DataVolumes (imageURL boot source): the phase timer reads
   # them to surface the Importing phase. Created via the VM's
   # dataVolumeTemplates, so no create/delete needed here.
@@ -184,9 +193,14 @@ rules:
     resources: [pods]
     verbs: [get, list, watch, delete]
 
-  # Dashboard tab: node allocatable CPU/memory/GPU capacity.
+  # Dashboard tab: node allocatable CPU/memory/GPU capacity. The KubeVirt CR's
+  # permittedHostDevices tells the GPU catalog which allocatable resources are
+  # passthrough GPUs (vs. e.g. the card's audio function).
   - apiGroups: [""]
     resources: [nodes]
+    verbs: [get, list]
+  - apiGroups: [kubevirt.io]
+    resources: [kubevirts]
     verbs: [get, list]
 
   # Web terminal: the portal shells out to `kubectl exec` into the session pod

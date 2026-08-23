@@ -200,7 +200,8 @@ templates:
       gpu: "1"
 
   # GPU passthrough smoke test (k3s-metal only): requests the RTX 4090 via
-  # KubeVirt's domain.devices.gpus (see whistler.security.gpuVmResourceName).
+  # KubeVirt's domain.devices.gpus (deviceName resolved per GPU type from the
+  # live catalog: node labels + KubeVirt permittedHostDevices).
   # nodeSelector pins it to a node labeled with this GPU product, same as the
   # pod-mode path — moot on the single-node dev cluster but keeps the
   # template honest about what it actually needs.

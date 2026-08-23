@@ -15,6 +15,7 @@ import ipaddress
 import json
 import os
 import secrets
+import time
 import yaml
 
 from whistler.cloudinit import (HOME_DISK_SERIAL, S3_PROXY_BUCKET,
@@ -58,7 +59,6 @@ VOLUMES_FILE = os.path.join(CONFIG_DIR, "volumes.yaml")
 NETWORKPOLICY_FILE = os.path.join(CONFIG_DIR, "networkpolicy.yaml")
 ZONES_FILE = os.path.join(CONFIG_DIR, "zones.yaml")
 IMAGES_FILE = os.path.join(CONFIG_DIR, "images.yaml")
-GPU_TYPES_FILE = os.path.join(CONFIG_DIR, "gpuTypes.yaml")
 # Seeds the first admin User CR at operator startup (KubeConfigManager.
 # ensure_bootstrap_admin); create-if-absent only, see values.yaml bootstrapAdmin.
 BOOTSTRAP_ADMIN_FILE = os.path.join(CONFIG_DIR, "bootstrapAdmin.yaml")
@@ -111,6 +111,68 @@ HOME_VOLUME_PLURAL = "homevolumes"
 # "NVIDIA-A100-SXM4-40GB") — not a whistler-specific label an admin has to
 # set by hand, unlike the "accelerator" shorthand this used to be.
 GPU_NODE_LABEL = "nvidia.com/gpu.product"
+
+# The pod-mode GPU resource (NVIDIA device plugin). A node in VM-passthrough
+# mode advertises 0 of these and instead exposes a product-specific vfio
+# resource (e.g. "nvidia.com/AD102_GEFORCE_RTX_4090") via the sandbox device
+# plugin. Which of those product-specific names are actually GPUs — and not,
+# say, the card's audio function, which is advertised right next to it — is
+# not guessable from the name; the KubeVirt CR's permittedHostDevices is the
+# authority, and _vm_gpu_resource_names reads it. See build_gpu_catalog.
+GPU_POD_RESOURCE = "nvidia.com/gpu"
+
+
+def build_gpu_catalog(nodes: List[Dict[str, Any]],
+                      vm_resource_names: Set[str]) -> List[Dict[str, Any]]:
+    """Derive the GPU-type catalog from live node data — no static config.
+
+    ``nodes``: ``[{"name": ..., "labels": {...}, "allocatable": {...}}]``.
+    ``vm_resource_names``: resource names KubeVirt permits as host devices
+    (the set _vm_gpu_resource_names reads from the KubeVirt CR).
+
+    Returns one entry per GPU *type* (the GFD ``nvidia.com/gpu.product``
+    label, which is also what templates schedule by via GPU_NODE_LABEL):
+    ``{"name", "count", "vmResource"}`` where ``count`` sums pod-mode and
+    passthrough devices across nodes and ``vmResource`` is the KubeVirt
+    device-plugin resource name for passthrough (None when the type is only
+    available to pods). Nodes without the product label are skipped — a
+    type nothing can schedule by name isn't selectable; the dashboard still
+    counts such capacity separately as "unknown".
+
+    Pure so it's unit-testable; KubeConfigManager.get_gpu_catalog feeds it
+    live cluster data."""
+    by_name: Dict[str, Dict[str, Any]] = {}
+    for node in nodes:
+        labels = node.get("labels") or {}
+        allocatable = node.get("allocatable") or {}
+        gpu_type = labels.get(GPU_NODE_LABEL)
+        if not gpu_type:
+            continue
+        count = int(parse_quantity(allocatable.get(GPU_POD_RESOURCE, 0)))
+        vm_resource = None
+        for rname in sorted(vm_resource_names):
+            vm_count = int(parse_quantity(allocatable.get(rname, 0)))
+            if vm_count:
+                if vm_resource is not None:
+                    logger.warning(
+                        "Node %s advertises multiple permitted VM GPU resources "
+                        "(%s, %s); using %s", node.get("name"), vm_resource,
+                        rname, vm_resource)
+                    continue
+                vm_resource = rname
+                count += vm_count
+        entry = by_name.setdefault(
+            gpu_type, {"name": gpu_type, "count": 0, "vmResource": None})
+        entry["count"] += count
+        if vm_resource:
+            if entry["vmResource"] and entry["vmResource"] != vm_resource:
+                logger.warning(
+                    "GPU type %s maps to multiple VM resource names (%s, %s); "
+                    "keeping %s", gpu_type, entry["vmResource"], vm_resource,
+                    entry["vmResource"])
+            else:
+                entry["vmResource"] = vm_resource
+    return sorted(by_name.values(), key=lambda e: e["name"])
 
 # Zones: admin-defined network postures (whistler.zones) a session runs under.
 # Each zone renders to one NetworkPolicy per user namespace selecting pods by
@@ -795,9 +857,6 @@ class KubeConfigManager(ConfigManager):
         self.images = {"ssh": [], "desktop": [], "vm": []}
         self._load_images()
 
-        # Catalog of selectable GPU types (see gpuTypes.yaml / whistler.gpuTypes).
-        self.gpu_types = []
-        self._load_gpu_types()
         self.force_kata_for_privileged = os.environ.get(
             "WHISTLER_FORCE_KATA_FOR_PRIVILEGED", "false"
         ).strip().lower() in ("1", "true", "yes")
@@ -810,15 +869,10 @@ class KubeConfigManager(ConfigManager):
         # NVIDIA runtime's hook does that. Empty disables this (e.g. a
         # cluster using containerd-native CDI with no RuntimeClass at all).
         self.gpu_runtime_class = os.environ.get("WHISTLER_GPU_RUNTIME_CLASS", "nvidia")
-        # KubeVirt device-plugin resource name a VM's domain.devices.gpus[]
-        # requests for passthrough. Product-specific — a kubevirt-flavored
-        # sandbox device plugin (e.g. the NVIDIA GPU Operator's) derives it
-        # from the GPU's PCI codename (e.g. "nvidia.com/AD102_GEFORCE_RTX_4090"),
-        # not the generic pod-mode "nvidia.com/gpu" resource. Must match both
-        # the cluster's device plugin and the KubeVirt CR's
-        # permittedHostDevices.resourceName for the same PCI device.
-        self.gpu_vm_resource_name = os.environ.get(
-            "WHISTLER_GPU_VM_RESOURCE_NAME", "nvidia.com/gpu")
+        # GPU-type catalog cache (get_gpu_catalog): (catalog, monotonic ts).
+        # Derived live from node labels/allocatable + the KubeVirt CR's
+        # permittedHostDevices — there is no static gpuTypes config anymore.
+        self._gpu_catalog_cache: Optional[tuple] = None
         # SSH host CA: the Secret the operator signs session host keys with
         # and whose public half the gateway hands users for their
         # `@cert-authority` line (see hostca.py). Lives in the system
@@ -1381,19 +1435,93 @@ class KubeConfigManager(ConfigManager):
     def get_selectors(self) -> Dict[str, Any]:
         return self.selectors
 
-    def _load_gpu_types(self):
+    # ------------------------------------------------------------------ #
+    # GPU-type catalog — read from the cluster, no static config           #
+    # ------------------------------------------------------------------ #
+
+    _GPU_CATALOG_TTL = 30.0  # seconds; portal pages poll, nodes don't churn
+
+    def _vm_gpu_resource_names(self) -> Set[str]:
+        """Resource names KubeVirt permits as VM host devices — the authority
+        on which device-plugin resources are attachable GPUs (a passthrough
+        node also advertises the card's *audio* function as an allocatable
+        resource, which must not be counted as a GPU). Empty when KubeVirt is
+        not installed or permits nothing."""
+        names: Set[str] = set()
         try:
-            with open(GPU_TYPES_FILE, "r") as f:
-                data = yaml.safe_load(f)
-                if data:
-                    self.gpu_types = data
-        except FileNotFoundError:
-            logger.warning(f"No gpuTypes.yaml found at {GPU_TYPES_FILE}")
-        except Exception as e:
-            logger.error(f"Failed to load GPU types: {e}")
+            resp = self.api.list_cluster_custom_object(
+                KUBEVIRT_GROUP, KUBEVIRT_VERSION, "kubevirts")
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to read KubeVirt permittedHostDevices: {e}")
+            return names
+        for kv in resp.get("items", []):
+            permitted = ((kv.get("spec", {}) or {}).get("configuration", {})
+                         or {}).get("permittedHostDevices", {}) or {}
+            for kind in ("pciHostDevices", "mediatedDevices"):
+                for dev in permitted.get(kind, []) or []:
+                    rname = dev.get("resourceName")
+                    if rname:
+                        names.add(rname)
+        return names
+
+    def get_gpu_catalog(self) -> List[Dict[str, Any]]:
+        """The live GPU-type catalog (see build_gpu_catalog), TTL-cached so
+        every portal page render doesn't cost a node list."""
+        cached = getattr(self, "_gpu_catalog_cache", None)
+        if cached and time.monotonic() - cached[1] < self._GPU_CATALOG_TTL:
+            return cached[0]
+        try:
+            node_items = client.CoreV1Api().list_node().items
+        except ApiException as e:
+            logger.error(f"Failed to list nodes for GPU catalog: {e}")
+            # Serve stale over empty: a blip shouldn't blank the catalog.
+            return cached[0] if cached else []
+        nodes = [{
+            "name": n.metadata.name,
+            "labels": n.metadata.labels or {},
+            "allocatable": n.status.allocatable or {},
+        } for n in node_items]
+        catalog = build_gpu_catalog(nodes, self._vm_gpu_resource_names())
+        self._gpu_catalog_cache = (catalog, time.monotonic())
+        return catalog
 
     def get_gpu_types(self) -> List[str]:
-        return self.gpu_types
+        return [entry["name"] for entry in self.get_gpu_catalog()]
+
+    def _vm_gpu_device_name(self, gpu_type: Optional[str]) -> str:
+        """Resolve the KubeVirt deviceName for a VM template's GPU request.
+
+        ``gpu_type`` is the template's nodeSelector[GPU_NODE_LABEL] (absent
+        on single-GPU-type clusters, where templates never needed to pin
+        one). Fails closed with an actionable message rather than emitting a
+        deviceName the scheduler can never satisfy."""
+        catalog = self.get_gpu_catalog()
+        if gpu_type:
+            entry = next((e for e in catalog if e["name"] == gpu_type), None)
+            if entry is None:
+                raise PolicyError(
+                    f"GPU type {gpu_type!r} is not present on any node "
+                    f"(known types: {[e['name'] for e in catalog]})")
+            if not entry.get("vmResource"):
+                raise PolicyError(
+                    f"GPU type {gpu_type!r} is not VM-attachable: no node "
+                    f"advertises a KubeVirt-permitted resource for it. Is the "
+                    f"device bound to vfio-pci and listed in the KubeVirt "
+                    f"CR's permittedHostDevices?")
+            return entry["vmResource"]
+        vm_capable = [e for e in catalog if e.get("vmResource")]
+        if len(vm_capable) == 1:
+            return vm_capable[0]["vmResource"]
+        if not vm_capable:
+            raise PolicyError(
+                "template requests a GPU but no VM-attachable GPU was "
+                "discovered (no node advertises a KubeVirt-permitted "
+                "host-device resource)")
+        raise PolicyError(
+            f"multiple VM GPU types available "
+            f"({[e['name'] for e in vm_capable]}); the template must pin one "
+            f"via its gpuType")
 
     def _load_volumes(self):
         try:
@@ -2577,8 +2705,13 @@ class KubeConfigManager(ConfigManager):
                 "disk": {"bus": "virtio"},
             })
         if 'gpu' in resources:
-            gpu_resource_name = getattr(self, "gpu_vm_resource_name", "nvidia.com/gpu")
-            devices["gpus"] = [{"name": "gpu0", "deviceName": gpu_resource_name}]
+            # deviceName comes from the live GPU catalog: the template's
+            # gpuType (nodeSelector) picks the entry, whose vmResource is the
+            # KubeVirt-permitted device-plugin name for that card. Per-type,
+            # so mixed clusters work — no global resource-name setting.
+            gpu_type = (node_selector or {}).get(GPU_NODE_LABEL)
+            devices["gpus"] = [{"name": "gpu0",
+                                "deviceName": self._vm_gpu_device_name(gpu_type)}]
 
         # The guest's authorized_keys: the user's own keys plus the portal's
         # per-user access key, which backs the web terminal (an SSH session
@@ -4306,7 +4439,8 @@ class KubeConfigManager(ConfigManager):
         for item in resp.get("items", []):
             meta = item.get("metadata", {})
             status = item.get("status", {}) or {}
-            username = (item.get("spec", {}) or {}).get("user")
+            spec = item.get("spec", {}) or {}
+            username = spec.get("user")
             full_name = meta.get("name", "")
             if not username or not full_name:
                 continue
@@ -4323,6 +4457,8 @@ class KubeConfigManager(ConfigManager):
                 "runtime": status.get("runtime"),
                 "podName": status.get("podName"),
                 "vmiName": status.get("vmiName"),
+                "template": spec.get("templateRef"),
+                "preemptible": spec.get("preemptible", False),
             })
         return sessions
 
@@ -5433,17 +5569,32 @@ class KubeConfigManager(ConfigManager):
         # and overrides request GPUs by (see save_system_template / gpuType
         # overrides) — used below both for node GPU totals and, as a
         # fallback, to type a scheduled pod's GPU request.
+        #
+        # A node advertises a GPU either pod-mode (GPU_POD_RESOURCE) or,
+        # under VM passthrough, as a KubeVirt-permitted vfio resource (e.g.
+        # "nvidia.com/AD102_GEFORCE_RTX_4090") — never both at once for the
+        # same device, so summing the two is safe. vm_resource_type maps a
+        # vfio resource back to the product of the node advertising it, to
+        # type virt-launcher pods that carry no GPU nodeSelector.
+        vm_resources = self._vm_gpu_resource_names()
         node_gpu_type: Dict[str, Optional[str]] = {}
+        vm_resource_type: Dict[str, Optional[str]] = {}
         nodes = []
         for node in node_items:
             allocatable = node.status.allocatable or {}
             gpu_type = (node.metadata.labels or {}).get(GPU_NODE_LABEL)
             node_gpu_type[node.metadata.name] = gpu_type
+            gpu_count = int(parse_quantity(allocatable.get(GPU_POD_RESOURCE, 0)))
+            for rname in vm_resources:
+                vm_count = int(parse_quantity(allocatable.get(rname, 0)))
+                if vm_count:
+                    gpu_count += vm_count
+                    vm_resource_type.setdefault(rname, gpu_type)
             nodes.append({
                 "cpu": allocatable.get("cpu", "0"),
                 "memory": allocatable.get("memory", "0"),
                 "gpuType": gpu_type,
-                "gpuCount": allocatable.get("nvidia.com/gpu", "0"),
+                "gpuCount": gpu_count,
             })
 
         try:
@@ -5485,20 +5636,27 @@ class KubeConfigManager(ConfigManager):
             else:
                 bucket = "other"
 
-            gpu_type = (pod.spec.node_selector or {}).get(GPU_NODE_LABEL) \
-                or node_gpu_type.get(pod.spec.node_name)
-
             cpu = Decimal(0)
             memory = Decimal(0)
             gpu_count = 0
+            requested_vm_type = None
             for container in (pod.spec.containers or []):
                 requests = (container.resources and container.resources.requests) or {}
                 if "cpu" in requests:
                     cpu += parse_quantity(requests["cpu"])
                 if "memory" in requests:
                     memory += parse_quantity(requests["memory"])
-                if "nvidia.com/gpu" in requests:
-                    gpu_count += int(parse_quantity(requests["nvidia.com/gpu"]))
+                if GPU_POD_RESOURCE in requests:
+                    gpu_count += int(parse_quantity(requests[GPU_POD_RESOURCE]))
+                for rname in vm_resources:
+                    if rname in requests:
+                        gpu_count += int(parse_quantity(requests[rname]))
+                        requested_vm_type = requested_vm_type \
+                            or vm_resource_type.get(rname)
+
+            gpu_type = (pod.spec.node_selector or {}).get(GPU_NODE_LABEL) \
+                or node_gpu_type.get(pod.spec.node_name) \
+                or requested_vm_type
 
             pod_requests.append({
                 "bucket": bucket, "cpu": cpu, "memory": memory,

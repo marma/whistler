@@ -5,17 +5,24 @@ tests/integration/test_vm.py on clusters that have KubeVirt installed."""
 from whistler.config import KubeConfigManager
 
 
-def _manager():
+# What get_gpu_catalog would derive from a single-4090 passthrough cluster
+# (node gpu.product label + KubeVirt permittedHostDevices).
+GPU_CATALOG = [{"name": "NVIDIA-GeForce-RTX-4090", "count": 1,
+                "vmResource": "nvidia.com/AD102_GEFORCE_RTX_4090"}]
+
+
+def _manager(catalog=GPU_CATALOG):
     cm = KubeConfigManager.__new__(KubeConfigManager)
     cm.group = "whistler.martinmalmsten.net"
     cm.version = "v1"
     cm.zones = {"default": {}}
+    cm.get_gpu_catalog = lambda: catalog
     return cm
 
 
 def _build_both(**overrides):
     """(vm manifest, companion cloud-init Secret manifest)."""
-    cm = _manager()
+    cm = _manager(overrides.pop("_catalog", GPU_CATALOG))
     args = dict(
         session_name="alice-desk",
         hostname="desk",
@@ -225,12 +232,57 @@ def test_inline_cpu_memory_when_no_instancetype():
 
 
 def test_gpu_devices_present_only_when_requested():
+    # deviceName is the catalog's per-type passthrough resource, not the
+    # pod-mode nvidia.com/gpu (a vfio-bound card advertises 0 of those).
     with_gpu = _build(template_spec={"image": "x", "resources": {"gpu": 1}})
     assert with_gpu["spec"]["template"]["spec"]["domain"]["devices"]["gpus"] == \
-        [{"name": "gpu0", "deviceName": "nvidia.com/gpu"}]
+        [{"name": "gpu0", "deviceName": "nvidia.com/AD102_GEFORCE_RTX_4090"}]
 
     without_gpu = _build(template_spec={"image": "x"})
     assert "gpus" not in without_gpu["spec"]["template"]["spec"]["domain"]["devices"]
+
+
+def test_gpu_type_pin_selects_its_own_resource_on_mixed_clusters():
+    from whistler.config import GPU_NODE_LABEL
+    catalog = [
+        {"name": "NVIDIA-A100-SXM4-40GB", "count": 2,
+         "vmResource": "nvidia.com/GA100_A100_SXM4_40GB"},
+        {"name": "NVIDIA-GeForce-RTX-4090", "count": 1,
+         "vmResource": "nvidia.com/AD102_GEFORCE_RTX_4090"},
+    ]
+    cm = _manager(catalog)
+    vm, _ = cm._build_vm_spec(
+        session_name="alice-desk", hostname="desk", username="alice",
+        uid="uid-123", display_port=5900, instancetype=None,
+        preemptible=False, home_pvc=None, user_details={},
+        template_spec={"image": "x", "resources": {"gpu": 1},
+                       "nodeSelector": {GPU_NODE_LABEL: "NVIDIA-A100-SXM4-40GB"}})
+    assert vm["spec"]["template"]["spec"]["domain"]["devices"]["gpus"] == \
+        [{"name": "gpu0", "deviceName": "nvidia.com/GA100_A100_SXM4_40GB"}]
+
+
+def test_gpu_without_type_on_mixed_cluster_fails_closed():
+    from whistler.config import PolicyError
+    import pytest
+    catalog = [
+        {"name": "A", "count": 1, "vmResource": "nvidia.com/AAA"},
+        {"name": "B", "count": 1, "vmResource": "nvidia.com/BBB"},
+    ]
+    with pytest.raises(PolicyError, match="must pin one"):
+        _build(template_spec={"image": "x", "resources": {"gpu": 1}},
+               _catalog=catalog)
+
+
+def test_gpu_type_without_vm_resource_fails_closed():
+    # The type exists (pod-mode node) but nothing KubeVirt-permitted backs it:
+    # emitting a deviceName would create a VM the scheduler can never place.
+    from whistler.config import PolicyError, GPU_NODE_LABEL
+    import pytest
+    catalog = [{"name": "NVIDIA-GeForce-RTX-4090", "count": 1, "vmResource": None}]
+    with pytest.raises(PolicyError, match="not VM-attachable"):
+        _build(template_spec={"image": "x", "resources": {"gpu": 1},
+                              "nodeSelector": {GPU_NODE_LABEL: "NVIDIA-GeForce-RTX-4090"}},
+               _catalog=catalog)
 
 
 def test_node_selector_propagated():

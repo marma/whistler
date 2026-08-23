@@ -289,6 +289,9 @@ class FakeConfigManager(ConfigManager):
         zero = {"total": 0, "free": 0, "whistler": 0, "whistlerPreemptible": 0, "other": 0}
         return {"cpu": dict(zero), "memory": dict(zero), "gpus": []}
 
+    def list_all_desktop_sessions(self):
+        return []
+
     def save_system_template(self, template_data):
         return True
 

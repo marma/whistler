@@ -42,8 +42,6 @@ spec:
               value: {{ .Values.whistler.security.kataRuntimeClass | quote }}
             - name: WHISTLER_GPU_RUNTIME_CLASS
               value: {{ .Values.whistler.security.gpuRuntimeClass | quote }}
-            - name: WHISTLER_GPU_VM_RESOURCE_NAME
-              value: {{ .Values.whistler.security.gpuVmResourceName | quote }}
             # SSH host CA + jump addressing (design/proxyjump.md). The
             # operator signs session host keys with the CA; the suffix goes
             # into the certificates as a principal, so it MUST match the
@@ -86,10 +84,6 @@ spec:
             - name: config
               mountPath: "/etc/whistler-config/images.yaml"
               subPath: "images.yaml"
-              readOnly: true
-            - name: config
-              mountPath: "/etc/whistler-config/gpuTypes.yaml"
-              subPath: "gpuTypes.yaml"
               readOnly: true
             # Only the operator seeds the bootstrap admin (ensure_bootstrap_admin,
             # called once at startup) — server/portal don't need this file.

@@ -78,10 +78,6 @@ spec:
               mountPath: "/etc/whistler-config/images.yaml"
               subPath: "images.yaml"
               readOnly: true
-            - name: selectors-config
-              mountPath: "/etc/whistler-config/gpuTypes.yaml"
-              subPath: "gpuTypes.yaml"
-              readOnly: true
 
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}

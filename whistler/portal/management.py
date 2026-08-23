@@ -594,16 +594,25 @@ def _dashboard_resource_views(resources: dict) -> dict:
 # --------------------------------------------------------------------------- #
 
 async def dashboard(request: Request, cm: CM, user: User, is_admin: IsAdmin):
-    resources, all_instances = await asyncio.gather(
+    resources, all_instances, desktop_sessions = await asyncio.gather(
         request.app.state.run(cm.get_cluster_resources),
         request.app.state.run(cm.get_all_instances),
+        request.app.state.run(cm.list_all_desktop_sessions),
     )
     # Two vocabularies: a pod reports "Running", a VM session reports the
     # operator's "Ready". Both mean the same thing on this dashboard.
-    running = sorted(
-        (i for i in all_instances if i.get("status") in ("Running", "Ready")),
-        key=lambda i: (i["username"], i["name"]),
-    )
+    # get_all_instances is ssh-mode only, so desktop sessions come in via
+    # list_all_desktop_sessions (whose rows say "user"/"phase", not
+    # "username"/"status") — without them a running desktop VM is invisible
+    # here.
+    running = [i for i in all_instances
+               if i.get("status") in ("Running", "Ready")]
+    running += [
+        {"username": s["user"], "name": s["name"], "template": s.get("template"),
+         "preemptible": s.get("preemptible", False)}
+        for s in desktop_sessions if s.get("phase") in ("Running", "Ready")
+    ]
+    running.sort(key=lambda i: (i["username"], i["name"]))
     return templates.TemplateResponse(
         request=request, name="dashboard.html",
         context=_ctx(user, is_admin=is_admin, res=_dashboard_resource_views(resources),
@@ -1639,7 +1648,7 @@ def _template_form_data(*, name, display_name, image, description, cpu, memory,
     """Assemble a save_system_template payload from the admin template form,
     including the access mode / runtime / privileged toggles. Desktop-only
     fields are only included when mode == 'desktop'. gpu (count) maps to
-    resources.gpu; gpu_type (from the gpuTypes catalog) maps to
+    resources.gpu; gpu_type (from the live GPU catalog) maps to
     nodeSelector[GPU_NODE_LABEL], the key _apply_policy checks against a
     user's allowedGpuTypes. zone names a network zone; empty means the
     implicit default."""

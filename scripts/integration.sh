@@ -125,7 +125,6 @@ spec:
 EOF
 echo "[]" > "$WORK/volumes.yaml"
 echo "[]" > "$WORK/selectors.yaml"
-echo "[]" > "$WORK/gpuTypes.yaml"
 # Zones live as Zone CRs (none defined -> the default zone is synthesized:
 # deny-all egress except DNS); zones.yaml is only an API-failure fallback.
 # Image allow-lists. ssh is unrestricted (empty); desktop/vm are enforced by the
