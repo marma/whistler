@@ -4,6 +4,14 @@
 # virtctl onto this machine (~/.local/bin). Called by multipass_k3s_create.sh
 # and metal_k3s_create.sh; usable standalone against any cluster.
 #
+# OPTIONAL on a cluster that already runs KubeVirt: Whistler needs only the
+# kubevirt.io/v1 API, CDI for imageURL boot sources, and no non-default
+# feature gates — see "Already running KubeVirt?" in README.md. Do NOT run
+# this where another operator owns KubeVirt (HCO / OpenShift Virtualization):
+# the feature-gate/emulation patch below edits the KubeVirt CR directly, and
+# HCO reverts direct edits — such clusters are configured through the
+# HyperConverged CR instead.
+#
 # SAFE TO RE-RUN. The script reads what is already installed and, by default,
 # will NOT change its version: a re-run against an existing cluster reconciles
 # configuration (feature gates, emulation) and the local virtctl, then exits.

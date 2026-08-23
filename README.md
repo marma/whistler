@@ -9,9 +9,8 @@ Whistler is a Kubernetes Operator that provisions on-demand and persistant insta
 
 Whistler has the following features:
 
-- A simple administrative TUI used to manage existing sessions and create templates for future sessions
-- Ease of use: users use standard SSH to connect to existing pod or create one on-demand
-- It allows for configuration of templates used to start interactive sessions through an administrative TUI available to users
+- Ease of use: users use standard SSH — `ssh <instance>.w` through the gateway as a jump host — to connect to a session or create one on-demand; scp/rsync/sftp/port-forwarding/VS Code Remote work natively
+- A launcher TUI (`ssh user@gateway`) that lists sessions and connects; templates, users, groups and zones are managed in a web portal
 - Sessions can be preemptible, ephemeral, or persistent
 - Support for ssh agent and port forwarding
 - Whistler is *not* a general purpose way to connect to running pods
@@ -99,6 +98,27 @@ Knobs (all env vars): `KUBEVIRT_VERSION` (default: latest stable),
 `KUBEVIRT_USE_EMULATION=1` for nodes with no `/dev/kvm` (`=0` turns it back
 off; leave it unset to keep whatever is configured),
 `KUBEVIRT_INSTALL_CDI=0` to skip CDI, `CDI_VERSION`.
+
+**Already running KubeVirt?** Skip the script — it is a convenience, not a
+requirement. What Whistler actually needs from the cluster:
+
+- The `kubevirt.io/v1` API. Whistler creates `VirtualMachine`s imperatively
+  and uses the `/vnc` and `/console` subresources for the portal's screen and
+  serial views. Developed and tested against v1.8–v1.9; older releases likely
+  work but are untested.
+- CDI, and only for templates that boot from an `imageURL` (see below) — a
+  cluster where every template uses a containerDisk does not need it.
+- No non-default feature gates. (The script still sets
+  `EnableVirtioFsStorageVolumes`, a leftover from the retired virtiofs home
+  path; nothing requires it and it is pending removal.)
+
+On a cluster where another operator owns KubeVirt — HCO / OpenShift
+Virtualization — do **not** run the script at all, not even for its
+reconcile-only re-run: it patches the `KubeVirt` CR directly (feature gates,
+emulation), and HCO reconciles that CR from its own `HyperConverged` CR and
+reverts direct edits. Nothing needs patching on such a cluster anyway; grab
+`virtctl` from the [KubeVirt releases](https://github.com/kubevirt/kubevirt/releases)
+yourself if you want it.
 
 Note that there is **no official KubeVirt Helm chart** — the request
 ([kubevirt#8347](https://github.com/kubevirt/kubevirt/issues/8347)) is still
@@ -428,27 +448,122 @@ Then add the tags to `whistler.images.vm` and write templates against them; see
 [images/devbase/README.md](images/devbase/README.md) and
 [design/creating_desktops.md](design/creating_desktops.md).
 
+# Uninstall
+
+Order matters, for two reasons Helm cannot see: the operator holds a
+finalizer on every Session CR (its delete handler is what tears down the
+pod/VM behind it), and per-user namespaces are created imperatively by the
+operator, not by the chart. Remove the release first and both are stranded —
+Session CRs, and any namespace containing one, hang in `Terminating` on a
+finalizer no controller is left to clear.
+
+```bash
+# 1. End every session while the operator is still there to clear its
+#    finalizers and delete the pods/VMs behind them.
+kubectl delete sessions --all --all-namespaces
+
+# 2. The release: deployments, services, RBAC, and the Helm-owned
+#    Zone/Group/Template CRs. `helm uninstall` does not undo
+#    --create-namespace, hence the second line.
+helm uninstall whistler -n whistler
+kubectl delete namespace whistler
+
+# 3. Per-user namespaces. Every user's home PVC, storage gateway, secrets
+#    and NetworkPolicies live here — THIS DELETES USER DATA.
+kubectl delete namespaces -l whistler.martinmalmsten.net/managed=true
+
+# 4. The CRDs. Helm never touches these (install-only, see step 4 of the
+#    install); deleting them cascades to any CR of those kinds still left,
+#    portal-created Users among them.
+kubectl delete -f charts/whistler/crds/crds.yaml
+```
+
+Nothing else cluster-scoped remains: the PriorityClass and RBAC are
+Helm-owned and go with the release.
+
+If the steps ran out of order and something hangs in `Terminating`, it is
+almost always a Session finalizer with the operator already gone. Clear them
+by hand and deletion resumes:
+
+```bash
+kubectl get sessions -A --no-headers \
+  -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name \
+| while read ns name; do
+    kubectl -n "$ns" patch session "$name" --type=merge \
+      -p '{"metadata":{"finalizers":[]}}'
+  done
+```
+
+KubeVirt, CDI, VersityGW and the registry are prerequisites, not parts of
+Whistler — leave them alone if anything else uses them. If nothing does,
+KubeVirt has its own strict order: the `KubeVirt` CR first, and *wait* —
+virt-operator tears down the components it created — then the operator
+manifest last. Deleting the operator first orphans everything it made.
+
+```bash
+kubectl -n kubevirt delete kubevirt kubevirt --wait=true
+kubectl delete -f https://github.com/kubevirt/kubevirt/releases/download/${VERSION}/kubevirt-operator.yaml
+
+kubectl delete cdi cdi --wait=true
+kubectl delete -f https://github.com/kubevirt/containerized-data-importer/releases/download/${CDI}/cdi-operator.yaml
+```
+
 # Usage
 
-Example:
+There are two ways in, both plain SSH. (Examples assume the gateway is
+`whistler.example.com`; add `-p 30022` / a `Port` line if you exposed the
+NodePort from the install section.)
 
-Connect to the administrative interface for user `someuser`:
+## The launcher
 
 ```
 ssh someuser@whistler.example.com
 ```
 
-Connect to an existing instance with the name `123`: 
+lands in the launcher TUI: your sessions, each with its `ssh <name>.w`
+address, connect/delete, and a `?` screen with the setup below. It is a
+launcher, not an admin surface — templates, users and zones are managed in
+the portal.
 
+## Straight to an instance
+
+SSH has no SNI, so the gateway learns which instance you want the one way
+SSH carries a destination: the jump-host mechanism
+([design/proxyjump.md](design/proxyjump.md)). One-time setup — the gateway
+prints both pieces itself:
+
+```bash
+ssh someuser@whistler.example.com ssh-config  >> ~/.ssh/config
+ssh someuser@whistler.example.com known-hosts >> ~/.ssh/known_hosts
 ```
 
-ssh someuser-123@whistler.example.com
-```
-Create and connect to an ephemeral session using template `small`:
+The first is a `Host *.w` stanza with `ProxyJump` through the gateway (plus
+`AddKeysToAgent`/`ControlMaster`, because a jump is two logins and VS Code
+opens several connections). The second is one `@cert-authority *.w` line:
+instance host keys are signed by Whistler's host CA, so no instance ever
+asks you to trust a new key. Then, from your own shell:
 
+```bash
+ssh mybox.w
+scp report.pdf mybox.w:
+rsync -a data/ mybox.w:data/
 ```
-ssh someuser-small@whistler.example.com
-```
+
+Naming an instance that doesn't exist yet creates one from the template of
+that name and waits for it to boot — `ssh devbase.w` is "give me a devbase".
+Port forwarding (`-L`/`-R`), sftp, and VS Code Remote all work natively: the
+gateway only splices the encrypted channel to the instance, so the
+connection is end-to-end — crypto terminates in the guest, not on the
+gateway.
+
+Names resolve against *your* sessions only, and anything else — another
+user's instance, an unknown name, a zone whose posture forbids SSH — refuses
+the channel. Container sessions have no sshd and are reachable only through
+the portal's web terminal; the launcher marks them accordingly.
+
+The legacy `someuser-<instance>@gateway` username routing still works behind
+`whistler.ssh.legacyUsernameRouting` (default on, warns per use) but is on
+its way out — new setups should not rely on it.
 
 
 # Implementation
