@@ -810,43 +810,55 @@ class WhistlerSession(asyncssh.SSHServerSession):
             return
         self._chan.exit(0)
 
-    def session_started(self):
-        logger.debug("WhistlerSession.session_started")
+    def _new_app(self):
+        """Build a launcher app with the client's terminal advertised in the
+        environment.
 
-        # Temporarily set TERM/COLORTERM based on client request so Textual/Rich picks it up
+        Textual snapshots os.environ when the App is *constructed*, and Rich
+        derives the colour system from COLORTERM/TERM at that same moment — so
+        this has to wrap every construction, not just the first one. The app
+        built after a relay handover missed it and came back in 8 colours
+        (see _run_app).
+        """
         old_term = os.environ.get('TERM')
         old_colorterm = os.environ.get('COLORTERM')
-        old_escdelay = os.environ.get('ESCDELAY')
-        
-        if hasattr(self, 'term_type') and self.term_type:
+
+        if self.term_type:
             os.environ['TERM'] = self.term_type
             # Assume truecolor support for modern SSH clients if not specified
             os.environ['COLORTERM'] = 'truecolor'
-
         try:
-            if self.target_type == "tui":
-                if self.exec_command:
-                     self._shell_task = asyncio.create_task(
-                         self._run_gateway_command(self.exec_command))
-                else:
-                    self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
-                    self._app.ssh_channel = self._chan
-                    self._app_task = asyncio.create_task(self._run_app())
-            elif self.target_type == "instance":
-                # Find the instance
-                self._shell_task = asyncio.create_task(self._connect_to_instance(command=self.exec_command))
-            else:
-                logger.warning(f"Target type {self.target_type} unknown, falling back to TUI")
-                self._app = WhistlerApp(driver_class=WhistlerDriver, config_manager=self.config_manager, username=self.username, session=self)
-                self._app.ssh_channel = self._chan
-                self._app_task = asyncio.create_task(self._run_app())
+            app = WhistlerApp(driver_class=WhistlerDriver,
+                              config_manager=self.config_manager,
+                              username=self.username, session=self)
         finally:
             # Restore environment
-            if old_term: os.environ['TERM'] = old_term
-            else: os.environ.pop('TERM', None)
-            
-            if old_colorterm: os.environ['COLORTERM'] = old_colorterm
-            else: os.environ.pop('COLORTERM', None)
+            if old_term is None: os.environ.pop('TERM', None)
+            else: os.environ['TERM'] = old_term
+
+            if old_colorterm is None: os.environ.pop('COLORTERM', None)
+            else: os.environ['COLORTERM'] = old_colorterm
+
+        app.ssh_channel = self._chan
+        return app
+
+    def session_started(self):
+        logger.debug("WhistlerSession.session_started")
+
+        if self.target_type == "tui":
+            if self.exec_command:
+                 self._shell_task = asyncio.create_task(
+                     self._run_gateway_command(self.exec_command))
+            else:
+                self._app = self._new_app()
+                self._app_task = asyncio.create_task(self._run_app())
+        elif self.target_type == "instance":
+            # Find the instance
+            self._shell_task = asyncio.create_task(self._connect_to_instance(command=self.exec_command))
+        else:
+            logger.warning(f"Target type {self.target_type} unknown, falling back to TUI")
+            self._app = self._new_app()
+            self._app_task = asyncio.create_task(self._run_app())
 
     async def _run_app(self):
         """Run the launcher, and keep running it around any handovers.
@@ -876,11 +888,7 @@ class WhistlerSession(asyncssh.SSHServerSession):
                 finally:
                     self._return_to_tui = False
 
-                self._app = WhistlerApp(
-                    driver_class=WhistlerDriver,
-                    config_manager=self.config_manager,
-                    username=self.username, session=self)
-                self._app.ssh_channel = self._chan
+                self._app = self._new_app()
         except Exception as e:
             logger.error(f"App error: {e}")
             traceback.print_exc(file=sys.stderr)
