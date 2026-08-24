@@ -30,7 +30,6 @@ RUN arch="${TARGETARCH:-$(dpkg --print-architecture)}" && \
 # Copy application code
 COPY whistler/ whistler/
 COPY manifests/ manifests/
-COPY bin/ bin/
 
 # Install Python dependencies
 COPY pyproject.toml README.md ./
