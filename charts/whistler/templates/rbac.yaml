@@ -117,6 +117,23 @@ rules:
     resources: [sessions, templates, sessions/status, users, zones, groups, datasets, homevolumes]
     verbs: [create, delete, get, list, patch, update, watch]
 
+  # KubeVirt VM sessions: READ ONLY, deliberately. get_user_instances checks a
+  # VMI's deletionTimestamp to report a shutting-down guest as Terminating
+  # (that 403 was swallowed by an `except ApiException`, so the only symptom
+  # was a VM stuck on its old phase while it went down).
+  #
+  # No write verbs, and that is the point: both directions of start/stop are
+  # annotation writes on the Session CR, and the operator's reconcile is what
+  # touches the VirtualMachine. The gateway is the process that terminates
+  # untrusted SSH, so it holds no KubeVirt write at all — see
+  # design/proxyjump.md, "Stopping through the operator".
+  #
+  # Harmless when KubeVirt is not installed — the resource types simply do
+  # not exist.
+  - apiGroups: [kubevirt.io]
+    resources: [virtualmachines, virtualmachineinstances]
+    verbs: [get, list, watch]
+
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -216,14 +233,19 @@ rules:
     resources: [persistentvolumeclaims]
     verbs: [get, list]
 
-  # KubeVirt VM sessions: read VMs/VMIs for status, patch VMs so
-  # stop_instance / reconnect can flip runStrategy (Halted/Always), and open
-  # the serial-console / VNC subresource websockets for the web terminal and
-  # the noVNC viewer (same grant virtctl console/vnc needs). Harmless when
-  # KubeVirt is not installed.
+  # KubeVirt VM sessions: read VMs/VMIs for status, and open the serial-console
+  # / VNC subresource websockets for the web terminal and the noVNC viewer
+  # (same grant virtctl console/vnc needs). Harmless when KubeVirt is not
+  # installed.
+  #
+  # `patch` on virtualmachines used to be here for stop_instance flipping
+  # runStrategy to Halted. Stopping is now an annotation on the Session CR
+  # that the operator acts on, exactly like starting always was, so the last
+  # KubeVirt write left this role with it — the only process that writes to
+  # KubeVirt is the operator.
   - apiGroups: [kubevirt.io]
     resources: [virtualmachines, virtualmachineinstances]
-    verbs: [get, list, watch, patch]
+    verbs: [get, list, watch]
   - apiGroups: [subresources.kubevirt.io]
     resources: [virtualmachineinstances/console, virtualmachineinstances/vnc]
     verbs: [get]

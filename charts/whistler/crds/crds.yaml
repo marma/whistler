@@ -249,9 +249,12 @@ spec:
                   type: string
                   description: >-
                     Session lifecycle phase. Pending/Provisioning/Booting/Ready/
-                    Failed/Terminating for all runtimes; VM sessions additionally
-                    use Importing (CDI is pulling the root disk image) and
-                    Stopped (the VirtualMachine exists but is halted).
+                    Stopping/Failed/Terminating for all runtimes; VM sessions
+                    additionally use Importing (CDI is pulling the root disk
+                    image) and Stopped (the VirtualMachine exists but is
+                    halted). Stopping is set by the reconcile that acts on a
+                    stop request and replaced by the phase timer's next probe;
+                    Terminating means the CR itself is going away.
                 statusMessage:
                   type: string
                   description: >-

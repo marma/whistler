@@ -1,9 +1,20 @@
 """The SSH gateway's terminal UI: an instance launcher.
 
-Read-and-connect only. Templates, instances, users and zones are configured
-in the web portal, so there is one configuration surface rather than two that
-drift out of sync — which is what the TUI's create/edit screens had done. See
-design/proxyjump.md, "TUI diet".
+List, start, stop, connect. Templates, instances, users and zones are
+configured in the web portal, so there is one configuration surface rather
+than two that drift out of sync — which is what the TUI's create/edit screens
+had done. See design/proxyjump.md, "TUI diet".
+
+Nothing here changes a session, only runs one. Start and stop are operations
+on a workload — reversible, and the pair a terminal is good at. Delete was
+the odd one out and moved to the portal (2026-08-23): it destroys the session
+itself, which is a configuration change wearing an operation's clothes.
+
+Starting and connecting are separate keys. Connect used to imply "start it if
+it is off and wait", which read well and behaved badly: the screen was gone
+for as long as a cold VM takes to boot, with no way back and no way to start
+something and then do anything else. Now `s` declares the intent, the row
+shows the state, and enter connects when it is Running.
 
 What it keeps is what a terminal does better than a browser: see what you
 have, get into it, get out. And it advertises the direct path (`ssh box.w`
@@ -12,11 +23,13 @@ is the better tool — it brings scp, rsync, port forwarding and IDE remotes
 with it.
 """
 
+from rich.cells import cell_len
 from textual.binding import Binding
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Static, DataTable, Label
-from textual.containers import Container
+from textual.containers import Container, VerticalScroll
 from textual.screen import ModalScreen, Screen
+from whistler.status import status_group
 import asyncio
 import logging
 
@@ -132,15 +145,47 @@ class LoadingScreen(Screen):
 GATEWAY_HOST_PLACEHOLDER = "<gateway-host>"
 
 
+def _state(target: dict) -> str:
+    """The user-facing state of one launcher row (whistler/status.py)."""
+    return status_group(target.get("status"), target.get("ready", True))
+
+
+def _square_block(art: str) -> str:
+    """Pad every line of a block of text to the width of its widest line.
+
+    Because `text-align: center` centers each line *independently*: a line one
+    cell narrower than its neighbours lands one cell off, which is visible as a
+    wobble in ASCII art even though nothing is wrong with the layout. The logo
+    had exactly that — the ANSI Shadow `R` ends its top row with a trailing
+    space, and trailing spaces do not survive contact with an editor that trims
+    them. Padding here means they never need to: the source can hold the art
+    ragged and it still renders square.
+
+    Measured in cells rather than characters so a future logo with double-width
+    glyphs pads correctly."""
+    lines = art.strip("\n").split("\n")
+    width = max(cell_len(line) for line in lines)
+    return "\n".join(line + " " * (width - cell_len(line)) for line in lines)
+
+
+LOGO = _square_block(r"""
+██╗    ██╗██╗  ██╗██╗███████╗████████╗██╗     ███████╗██████╗
+██║    ██║██║  ██║██║██╔════╝╚══██╔══╝██║     ██╔════╝██╔══██╗
+██║ █╗ ██║███████║██║███████╗   ██║   ██║     █████╗  ██████╔╝
+██║███╗██║██╔══██║██║╚════██║   ██║   ██║     ██╔══╝  ██╔══██╗
+╚███╔███╔╝██║  ██║██║███████║   ██║   ███████╗███████╗██║  ██║
+ ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝╚══════╝   ╚═╝   ╚══════╝╚══════╝╚═╝  ╚═╝""")
+
+
 def ssh_config_stanza(username: str, suffix: str,
                       gateway_host: str = GATEWAY_HOST_PLACEHOLDER) -> str:
     """The ``~/.ssh/config`` a jump needs, as plain unindented text.
 
-    A module function with two consumers: the `?` screen renders it (indented
-    into its box), and ``ssh <gateway> ssh-config`` prints it for redirection.
-    The second exists because the first cannot be copied — a terminal in
-    mouse-reporting mode hands drags to the application instead of selecting
-    text, and this is exactly the text a user has to get into a file.
+    One consumer now: ``ssh <gateway> ssh-config``, which prints it for
+    redirection into the file. The `?` screen used to render it too and
+    stopped — a terminal in mouse-reporting mode hands drags to the
+    application instead of selecting text, so the on-screen copy was the one
+    thing here nobody could actually copy, and it was most of the screen.
     """
     return "\n".join([
         "Host whistler-gateway",
@@ -164,9 +209,13 @@ def ssh_config_stanza(username: str, suffix: str,
 class SshHelpScreen(ModalScreen):
     """How to reach instances directly, without going through this TUI.
 
-    Deliberately prominent: the TUI is a launcher, and the better path for
-    everything except a quick look is the user's own ssh client, which gets
-    scp/rsync/port-forwarding/VS Code for free (design/proxyjump.md)."""
+    The TUI is a launcher; for anything beyond a quick look the better path is
+    the user's own ssh client, which brings scp/rsync/port-forwarding/VS Code
+    with it (design/proxyjump.md). What that takes is two files and one flag,
+    so this screen is the explicit `-J` invocation plus the two commands that
+    write the files. Everything else it used to hold — the config stanza
+    itself, agent-forwarding prose, scp examples — was screen-filling text
+    that either lives in a file or in `man ssh_config`."""
 
     BINDINGS = [("escape,q,question_mark", "app.pop_screen", "Close")]
 
@@ -175,8 +224,15 @@ class SshHelpScreen(ModalScreen):
         align: center middle;
     }
     #help-box {
-        width: 78;
+        /* Sized to the longest command line rather than to the old stanza,
+           which was 16 lines wide and tall. Long usernames or instance names
+           wrap inside it, which is why the width is a little over. */
+        width: 72;
         height: auto;
+        /* Still scrolls rather than clips: a terminal can be shorter than
+           this, and a truncated command is worse than one you scroll to. */
+        max-height: 100%;
+        overflow-y: auto;
         border: thick $accent;
         background: $surface;
         padding: 1 2;
@@ -194,55 +250,42 @@ class SshHelpScreen(ModalScreen):
 
     def help_text(self) -> str:
         """The instructions, as plain text — built here rather than inline in
-        compose so it can be asserted on, and reused wherever else the hint
-        needs printing."""
-        stanza = [f"    {line}" if line else ""
-                  for line in ssh_config_stanza(
-                      self.username, self.suffix).split("\n")]
+        compose so it can be asserted on.
+
+        Three commands and the sentence each one needs. The `~/.ssh/config`
+        stanza used to be printed here in full, which made this the longest
+        screen in the launcher to say something the user cannot act on by
+        reading: it is 16 lines of text whose only use is being in a file, and
+        `ssh <gateway> ssh-config` puts it there. What is worth showing is the
+        explicit `-J` form, because that one *is* typed by hand — it is how
+        you reach an instance before any config exists."""
+        gw = f"{self.username}@{GATEWAY_HOST_PLACEHOLDER}"
         body = [
-            "[b]Connect straight to an instance[/b]",
+            "[b]Direct ssh access[/b] — access to running instances uses",
+            "the SSH ProxyJump capability, which can be used explicitly:",
             "",
-            "Add this once to [b]~/.ssh/config[/b]:",
+            f"    ssh -J {gw} {self.username}@{self.example}{self.suffix}",
             "",
-            *stanza,
+            "Configuration for the proxy can be retrieved from the gateway",
+            "and added permanently to [b]~/.ssh/config[/b]:",
             "",
-            "A jump is [b]two[/b] logins — the gateway, then the instance — so",
-            "without an agent your key's passphrase is asked for twice, and",
-            "again per connection (VS Code Remote opens several).",
-            "AddKeysToAgent asks once; ControlMaster then reuses the open",
-            "connections instead of making new ones.",
-            "",
-            "Then, from your own shell:",
-            "",
-            f"    ssh {self.example}{self.suffix}",
-            f"    scp report.pdf {self.example}{self.suffix}:",
-            f"    rsync -a data/ {self.example}{self.suffix}:data/",
-            "",
-            "Naming an instance that doesn't exist yet creates it from the",
-            "template of that name and waits for it to boot.",
+            f"    ssh {gw} ssh-config  >> ~/.ssh/config",
         ]
+        # Only when a host CA exists: the command would otherwise print
+        # nothing, and telling someone to append nothing is worse than silence.
         if self.known_hosts:
             body += [
                 "",
-                "And this once to [b]~/.ssh/known_hosts[/b], so no instance",
-                "ever asks you to trust a new host key:",
+                "To retrieve the host CA's @cert-authority line and add it to",
+                "known hosts:",
                 "",
-                f"    {self.known_hosts}",
+                f"    ssh {gw} known-hosts >> ~/.ssh/known_hosts",
             ]
-        body += [
-            "",
-            "Rather than copying either out of here, redirect them:",
-            "",
-            f"    ssh {self.username}@{GATEWAY_HOST_PLACEHOLDER} ssh-config"
-            "  >> ~/.ssh/config",
-            f"    ssh {self.username}@{GATEWAY_HOST_PLACEHOLDER} known-hosts"
-            " >> ~/.ssh/known_hosts",
-        ]
         body += ["", "[dim]esc to close[/dim]"]
         return "\n".join(body)
 
     def compose(self) -> ComposeResult:
-        with Container(id="help-box"):
+        with VerticalScroll(id="help-box"):
             yield Static(self.help_text(), markup=True)
 
     # Mouse reporting off while this screen is up, restored on close. This
@@ -269,10 +312,16 @@ class SshHelpScreen(ModalScreen):
 class WhistlerApp(App):
     """Instance launcher.
 
-    Read-and-connect only, by design. Creating and editing templates,
-    instances, users and zones lives in the web portal — one configuration
+    List, start, stop, connect. Creating, editing and deleting sessions,
+    templates, users and zones lives in the web portal — one configuration
     surface rather than two that drift apart. What is left is what a terminal
-    is genuinely better at: see what you have, get into it, get out."""
+    is genuinely better at: see what you have, get into it, get out.
+
+    Starting is a step of its own (`s`), not something connect does for you.
+    Enter connects to a session that is *Running*; a stopped one is started
+    and the row shows it coming up. Folding the two together meant enter on a
+    stopped VM handed the screen to a progress-dot wait of up to a minute with
+    no way back — and no way to start something and go do anything else."""
 
     CSS = """
     Screen {
@@ -321,7 +370,8 @@ class WhistlerApp(App):
         Binding("q", "quit", "Quit"),
         Binding("enter", "connect_instance", "Connect", priority=True),
         Binding("c", "connect_instance", "Connect"),
-        Binding("D", "delete", "Delete"),
+        Binding("s", "start_instance", "Start"),
+        Binding("S", "stop_instance", "Stop"),
         Binding("r", "refresh", "Refresh"),
         Binding("question_mark", "ssh_help", "ssh help"),
         Binding("d", "toggle_dark", "Toggle dark"),
@@ -343,22 +393,18 @@ class WhistlerApp(App):
     def compose(self) -> ComposeResult:
         logger.debug("WhistlerApp.compose")
         yield Header()
-        logo = r"""
-██╗    ██╗██╗  ██╗██╗███████╗████████╗██╗     ███████╗██████╗
-██║    ██║██║  ██║██║██╔════╝╚══██╔══╝██║     ██╔════╝██╔══██╗
-██║ █╗ ██║███████║██║███████╗   ██║   ██║     █████╗  ██████╔╝
-██║███╗██║██╔══██║██║╚════██║   ██║   ██║     ██╔══╝  ██╔══██╗
-╚███╔███╔╝██║  ██║██║███████║   ██║   ███████╗███████╗██║  ██║
- ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝╚══════╝   ╚═╝   ╚══════╝╚══════╝╚═╝  ╚═╝"""
-
-        yield Static(logo, classes="logo")
+        yield Static(LOGO, classes="logo")
         yield Static("Your friendly terminal operator", classes="welcome")
 
         yield Label("Instances", classes="section-header")
         yield DataTable(id="instances_table")
+        # Two short lines rather than one long one: at 80 columns a single
+        # line wraps mid-phrase, and the second says the thing a launcher
+        # cannot answer for itself — where sessions come from.
         yield Static(
-            "enter to connect  ·  ? for direct ssh access  ·  "
-            "manage templates and instances in the web portal",
+            "s start  ·  S stop  ·  enter connect when Running  ·  "
+            "? ssh setup"
+            "\ncreate, edit and delete sessions in the web portal",
             classes="hint")
 
         yield Footer()
@@ -439,7 +485,11 @@ class WhistlerApp(App):
             table.add_row(
                 name,
                 instance.get("template", "Unknown"),
-                instance.get("status", "Unknown"),
+                # The collapsed state, not the raw phase: the two keys the row
+                # offers are "start" and "connect", and which one applies is
+                # exactly what Stopped/Starting/Running says. Ready, Booting
+                # and Importing are the operator's words for the same three.
+                _state(instance),
                 address,
                 key=name)
 
@@ -486,29 +536,94 @@ class WhistlerApp(App):
                 f"{target['name']} has no SSH — open it in the portal's web "
                 f"terminal instead.", severity="warning")
             return
+        state = _state(target)
+        if state != "Running":
+            # Connect no longer starts anything. Same reason as above, one step
+            # earlier: this key hands the screen to a relay, and a session that
+            # is off (or still booting) has nothing to hand it to.
+            if state in ("Stopped", "Error"):
+                self.notify(f"{target['name']} is not running — press s to "
+                            f"start it.", severity="warning")
+            else:
+                self.notify(f"{target['name']} is {state.lower()} — connect "
+                            f"when it says Running.")
+            return
         self.exit(("connect", target["name"]))
 
-    def action_delete(self) -> None:
-        instance_name = self._get_selected_instance()
-        if not instance_name:
+    def action_start_instance(self) -> None:
+        """Start a stopped session and stay here while it boots.
+
+        Declaring intent is all this does: `trigger_instance_start` bumps the
+        Session CR's last-connect annotation, the operator's reconcile creates
+        the pod or unhalts the VM, and the five-second poll shows the row walk
+        Stopped -> Starting -> Running. The portal's play button is the same
+        call, so the two surfaces cannot disagree about what starting means."""
+        target = self._selected_target()
+        if not target:
             self.notify("No instance selected.")
             return
+        name = target["name"]
+        state = _state(target)
+        if state not in ("Stopped", "Error"):
+            self.notify(f"{name} is already {state.lower()}.")
+            return
 
-        self.notify(f"Deleting instance {instance_name}...")
+        self.notify(f"Starting {name}...")
 
-        async def do_delete():
+        async def do_start():
             loop = asyncio.get_running_loop()
-            success = await loop.run_in_executor(
-                None, self.config_manager.delete_instance,
-                self.username, instance_name)
-            if success:
-                self.notify(f"Instance {instance_name} deleted.")
-                asyncio.create_task(self._refresh_async())
-            else:
-                self.notify(f"Failed to delete instance {instance_name}.",
-                            severity="error")
+            ok = await loop.run_in_executor(
+                None, self.config_manager.trigger_instance_start,
+                self.username, name)
+            if not ok:
+                self.notify(f"Failed to start {name}.", severity="error")
+            await self._refresh_async()
 
-        asyncio.create_task(do_delete())
+        asyncio.create_task(do_start())
+
+    def action_stop_instance(self) -> None:
+        """Stop the workload, keeping the session.
+
+        `stop_instance` deletes the pod or halts the VirtualMachine; the
+        Session CR, the home volume and a VM's root disk all survive, so `s`
+        brings it back. That is the whole reason this key replaced delete
+        (2026-08-23): stopping is the reversible half of the pair the launcher
+        already had a start for, and **deleting is a change, not an
+        operation** — it destroys a session's identity and belongs on the one
+        surface that owns configuration, the portal.
+
+        Deliberately no confirmation prompt: the worst case of a mis-stop is a
+        reboot, and the key that undoes it is the one beside it. Delete had no
+        prompt either and badly needed one — a third reason it is better off
+        in the portal.
+
+        Uppercase `S` so it cannot be a slip of the `s` that starts. A toggle
+        on one key would have been tidier and is exactly wrong here — the two
+        directions are not equally cheap, and the expensive one should need
+        the shift.
+        """
+        target = self._selected_target()
+        if not target:
+            self.notify("No instance selected.")
+            return
+        name = target["name"]
+        # The portal's rule, verbatim: anything already stopped or on its way
+        # down has nothing to stop.
+        if _state(target) in ("Stopped", "Stopping"):
+            self.notify(f"{name} is not running.")
+            return
+
+        self.notify(f"Stopping {name}...")
+
+        async def do_stop():
+            loop = asyncio.get_running_loop()
+            ok = await loop.run_in_executor(
+                None, self.config_manager.stop_instance, self.username, name)
+            if not ok:
+                self.notify(f"Failed to stop {name}.", severity="error")
+            await self._refresh_async()
+
+        asyncio.create_task(do_stop())
 
     def action_refresh(self) -> None:
         asyncio.create_task(self._refresh_async())

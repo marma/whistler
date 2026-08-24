@@ -16,6 +16,7 @@ from textual._xterm_parser import XTermParser
 import time
 from whistler.tui import WhistlerApp, LoadingScreen, ssh_config_stanza
 from whistler import relay
+from whistler.status import status_group
 from whistler.logsetup import quiet_chatty_libraries
 
 import argparse
@@ -516,9 +517,11 @@ class SSHServer(asyncssh.SSHServer):
                 f"Direct SSH to '{name}' is not available to you in zone "
                 f"'{target.get('zone')}'")
 
-        # Declare intent and let the operator do the work, exactly as the TUI
-        # path does: bumping last-connect fires reconcile, which starts a
-        # halted VM. Harmless when it is already running.
+        # Declare intent and let the operator do the work: bumping
+        # last-connect fires reconcile, which starts a halted VM. Harmless
+        # when it is already running. Unlike the launcher, a jump has no
+        # second key to press — `ssh box.w` on a stopped instance is meant to
+        # bring it up (the client is showing the wait either way).
         await loop.run_in_executor(
             None, cm.trigger_instance_start, self.username, name)
 
@@ -884,7 +887,10 @@ class WhistlerSession(asyncssh.SSHServerSession):
                     self.server.active_instance_name = choice[1]
                 self._return_to_tui = True
                 try:
-                    await self._connect_to_instance()
+                    # The launcher only offers connect on a Running session,
+                    # and starting one is its own key there — so this path
+                    # connects, it does not boot.
+                    await self._connect_to_instance(start=False)
                 finally:
                     self._return_to_tui = False
 
@@ -922,13 +928,21 @@ class WhistlerSession(asyncssh.SSHServerSession):
             pass
         return True
 
-    async def _connect_to_instance(self, loading_screen=None, command=None):
+    async def _connect_to_instance(self, loading_screen=None, command=None,
+                                   start=True):
         """Connect this channel to an instance over the SSH relay.
 
         Same three-outcome wait as the jump path — ready, still booting, or
         refused by policy — because a session the operator declined to start
         must say so rather than time out silently. The difference is that
         here there is a terminal to explain the wait in.
+
+        ``start=False`` connects to what is already running and nothing else.
+        That is how the launcher calls it: starting a session is its own key
+        there now, so connect must not smuggle a cold boot in behind a
+        progress-dot wait the user cannot escape. The direct paths (a named
+        instance target, and the jump) still start on connect — `ssh box.w`
+        has no launcher to press a key in.
         """
         loop = asyncio.get_running_loop()
         cm = self.config_manager
@@ -949,9 +963,10 @@ class WhistlerSession(asyncssh.SSHServerSession):
                        f"zone '{target.get('zone')}'.")
             return
 
-        # Declare intent; the operator starts a stopped instance.
-        await loop.run_in_executor(
-            None, cm.trigger_instance_start, self.username, name)
+        if start:
+            # Declare intent; the operator starts a stopped instance.
+            await loop.run_in_executor(
+                None, cm.trigger_instance_start, self.username, name)
 
         interactive = bool(self.term_type) and not command
         deadline = time.monotonic() + JUMP_CONNECT_TIMEOUT
@@ -965,6 +980,17 @@ class WhistlerSession(asyncssh.SSHServerSession):
             if fresh.get("policyFailed"):
                 self._fail(fresh.get("statusMessage")
                            or f"Policy refused to start '{name}'.")
+                return
+            phase = fresh.get("phase")
+            at_rest = bool(phase) and status_group(phase) in ("Stopped",
+                                                              "Error")
+            if not start and at_rest:
+                # Nothing is coming: we did not ask for a start, and the
+                # session is not on its way up. Say so now rather than
+                # spending the whole connect budget on dots — the launcher is
+                # still behind this channel, and `s` is the answer.
+                self._fail(f"'{name}' is not running (phase: {phase}). Start "
+                           f"it from the launcher first.")
                 return
             if time.monotonic() >= deadline:
                 self._fail(f"Timed out waiting for '{name}' to accept SSH "

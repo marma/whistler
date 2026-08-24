@@ -10,7 +10,7 @@ Whistler is a Kubernetes Operator that provisions on-demand and persistant insta
 Whistler has the following features:
 
 - Ease of use: users use standard SSH — `ssh <instance>.w` through the gateway as a jump host — to connect to a session or create one on-demand; scp/rsync/sftp/port-forwarding/VS Code Remote work natively
-- A launcher TUI (`ssh user@gateway`) that lists sessions and connects; templates, users, groups and zones are managed in a web portal
+- A launcher TUI (`ssh user@gateway`) that lists sessions, starts them and connects; templates, users, groups and zones are managed in a web portal
 - Sessions can be preemptible, ephemeral, or persistent
 - Support for ssh agent and port forwarding
 - Whistler is *not* a general purpose way to connect to running pods
@@ -520,10 +520,16 @@ NodePort from the install section.)
 ssh someuser@whistler.example.com
 ```
 
-lands in the launcher TUI: your sessions, each with its `ssh <name>.w`
-address, connect/delete, and a `?` screen with the setup below. It is a
-launcher, not an admin surface — templates, users and zones are managed in
-the portal.
+lands in the launcher TUI: your sessions, each with its state and its
+`ssh <name>.w` address. `s` starts a stopped session, `S` stops a running
+one, `enter` connects once it says Running, and `?` shows the setup below.
+Starting and connecting are separate keys on purpose — connect used to imply
+"start it and wait", which took the screen away for as long as a cold VM
+takes to boot.
+
+The launcher *runs* sessions; it does not change them. Creating, editing and
+deleting sessions — and templates, users, groups and zones — is the portal's
+job, so there is one place where configuration lives.
 
 ## Straight to an instance
 
@@ -549,8 +555,13 @@ scp report.pdf mybox.w:
 rsync -a data/ mybox.w:data/
 ```
 
-Naming an instance that doesn't exist yet creates one from the template of
-that name and waits for it to boot — `ssh devbase.w` is "give me a devbase".
+Naming a session that is stopped starts it and waits for it to boot — the
+one case where connecting implies a start, since a jump has no launcher to
+press a key in. Naming one that does not *exist* is an error, not a
+create-from-template: a channel open is the wrong place to wait on a cold
+boot, with nothing to show and no way to report that it will never finish
+(create sessions in the portal).
+
 Port forwarding (`-L`/`-R`), sftp, and VS Code Remote all work natively: the
 gateway only splices the encrypted channel to the instance, so the
 connection is end-to-end — crypto terminates in the guest, not on the

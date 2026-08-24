@@ -201,8 +201,9 @@ def test_splices_to_the_session_service(make_config):
 
 def test_connecting_starts_a_stopped_instance(make_config):
     """`ssh box.w` on a halted VM means "start it and let me in": the gateway
-    declares intent on the CR and the operator does the work, exactly as the
-    TUI path does."""
+    declares intent on the CR and the operator does the work. Unlike the
+    launcher — where starting is its own key — a jump has no second key to
+    press, and the client is showing the wait either way."""
     srv = _server(make_config, targets={"box": _target(phase="Stopped")})
     _jump(srv)
     assert srv.config_manager.started == [("alice", "box")]

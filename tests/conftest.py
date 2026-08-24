@@ -37,6 +37,7 @@ class FakeConfigManager(ConfigManager):
         self._ssh_targets: Dict[str, Dict[str, Any]] = ssh_targets or {}
         self.ssh_domain_suffix = ssh_domain_suffix
         self.started: List[tuple] = []
+        self.stopped: List[tuple] = []
         self.created: List[tuple] = []
         self.deleted: List[tuple] = []
         self.ssh_ca_public_key = ssh_ca_public_key
@@ -413,6 +414,7 @@ class FakeConfigManager(ConfigManager):
         return True
 
     def stop_instance(self, username, instance_name):
+        self.stopped.append((username, instance_name))
         return True
 
     def trigger_instance_start(self, username, instance_name):

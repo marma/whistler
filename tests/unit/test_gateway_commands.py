@@ -74,10 +74,16 @@ async def test_ssh_config_emits_both_host_blocks(make_config):
     assert "Host *.w" in out
     assert "ProxyJump whistler-gateway" in out
     assert "    User alice" in out
-    # Unindented Host lines: this is appended to a config file, not framed in
-    # a box like the `?` screen's copy.
+    # Unindented Host lines: this is appended to a config file.
     assert "\nHost *.w" in out
     assert "\r" not in out
+    # A jump authenticates twice (gateway, then instance), so a stanza without
+    # these asks for the key passphrase twice per connection — and VS Code
+    # Remote opens several. Asserted here because this command is the only
+    # place the stanza is served now: the `?` screen used to print a copy of
+    # it, and these lines were only ever checked there.
+    assert out.count("AddKeysToAgent yes") == 2      # both Host blocks
+    assert out.count("ControlPersist 10m") == 2
     assert sess._chan.status == 0
 
 

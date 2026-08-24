@@ -10,6 +10,7 @@ from kubernetes.client.rest import ApiException
 from kubernetes.utils import parse_quantity
 import base64
 import copy
+import datetime
 import hashlib
 import ipaddress
 import json
@@ -49,6 +50,71 @@ SSH_POSTURES = (SSH_POSTURE_DIRECT, SSH_POSTURE_RELAY, SSH_POSTURE_NONE)
 # gateway's memory so a gateway restart doesn't orphan it — though reaping
 # itself is still gateway-driven; see design/proxyjump.md.
 EPHEMERAL_ANNOTATION = "whistler/ephemeral"
+
+# Run intent, as two timestamps on the Session CR. Whoever wants a session
+# running or stopped writes one of these and lets the operator's reconcile do
+# the work; nothing outside the operator touches a pod or a VirtualMachine.
+#
+# Why two timestamps instead of one `desired-state: running|stopped`: an
+# annotation patch has to *differ* to produce an update event, and a one-shot
+# request the operator clears is worse still — clearing it is itself an update,
+# whose reconcile would see the surviving start annotation and boot the guest
+# straight back up. Two monotonic marks with "latest wins" are declarative:
+# re-reading them any number of times gives the same answer, so an unrelated
+# reconcile (an admin editing overrides) cannot flip a stopped session on.
+#
+# It also closes a real hole. START_ANNOTATION alone, once set, said "wants to
+# run" forever, so a session stopped from the portal would come back on the
+# next reconcile that happened to touch it.
+START_ANNOTATION = "whistler/last-connect"
+STOP_ANNOTATION = "whistler/last-stop"
+
+
+def _annotation_time(value: Any) -> Optional[float]:
+    """One of these annotations as an epoch float, or None if it isn't one.
+
+    Two formats are in the wild: `str(time.time())` from the gateway and an
+    ISO string from `trigger_instance_start`. Both parse here rather than
+    forcing a migration of live CRs — and an unrecognised value (the
+    integration fixture writes the literal "test") returns None, which the
+    caller reads as "present but undatable"."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        # trigger_instance_start writes utcnow().isoformat() — naive, UTC.
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
+
+
+def run_intent(annotations: Optional[Dict[str, Any]]) -> bool:
+    """Whether a Session's annotations say its workload should be running.
+
+    The rule in one line: a start mark means run, unless a stop mark is at
+    least as new. Ties go to stop — two writes in the same clock tick are a
+    stop landing on a start, and stopped is the state that runs nothing and
+    holds no home volume, so it is the safe way to resolve a coin flip.
+    Undatable values (see `_annotation_time`) also lose to a stop for the same
+    reason; a bare start mark with no stop still means run, which is what
+    keeps every existing CR behaving exactly as it did."""
+    annotations = annotations or {}
+    if START_ANNOTATION not in annotations:
+        return False
+    if STOP_ANNOTATION not in annotations:
+        return True
+    started = _annotation_time(annotations.get(START_ANNOTATION))
+    stopped = _annotation_time(annotations.get(STOP_ANNOTATION))
+    if started is None or stopped is None:
+        return False
+    return started > stopped
 
 # Config file locations. Defaults match the in-cluster mount paths used by the
 # Helm chart; override via env so the server/operator can run as host processes
@@ -3079,14 +3145,18 @@ class KubeConfigManager(ConfigManager):
             except Exception:
                 return result
 
-        # A connect (portal connect/term/vnc, or SSH) bumps this annotation
-        # before/while reconcile runs; its presence means "the user wants in
-        # now", so boot immediately even if the create and the trigger
-        # coalesced into one event. Absent a connect, the workload starts
-        # life Stopped — pods included, so a freshly-created session doesn't
-        # start running before anyone has asked to use it.
-        wants_start = 'whistler/last-connect' in (
-            cr['metadata'].get('annotations') or {})
+        # A connect (portal connect/term/vnc, or SSH) bumps the start
+        # annotation before/while reconcile runs, so a create and a trigger
+        # that coalesce into one event still boot immediately; a stop writes
+        # the stop annotation and the newer of the two wins (see run_intent).
+        # Absent any connect, the workload starts life Stopped — pods
+        # included, so a freshly-created session doesn't start running before
+        # anyone has asked to use it.
+        #
+        # This is the ONLY place the run decision is made, and it is made from
+        # the CR. That is what lets stop be a CR patch from an unprivileged
+        # caller: the operator, reconciling, is what touches the workload.
+        wants_start = run_intent(cr['metadata'].get('annotations'))
 
         if effective_runtime == 'vm':
             # The home is a named volume the instance selects, not a share
@@ -3170,7 +3240,11 @@ class KubeConfigManager(ConfigManager):
                 preemptible, user_details=user_details,
             )
         else:
-            ok = True
+            # Reconcile *toward* stopped rather than merely declining to
+            # start: a pod session that is running when the intent says
+            # stopped has to go. Deleting the pod is the stop (state lives on
+            # the PVC), and it is idempotent — a 404 is the desired state.
+            ok = self._delete_session_pod(user_ns, full_name)
 
         # Honest initial phase: without a connect the workload isn't
         # started, and reporting Provisioning would show a phantom
@@ -3181,11 +3255,20 @@ class KubeConfigManager(ConfigManager):
         # (up to 10s away) briefly makes the session look down, and anything
         # gating on phase=="Ready" right after the connect (the web terminal's
         # readiness check) can spuriously fail.
+        # A stop is the one case where a Ready session must NOT keep its
+        # phase: we just halted it, and holding Ready for up to a probe
+        # interval would leave the launcher offering a connect into a guest on
+        # its way down. Stopping vs Stopped tells "was running, going down"
+        # from "was never up" — a guest takes seconds to shut down, and the
+        # phase timer replaces either with what it actually finds.
         current_phase = (cr.get('status') or {}).get('phase')
-        if current_phase == "Ready":
-            result["phase"] = current_phase
+        if wants_start:
+            result["phase"] = ("Ready" if current_phase == "Ready"
+                               else "Provisioning")
+        elif current_phase in (None, "", "Stopped", "Failed"):
+            result["phase"] = "Stopped"
         else:
-            result["phase"] = "Provisioning" if wants_start else "Stopped"
+            result["phase"] = "Stopping"
 
         if not ok:
             return result
@@ -4241,18 +4324,24 @@ class KubeConfigManager(ConfigManager):
                 # picks them up on reboot — the same change-on-reboot contract
                 # zones already have.
                 self._patch_vm_spec(user_ns, full_name, vm_body["spec"])
-                # Only a connect (start=True, i.e. the last-connect annotation
-                # is present) flips it to running; other reconciles (admin
-                # edits etc.) must leave a stopped VM stopped.
-                if start:
-                    try:
-                        self.api.patch_namespaced_custom_object(
-                            KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns,
-                            KUBEVIRT_VM_PLURAL, full_name,
-                            {"spec": {"runStrategy": "Always"}},
-                        )
-                    except ApiException as pe:
-                        logger.warning(f"Could not restart VirtualMachine {full_name}: {pe}")
+                # Drive runStrategy to the run intent, in BOTH directions.
+                # It used to only ever flip a VM on, which left stopping to
+                # whoever asked for it — meaning the gateway and the portal
+                # each needed `patch` on virtualmachines. Halting here is what
+                # makes a stop a plain annotation write for them and keeps
+                # KubeVirt writes inside the operator, where lifecycle already
+                # lives. Cheap and idempotent: the patch is a no-op when the
+                # VM is already in the wanted state.
+                desired = "Always" if start else "Halted"
+                try:
+                    self.api.patch_namespaced_custom_object(
+                        KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns,
+                        KUBEVIRT_VM_PLURAL, full_name,
+                        {"spec": {"runStrategy": desired}},
+                    )
+                except ApiException as pe:
+                    logger.warning(f"Could not set runStrategy={desired} on "
+                                   f"VirtualMachine {full_name}: {pe}")
                 return True
             # 404 here means the KubeVirt CRDs are not installed in this cluster.
             logger.error(f"Failed to create VirtualMachine {full_name} "
@@ -5814,38 +5903,13 @@ class KubeConfigManager(ConfigManager):
             logger.error(f"Failed to delete volume: {e}")
             return False
 
-    def stop_instance(self, username: str, instance_name: str) -> bool:
-        """Stop the running workload but leave the Session CR in place.
-        Pods are deleted (state lives on the PVC); VMs are halted via
-        runStrategy so the VirtualMachine object (and a CDI root disk)
-        survive for restart on the next connect."""
-        user_ns = self._get_user_namespace(username)
-        full_name = f"{username}-{instance_name}"
+    def _delete_session_pod(self, user_ns: str, full_name: str) -> bool:
+        """Delete a session's pod, treating "already gone" as success.
 
-        runtime = None
-        try:
-            cr = self.api.get_namespaced_custom_object(
-                self.group, self.version, user_ns, SESSION_PLURAL, full_name
-            )
-            runtime = (cr.get("status") or {}).get("runtime")
-        except ApiException:
-            pass  # fall through to the pod path
-
-        if runtime == "vm":
-            try:
-                self.api.patch_namespaced_custom_object(
-                    KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns,
-                    KUBEVIRT_VM_PLURAL, full_name,
-                    {"spec": {"runStrategy": "Halted"}},
-                )
-                logger.info(f"Halted VirtualMachine {full_name} in {user_ns}")
-                return True
-            except ApiException as e:
-                if e.status == 404:
-                    return True  # Already gone
-                logger.error(f"Failed to halt VirtualMachine {full_name}: {e}")
-                return False
-
+        How a *pod* session stops: its state lives on the PVC, so the pod is
+        disposable. Operator-side (called from ensure_session when the run
+        intent says stopped), which is why nothing else needs pod-delete
+        rights to stop something."""
         core_api = client.CoreV1Api()
         try:
             core_api.delete_namespaced_pod(full_name, user_ns)
@@ -5853,20 +5917,59 @@ class KubeConfigManager(ConfigManager):
             return True
         except ApiException as e:
             if e.status == 404:
-                return True  # Already stopped
+                return True  # already the desired state
             logger.error(f"Failed to stop pod {full_name}: {e}")
             return False
 
+    def stop_instance(self, username: str, instance_name: str) -> bool:
+        """Ask for the workload to stop, leaving the Session CR in place.
+
+        A declaration, not an action: it writes STOP_ANNOTATION on the Session
+        CR and the operator's reconcile does the work — halting the
+        VirtualMachine (runStrategy, so the VM object and its CDI root disk
+        survive) or deleting the pod. Exactly mirrors how starting has always
+        worked (`trigger_instance_start`), and returning True means "the
+        request is recorded", not "the guest is down"; the phase timer reports
+        the rest.
+
+        It used to halt the VM and delete the pod itself, from whichever
+        process called it. That made *stopping* a privilege: the SSH gateway
+        needed `patch` on virtualmachines for the launcher's stop key — a
+        KubeVirt write in the one process that terminates untrusted SSH. The
+        operator already owns pod and VM lifecycle; this puts stopping where
+        starting already was and leaves both UI surfaces with CR writes only
+        (design/proxyjump.md, "Stopping through the operator").
+        """
+        user_ns = self._get_user_namespace(username)
+        full_name = f"{username}-{instance_name}"
+        patch = {"metadata": {"annotations": {
+            STOP_ANNOTATION: str(time.time())}}}
+        try:
+            self.api.patch_namespaced_custom_object(
+                self.group, self.version, user_ns, SESSION_PLURAL,
+                full_name, patch)
+            logger.info(f"Requested stop of {full_name} in {user_ns}")
+            return True
+        except ApiException as e:
+            if e.status == 404:
+                # No CR, no workload: the caller's goal is already met.
+                logger.info(f"Stop requested for absent session {full_name}")
+                return True
+            logger.error(f"Failed to request stop of {full_name}: {e}")
+            return False
+
     def trigger_instance_start(self, username: str, instance_name: str) -> bool:
-        """Bump the whistler/last-connect annotation to fire the operator's reconcile."""
-        import datetime
+        """Bump the start annotation to fire the operator's reconcile.
+
+        An epoch float, like the stop annotation and like the gateway's own
+        bump: the two marks are compared against each other (run_intent), so
+        writing them in the same units keeps that comparison obvious. Older
+        CRs hold an ISO string here and still parse."""
         user_ns = self._get_user_namespace(username)
         full_name = f"{username}-{instance_name}"
         patch = {
             "metadata": {
-                "annotations": {
-                    "whistler/last-connect": datetime.datetime.utcnow().isoformat()
-                }
+                "annotations": {START_ANNOTATION: str(time.time())}
             }
         }
         try:

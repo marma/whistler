@@ -15,6 +15,11 @@ def _vm(name="box", template="ubuntu-vm", phase="Ready"):
     return {"name": name, "template": template, "phase": phase, "runtime": "vm"}
 
 
+def _stopped_vm(name="box", template="ubuntu-vm"):
+    """A VM session whose workload is halted — the one the launcher starts."""
+    return _vm(name, template, phase="Stopped")
+
+
 def _pod(name="scratch", template="small", status="Running"):
     """An ssh-mode container session — listed, but with no sshd to reach."""
     return {"name": name, "template": template, "status": status}
@@ -119,57 +124,219 @@ async def test_connect_with_nothing_selected_does_not_exit(make_config):
     assert app.return_value is None
 
 
+def test_the_logo_block_is_square():
+    """Every line the same cell width, because `text-align: center` centers
+    each line on its own: a row one cell short of its neighbours is centered
+    one cell further along, which shows up as the top of the logo sitting
+    proud of the rest.
+
+    Only at ODD container widths — 61 and 62 both center to the same offset in
+    an 84-column terminal and differ in an 85-column one — which is why this
+    survived a long time and why it is worth a test rather than an eyeball."""
+    from rich.cells import cell_len
+    from whistler.tui import LOGO
+    widths = {cell_len(line) for line in LOGO.split("\n")}
+    assert len(widths) == 1, f"ragged logo: {sorted(widths)}"
+
+
+def test_the_logo_survives_a_whitespace_trim():
+    """The reason the padding is computed rather than typed: the art's own
+    trailing spaces (the ANSI Shadow `R` ends its top row with one) are
+    exactly what an editor set to trim trailing whitespace removes."""
+    from rich.cells import cell_len
+    from whistler.tui import _square_block
+    trimmed = "\n".join(l.rstrip() for l in ["ab ", "cd", "e  "])
+    squared = _square_block(trimmed)
+    assert {cell_len(l) for l in squared.split("\n")} == {2}
+
+
 @pytest.mark.asyncio
-async def test_ssh_help_screen_shows_a_usable_config_stanza(make_config):
-    cm = _config(make_config)
+async def test_the_status_column_shows_the_collapsed_state(make_config):
+    """`Ready` is the operator's word; the row has to say which of the two
+    keys applies, and Running/Starting/Stopped is that."""
+    cm = _config(make_config, sessions=[_vm(phase="Ready")])
     app = WhistlerApp(config_manager=cm, username="alice")
 
     async with app.run_test() as pilot:
         await pilot.pause()
-        app.action_ssh_help()
-        await pilot.pause()
-        screen = app.screen
-        assert isinstance(screen, SshHelpScreen)
-        text = screen.help_text()
-        assert "Host *.w" in text
-        assert "ProxyJump whistler-gateway" in text
-        assert "@cert-authority" in text   # from the fake's CA line
-        # A jump authenticates twice (gateway, then instance), so a stanza
-        # without these asks for the key passphrase twice per connection —
-        # and VS Code Remote opens several.
-        assert "AddKeysToAgent yes" in text
-        assert "ControlPersist" in text
+        assert app.query_one("#instances_table").get_row_at(0)[2] == "Running"
 
 
 @pytest.mark.asyncio
-async def test_delete_removes_the_instance(make_config):
-    cm = _config(make_config, instances=[_pod("scratch")])
+async def test_connect_refuses_a_stopped_session(make_config):
+    """Connect no longer starts anything. It used to, which meant enter on a
+    halted VM replaced the launcher with a progress-dot wait as long as a cold
+    boot, with no way back and no way to start it and go do something else."""
+    cm = _config(make_config, sessions=[_stopped_vm()])
     app = WhistlerApp(config_manager=cm, username="alice")
 
     async with app.run_test() as pilot:
         await pilot.pause()
         app.query_one("#instances_table").focus()
-        app.action_delete()
+        app.action_connect_instance()
         await pilot.pause()
+        assert app.is_running
 
-    assert cm.deleted == [("alice", "scratch")]
+    assert app.return_value is None
+    assert cm.started == []      # and it did not quietly start it either
 
 
 @pytest.mark.asyncio
-async def test_delete_works_for_vm_sessions_too(make_config):
-    """Both kinds are Session CRs, and delete_instance removes one by name
-    regardless of mode — so the launcher needs no second delete path now that
-    it lists both."""
+async def test_start_declares_intent_on_a_stopped_session(make_config):
+    """The same call the portal's play button makes: bump last-connect and let
+    the operator create the pod / unhalt the VM. The launcher stays up and the
+    poll shows the row come Running."""
+    cm = _config(make_config, sessions=[_stopped_vm()])
+    app = WhistlerApp(config_manager=cm, username="alice")
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one("#instances_table").focus()
+        app.action_start_instance()
+        await pilot.pause()
+        assert app.is_running       # starting is not a handover
+
+    assert cm.started == [("alice", "box")]
+
+
+@pytest.mark.asyncio
+async def test_start_leaves_a_running_session_alone(make_config):
+    cm = _config(make_config, sessions=[_vm()])
+    app = WhistlerApp(config_manager=cm, username="alice")
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one("#instances_table").focus()
+        app.action_start_instance()
+        await pilot.pause()
+
+    assert cm.started == []
+
+
+@pytest.mark.asyncio
+async def test_start_with_nothing_selected_does_nothing(make_config):
+    cm = _config(make_config)
+    app = WhistlerApp(config_manager=cm, username="alice")
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_start_instance()
+        await pilot.pause()
+
+    assert cm.started == []
+
+
+@pytest.mark.asyncio
+async def test_ssh_help_screen_shows_the_three_commands(make_config):
+    """What the screen is for: the one invocation a user types by hand, and
+    the two that write the files so they don't have to."""
     cm = _config(make_config, sessions=[_vm("box")])
     app = WhistlerApp(config_manager=cm, username="alice")
 
     async with app.run_test() as pilot:
         await pilot.pause()
         app.query_one("#instances_table").focus()
-        app.action_delete()
+        app.action_ssh_help()
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, SshHelpScreen)
+        text = screen.help_text()
+        # The explicit form, with the selected instance in it — this is the
+        # one you can use before any config exists.
+        assert "ssh -J alice@<gateway-host> alice@box.w" in text
+        assert "ssh-config  >> ~/.ssh/config" in text
+        assert "known-hosts >> ~/.ssh/known_hosts" in text
+
+
+@pytest.mark.asyncio
+async def test_ssh_help_screen_does_not_reprint_the_config_stanza(make_config):
+    """It is 16 lines whose only use is being in a file, and the command
+    beside it puts them there — while a terminal in mouse mode won't let you
+    select them anyway. Its content is covered by
+    tests/unit/test_gateway_commands.py, where it is actually served."""
+    app = WhistlerApp(config_manager=_config(make_config), username="alice")
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_ssh_help()
+        await pilot.pause()
+        text = app.screen.help_text()
+        assert "Host whistler-gateway" not in text
+        assert "AddKeysToAgent" not in text
+        # Small enough to read at a glance on any terminal: it was 44 lines,
+        # then 31. A guard against re-growth.
+        assert len(text.splitlines()) <= 18
+
+
+@pytest.mark.asyncio
+async def test_stop_halts_a_running_session(make_config):
+    """The reversible half of the pair: `stop_instance` deletes the pod or
+    halts the VirtualMachine and leaves the Session CR, so `s` brings it
+    back."""
+    cm = _config(make_config, sessions=[_vm("box")])
+    app = WhistlerApp(config_manager=cm, username="alice")
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one("#instances_table").focus()
+        app.action_stop_instance()
         await pilot.pause()
 
-    assert cm.deleted == [("alice", "box")]
+    assert cm.stopped == [("alice", "box")]
+
+
+@pytest.mark.asyncio
+async def test_stop_works_for_container_sessions_too(make_config):
+    """Both kinds are Session CRs and stop_instance picks the right mechanism
+    by runtime — so the launcher needs no second stop path, even though a pod
+    has no SSH to connect to."""
+    cm = _config(make_config, instances=[_pod("scratch")])
+    app = WhistlerApp(config_manager=cm, username="alice")
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one("#instances_table").focus()
+        app.action_stop_instance()
+        await pilot.pause()
+
+    assert cm.stopped == [("alice", "scratch")]
+
+
+@pytest.mark.asyncio
+async def test_stop_leaves_an_already_stopped_session_alone(make_config):
+    cm = _config(make_config, sessions=[_stopped_vm()])
+    app = WhistlerApp(config_manager=cm, username="alice")
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one("#instances_table").focus()
+        app.action_stop_instance()
+        await pilot.pause()
+
+    assert cm.stopped == []
+
+
+@pytest.mark.asyncio
+async def test_stop_with_nothing_selected_does_nothing(make_config):
+    cm = _config(make_config)
+    app = WhistlerApp(config_manager=cm, username="alice")
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_stop_instance()
+        await pilot.pause()
+
+    assert cm.stopped == []
+
+
+def test_delete_is_gone_from_the_launcher(make_config):
+    """Deleting a session destroys its identity — a configuration change, so
+    the portal owns it (2026-08-23). The launcher runs sessions; it does not
+    change them. A re-added key here would put a destructive, unconfirmed
+    action one keystroke from `s`."""
+    import whistler.tui as tui
+    assert not hasattr(tui.WhistlerApp, "action_delete")
+    assert not any(b.action == "delete" for b in tui.WhistlerApp.BINDINGS)
 
 
 def test_config_screens_are_gone():

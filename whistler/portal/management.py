@@ -27,6 +27,7 @@ from fastapi.templating import Jinja2Templates
 from whistler.config import (ACCESS_MODES, CHANNELS, ConfigWriteError,
                              ENFORCED_ACCESS_KINDS, ENFORCED_CHANNELS,
                              GPU_NODE_LABEL, OVERRIDE_GROUPS)
+from whistler.status import GROUP_COLORS, status_group
 
 logger = logging.getLogger("whistler.management")
 
@@ -35,47 +36,11 @@ _STATIC_DIR   = os.path.join(os.path.dirname(__file__), "static")
 
 templates = Jinja2Templates(directory=_TEMPLATE_DIR)
 
-# The various raw pod/CR phases are consolidated into a few user-facing states,
-# mirroring the actual pod lifecycle: no pod -> Stopped, deleting -> Stopping,
-# scheduled but not started -> Pending, running but not yet ready -> Starting,
-# running and ready -> Running.
-_STATUS_GROUPS = {
-    "running":      "Running",
-    "ready":        "Running",
-    "pending":      "Pending",
-    "initializing": "Starting",
-    "provisioning": "Starting",
-    "booting":      "Starting",
-    "importing":    "Starting",
-    "stopping":     "Stopping",
-    "terminating":  "Stopping",
-    "stopped":      "Stopped",
-    "unknown":      "Stopped",
-    "failed":       "Error",
-}
-_GROUP_COLORS = {
-    "Running":  "green",
-    "Starting": "yellow",
-    "Pending":  "blue",
-    "Stopping": "orange",
-    "Stopped":  "grey",
-    "Error":    "red",
-}
-
-
-def _status_group(status: str, ready: bool = True) -> str:
-    """Collapse a raw pod/CR phase into one of the user-facing states. A
-    "running" phase pod whose containers aren't all ready yet reads as
-    Starting rather than Running."""
-    s = (status or "").lower()
-    if s == "running" and not ready:
-        return "Starting"
-    return _STATUS_GROUPS.get(s, "Stopped")
-
-
-# Jinja2 globals: consolidated status label + its Fomantic UI label color.
-templates.env.globals["status_label"] = _status_group
-templates.env.globals["status_color"] = lambda s, ready=True: _GROUP_COLORS[_status_group(s, ready)]
+# The user-facing states live in whistler/status.py — the launcher collapses
+# the same phases when it decides whether a row can be connected to or has to
+# be started first, and one table beats two that drift.
+templates.env.globals["status_label"] = status_group
+templates.env.globals["status_color"] = lambda s, ready=True: GROUP_COLORS[status_group(s, ready)]
 templates.env.globals["GPU_NODE_LABEL"] = GPU_NODE_LABEL
 
 _ADMIN_USERS: set[str] = set(
@@ -394,7 +359,7 @@ async def instance_edit_form(request: Request, cm: CM, user: User, is_admin: IsA
     # Overrides only take effect on the next start/reboot, so only allow editing
     # once the instance is fully at rest (no pod). While it's Pending/Starting/
     # Running a change would silently not apply to the live session.
-    if _status_group(inst["status"], inst.get("ready", True)) not in ("Stopped", "Error"):
+    if status_group(inst["status"], inst.get("ready", True)) not in ("Stopped", "Error"):
         raise HTTPException(status_code=409, detail="Stop the instance before editing it.")
 
     selectable_zones = [z for z in zones if not allowed_zones or z in allowed_zones]

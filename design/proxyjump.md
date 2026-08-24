@@ -427,15 +427,88 @@ Keeps:
 - Connect (SSH relay handover above), and the copyable `ssh <name>.w` hint +
   first-run `~/.ssh/config` stanza.
 - Probably: delete/stop of *own* instances (cheap, high-value; decide during
-  implementation).
+  implementation). **Decided 2026-08-23: start and stop, not delete.** The
+  line that holds is *operations here, changes in the portal*. Start (`s`) and
+  stop (`S`) act on a workload and undo each other — the Session CR, the home
+  volume and a VM's root disk all survive a stop, so the worst case of a
+  mis-key is a reboot. Delete destroys the session's identity, which is a
+  configuration change wearing an operation's clothes; it also wants a
+  confirmation step, and the launcher had it as an unconfirmed keystroke.
 
 Goes (moves to portal, which already has equivalents):
 - `InstanceCreateScreen`, `TemplateEditScreen`, `TemplateViewScreen`
-  ([tui.py](../whistler/tui.py)) and every mutation path except (maybe)
-  delete. Template CRUD, user admin, zone admin: portal only.
+  ([tui.py](../whistler/tui.py)) and every mutation path. Template CRUD, user
+  admin, zone admin, and session create/edit/**delete**: portal only.
 
 Whether quick-create-from-template stays in the TUI is an open question; the
 `ssh marma@<template>.w` on-demand path may make it redundant.
+
+**Resolved (2026-08-23): it does not.** Creating a session is the portal's
+job — it is where the template, zone, home volume and GPU choices live, and a
+form is the right shape for them. What the launcher gained instead is
+**start**: `s` on a stopped session declares intent (the same
+`trigger_instance_start` the portal's play button calls) and the row walks
+Stopped → Starting → Running under the poll, while `enter` connects only to a
+Running one.
+
+That split is the point. Connect used to mean "start it if it is off, then
+wait", which is the same mistake as the on-demand jump path one level up: the
+screen is taken away for as long as a cold VM takes to boot, with no way back
+and no way to start something and go do anything else meanwhile. The launcher
+is the surface that *can* show a wait, so it shows it as a row, not as a
+blocking progress line. The direct paths keep start-on-connect, because `ssh
+box.w` has no second key to press and the client is showing the wait either
+way (`_connect_to_instance(start=False)` is the launcher's call; anything else
+defaults to starting).
+
+## Stopping through the operator
+
+Added 2026-08-23, when the launcher gained a stop key and immediately got a
+403:
+
+```
+virtualmachines.kubevirt.io "marma-vm-gnome-cuda" is forbidden:
+User "system:serviceaccount:whistler:whistler-server" cannot patch
+resource "virtualmachines" in API group "kubevirt.io"
+```
+
+The obvious fix — grant the gateway `patch` on `virtualmachines` — is the
+wrong one. The gateway is the process that terminates untrusted SSH; it is the
+last place to hand a KubeVirt write. And the asymmetry was the real smell:
+**starting** had never needed one. A start is a bump of the
+`whistler/last-connect` annotation on the Session CR, and the operator's
+reconcile does the work, because the operator owns pod and VM lifecycle.
+Stopping reached around that and halted the VM itself, from whichever process
+happened to be asked.
+
+So stop became a declaration too:
+
+- `whistler/last-connect` — "should be running as of this moment"
+- `whistler/last-stop` — "should be stopped as of this moment"
+
+`run_intent()` reads both and the newer one wins (ties go to stopped, which is
+the state that runs nothing and holds no home volume). `ensure_session` calls
+it, and now reconciles **toward** the answer in both directions: an existing
+VM has its `runStrategy` set to `Always` *or* `Halted`, and a pod session that
+should be down has its pod deleted. `stop_instance` is a single CR patch.
+
+Two timestamps rather than one `desired-state: running|stopped` field, for two
+reasons. An annotation patch has to *differ* to produce an update event, so a
+field re-set to the value it already holds fires no reconcile. And a one-shot
+request the operator clears is worse: clearing it is itself an update, and
+that reconcile would see the surviving start annotation and boot the guest
+straight back up — a ping-pong.
+
+What this also fixed: a start annotation, once written, was never cleared, so
+"wants to run" was permanent. A session stopped from the portal could come
+back on the next reconcile that happened to touch it (an admin editing
+overrides was enough). Under "latest wins" a stop is a fact of equal standing,
+so it survives an unrelated reconcile.
+
+The RBAC that follows is the point of the exercise. Neither the gateway nor the
+portal holds a write verb on `kubevirt.io` any more — they read VMs and VMIs
+for status, and the console/VNC subresources for the viewer. **The only
+process that writes to KubeVirt is the operator.**
 
 ## Username parsing
 
@@ -492,7 +565,8 @@ The pleasant part. Once relay + ProxyJump land:
    marked throwaway is reaped once the last connection closes, with a grace
    window (`scp` then `ssh` seconds apart is the common shape, and reaping
    between them would make the second pay for a cold boot). Nothing sets the
-   annotation today; the launcher's create flow will.
+   annotation today, and the launcher will not: creating is the portal's job
+   (see "TUI diet"), so whatever sets it will be a portal flow.
 4. **Relay handover.** ✅ **Done**
    ([whistler/relay.py](../whistler/relay.py)): an `asyncssh.connect` bridge
    with native PTY, window-change, exit-status propagation and agent
@@ -506,10 +580,15 @@ The pleasant part. Once relay + ProxyJump land:
    against a real sshd rather than a mock.
 5. **TUI diet + username cleanup.** ✅ **Done.** tui.py is 1099 → ~450 lines:
    `InstanceCreateScreen`, `TemplateEditScreen` and `TemplateViewScreen` are
-   gone, replaced by an instance list showing each instance's `ssh` address
-   and an `SshHelpScreen` (`?`) that prints the `~/.ssh/config` stanza and the
-   `@cert-authority` line. Connect exits the app with the choice and the
-   session relays, returning to a fresh launcher when the remote shell ends.
+   gone, replaced by an instance list showing each instance's state and `ssh`
+   address, `s`/`S` to start and stop one, and an `SshHelpScreen` (`?`) that
+   is three commands: the explicit `ssh -J gw user@box.w`, and the two
+   redirections that write `~/.ssh/config` and the `@cert-authority` line.
+   Down from 44 lines — the stanza it used to print in full is 16 lines whose
+   only use is being in a file, which the command beside it does, and which a
+   terminal in mouse-reporting mode won't let you select anyway. Connect exits
+   the app with the choice and the session relays, returning to a fresh
+   launcher when the remote shell ends.
    Username routing prefers the whole username, so `anna-lisa` can finally
    log in; the legacy split survives behind
    `whistler.ssh.legacyUsernameRouting` (default on) and warns per use.
@@ -594,7 +673,6 @@ up. Two different views, and `viewer: vnc` vs `websockets` picks.
   a simple rule — genuinely arguable either way.
 - Grace period + exact signal for ephemeral cleanup under ProxyJump
   (last-channel-closed vs. idle timer)?
-- Does quick-create stay in the TUI at all?
 - Suffix default (`.w`?) and whether to accept un-suffixed names too.
 - Access-key vs. user-key for the relay hop (access key avoids needing the
   user's *private* key, which the gateway never has — it's the only option;
