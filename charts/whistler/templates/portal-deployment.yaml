@@ -64,6 +64,10 @@ spec:
               value: {{ .Values.portal.screenshots.intervalSeconds | quote }}
             - name: WHISTLER_SCREENSHOT_WIDTH
               value: {{ .Values.portal.screenshots.maxWidth | quote }}
+            # Kiosk surface (whistler/portal/kiosk.py): idle returns to the
+            # kiosk start. 0 disables.
+            - name: WHISTLER_KIOSK_IDLE_TIMEOUT
+              value: {{ .Values.portal.kiosk.idleTimeoutSeconds | quote }}
             # The screenshot store is per-process; the loop warns if this is >1.
             - name: PORTAL_REPLICAS
               value: {{ .Values.portal.replicaCount | quote }}

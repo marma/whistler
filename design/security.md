@@ -234,6 +234,52 @@ so the routing seam exists — but the proxy does not know who the user is, so
 path routing alone is all-or-nothing for a deployment. **The identity check is
 the boundary; the address check is the location control.**
 
+#### What exists today: the surface, not the binding
+
+`/kiosk` ([`whistler/portal/kiosk.py`](../whistler/portal/kiosk.py), 2026-08-24)
+is the **surface** described above, built on the viewer app so its session page
+can frame `/connect` same-origin: a login, the user's own desktop sessions as
+cards, one full-screen desktop, and an idle timer
+(`portal.kiosk.idleTimeoutSeconds`, default 900s) that returns from a session
+to the grid and from the grid to a logged-out login screen. There is no
+template picker, no launch form, no web terminal and no admin surface on it —
+not as a policy check, but because the pages have nothing else on them.
+
+**It is not yet the binding.** Serving a user the kiosk does not stop that same
+account from opening the ordinary portal, the web terminal, or SSH; the surface
+is a place to send someone, not a restriction on where else they can go. The
+binding is the identity half of this section — a per-user or per-group grant
+enforced *at every entry point* — and it is the part still to build. Until then
+the kiosk's containment rests entirely on the deployment's half, which is the
+failure mode named above ("the network half is doing all the work"), and it
+should be described that way rather than as a control.
+
+**The lock is the one part that is enforced rather than merely offered.** The
+thin client decides the person has gone and navigates to
+`/kiosk/lock?next=<where it was>`; the portal answers with an HttpOnly cookie
+and refuses every route on the viewer app but the lock screen while it is set.
+That distinction matters here specifically: a locked browser still holds a
+valid identity cookie, so a lock that were only a page — a `?locked=1`, a
+screensaver drawn over the desktop — would rest on the client again, which is
+the failure this whole section is about. Because it is a cookie the guarded
+page cannot clear, the lock holds whether or not the client has an address bar.
+It is a lock on *the browser*, not a binding on the account: the same account
+elsewhere is unaffected, which is still the missing half above.
+
+Two smaller facts follow from where it is built:
+
+- The login form is real but has nothing to check against. Whistler stores no
+  passwords (`User` CRs carry public keys), so `_verify_credentials` accepts
+  any password while the portal's dev auth gate is open and nothing otherwise —
+  the same "SSO/OIDC is a follow-up" position the rest of the portal holds.
+  That one function is where a real credential, and the OTP beside it, lands.
+  **The unlock shares it**, so in dev the lock is a working mechanism with no
+  secret behind it. The lock screen says so on its face; it must not be
+  described as protecting an unattended session until that function does.
+- The card thumbnails are `/screenshot/<id>`, so a kiosk shows exactly what the
+  `screenshots` channel already permits — including nothing, if it was never
+  granted. Nothing new leaves the zone for the kiosk's sake.
+
 #### What the kiosk situation does not fix
 
 - **The clipboard is in the streamer, not the portal**, so refusing the

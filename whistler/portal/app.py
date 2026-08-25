@@ -20,6 +20,10 @@ Routes (all under a dev-only auth gate — see ``auth_middleware``):
                          serial console relay
   GET  /screenshot/<id>  latest desktop thumbnail (PNG) — see
                          whistler.portal.screenshots
+  GET  /kiosk*           the kiosk surface (login + session grid + full-screen
+                         desktop, and nothing else) — see whistler.portal.kiosk
+  GET  /kiosk/lock       lock this browser; while locked, kiosk.lock_middleware
+                         refuses every route above it but the lock screen
   GET  /healthz          readiness probe
 
 Two display backends, chosen per session by ``status.viewer``:
@@ -814,7 +818,14 @@ async def _proxy_client_ctx(app):
 
 
 def build_app(config_manager):
-    app = web.Application(middlewares=[auth_middleware])
+    # Imported here, not at module scope: kiosk.py reads this module's cookie
+    # name and the two would otherwise import each other.
+    from whistler.portal import kiosk
+
+    # lock_middleware sits inside auth_middleware: a locked kiosk browser is
+    # refused every path on this app but the lock screen, which is what makes
+    # the lock hold against a live session cookie (whistler/portal/kiosk.py).
+    app = web.Application(middlewares=[auth_middleware, kiosk.lock_middleware])
     app["cm"] = config_manager
     app.cleanup_ctx.append(_proxy_client_ctx)
     app.cleanup_ctx.append(kubevirt.kube_ws_client_ctx)
@@ -842,4 +853,7 @@ def build_app(config_manager):
         web.static("/static/novnc", os.path.join(_STATIC_DIR, "novnc")),
         web.get("/static/{filename}", static_file),
     ])
+    # The kiosk surface (/kiosk) lives on this app so its session page can frame
+    # /connect same-origin and its cards can load /screenshot — see kiosk.py.
+    kiosk.add_routes(app)
     return app

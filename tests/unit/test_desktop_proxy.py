@@ -38,6 +38,11 @@ def _fake_selkies_app():
         return web.Response(text="// cached", content_type="text/javascript",
                             headers={"Cache-Control": "max-age=3600"})
 
+    async def framed(request):
+        # Some in-session servers stamp X-Frame-Options on their web root.
+        return web.Response(text="FRAMED", content_type="text/html",
+                            headers={"X-Frame-Options": "DENY"})
+
     async def status(request):
         return web.json_response({"current_mode": "websockets"})
 
@@ -73,6 +78,7 @@ def _fake_selkies_app():
         web.get("/src/selkies-core.js", core_js),
         web.get("/vite.svg", png),
         web.get("/cached.js", cached_js),
+        web.get("/framed.html", framed),
         web.get("/status", status),
         web.post("/tokens", tokens),
         web.get("/websockets", websockets),
@@ -186,6 +192,17 @@ async def test_proxies_post_body(portal):
                              params={"user": "alice"})
     assert resp.status == 200
     assert await resp.text() == 'tokens:{"t":1}'
+
+
+async def test_upstream_x_frame_options_is_dropped(portal):
+    """Framing is the portal's call, not the guest's. The kiosk session page
+    embeds /desktop/<id>/ in a same-origin iframe so it can keep an idle
+    watcher over the desktop; an upstream X-Frame-Options would make that a
+    blank rectangle, and it is an opinion about a URL the guest does not
+    serve."""
+    resp = await portal.get("/desktop/d1/framed.html", params={"user": "alice"})
+    assert resp.status == 200
+    assert "X-Frame-Options" not in resp.headers
 
 
 async def test_viewer_entry_points_get_no_cache_stamped(portal):

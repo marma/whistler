@@ -7,9 +7,15 @@ routers/services in one ConfigMap.
 {{- $host := .Values.portal.ingress.host }}
 {{- /* The viewer app serves the desktop connect page (/connect), the
        reverse-proxied Selkies viewer (/desktop), the noVNC viewer for VM
-       sessions (/vnc + /ws-vnc + its /static assets) and the web terminal
-       (/term + /term-status + /ws-term). */}}
-{{- $viewerPaths := "PathPrefix(`/connect`) || PathPrefix(`/desktop`) || PathPrefix(`/launch`) || PathPrefix(`/status`) || PathPrefix(`/term`) || PathPrefix(`/ws-term`) || PathPrefix(`/vnc`) || PathPrefix(`/ws-vnc`) || PathPrefix(`/console`) || PathPrefix(`/ws-console`) || PathPrefix(`/static`)" }}
+       sessions (/vnc + /ws-vnc + its /static assets), the web terminal
+       (/term + /term-status + /ws-term), the session thumbnails
+       (/screenshot) and the kiosk surface (/kiosk).
+
+       /screenshot belongs to the viewer app but was missing here, so behind
+       this proxy it fell through to the management catch-all and 404'd —
+       invisibly, because the dashboard hides a thumbnail that fails to load.
+       The kiosk cards use the same URL, which is how it surfaced. */}}
+{{- $viewerPaths := "PathPrefix(`/connect`) || PathPrefix(`/desktop`) || PathPrefix(`/launch`) || PathPrefix(`/status`) || PathPrefix(`/term`) || PathPrefix(`/ws-term`) || PathPrefix(`/vnc`) || PathPrefix(`/ws-vnc`) || PathPrefix(`/console`) || PathPrefix(`/ws-console`) || PathPrefix(`/screenshot`) || PathPrefix(`/kiosk`) || PathPrefix(`/static`)" }}
 {{- $viewerRule := $viewerPaths }}
 {{- $mgmtRule := "PathPrefix(`/`)" }}
 {{- if $host }}

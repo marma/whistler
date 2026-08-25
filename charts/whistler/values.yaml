@@ -109,6 +109,24 @@ portal:
   screenshots:
     intervalSeconds: 300
     maxWidth: 320
+  # The kiosk surface (/kiosk, whistler/portal/kiosk.py): a login, the user's
+  # own desktops as cards, and a full-screen desktop — no templates, no launch
+  # form, no terminal, no admin. This is Whistler's half of the "kiosk
+  # situation" (design/security.md, "Closing the fourth axis"); the other half
+  # is a network on which every client is a controlled device, and neither half
+  # is a boundary alone. Note that serving /kiosk does not yet *bind* a user to
+  # it — nothing stops the same account opening the ordinary portal.
+  #
+  # Locking is the thin client's job, not a setting here: it navigates to
+  # /kiosk/lock?next=<where it was> and the portal refuses every viewer route
+  # but the lock screen until a password is entered. The idle timeout below is
+  # the portal's own, weaker fallback for browsers that do no such thing.
+  kiosk:
+    # Seconds without mouse, key or touch input before a kiosk returns to the
+    # start: from a session back to the card grid, from the grid to a logged-out
+    # login screen. 0 disables — which on an unattended screen means the last
+    # person's desktop stays up until someone else touches it.
+    idleTimeoutSeconds: 900
   resources:
     limits:
       cpu: 1000m

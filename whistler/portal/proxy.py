@@ -35,6 +35,16 @@ _HOP_BY_HOP = frozenset({
     "te", "trailer", "transfer-encoding", "upgrade",
 })
 
+# Framing is the portal's decision, not the guest's: the kiosk session page
+# embeds /desktop/<id>/ in a same-origin iframe so it can keep an idle watcher
+# running over the desktop (whistler.portal.kiosk). An X-Frame-Options the
+# in-session server happens to send is about a URL it does not serve and would
+# turn that page into a blank rectangle, so it is dropped on the way back.
+# CSP frame-ancestors is left alone — no Selkies build sends one, and silently
+# rewriting a policy header is a different and worse habit than dropping a
+# header that predates CSP.
+_DROP_FROM_UPSTREAM = frozenset({"x-frame-options"})
+
 _WS_CLOSED_TYPES = (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR)
 
 # Selkies serves its web root with ETag/Last-Modified but NO Cache-Control, so
@@ -50,8 +60,10 @@ _WS_CLOSED_TYPES = (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgT
 _REVALIDATE_TYPES = ("text/html", "javascript", "application/json")
 
 
-def _forward_headers(headers, *, drop_host=False):
+def _forward_headers(headers, *, drop_host=False, from_upstream=False):
     skip = _HOP_BY_HOP | ({"host"} if drop_host else set())
+    if from_upstream:
+        skip = skip | _DROP_FROM_UPSTREAM
     return [(k, v) for k, v in headers.items() if k.lower() not in skip]
 
 
@@ -75,7 +87,7 @@ async def relay_http(request: web.Request, target_url: str,
             data=body, allow_redirects=False,
         ) as upstream:
             response = web.StreamResponse(status=upstream.status)
-            for k, v in _forward_headers(upstream.headers):
+            for k, v in _forward_headers(upstream.headers, from_upstream=True):
                 response.headers.add(k, v)
             if ("Cache-Control" not in response.headers
                     and any(t in response.headers.get("Content-Type", "")

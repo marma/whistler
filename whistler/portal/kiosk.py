@@ -1,0 +1,701 @@
+"""The kiosk surface: ``/kiosk`` — the whole portal, for a user who should have
+nothing else.
+
+This is Whistler's half of the "kiosk situation" (design/security.md, "Closing
+the fourth axis") rendered as a page: a login, a grid of the sessions this user
+already has, and a full-screen desktop. **No configuration** — no template
+picker, no create form, no volume or zone controls, no web terminal, no admin
+anything. A kiosk-bound user is meant to be able to reach their desktops and
+nothing more, so the surface itself has nothing more on it.
+
+Routes (registered onto the viewer app, so ``/connect``, ``/desktop`` and
+``/screenshot`` are same-origin — the session page depends on that):
+
+  GET  /kiosk                the login screen, or the session grid once known
+  POST /kiosk/login          credentials -> identity cookies -> /kiosk
+  POST /kiosk/logout         drop the cookies -> the login screen
+  GET  /kiosk/sessions       JSON the grid repaints itself from
+  GET  /kiosk/session/{id}   the desktop, full-bleed, under an idle watcher
+  GET  /kiosk/lock           lock this browser; ?next= is where unlocking
+                             returns to (see "The lock" below)
+
+The lock
+--------
+The thin client watches for inactivity itself — it is outside Selkies and
+outside this app, which is the right place for it — and navigates to
+``/kiosk/lock?next=<where it was>``. What makes that a lock rather than a
+screensaver is that the portal answers it by setting an **HttpOnly cookie**
+holding the return path, and ``lock_middleware`` then refuses *every* route on
+this app but the lock screen itself. So the live session cookie stops being
+enough: a locked browser cannot reach /kiosk/session/<id>, /desktop/<id>/,
+/screenshot/<id> or the display WebSocket, whether or not it has an address bar
+to type them into. Only a password clears the cookie, and only for the user who
+was locked — unlocking is not a login, and there is a separate Sign out for
+when the next person is someone else.
+
+The return path is read from the cookie, never from the query string of the
+request being answered, so it cannot be rewritten mid-lock; ``_safe_return``
+also refuses anything that is not a kiosk path, which is what keeps ?next= from
+being an open redirect.
+
+**In dev mode the lock is a mechanism with no secret behind it.** ``/kiosk`` and
+the lock screen share ``_verify_credentials``, so while ``WHISTLER_AUTH_ALLOW_ANY``
+is on, any password unlocks. The lock screen says so on its face rather than
+implying an assurance it cannot give.
+
+What is *not* here yet, deliberately:
+
+* **A password store.** Whistler has none — ``User`` CRs carry public keys, and
+  the portal's web auth is still the dev gate the rest of ``app.py`` describes.
+  So the form is real and ``_verify_credentials`` is the one place a real check
+  goes, but today it only answers in dev mode (``WHISTLER_AUTH_ALLOW_ANY``),
+  where any password is accepted. Outside dev mode the middleware 401s this
+  path like every other. OTP is a second factor for the same function.
+* **A screen lock driven from inside the desktop.** The lock above is entered
+  by the *client*, so it covers a person walking away from the browser. A guest
+  that locks its own X session is a different and complementary thing.
+* **Reacting to the guest's own "Log off" / "Power off".** Those are XFCE/GNOME
+  menu items; the portal only ever sees them indirectly (the stream drops, or
+  the phase leaves Ready while ``runStrategy: Always`` reboots the VM out from
+  under the user). Detecting and acting on that is its own decision and is
+  deferred. The way back to the grid today is the corner control on the session
+  page, or the idle timer.
+"""
+import asyncio
+import html
+import logging
+import os
+
+from aiohttp import web
+
+from whistler.portal.app import _USER_COOKIE
+from whistler.status import status_group
+
+logger = logging.getLogger("whistler.portal")
+
+# Marks a browser that came through the kiosk login. Identity itself rides the
+# same _USER_COOKIE the auth middleware reads, so the proxied /desktop asset and
+# WebSocket requests — which carry no ?user= — are authorized exactly as they
+# are for the ordinary viewer pages. This second cookie is what makes "logged
+# out of the kiosk" distinguishable from "has been to the portal at some point".
+KIOSK_COOKIE = "whistler_kiosk"
+
+# Set when a browser locks, cleared only by a correct password. HttpOnly and
+# holding the return path, because both facts are load-bearing: the page it
+# guards must not be able to clear it, and the place unlocking returns to must
+# not be re-supplied by whoever is asking. Its presence — not a URL parameter —
+# is what lock_middleware refuses on.
+LOCK_COOKIE = "whistler_kiosk_lock"
+
+# How long a kiosk may sit untouched. On a session page the timer returns to
+# the grid; on the grid it logs out, because a kiosk that leaves the previous
+# person's session list on screen has not really ended their visit. <=0
+# disables, matching WHISTLER_SCREENSHOT_INTERVAL's convention.
+_DEFAULT_IDLE_SECONDS = 900
+
+# One colour per user-facing state from whistler/status.py. The management UI
+# renders the same states as Fomantic label colours; the viewer app has no
+# Fomantic, so these are the hex equivalents. test_kiosk asserts this covers
+# every group, so a new state cannot silently render as "no colour".
+_STATE_COLORS = {
+    "Running":  "#21ba45",
+    "Starting": "#fbbd08",
+    "Pending":  "#2185d0",
+    "Stopping": "#f2711c",
+    "Stopped":  "#767676",
+    "Error":    "#db2828",
+}
+
+
+def _dev_auth() -> bool:
+    """Whether the portal's dev auth gate is open. Read per request, not at
+    import, so tests and a restarted process agree."""
+    return os.environ.get("WHISTLER_AUTH_ALLOW_ANY") == "true"
+
+
+def _idle_seconds() -> int:
+    try:
+        return int(os.environ.get("WHISTLER_KIOSK_IDLE_TIMEOUT",
+                                  _DEFAULT_IDLE_SECONDS))
+    except ValueError:
+        return _DEFAULT_IDLE_SECONDS
+
+
+async def _run(func, *args):
+    """Run a blocking KubeConfigManager method off the event loop (the viewer
+    app's own helper takes a request it never uses; this one doesn't)."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, func, *args)
+
+
+def _verify_credentials(user: str, password: str) -> bool:
+    """The single point where a kiosk login is accepted or refused.
+
+    There is nothing to check against yet: Whistler stores no passwords, so in
+    dev mode any password is accepted for any name, and outside it nothing is
+    (the middleware has already refused the request by then anyway). When a
+    real credential lands — a ``passwordHash`` on the User CR, or an OIDC
+    handoff — it goes here, and the OTP second factor goes here beside it.
+    Keeping the decision in one function is the point of the function."""
+    if not user:
+        return False
+    return _dev_auth()
+
+
+def _identity(request: web.Request):
+    """Who this kiosk request is, or None to show the login screen.
+
+    Deliberately *not* the middleware's answer: that falls back to a default
+    name so the viewer pages always have one, which for a login screen would
+    mean nobody is ever logged out."""
+    explicit = request.query.get("user")
+    if explicit and _dev_auth():
+        # Dev auto-forward: ?user= skips the form, matching the rest of the
+        # portal's dev identity.
+        return explicit.split("-")[0]
+    if request.cookies.get(KIOSK_COOKIE) != "1":
+        return None
+    raw = request.cookies.get(_USER_COOKIE)
+    return raw.split("-")[0] if raw else None
+
+
+# The kiosk's own paths. Everything else on this app is refused while a browser
+# is locked, so this set is the lock's blast radius and is written out rather
+# than pattern-matched.
+LOCK_PATH = "/kiosk/lock"
+_LOCK_ALLOWED = frozenset({LOCK_PATH, "/kiosk/login", "/kiosk/logout"})
+
+
+def _safe_return(path) -> str:
+    """Sanitise a ?next=. Only a kiosk path is accepted — which also disposes
+    of protocol-relative "//host" and absolute URLs, since neither can start
+    with "/kiosk" — and anything else falls back to the grid rather than being
+    refused, because a thin client sending a stale URL should still lock."""
+    if not path or not isinstance(path, str) or len(path) > 512:
+        return "/kiosk"
+    if any(c in path for c in "\r\n\\"):
+        return "/kiosk"
+    if path == "/kiosk" or path.startswith("/kiosk/"):
+        # Returning *to* the lock screen would be a loop.
+        return "/kiosk" if path.startswith(LOCK_PATH) else path
+    return "/kiosk"
+
+
+def _locked(request: web.Request):
+    """The path unlocking should return to, or None when not locked."""
+    return request.cookies.get(LOCK_COOKIE) or None
+
+
+def _lock(response: web.StreamResponse, return_to: str) -> web.StreamResponse:
+    response.set_cookie(LOCK_COOKIE, return_to, path="/", samesite="Lax",
+                        httponly=True)
+    return response
+
+
+def _unlock(response: web.StreamResponse) -> web.StreamResponse:
+    response.del_cookie(LOCK_COOKIE, path="/")
+    return response
+
+
+# _sign_in/_sign_out stamp the redirect that carries them. Both are *raised*
+# by their handlers (aiohttp deprecated returning an HTTPException), and the
+# cookies ride on the exception object itself — which is also why the auth
+# middleware's own cookie write is skipped on these paths and the kiosk sets
+# the identity cookie explicitly rather than leaning on it.
+def _sign_in(response: web.StreamResponse, user: str) -> web.StreamResponse:
+    response.set_cookie(_USER_COOKIE, user, path="/", samesite="Lax")
+    response.set_cookie(KIOSK_COOKIE, "1", path="/", samesite="Lax",
+                        httponly=True)
+    return _unlock(response)
+
+
+def _sign_out(response: web.StreamResponse) -> web.StreamResponse:
+    response.del_cookie(_USER_COOKIE, path="/")
+    response.del_cookie(KIOSK_COOKIE, path="/")
+    return _unlock(response)
+
+
+# --------------------------------------------------------------------------- #
+# Pages. Hand-rolled like the rest of the viewer app (the Jinja/Fomantic       #
+# templates belong to the management app on the other port). Placeholders are  #
+# replaced rather than .format-ed so the JS braces survive.                    #
+# --------------------------------------------------------------------------- #
+
+_BASE_CSS = """
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#1a1a1a;color:#e8e8e8;
+            font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;
+            -webkit-font-smoothing:antialiased}
+  a{color:inherit;text-decoration:none}
+  h1{font-size:1.6rem;font-weight:600;letter-spacing:.01em;margin:0}
+  .muted{color:#8a8a8a}
+"""
+
+_LOGIN_HTML = """<!doctype html><meta charset=utf-8><title>Whistler</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<link rel=icon type=image/svg+xml href=/static/favicon.svg>
+<style>__BASE_CSS__
+  body{display:flex;align-items:center;justify-content:center;padding:2rem}
+  form{width:100%;max-width:22rem;display:flex;flex-direction:column;gap:1rem}
+  h1{text-align:center;margin-bottom:.5rem}
+  label{display:flex;flex-direction:column;gap:.35rem;font-size:.82rem;
+        text-transform:uppercase;letter-spacing:.08em;color:#9a9a9a}
+  input{font:inherit;text-transform:none;letter-spacing:normal;color:#e8e8e8;
+        background:#242424;border:1px solid #383838;border-radius:6px;
+        padding:.6rem .7rem}
+  input:focus{outline:none;border-color:#4b8bd6;background:#282828}
+  button{font:inherit;font-weight:600;color:#fff;background:#2f6fb5;border:0;
+         border-radius:6px;padding:.65rem;cursor:pointer}
+  button:hover{background:#3b81cd}
+  .error{background:#3a1e1e;border:1px solid #6e2b2b;border-radius:6px;
+         padding:.55rem .7rem;font-size:.88rem;color:#f3b6b6}
+  .note{font-size:.78rem;text-align:center;margin:0}
+</style>
+<form method=post action=/kiosk/login>
+  <h1>Whistler</h1>
+  __ERROR__
+  <label>User<input name=user autocomplete=username autofocus required></label>
+  <label>Password<input name=password type=password autocomplete=current-password></label>
+  <button type=submit>Sign in</button>
+  <p class="note muted">__NOTE__</p>
+</form>"""
+
+
+def _render_login(error: str = None) -> str:
+    note = ("Development mode — any password is accepted."
+            if _dev_auth() else "")
+    err = (f"<div class=error>{html.escape(error)}</div>" if error else "")
+    return (_LOGIN_HTML
+            .replace("__BASE_CSS__", _BASE_CSS)
+            .replace("__ERROR__", err)
+            .replace("__NOTE__", html.escape(note)))
+
+
+# The lock screen. Same furniture as the login form, and deliberately a
+# different statement: it names who is locked and asks only for their password,
+# because unlocking returns a person to their own session rather than starting
+# one. Signing out is the escape hatch when the next person is someone else —
+# it is a button, not the default, so a passer-by cannot end a session by
+# guessing at the form.
+_LOCK_HTML = """<!doctype html><meta charset=utf-8><title>Locked</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<link rel=icon type=image/svg+xml href=/static/favicon.svg>
+<style>__BASE_CSS__
+  body{display:flex;align-items:center;justify-content:center;padding:2rem}
+  .box{width:100%;max-width:22rem;display:flex;flex-direction:column;gap:1rem}
+  h1{text-align:center}
+  .who{text-align:center;font-size:.95rem;margin:-.4rem 0 .2rem}
+  form{display:flex;flex-direction:column;gap:1rem;margin:0}
+  label{display:flex;flex-direction:column;gap:.35rem;font-size:.82rem;
+        text-transform:uppercase;letter-spacing:.08em;color:#9a9a9a}
+  input{font:inherit;text-transform:none;letter-spacing:normal;color:#e8e8e8;
+        background:#242424;border:1px solid #383838;border-radius:6px;
+        padding:.6rem .7rem}
+  input:focus{outline:none;border-color:#4b8bd6;background:#282828}
+  button{font:inherit;font-weight:600;color:#fff;background:#2f6fb5;border:0;
+         border-radius:6px;padding:.65rem;cursor:pointer}
+  button:hover{background:#3b81cd}
+  .signout button{background:none;border:1px solid #3a3a3a;color:#9a9a9a;
+                  font-weight:400;font-size:.82rem;width:100%}
+  .signout button:hover{color:#fff;border-color:#5a5a5a}
+  .error{background:#3a1e1e;border:1px solid #6e2b2b;border-radius:6px;
+         padding:.55rem .7rem;font-size:.88rem;color:#f3b6b6}
+  .note{font-size:.78rem;text-align:center;margin:0}
+  hr{border:0;border-top:1px solid #2c2c2c;margin:.2rem 0}
+</style>
+<div class=box>
+  <h1>Locked</h1>
+  <p class="who muted">__USER__</p>
+  __ERROR__
+  <form method=post action=/kiosk/login>
+    <label>Password<input name=password type=password autofocus
+           autocomplete=current-password></label>
+    <button type=submit>Unlock</button>
+  </form>
+  <p class="note muted">__NOTE__</p>
+  <hr>
+  <form class=signout method=post action=/kiosk/logout>
+    <button type=submit>Sign out &mdash; a different person is using this screen</button>
+  </form>
+</div>"""
+
+
+def _render_lock(user: str, error: str = None) -> str:
+    note = ("Development mode — any password unlocks."
+            if _dev_auth() else "")
+    err = (f"<div class=error>{html.escape(error)}</div>" if error else "")
+    return (_LOCK_HTML
+            .replace("__BASE_CSS__", _BASE_CSS)
+            .replace("__ERROR__", err)
+            .replace("__NOTE__", html.escape(note))
+            .replace("__USER__", html.escape(user)))
+
+
+# The grid paints itself from /kiosk/sessions and repaints on a timer, so there
+# is one renderer for the cards rather than a server-rendered copy that has to
+# agree with it. Thumbnails are (re)fetched only when a card appears or changes
+# state — /screenshot is no-store, and a poll-rate refresh would flicker for no
+# gain against a capture interval measured in minutes.
+_GRID_HTML = """<!doctype html><meta charset=utf-8><title>Whistler</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<link rel=icon type=image/svg+xml href=/static/favicon.svg>
+<style>__BASE_CSS__
+  body{display:flex;flex-direction:column}
+  header{display:flex;align-items:center;justify-content:space-between;
+         padding:1.1rem 1.6rem;flex:0 0 auto}
+  header .who{font-size:.9rem}
+  header form{margin:0}
+  header button{font:inherit;font-size:.82rem;color:#bdbdbd;background:none;
+                border:1px solid #3a3a3a;border-radius:6px;padding:.35rem .8rem;
+                cursor:pointer}
+  header button:hover{color:#fff;border-color:#5a5a5a}
+  main{flex:1 1 auto;display:flex;align-items:center;justify-content:center;
+       padding:1rem 1.6rem 3rem}
+  /* 68rem is four cards plus their gaps: the common case for a kiosk screen
+     is a handful of sessions, and wrapping 4 to 3+1 for the sake of a round
+     number reads as a mistake. */
+  #grid{display:flex;flex-wrap:wrap;gap:1.4rem;justify-content:center;
+        max-width:68rem}
+  .card{width:15.5rem;background:#242424;border:1px solid #333;border-radius:10px;
+        overflow:hidden;display:flex;flex-direction:column;cursor:pointer;
+        transition:border-color .15s,transform .15s}
+  .card:hover{border-color:#4b8bd6;transform:translateY(-2px)}
+  .shot{aspect-ratio:16/10;background:#1c1c1c;display:flex;align-items:center;
+        justify-content:center;overflow:hidden}
+  .shot img{width:100%;height:100%;object-fit:cover;display:block}
+  .shot .glyph{font-size:2.2rem;color:#3d3d3d}
+  .body{padding:.75rem .85rem .85rem;display:flex;flex-direction:column;gap:.3rem}
+  .name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tpl{font-size:.78rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .state{display:flex;align-items:center;gap:.45rem;font-size:.8rem;
+         margin-top:.15rem}
+  .dot{width:.55rem;height:.55rem;border-radius:50%;flex:0 0 auto}
+  .empty{text-align:center;line-height:1.8}
+</style>
+<header>
+  <h1>Whistler</h1>
+  <div style="display:flex;align-items:center;gap:1rem">
+    <span class="who muted">__USER__</span>
+    <form method=post action=/kiosk/logout><button type=submit>Log out</button></form>
+  </div>
+</header>
+<main><div id=grid></div></main>
+<script>
+const IDLE_MS = __IDLE_MS__, POLL_MS = 5000;
+const grid = document.getElementById('grid');
+const seen = new Map();   // name -> last rendered state
+
+function paint(sessions) {
+  if (!sessions.length) {
+    grid.innerHTML = '<p class="empty muted">No sessions available.<br>' +
+                     'Ask an administrator to set one up for you.</p>';
+    seen.clear();
+    return;
+  }
+  const names = new Set(sessions.map(s => s.name));
+  for (const [name, el] of seen) {
+    if (!names.has(name)) { el.node.remove(); seen.delete(name); }
+  }
+  for (const s of sessions) {
+    let entry = seen.get(s.name);
+    if (!entry) {
+      const node = document.createElement('a');
+      node.className = 'card';
+      node.href = '/kiosk/session/' + encodeURIComponent(s.name);
+      node.innerHTML =
+        '<div class=shot><span class=glyph>\\u25a2</span></div>' +
+        '<div class=body><span class=name></span>' +
+        '<span class="tpl muted"></span>' +
+        '<span class=state><span class=dot></span><span class=label></span></span></div>';
+      node.querySelector('.name').textContent = s.name;
+      node.querySelector('.tpl').textContent = s.template || '';
+      grid.appendChild(node);
+      entry = { node, state: null };
+      seen.set(s.name, entry);
+    }
+    if (entry.state !== s.state) {
+      entry.state = s.state;
+      entry.node.querySelector('.dot').style.background = s.color;
+      entry.node.querySelector('.label').textContent = s.state;
+      const shot = entry.node.querySelector('.shot');
+      if (s.running) {
+        const img = new Image();
+        img.onload = () => { shot.replaceChildren(img); };
+        img.src = '/screenshot/' + encodeURIComponent(s.name) + '?t=' + Date.now();
+      } else {
+        shot.replaceChildren(Object.assign(document.createElement('span'),
+                                           { className: 'glyph', textContent: '\\u25a2' }));
+      }
+    }
+  }
+  // Keep the DOM order stable and alphabetical as sessions come and go.
+  for (const s of sessions) grid.appendChild(seen.get(s.name).node);
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/kiosk/sessions', { cache: 'no-store' });
+    // 401 = signed out, 423 = locked while this page was up. Either way the
+    // answer is /kiosk, which sends a locked browser on to the lock screen.
+    if (r.status === 401 || r.status === 423) { location.replace('/kiosk'); return; }
+    if (r.ok) paint(await r.json());
+  } catch (e) {}
+}
+poll();
+setInterval(poll, POLL_MS);
+
+// Idle on the grid ends the visit: leaving the previous person's session list
+// on a kiosk screen is not an ended visit.
+if (IDLE_MS > 0) {
+  let timer;
+  const reset = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const f = document.createElement('form');
+      f.method = 'post'; f.action = '/kiosk/logout';
+      document.body.appendChild(f); f.submit();
+    }, IDLE_MS);
+  };
+  for (const e of ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart'])
+    document.addEventListener(e, reset, { capture: true, passive: true });
+  reset();
+}
+</script>"""
+
+
+def _render_grid(user: str) -> str:
+    return (_GRID_HTML
+            .replace("__BASE_CSS__", _BASE_CSS)
+            .replace("__IDLE_MS__", str(_idle_seconds() * 1000))
+            .replace("__USER__", html.escape(user)))
+
+
+# The desktop, full-bleed. It is an *iframe* rather than a navigation for one
+# reason: something has to keep watching for idleness while the desktop is on
+# screen, and a navigation to /desktop/<id>/ hands the page to the guest's own
+# Selkies client, which is not ours to instrument. The frame is same-origin
+# (both are served by this app), so a capture-phase listener on its document
+# sees every pointer and key event that reaches the canvas — including under
+# pointer lock, where the events still land on the document.
+#
+# The src is /connect/<id>, not /desktop/<id>/ directly: that page already
+# nudges the session awake, waits for Ready, and picks the websockets or vnc
+# viewer. Its own location.replace fires the frame's load event again, which is
+# why the watcher re-attaches on every load.
+_SESSION_HTML = """<!doctype html><meta charset=utf-8><title>__ID__</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<link rel=icon type=image/svg+xml href=/static/favicon.svg>
+<style>
+  html,body{margin:0;height:100%;background:#1a1a1a;overflow:hidden}
+  iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+  #back{position:absolute;bottom:.6rem;right:.6rem;z-index:10;opacity:.12;
+        font:600 .78rem/1 system-ui,sans-serif;color:#fff;text-decoration:none;
+        background:rgba(0,0,0,.65);border:1px solid rgba(255,255,255,.25);
+        border-radius:999px;padding:.45rem .85rem;cursor:pointer;
+        transition:opacity .18s}
+  #back:hover{opacity:1}
+</style>
+<iframe id=screen src="/connect/__ID__" allow="fullscreen; clipboard-read; clipboard-write"></iframe>
+<a id=back href="/kiosk">&#8592; Sessions</a>
+<script>
+const IDLE_MS = __IDLE_MS__;
+const EVENTS = ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart'];
+let timer;
+
+const reset = () => {
+  if (IDLE_MS <= 0) return;
+  clearTimeout(timer);
+  timer = setTimeout(() => location.replace('/kiosk'), IDLE_MS);
+};
+
+function watch(doc) {
+  if (!doc) return;
+  for (const e of EVENTS)
+    doc.addEventListener(e, reset, { capture: true, passive: true });
+}
+
+watch(document);
+const frame = document.getElementById('screen');
+// Same-origin, so contentDocument is readable; the try/catch is only there so a
+// deployment that ever ends up serving the viewer from another origin degrades
+// to "no idle timeout inside the desktop" instead of a dead page.
+const hook = () => { try { watch(frame.contentDocument); } catch (e) {} };
+frame.addEventListener('load', hook);
+hook();
+reset();
+</script>"""
+
+
+def _render_session(session_id: str) -> str:
+    return (_SESSION_HTML
+            .replace("__IDLE_MS__", str(_idle_seconds() * 1000))
+            .replace("__ID__", html.escape(session_id, quote=True)))
+
+
+# --------------------------------------------------------------------------- #
+# Handlers                                                                     #
+# --------------------------------------------------------------------------- #
+
+def _html(body: str, **kw) -> web.Response:
+    return web.Response(text=body, content_type="text/html", **kw)
+
+
+async def kiosk_index(request: web.Request):
+    """The login screen, or the grid. ``?user=`` in dev mode signs in and
+    redirects to the bare path so the URL a kiosk browser sits on carries no
+    identity.
+
+    A locked browser never gets here — lock_middleware sends it to the lock
+    screen first."""
+    user = _identity(request)
+    if user is None:
+        return _html(_render_login())
+    if request.query.get("user"):
+        raise _sign_in(web.HTTPSeeOther("/kiosk"), user)
+    return _html(_render_grid(user))
+
+
+async def kiosk_lock(request: web.Request):
+    """Lock this browser, and serve the lock screen.
+
+    This is the URL the thin client navigates to when it decides the person has
+    gone: ``/kiosk/lock?next=<where it was>``. The ?next= is consumed once, into
+    the cookie, and the browser is redirected to the bare path — so the parked
+    URL says nothing about which session is behind it, and a reload cannot
+    change where unlocking goes.
+
+    Locking someone who was never signed in is a no-op: there is nothing to
+    lock, and the login screen is already the strictest thing to show."""
+    user = _identity(request)
+    if user is None:
+        raise _sign_out(web.HTTPSeeOther("/kiosk"))
+    if "next" in request.query:
+        return_to = _safe_return(request.query.get("next"))
+        logger.info(f"Kiosk locked for {user} (returns to {return_to})")
+        raise _lock(web.HTTPSeeOther(LOCK_PATH), return_to)
+    if _locked(request) is None:
+        # Reached without ?next= and not already locked — lock anyway, to the
+        # grid. "Show me the lock screen" must never mean "and stay unlocked".
+        raise _lock(web.HTTPSeeOther(LOCK_PATH), "/kiosk")
+    return _html(_render_lock(user))
+
+
+async def kiosk_login(request: web.Request):
+    """Sign in, or unlock — the same password, two different contracts.
+
+    Unlocking takes the user from the lock cookie, not from the form: the point
+    of a lock is to return one specific person to their own screen, so there is
+    no username field to fill in and no way to become someone else by filling
+    it in anyway. Becoming someone else is Sign out, which is a different
+    button with a different effect."""
+    form = await request.post()
+    password = form.get("password") or ""
+    return_to = _locked(request)
+
+    if return_to is not None:
+        user = _identity(request)
+        if user is None:                     # lock outlived the identity
+            raise _sign_out(web.HTTPSeeOther("/kiosk"))
+        if not _verify_credentials(user, password):
+            logger.warning(f"Kiosk unlock refused for {user}")
+            return _html(_render_lock(user, "Wrong password."), status=401)
+        logger.info(f"Kiosk unlocked for {user}")
+        raise _unlock(web.HTTPSeeOther(return_to))
+
+    user = (form.get("user") or "").strip().split("-")[0]
+    if not _verify_credentials(user, password):
+        logger.warning(f"Kiosk login refused for {user!r}")
+        return _html(_render_login("Sign-in failed."), status=401)
+    logger.info(f"Kiosk login for {user}")
+    raise _sign_in(web.HTTPSeeOther("/kiosk"), user)
+
+
+async def kiosk_logout(request: web.Request):
+    raise _sign_out(web.HTTPSeeOther("/kiosk"))
+
+
+def _session_view(session: dict) -> dict:
+    """One card. ``state`` is the shared user-facing state (whistler/status.py),
+    so the kiosk and the management dashboard cannot disagree about what
+    "Running" means."""
+    state = status_group(session.get("phase"))
+    return {
+        "name": session["name"],
+        "template": session.get("template"),
+        "state": state,
+        "running": state == "Running",
+        "color": _STATE_COLORS[state],
+    }
+
+
+async def kiosk_sessions(request: web.Request):
+    """The grid's data. Desktop-mode sessions only: a card's whole purpose is
+    to open a desktop, and an ssh-mode session has none — offering one here
+    would mean offering a web terminal, which is exactly the surface a
+    kiosk-bound user is not supposed to have."""
+    user = _identity(request)
+    if user is None:
+        return web.json_response({"error": "not signed in"}, status=401)
+    sessions = await _run(request.app["cm"].get_user_desktop_sessions, user)
+    return web.json_response(
+        sorted((_session_view(s) for s in sessions), key=lambda s: s["name"]),
+        headers={"Cache-Control": "no-store"})
+
+
+async def kiosk_session(request: web.Request):
+    """The desktop page. Resolves the name against this user's own sessions
+    first: an unknown name must be a 404 here rather than a frame pointed at
+    /connect, which would leave the user staring at a page that polls forever."""
+    user = _identity(request)
+    if user is None:
+        raise web.HTTPSeeOther("/kiosk")
+    name = request.match_info["id"]
+    sessions = await _run(request.app["cm"].get_user_desktop_sessions, user)
+    if not any(s.get("name") == name for s in sessions):
+        return web.Response(status=404, text="unknown session")
+    return _html(_render_session(name))
+
+
+@web.middleware
+async def lock_middleware(request: web.Request, handler):
+    """What turns the lock screen into a lock.
+
+    A locked browser still holds a perfectly good identity cookie, so nothing
+    in the handlers below would stop it reaching a desktop — /kiosk/session,
+    /connect, /desktop/<id>/, the display WebSocket, /screenshot. This refuses
+    all of it at the door on the *presence of the lock cookie*, which the
+    locked page cannot clear (HttpOnly) and no URL can express. Only the
+    password clears it.
+
+    Static assets and /healthz are exempt: the lock screen is made of the
+    former, and the latter is the kubelet's, not a user's."""
+    if _locked(request) is None:
+        return await handler(request)
+    path = request.path
+    if path in _LOCK_ALLOWED or path == "/healthz" or path.startswith("/static/"):
+        return await handler(request)
+    # A navigation is sent to the screen the person is actually looking at;
+    # everything else — fetch, the display WebSocket, an <img> — gets a status
+    # it can act on, since redirecting those to an HTML page just produces a
+    # confusing parse error at the other end. Sec-Fetch-Mode is the browser's
+    # own answer to "is this a navigation"; Accept is the fallback for clients
+    # that do not send it.
+    if (request.headers.get("Sec-Fetch-Mode") == "navigate"
+            or "text/html" in request.headers.get("Accept", "")):
+        raise web.HTTPSeeOther(LOCK_PATH)
+    return web.Response(status=423, text="kiosk is locked")
+
+
+def add_routes(app: web.Application) -> None:
+    """Register the kiosk onto the viewer app. Same app, and therefore the same
+    origin as /connect, /desktop, /vnc and /screenshot — which the session page
+    and the card thumbnails both depend on, and which is also what puts them all
+    behind one lock."""
+    app.add_routes([
+        web.get("/kiosk", kiosk_index),
+        web.get(LOCK_PATH, kiosk_lock),
+        web.post("/kiosk/login", kiosk_login),
+        web.post("/kiosk/logout", kiosk_logout),
+        web.get("/kiosk/sessions", kiosk_sessions),
+        web.get("/kiosk/session/{id}", kiosk_session),
+    ])
