@@ -272,10 +272,30 @@ Two smaller facts follow from where it is built:
   passwords (`User` CRs carry public keys), so `_verify_credentials` accepts
   any password while the portal's dev auth gate is open and nothing otherwise —
   the same "SSO/OIDC is a follow-up" position the rest of the portal holds.
-  That one function is where a real credential, and the OTP beside it, lands.
-  **The unlock shares it**, so in dev the lock is a working mechanism with no
-  secret behind it. The lock screen says so on its face; it must not be
-  described as protecting an unattended session until that function does.
+  That one function is where a real credential lands. **The unlock shares it**,
+  so in dev the lock is a working mechanism with no secret behind it. The lock
+  screen says so on its face; it must not be described as protecting an
+  unattended session until that function does.
+- **A second factor is drawn in, at the right point in the flow, and mocked.**
+  `/kiosk/otp` stands between the password and the identity cookie, so the
+  password alone yields a pending name and no access. The algorithm under it is
+  real and standard — RFC 6238 in the standard library, a scannable
+  `otpauth://` QR any authenticator app reads, so no app is privileged — which makes the honest
+  claim a narrow one: the *algorithm* is settled, and the parts that would make
+  it a control are not. The enrolment secret lives in a process-local dict
+  rather than a Secret; no counter is recorded, so a code is replayable inside
+  its 30-second step; the pending cookie is a client-supplied username rather
+  than a signed token; and there is no rate limit on a six-digit field. Each is
+  named in `whistler/portal/kiosk.py`. The QR is genuine — `segno` encodes the
+  provisioning URI and it is inlined into the page rather than given a URL of
+  its own, because that image is the shared secret; every kiosk page is
+  `no-store` for the same reason. So a phone really does enrol here, which is
+  worth stating precisely because it makes the screen feel more finished than
+  the store behind it is. Until
+  the store and the rate limit exist this is a screen that shows the intended
+  flow, not a second factor — and specifically not a mitigation for the missing
+  entry-point binding above, which is an authorisation question that a stronger
+  login does not answer.
 - The card thumbnails are `/screenshot/<id>`, so a kiosk shows exactly what the
   `screenshots` channel already permits — including nothing, if it was never
   granted. Nothing new leaves the zone for the kiosk's sake.
@@ -352,8 +372,11 @@ timer, keeps a PNG in memory and serves it at `/screenshot/<id>` at full
 stored resolution. That is a data path *out of a restricted zone, created by
 Whistler itself*, and it survives disabling SSH, the terminal and the
 clipboard. It is documented as monitoring, which it is; it is also egress,
-which had not been priced in. `WHISTLER_SCREENSHOT_WIDTH` is currently the
-only dial and it is global — a per-zone setting is what this model needs, and
+which had not been priced in, and the default box is now 960x540 — half a
+1080p desktop, where window titles and UI text are readable —
+so the egress is of legible pixels, not of a blur.
+`WHISTLER_SCREENSHOT_WIDTH`/`_HEIGHT` are currently the only dial and it is
+global — a per-zone setting is what this model needs, and
 a zone that means what it says probably wants them off entirely.
 
 **Shape of the setting.** A zone carries a channel **ceiling** — the most any

@@ -61,6 +61,9 @@ spec:
               value: {{ .Values.whistler.storageGateway.resources | toJson | quote }}
             - name: WHISTLER_HOME_DISK_SIZE
               value: {{ .Values.whistler.homeDisk.size | quote }}
+            # "" disables hugepages for VM guest RAM (whistler.hugePages).
+            - name: WHISTLER_VM_HUGE_PAGE_SIZE
+              value: {{ .Values.whistler.hugePages.pageSize | quote }}
             - name: WHISTLER_S3_PROXY_IMAGE
               value: {{ .Values.whistler.s3Proxy.image | quote }}
             - name: WHISTLER_S3_PROXY_RESOURCES

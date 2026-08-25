@@ -74,6 +74,18 @@ spec:
                       type: string
                     gpu:
                       type: string
+                    hugePageSize:
+                      type: string
+                      description: >-
+                        VM-only. Page size backing this guest's RAM
+                        (domain.memory.hugepages.pageSize), overriding the
+                        cluster default (whistler.hugePages.pageSize, 1Gi).
+                        Hugepages are what keep VFIO's DMA pinning of a large
+                        GPU guest inside virt-handler's 20s SyncVMI deadline.
+                        Only 2Mi and 1Gi exist on x86_64, `memory` must be a
+                        multiple of it, and the node must have that many pages
+                        reserved or the VM never schedules. Set to "" to opt
+                        this template out and run it on 4KiB pages.
                 nodeSelector:
                   type: object
                   additionalProperties:

@@ -72,6 +72,28 @@ portal:
       requests:
         cpu: 100m
         memory: 64Mi
+    # A real Kubernetes Ingress object (networking.k8s.io/v1) on the cluster's
+    # own ingress controller — the other half of the story from `enabled`
+    # above, which only ships the bundled Traefik pod. Needs an ingress
+    # controller in the cluster (k3s/k3d ship Traefik as the default class).
+    #
+    # Backend: the bundled proxy service when `enabled` is true (it already
+    # owns the viewer/mgmt path split), otherwise the viewer service — a
+    # cluster Ingress cannot reproduce that path table without duplicating it.
+    #
+    # The controller's own listener is the port users hit: 80 (and 443 with
+    # tls below). Nothing here changes that; `service.port` above is only the
+    # bundled proxy's ClusterIP port.
+    resource:
+      enabled: false
+      # Empty uses the cluster's default IngressClass.
+      className: ""
+      host: whistler.martinmalmsten.net
+      path: /
+      pathType: Prefix
+      annotations: {}
+      # e.g. [{secretName: whistler-tls, hosts: [whistler.martinmalmsten.net]}]
+      tls: []
   logLevel: INFO
   auth:
     # Minimal/dev only this round. When false the portal returns 401 (real web
@@ -87,14 +109,19 @@ portal:
   # the session or the portal goes away. Shown on the dashboard's session rows.
   #
   # This is monitoring. Be deliberate about which kind you are enabling:
-  # maxWidth is the whole policy, because whatever is stored is retrievable at
-  # full stored resolution from /screenshot/<id> — the size the dashboard
-  # *displays* it at is not a boundary.
+  # maxWidth/maxHeight are the whole policy, because whatever is stored is
+  # retrievable at full stored resolution from /screenshot/<id> — the size the
+  # dashboard *displays* it at is not a boundary. The grab is always full
+  # resolution and the portal scales it properly (area reduce + cubic + a
+  # slight unsharp pass), so the box below is what a viewer actually gets.
   #
-  #   ~320 (default)  activity overview. A 1920px desktop downscaled 6x: you
+  #   ~320x180        activity overview. A 1920px desktop downscaled 6x: you
   #                   can see a session is in use, and roughly what kind of
   #                   window is open. Body text does not survive.
-  #   ~640            window titles and large text start to become readable.
+  #   960x540         the default. Half of a 1080p desktop: window titles,
+  #                   menus and most UI text are readable; editor body text
+  #                   mostly is not. Legible enough to be worth looking at,
+  #                   which is exactly why it is a policy choice.
   #   >=1280          readable monitoring of what the user is doing.
   #
   # intervalSeconds: 0 turns capture off entirely. Note that this does not make
@@ -108,7 +135,8 @@ portal:
   # or each replica will grab every session and serve only its own captures.
   screenshots:
     intervalSeconds: 300
-    maxWidth: 320
+    maxWidth: 960
+    maxHeight: 540
   # The kiosk surface (/kiosk, whistler/portal/kiosk.py): a login, the user's
   # own desktops as cards, and a full-screen desktop — no templates, no launch
   # form, no terminal, no admin. This is Whistler's half of the "kiosk
@@ -352,6 +380,36 @@ whistler:
   # default every VM gets.
   homeDisk:
     size: 20Gi
+
+  # Hugepages backing VM guest RAM (KubeVirt domain.memory.hugepages).
+  #
+  # This is a startup-latency setting. VFIO DMA-pins the entire guest address
+  # space when a GPU is attached: at 4KiB pages a 32GiB guest is 8.4M pages,
+  # measured at 19.75s on one host — against virt-handler's compile-time 20s
+  # SyncVMI deadline, which is not exposed on the KubeVirt CR and cannot be
+  # raised. Over it, virt-handler signals deletion while qemu keeps running,
+  # so the guest boots fine inside a virt-launcher pod stuck at 2/3 forever
+  # and the session's Service has no endpoints. 1Gi pages make that guest 32
+  # pages instead.
+  #
+  # Applies to EVERY VM, not just GPU ones; a template opts out or picks
+  # another size with `resources.hugePageSize`.
+  #
+  # PREREQUISITE: hugepages are reserved on the node, never allocated on
+  # demand, and are not overcommittable. A node with none pends every VM on
+  # `Insufficient hugepages-1Gi`. Reserve them on the kernel command line
+  # (`default_hugepagesz=1G hugepagesz=1G hugepages=<count>`) or at runtime
+  # into /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages followed by
+  # a kubelet restart; scripts/metal_k3s_create.sh reports what a node has. A
+  # template's `memory` must be a multiple of the page size (KubeVirt's
+  # webhook rejects the rest; Whistler checks first so the error names the
+  # template).
+  #
+  # Only 2Mi and 1Gi exist on x86_64 — libvirt takes this value verbatim, so
+  # any other size is a VM that never schedules. Set to "" to disable
+  # hugepages cluster-wide.
+  hugePages:
+    pageSize: 1Gi
 
   # Per-user NFS storage gateway (built from images/storage-gateway).
   #

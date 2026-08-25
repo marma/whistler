@@ -2,7 +2,9 @@
 
 Pure manifest assertions (no cluster); the e2e path is exercised by
 tests/integration/test_vm.py on clusters that have KubeVirt installed."""
-from whistler.config import KubeConfigManager
+import pytest
+
+from whistler.config import KubeConfigManager, PolicyError
 
 
 # What get_gpu_catalog would derive from a single-4090 passthrough cluster
@@ -11,18 +13,23 @@ GPU_CATALOG = [{"name": "NVIDIA-GeForce-RTX-4090", "count": 1,
                 "vmResource": "nvidia.com/AD102_GEFORCE_RTX_4090"}]
 
 
-def _manager(catalog=GPU_CATALOG):
+def _manager(catalog=GPU_CATALOG, huge_page_size=None):
     cm = KubeConfigManager.__new__(KubeConfigManager)
     cm.group = "whistler.martinmalmsten.net"
     cm.version = "v1"
     cm.zones = {"default": {}}
     cm.get_gpu_catalog = lambda: catalog
+    # Left None the class default (DEFAULT_HUGE_PAGE_SIZE) stands, which is
+    # what a cluster running the chart's whistler.hugePages.pageSize has.
+    if huge_page_size is not None:
+        cm.huge_page_size = huge_page_size
     return cm
 
 
 def _build_both(**overrides):
     """(vm manifest, companion cloud-init Secret manifest)."""
-    cm = _manager(overrides.pop("_catalog", GPU_CATALOG))
+    cm = _manager(overrides.pop("_catalog", GPU_CATALOG),
+                  overrides.pop("_huge_page_size", None))
     args = dict(
         session_name="alice-desk",
         hostname="desk",
@@ -231,6 +238,66 @@ def test_inline_cpu_memory_when_no_instancetype():
     assert "instancetype" not in vm["spec"]
 
 
+# --- hugepages ----------------------------------------------------------------
+# Guest RAM on hugepages is what keeps VFIO's DMA pinning of a large GPU guest
+# inside virt-handler's 20s SyncVMI deadline (see DEFAULT_HUGE_PAGE_SIZE). It
+# is on for every VM, so the interesting cases are the ways it must NOT be
+# emitted — each one is a VM that would never schedule or never be admitted.
+
+def _domain(**overrides):
+    return _build(**overrides)["spec"]["template"]["spec"]["domain"]
+
+
+def test_guest_memory_is_backed_by_hugepages_by_default():
+    domain = _domain(template_spec={"image": "x", "resources": {"memory": "8Gi"}})
+    assert domain["memory"] == {"hugepages": {"pageSize": "1Gi"}}
+
+
+def test_template_may_pick_another_page_size():
+    domain = _domain(template_spec={"image": "x", "resources": {
+        "memory": "8Gi", "hugePageSize": "2Mi"}})
+    assert domain["memory"] == {"hugepages": {"pageSize": "2Mi"}}
+
+
+def test_template_opts_out_with_an_empty_page_size():
+    # Empty is a value, not a missing key: this template runs on 4KiB pages on
+    # a node with no reservation, while the rest of the cluster uses hugepages.
+    domain = _domain(template_spec={"image": "x", "resources": {
+        "memory": "8Gi", "hugePageSize": ""}})
+    assert "memory" not in domain
+
+
+def test_cluster_default_off_leaves_every_guest_on_4k_pages():
+    domain = _domain(_huge_page_size="",
+                     template_spec={"image": "x", "resources": {"memory": "8Gi"}})
+    assert "memory" not in domain
+
+
+def test_no_memory_request_means_no_hugepages():
+    # KubeVirt's webhook rejects hugepages with nothing to size them against.
+    domain = _domain(template_spec={"image": "x", "resources": {"cpu": "4"}})
+    assert "memory" not in domain
+
+
+def test_instancetype_owns_memory_including_hugepages():
+    # The instancetype applier conflicts on domain.memory exactly as it does
+    # on domain.cpu/domain.resources.
+    domain = _domain(instancetype="u1.medium",
+                     template_spec={"image": "x", "resources": {"memory": "8Gi"}})
+    assert "memory" not in domain
+
+
+def test_memory_that_is_not_a_multiple_of_the_page_size_fails_closed():
+    # KubeVirt would reject this at VM creation, far from the template that
+    # caused it; failing here names the field to change.
+    with pytest.raises(PolicyError) as e:
+        _build(template_spec={"image": "x", "resources": {"memory": "1536Mi"}})
+    assert "hugePageSize" in str(e.value)
+    # ... and a guest smaller than one page is the same mistake.
+    with pytest.raises(PolicyError):
+        _build(template_spec={"image": "x", "resources": {"memory": "512Mi"}})
+
+
 def test_gpu_devices_present_only_when_requested():
     # deviceName is the catalog's per-type passthrough resource, not the
     # pod-mode nvidia.com/gpu (a vfio-bound card advertises 0 of those).
@@ -367,6 +434,17 @@ def test_patch_nulls_resources_when_switching_to_instancetype():
     assert patch["instancetype"] == {"name": "u1.medium"}
     domain = patch["template"]["spec"]["domain"]
     assert domain["cpu"] is None and domain["resources"] is None
+    # domain.memory conflicts with an instancetype the same way, and a merge
+    # patch never removes what it doesn't mention.
+    assert domain["memory"] is None
+
+
+def test_patch_nulls_hugepages_when_a_template_opts_out():
+    current = _build(template_spec={"image": "x",
+                                    "resources": {"memory": "8Gi"}})["spec"]
+    patch = _patch(current, template_spec={"image": "x", "resources": {
+        "memory": "8Gi", "hugePageSize": ""}})
+    assert patch["template"]["spec"]["domain"]["memory"] is None
 
 
 def test_patch_leaves_root_disk_import_alone():

@@ -137,6 +137,27 @@ KUBEVIRT_VERSION = "v1"
 KUBEVIRT_VM_PLURAL = "virtualmachines"
 KUBEVIRT_VMI_PLURAL = "virtualmachineinstances"
 
+# Page size backing a VM's guest RAM (domain.memory.hugepages.pageSize).
+#
+# This is a startup-latency setting, not a tuning knob. VFIO DMA-pins the
+# whole guest address space when the GPU is attached, and with 4 KiB pages a
+# 32 GiB guest is 8.4M pages to pin — measured at 19.75 s on wkstn, against
+# virt-handler's *compile-time* 20 s SyncVMI deadline. Blowing that deadline
+# does not fail cleanly: virt-handler signals deletion and unmounts the
+# containerDisk while qemu keeps running, leaving a virt-launcher pod stuck at
+# 2/3 with a healthy guest inside and no Service endpoints (so ssh and the
+# portal proxy die while the VNC console still works). 1 GiB pages make that
+# same guest 32 pages.
+#
+# Only 2Mi and 1Gi exist on x86_64 (/sys/kernel/mm/hugepages); libvirt takes
+# the value verbatim, so anything else is a VM that never schedules.
+#
+# Hugepages are NOT overcommittable and NOT allocated on demand: the node must
+# reserve them up front (kernel hugepagesz=/hugepages=, or nr_hugepages plus a
+# kubelet restart), and a VM whose node has none pends forever on Insufficient
+# hugepages-1Gi. Setting the chart's pageSize to "" turns the whole thing off.
+DEFAULT_HUGE_PAGE_SIZE = "1Gi"
+
 # Optional fields of a VirtualMachine spec that _build_vm_spec owns and may
 # stop emitting between builds (drop a GPU, move to an instancetype, leave a
 # DNS-forcing zone). A JSON merge patch never removes what it doesn't mention,
@@ -149,6 +170,7 @@ _VM_MANAGED_FIELDS = (
     ("template", "spec", "dnsConfig"),
     ("template", "spec", "domain", "cpu"),
     ("template", "spec", "domain", "resources"),
+    ("template", "spec", "domain", "memory"),
     ("template", "spec", "domain", "devices", "gpus"),
 )
 
@@ -865,6 +887,10 @@ class KubeConfigManager(ConfigManager):
     datasets: Optional[Dict[str, Dict[str, Any]]] = None
     _warned_no_dataset_crd: bool = False
     _warned_no_home_volume_crd: bool = False
+    # Default hugepage size for VM guest RAM; __init__ overrides it from the
+    # environment. Class-level for the same reason `groups` is — the pure
+    # builders are unit-tested on an instance made with __new__.
+    huge_page_size: str = DEFAULT_HUGE_PAGE_SIZE
 
     def __init__(self, kubeconfig: str = None):
         try:
@@ -973,6 +999,20 @@ class KubeConfigManager(ConfigManager):
         # it per-session with `homeDiskSize`; this is the floor every VM gets.
         self.home_disk_size = os.environ.get(
             "WHISTLER_HOME_DISK_SIZE", "20Gi")
+        # Hugepage size backing VM guest RAM (see DEFAULT_HUGE_PAGE_SIZE). A
+        # template may pick another size — or opt out — with
+        # `resources.hugePageSize`; empty here disables it everywhere.
+        self.huge_page_size = os.environ.get(
+            "WHISTLER_VM_HUGE_PAGE_SIZE", DEFAULT_HUGE_PAGE_SIZE).strip()
+        # A size no node provides is not an error we can raise here (nothing
+        # is scheduled yet) and not one KubeVirt catches either — the VM is
+        # admitted and then pends on Insufficient hugepages-<size> forever. So
+        # say it once, at startup, where it is still cheap to fix.
+        if self.huge_page_size and self.huge_page_size not in ("2Mi", "1Gi"):
+            logger.warning(
+                f"VM hugepage size {self.huge_page_size!r} is not one x86_64 "
+                f"provides (2Mi, 1Gi); VMs will pend unless these nodes are "
+                f"arm64 with that size available")
         # S3 dataset proxies (design/storage.md).
         self.s3_proxy_image = os.environ.get(
             "WHISTLER_S3_PROXY_IMAGE", "rclone/rclone:latest")
@@ -1588,6 +1628,43 @@ class KubeConfigManager(ConfigManager):
             f"multiple VM GPU types available "
             f"({[e['name'] for e in vm_capable]}); the template must pin one "
             f"via its gpuType")
+
+    def _vm_huge_page_size(self, resources: Dict[str, Any]) -> Optional[str]:
+        """Resolve the hugepage size backing this VM's guest RAM, or None to
+        leave it on 4 KiB pages. Pure (reads only self.huge_page_size).
+
+        The template's ``resources.hugePageSize`` wins over the cluster
+        default, and an explicit empty string is how a template opts out —
+        which is why `in` decides here rather than truthiness.
+
+        A guest with no memory request has nothing to back, so it gets no
+        hugepages: KubeVirt's admission webhook rejects that pairing, and it
+        would be rejected at VM *creation*, far from the template that caused
+        it. The multiple-of-page-size rule below is that same webhook's, moved
+        forward to where the message can name the field to change."""
+        size = (resources['hugePageSize'] if 'hugePageSize' in resources
+                else self.huge_page_size)
+        size = (size or "").strip()
+        if not size:
+            return None
+        memory = resources.get('memory')
+        if not memory:
+            return None
+        try:
+            page_bytes = int(parse_quantity(size))
+            memory_bytes = int(parse_quantity(memory))
+        except (ValueError, TypeError) as e:
+            raise PolicyError(
+                f"cannot size hugepages for this template: {e} "
+                f"(memory={memory!r}, hugePageSize={size!r})")
+        if page_bytes <= 0:
+            raise PolicyError(f"invalid hugePageSize {size!r}")
+        if memory_bytes < page_bytes or memory_bytes % page_bytes:
+            raise PolicyError(
+                f"template memory {memory} is not a multiple of the "
+                f"{size} hugepage size; round the memory, or set "
+                f"resources.hugePageSize (\"\" opts out of hugepages)")
+        return size
 
     def _load_volumes(self):
         try:
@@ -2920,6 +2997,8 @@ class KubeConfigManager(ConfigManager):
 
         # instancetype supplies cpu/memory; KubeVirt rejects setting both it and
         # domain.cpu/domain.resources, so they are mutually exclusive here.
+        # domain.memory goes the same way — the instancetype applier conflicts
+        # on it, and an instancetype carries its own memory.hugepages.
         if instancetype:
             vm_spec["instancetype"] = {"name": instancetype}
         else:
@@ -2927,6 +3006,12 @@ class KubeConfigManager(ConfigManager):
                 domain["cpu"] = {"cores": int(resources['cpu'])}
             if 'memory' in resources:
                 domain["resources"] = {"requests": {"memory": resources['memory']}}
+            # Guest RAM on hugepages (see DEFAULT_HUGE_PAGE_SIZE): this is
+            # what keeps a GPU VM's DMA pinning inside virt-handler's 20s
+            # SyncVMI deadline. The node must have them reserved.
+            huge_page_size = self._vm_huge_page_size(resources)
+            if huge_page_size:
+                domain["memory"] = {"hugepages": {"pageSize": huge_page_size}}
 
         vm_body = {
             "apiVersion": f"{KUBEVIRT_GROUP}/{KUBEVIRT_VERSION}",
@@ -5830,7 +5915,19 @@ class KubeConfigManager(ConfigManager):
                 existing = self.api.get_namespaced_custom_object(
                     self.group, self.version, self.namespace, TEMPLATE_PLURAL, name
                 )
-                merged = {**(existing.get("spec") or {}), **spec}
+                existing_spec = existing.get("spec") or {}
+                # The merge is top-level, so an incoming `resources` replaces
+                # the whole map. The admin form has no hugePageSize field
+                # (it is a YAML-level opt-out — see whistler.hugePages), and
+                # losing it on an unrelated edit would silently move a VM back
+                # onto 4KiB pages, which is a boot that may miss KubeVirt's
+                # SyncVMI deadline rather than a visible change.
+                if "resources" in spec:
+                    old_size = (existing_spec.get("resources") or {}).get("hugePageSize")
+                    if old_size is not None and "hugePageSize" not in spec["resources"]:
+                        spec["resources"] = {**spec["resources"],
+                                             "hugePageSize": old_size}
+                merged = {**existing_spec, **spec}
                 body = {
                     "apiVersion": f"{self.group}/{self.version}",
                     "kind": "Template",

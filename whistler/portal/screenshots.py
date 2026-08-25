@@ -10,11 +10,14 @@ session nothing when nobody is looking.
 
 Grab side, both runtimes, one command: ``xwd -root`` piped through ``gzip``.
 ``xwd`` (from **x11-apps**) is the one X grabber that needs no image encoder in
-the session — it dumps the raw framebuffer, and the portal does the downscale
-and PNG encode with nothing but the stdlib (``xwd_to_rgb`` / ``encode_png``
-below). That keeps the streamer sidecar and the VM guests at one extra apt
-package instead of imagemagick/ffmpeg, and puts the per-shot CPU on the idle
-portal rather than in the user's session.
+the session — it dumps the raw framebuffer at full resolution, and the portal
+does the resampling and PNG encode with nothing but the stdlib (``xwd_to_rgb``
+/ ``resize_rgb`` / ``sharpen_rgb`` / ``encode_png`` below). That keeps the
+streamer sidecar and the VM guests at one extra apt package instead of
+imagemagick/ffmpeg, and puts the per-shot CPU on the idle portal rather than in
+the user's session — which is also what makes it affordable to scale properly
+(box reduce, then a Catmull-Rom cubic, then a small unsharp pass) instead of
+throwing pixels away.
 
   * **pods** — ``kubectl exec -c streamer``: the sidecar owns Xvfb (the
     workload container shares the socket but need not carry the tool).
@@ -33,16 +36,19 @@ every session) and answer /screenshot from their own store. See
 
 ## This is monitoring — and it is not the only monitoring here
 
-Say it plainly: a periodic capture of a user's screen is surveillance, and
-``max_width`` is the only thing deciding which kind. At the 320px default a
-1920px desktop is downscaled 6x — window shapes, colours and layout survive,
-body text does not. That is an *activity overview*: you can see a session is
-being used, not what is being done in it. Raise it toward the native width and
-the same mechanism becomes readable monitoring. The setting is the policy, so
-it is documented as such rather than buried as a rendering detail. **The stored
-width is the boundary, not the CSS the dashboard displays it at** — anything
-this module holds is retrievable at full stored resolution from
-``/screenshot/<id>``.
+Say it plainly: a periodic capture of a user's screen is surveillance, and the
+stored size is the only thing deciding which kind. The default box is
+**960x540**, which puts a 1080p desktop at exactly half scale: window titles,
+menu entries and most UI text are readable, editor body text mostly is not.
+That is a deliberate step up from the 320px *activity overview* this shipped
+with first — at 6x down you could see a session was in use and nothing more —
+and it was taken because the overview was, in practice, too coarse to be worth
+looking at. Set ``WHISTLER_SCREENSHOT_WIDTH``/``_HEIGHT`` back down to get that
+posture, or toward the native resolution to get full readable monitoring.
+The setting is the policy, so it is documented as such rather than buried as a
+rendering detail. **The stored size is the boundary, not the CSS the dashboard
+displays it at** — anything this module holds is retrievable at full stored
+resolution from ``/screenshot/<id>``.
 
 Nor is this the first such capability in the stack, only the first one whistler
 actually uses. Selkies is multi-client by design: one capture pipeline
@@ -77,10 +83,16 @@ from whistler.config import CHANNEL_SCREENSHOTS
 logger = logging.getLogger("whistler.portal")
 
 DEFAULT_INTERVAL_SECONDS = 300
-# 320px is an activity overview, not a readable screen (see the module
-# docstring): it is the privacy posture, deliberately the default, and the
-# knob that turns this into real monitoring when raised.
-DEFAULT_MAX_WIDTH = 320
+# The stored size is the privacy posture, not a rendering detail (see the
+# module docstring). 960x540 is a legible half-scale view of a 1080p desktop:
+# window titles, menus and most UI text survive it. That is a deliberate step
+# up from the 320px activity overview this used to default to, and it is the
+# knob to turn back down for a deployment that only wants "in use or not".
+DEFAULT_MAX_WIDTH = 960
+DEFAULT_MAX_HEIGHT = 540
+# Unsharp amount applied after the downscale. Small on purpose: enough to give
+# text and window edges their contrast back, not enough to ring.
+DEFAULT_SHARPEN = 0.35
 DEFAULT_DISPLAY = ":0"
 # The streamer sidecar owns Xvfb in a desktop pod (see _build_pod_spec); the
 # workload container is "main" and is deliberately left without the grab tool.
@@ -157,15 +169,40 @@ def _scale8(value: int, bits: int) -> int:
     return value * 255 // ((1 << bits) - 1)
 
 
-def xwd_to_rgb(blob: bytes, max_width: int = DEFAULT_MAX_WIDTH) -> tuple[int, int, bytes]:
-    """Decode an ``xwd`` dump to ``(width, height, packed RGB)``, subsampling to
-    at most ``max_width`` on the way.
+def _fast_channel_offsets(bits_per_pixel: int, byte_order: int,
+                          masks: tuple[int, int, int]) -> tuple[int, int, int] | None:
+    """Byte index of R, G, B inside one pixel — or None if the visual does not
+    put each channel in a whole byte of its own.
 
-    Downscaling happens *during* decode, not after: at an integer pixel step we
-    only ever touch the pixels that survive, so a 4K desktop costs a 640-wide
-    thumbnail's worth of work rather than 8M per-pixel iterations. Nearest
-    neighbour is visibly coarse on text at large ratios, which is the right
-    trade for a thumbnail nobody reads.
+    This is the shape ``xwd -root`` produces on every desktop we run (depth 24
+    in 24 or 32 bits per pixel), and it is what lets the decoder below copy
+    channels with slice assignment instead of unpacking two million pixels in
+    Python. The generic path still handles anything else."""
+    if bits_per_pixel not in (24, 32):
+        return None
+    stride = bits_per_pixel // 8
+    offsets = []
+    for mask in masks:
+        shift, bits = _mask_channel(mask)
+        if bits != 8 or shift % 8 or shift // 8 >= stride:
+            return None
+        index = shift // 8
+        offsets.append(index if byte_order == 0 else stride - 1 - index)
+    return tuple(offsets)
+
+
+def xwd_to_rgb(blob: bytes) -> tuple[int, int, bytes]:
+    """Decode an ``xwd`` dump to ``(width, height, packed RGB)`` at the
+    display's **full resolution**.
+
+    Decoding used to subsample: taking every n-th pixel on the way out made a
+    4K grab cost a thumbnail's worth of work instead of 8M iterations. It also
+    made the thumbnails bad in the specific way nearest neighbour is bad —
+    at a 6x ratio text becomes speckle, one-pixel window chrome appears and
+    disappears between passes, and a scrollbar is there or not depending on
+    where the grid landed. Scaling is now its own step over every pixel
+    (``resize_rgb``), which is why this function has a fast path for the pixel
+    format the sessions actually produce.
     """
     fields = _xwd_header(blob)
     header_size, pixmap_format = fields[0], fields[2]
@@ -188,27 +225,244 @@ def xwd_to_rgb(blob: bytes, max_width: int = DEFAULT_MAX_WIDTH) -> tuple[int, in
     if len(blob) < needed:
         raise ScreenshotError(f"xwd dump truncated: {len(blob)} < {needed} bytes")
 
-    step = max(1, -(-width // max_width)) if max_width > 0 else 1
-    out_w, out_h = -(-width // step), -(-height // step)
-
     endian = "little" if byte_order == 0 else "big"
     stride = bits_per_pixel // 8
+    out_stride = width * 3
+    rgb = bytearray(out_stride * height)
+
+    fast = _fast_channel_offsets(bits_per_pixel, byte_order,
+                                 (red_mask, green_mask, blue_mask))
+    if fast:
+        r_at, g_at, b_at = fast
+        line = bytearray(out_stride)
+        for y in range(height):
+            base = offset + y * bytes_per_line
+            row = blob[base:base + width * stride]
+            # Three strided copies per row, all in C: pull each channel out of
+            # the pixels and drop it straight into its lane of the RGB line.
+            line[0::3] = row[r_at::stride]
+            line[1::3] = row[g_at::stride]
+            line[2::3] = row[b_at::stride]
+            rgb[y * out_stride:(y + 1) * out_stride] = line
+        return width, height, bytes(rgb)
+
     r_shift, r_bits = _mask_channel(red_mask)
     g_shift, g_bits = _mask_channel(green_mask)
     b_shift, b_bits = _mask_channel(blue_mask)
-
-    rgb = bytearray(out_w * out_h * 3)
     i = 0
-    for y in range(0, height, step):
+    for y in range(height):
         base = offset + y * bytes_per_line
-        for x in range(0, width, step):
+        for x in range(width):
             start = base + x * stride
             pixel = int.from_bytes(blob[start:start + stride], endian)
             rgb[i] = _scale8((pixel & red_mask) >> r_shift, r_bits)
             rgb[i + 1] = _scale8((pixel & green_mask) >> g_shift, g_bits)
             rgb[i + 2] = _scale8((pixel & blue_mask) >> b_shift, b_bits)
             i += 3
-    return out_w, out_h, bytes(rgb)
+    return width, height, bytes(rgb)
+
+
+# --------------------------------------------------------------------------- #
+# Resize + sharpen                                                             #
+#                                                                              #
+# A framebuffer scaled to a thumbnail is a resampling problem, and doing it    #
+# properly is the difference between a legible small picture and a crunchy     #
+# one. Two steps, both stdlib, both integer arithmetic:                        #
+#                                                                              #
+#   1. an integer box reduce (every source pixel averaged exactly once) down   #
+#      to the smallest whole multiple of the target, then                       #
+#   2. a Catmull-Rom cubic resample for whatever ratio is left over.            #
+#                                                                              #
+# Step 1 is what keeps this affordable in pure Python: a full-support cubic    #
+# straight from 1920 to 960 needs ~8 taps per output pixel per axis, while the #
+# box reduce touches each source pixel once and usually lands *on* the target  #
+# (1920x1080 -> 960x540 is exactly 2x, so step 2 is skipped entirely). It is   #
+# also the right filter for the job — at large ratios an area average is what  #
+# a cubic's widened kernel approximates anyway.                                #
+# --------------------------------------------------------------------------- #
+
+# Fixed-point weights: integer accumulation is both faster than float here and
+# exactly reversible, so a flat region stays flat instead of drifting a value.
+_WEIGHT_SCALE = 1 << 12
+_WEIGHT_HALF = _WEIGHT_SCALE // 2
+_WEIGHT_BITS = 12
+# Catmull-Rom (a = -0.5): the interpolating member of the cubic family, no
+# ringing worth the name and a little inherent crispness.
+_CUBIC_A = -0.5
+
+
+def _cubic(t: float) -> float:
+    t = abs(t)
+    if t < 1.0:
+        return ((_CUBIC_A + 2.0) * t - (_CUBIC_A + 3.0)) * t * t + 1.0
+    if t < 2.0:
+        return ((t - 5.0) * t + 8.0) * t * _CUBIC_A - 4.0 * _CUBIC_A
+    return 0.0
+
+
+def _cubic_taps(src: int, dst: int) -> list[tuple[int, list[int]]]:
+    """``(first source index, weights)`` per output pixel for one axis.
+
+    The kernel is widened by the downscale ratio (the standard trick: sample
+    the filter in *destination* space) so that every source pixel contributes
+    to some output pixel and nothing is simply skipped. Weights are normalised
+    to sum to exactly ``_WEIGHT_SCALE``."""
+    ratio = src / dst
+    scale = max(ratio, 1.0)
+    support = 2.0 * scale
+    taps = []
+    for i in range(dst):
+        center = (i + 0.5) * ratio
+        start = max(0, int(center - support + 0.5))
+        end = min(src, int(center + support + 0.5))
+        if end <= start:                      # degenerate at the very edges
+            start = min(start, src - 1)
+            end = start + 1
+        weights = [_cubic((x + 0.5 - center) / scale) for x in range(start, end)]
+        total = sum(weights) or 1.0
+        ints = [round(w * _WEIGHT_SCALE / total) for w in weights]
+        ints[len(ints) // 2] += _WEIGHT_SCALE - sum(ints)
+        taps.append((start, ints))
+    return taps
+
+
+def _clamp8(value: int) -> int:
+    """Fixed-point accumulator -> byte. A cubic's negative lobes can push a
+    high-contrast edge past either end; clip rather than wrap."""
+    value = (value + _WEIGHT_HALF) >> _WEIGHT_BITS
+    return 0 if value < 0 else (255 if value > 255 else value)
+
+
+def _box_reduce(width: int, height: int, rgb: bytes,
+                kx: int, ky: int) -> tuple[int, int, bytes]:
+    """Average every ``kx * ky`` block. The last partial block is cropped
+    rather than averaged short — at most ``kx - 1`` columns off the right edge
+    of a desktop, which no thumbnail will ever show."""
+    out_w, out_h = width // kx, height // ky
+    stride = width * 3
+    out = bytearray(out_w * out_h * 3)
+    count = kx * ky
+    half = count // 2
+    o = 0
+    for oy in range(out_h):
+        acc = [0] * (out_w * 3)
+        for k in range(ky):
+            base = (oy * ky + k) * stride
+            row = rgb[base:base + stride]
+            i = 0
+            for ox in range(out_w):
+                p = ox * kx * 3
+                for _ in range(kx):
+                    acc[i] += row[p]
+                    acc[i + 1] += row[p + 1]
+                    acc[i + 2] += row[p + 2]
+                    p += 3
+                i += 3
+        for value in acc:
+            out[o] = (value + half) // count
+            o += 1
+    return out_w, out_h, bytes(out)
+
+
+def _resample_x(width: int, height: int, rgb: bytes,
+                out_w: int) -> tuple[int, int, bytes]:
+    taps = _cubic_taps(width, out_w)
+    stride = width * 3
+    out = bytearray(out_w * height * 3)
+    o = 0
+    for y in range(height):
+        base = y * stride
+        for start, weights in taps:
+            p = base + start * 3
+            r = g = b = 0
+            for weight in weights:
+                r += weight * rgb[p]
+                g += weight * rgb[p + 1]
+                b += weight * rgb[p + 2]
+                p += 3
+            out[o] = _clamp8(r)
+            out[o + 1] = _clamp8(g)
+            out[o + 2] = _clamp8(b)
+            o += 3
+    return out_w, height, bytes(out)
+
+
+def _resample_y(width: int, height: int, rgb: bytes,
+                out_h: int) -> tuple[int, int, bytes]:
+    taps = _cubic_taps(height, out_h)
+    stride = width * 3
+    out = bytearray(stride * out_h)
+    o = 0
+    for start, weights in taps:
+        # Slice the contributing rows once, then walk them column by column:
+        # the whole row is one indexable object per tap instead of a multiply
+        # per sample.
+        rows = [rgb[(start + k) * stride:(start + k + 1) * stride]
+                for k in range(len(weights))]
+        pairs = list(zip(weights, rows))
+        for c in range(stride):
+            acc = 0
+            for weight, row in pairs:
+                acc += weight * row[c]
+            out[o] = _clamp8(acc)
+            o += 1
+    return width, out_h, bytes(out)
+
+
+def resize_rgb(width: int, height: int, rgb: bytes,
+               max_width: int = DEFAULT_MAX_WIDTH,
+               max_height: int = DEFAULT_MAX_HEIGHT) -> tuple[int, int, bytes]:
+    """Fit the image inside ``max_width`` x ``max_height``, preserving aspect.
+
+    Never upscales: a 640x480 desktop stays 640x480 rather than being blown up
+    to the box. A non-positive bound means "unbounded on that axis"."""
+    scale = 1.0
+    if max_width > 0:
+        scale = min(scale, max_width / width)
+    if max_height > 0:
+        scale = min(scale, max_height / height)
+    if scale >= 1.0:
+        return width, height, rgb
+
+    out_w = max(1, round(width * scale))
+    out_h = max(1, round(height * scale))
+    kx, ky = max(1, width // out_w), max(1, height // out_h)
+    if kx > 1 or ky > 1:
+        width, height, rgb = _box_reduce(width, height, rgb, kx, ky)
+    if width != out_w:
+        width, height, rgb = _resample_x(width, height, rgb, out_w)
+    if height != out_h:
+        width, height, rgb = _resample_y(width, height, rgb, out_h)
+    return width, height, rgb
+
+
+def sharpen_rgb(width: int, height: int, rgb: bytes,
+                amount: float = DEFAULT_SHARPEN) -> bytes:
+    """A gentle unsharp pass: ``p + amount * (p - neighbours)`` over the
+    5-point Laplacian.
+
+    Any honest downscale is a low-pass filter, so the result is softer than the
+    screen it came from — window borders and text edges lose the contrast that
+    made them readable at a glance. A small amount of sharpening puts that edge
+    energy back; a large amount would ring around every glyph, which is why the
+    default is deliberately timid. The one-pixel border keeps its original
+    values (no neighbours to work with) — invisible, and cheaper than
+    reflecting the edges."""
+    if amount <= 0 or width < 3 or height < 3:
+        return rgb
+    weight = int(round(amount * 256))
+    center = 256 + 4 * weight
+    stride = width * 3
+    out = bytearray(rgb)
+    for y in range(1, height - 1):
+        base = y * stride
+        for i in range(base + 3, base + stride - 3):
+            value = (center * rgb[i]
+                     - weight * (rgb[i - 3] + rgb[i + 3]
+                                 + rgb[i - stride] + rgb[i + stride])
+                     + 128) >> 8
+            out[i] = 0 if value < 0 else (255 if value > 255 else value)
+    return bytes(out)
 
 
 def _png_chunk(tag: bytes, data: bytes) -> bytes:
@@ -236,10 +490,15 @@ def encode_png(width: int, height: int, rgb: bytes) -> bytes:
             + _png_chunk(b"IEND", b""))
 
 
-def render_screenshot(gzipped_xwd: bytes, max_width: int = DEFAULT_MAX_WIDTH) -> bytes:
-    """gzipped xwd dump -> downscaled PNG. CPU-bound; callers run it in an
-    executor so a 4K decode doesn't stall the portal's event loop."""
-    width, height, rgb = xwd_to_rgb(gunzip(gzipped_xwd), max_width)
+def render_screenshot(gzipped_xwd: bytes, max_width: int = DEFAULT_MAX_WIDTH,
+                      max_height: int = DEFAULT_MAX_HEIGHT,
+                      sharpen: float = DEFAULT_SHARPEN) -> bytes:
+    """gzipped xwd dump -> resized, sharpened PNG. CPU-bound in pure Python
+    (a 1080p grab is a few hundred milliseconds of decode plus the resize), so
+    callers run it in an executor and never on the portal's event loop."""
+    width, height, rgb = xwd_to_rgb(gunzip(gzipped_xwd))
+    width, height, rgb = resize_rgb(width, height, rgb, max_width, max_height)
+    rgb = sharpen_rgb(width, height, rgb, sharpen)
     return encode_png(width, height, rgb)
 
 
@@ -350,24 +609,24 @@ class ScreenshotStore:
 STORE = ScreenshotStore()
 
 
-def settings() -> tuple[int, int, str]:
-    """``(interval_seconds, max_width, display)`` from the environment.
-    A non-positive interval disables capture entirely."""
-    try:
-        interval = int(os.environ.get("WHISTLER_SCREENSHOT_INTERVAL",
-                                      DEFAULT_INTERVAL_SECONDS))
-    except ValueError:
-        interval = DEFAULT_INTERVAL_SECONDS
-    try:
-        max_width = int(os.environ.get("WHISTLER_SCREENSHOT_WIDTH", DEFAULT_MAX_WIDTH))
-    except ValueError:
-        max_width = DEFAULT_MAX_WIDTH
+def settings() -> tuple[int, int, int, str]:
+    """``(interval_seconds, max_width, max_height, display)`` from the
+    environment. A non-positive interval disables capture entirely."""
+    def _int(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, default))
+        except ValueError:
+            return default
+
+    interval = _int("WHISTLER_SCREENSHOT_INTERVAL", DEFAULT_INTERVAL_SECONDS)
+    max_width = _int("WHISTLER_SCREENSHOT_WIDTH", DEFAULT_MAX_WIDTH)
+    max_height = _int("WHISTLER_SCREENSHOT_HEIGHT", DEFAULT_MAX_HEIGHT)
     display = os.environ.get("WHISTLER_SCREENSHOT_DISPLAY", DEFAULT_DISPLAY)
-    return interval, max(1, max_width), display
+    return interval, max(1, max_width), max(1, max_height), display
 
 
 async def _capture_one(cm, store: ScreenshotStore, session: dict,
-                       display: str, max_width: int,
+                       display: str, max_width: int, max_height: int,
                        semaphore: asyncio.Semaphore) -> bool:
     user, name = session["user"], session["name"]
     loop = asyncio.get_running_loop()
@@ -398,7 +657,8 @@ async def _capture_one(cm, store: ScreenshotStore, session: dict,
                 if not session.get("podName"):
                     raise ScreenshotError("session has no pod")
                 blob = await capture_pod(session["podName"], session["namespace"], display)
-            png = await loop.run_in_executor(None, render_screenshot, blob, max_width)
+            png = await loop.run_in_executor(
+                None, render_screenshot, blob, max_width, max_height)
         except ScreenshotError as e:
             # Expected and frequent (booting guest, session going away
             # mid-pass); debug so a busy cluster doesn't fill the log.
@@ -411,7 +671,8 @@ async def _capture_one(cm, store: ScreenshotStore, session: dict,
     return True
 
 
-async def capture_all(cm, store: ScreenshotStore, *, display: str, max_width: int) -> int:
+async def capture_all(cm, store: ScreenshotStore, *, display: str,
+                      max_width: int, max_height: int) -> int:
     """One pass over every desktop session in the cluster. Returns the number
     of screenshots taken."""
     loop = asyncio.get_running_loop()
@@ -425,17 +686,19 @@ async def capture_all(cm, store: ScreenshotStore, *, display: str, max_width: in
         return 0
     semaphore = asyncio.Semaphore(_MAX_CONCURRENT_GRABS)
     results = await asyncio.gather(*(
-        _capture_one(cm, store, s, display, max_width, semaphore) for s in ready
+        _capture_one(cm, store, s, display, max_width, max_height, semaphore)
+        for s in ready
     ))
     return sum(results)
 
 
 async def run_forever(cm, store: ScreenshotStore, *, interval: int,
-                      display: str, max_width: int) -> None:
+                      display: str, max_width: int, max_height: int) -> None:
     while True:
         started = time.monotonic()
         try:
-            taken = await capture_all(cm, store, display=display, max_width=max_width)
+            taken = await capture_all(cm, store, display=display,
+                                      max_width=max_width, max_height=max_height)
             logger.info(f"Screenshot pass: {taken} captured, {len(store)} held "
                         f"({time.monotonic() - started:.1f}s)")
         except asyncio.CancelledError:
@@ -447,7 +710,7 @@ async def run_forever(cm, store: ScreenshotStore, *, interval: int,
 
 def screenshot_ctx(app):
     """aiohttp cleanup_ctx: run the capture loop for the life of the app."""
-    interval, max_width, display = settings()
+    interval, max_width, max_height, display = settings()
     if interval <= 0:
         logger.info("Session screenshots disabled (WHISTLER_SCREENSHOT_INTERVAL<=0)")
 
@@ -458,7 +721,7 @@ def screenshot_ctx(app):
 
     async def _ctx(app):
         logger.info(f"Session screenshots: every {interval}s, "
-                    f"max width {max_width}px, DISPLAY={display}")
+                    f"max {max_width}x{max_height}px, DISPLAY={display}")
         # The store is per-process. With more than one replica each one grabs
         # every session on its own schedule and answers /screenshot only for
         # what it captured, so thumbnails appear and vanish as requests are
@@ -474,8 +737,8 @@ def screenshot_ctx(app):
                 f"every session and serve only its own captures. Run one "
                 f"portal replica, or disable screenshots.")
         task = asyncio.create_task(
-            run_forever(app["cm"], STORE, interval=interval,
-                        display=display, max_width=max_width))
+            run_forever(app["cm"], STORE, interval=interval, display=display,
+                        max_width=max_width, max_height=max_height))
         yield
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

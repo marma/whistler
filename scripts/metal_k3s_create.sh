@@ -82,6 +82,23 @@ else
   echo "    IOMMU: not enabled — needed only for GPU passthrough to VMs"
   echo "           (kernel args: intel_iommu=on or amd_iommu=on, plus iommu=pt)"
 fi
+# Whistler backs VM guest RAM with hugepages by default (whistler.hugePages.
+# pageSize, 1Gi) — that is what keeps VFIO's DMA pinning of a large GPU guest
+# inside virt-handler's 20s SyncVMI deadline. They are reserved, never
+# allocated on demand, so a node with none pends every VM.
+HP_1G=/sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
+hp_reserved="$(cat "$HP_1G" 2>/dev/null || echo 0)"
+if (( hp_reserved > 0 )); then
+  echo "    1Gi hugepages: ${hp_reserved} reserved ($(( hp_reserved )) GiB of guest RAM)"
+else
+  echo "    1Gi hugepages: NONE reserved — VMs will pend on 'Insufficient hugepages-1Gi'"
+  echo "           at boot (survives reboots, no fragmentation):"
+  echo "             kernel args  default_hugepagesz=1G hugepagesz=1G hugepages=<count>"
+  echo "           now (may fail once memory is fragmented; kubelet only reports"
+  echo "           the new capacity after a restart):"
+  echo "             echo <count> | sudo tee ${HP_1G} && sudo systemctl restart k3s"
+  echo "           or run guests on 4KiB pages: --set whistler.hugePages.pageSize=\"\""
+fi
 if command -v nvidia-smi >/dev/null 2>&1; then
   echo "    NVIDIA driver: $(nvidia-smi --query-gpu=driver_version,name --format=csv,noheader 2>/dev/null | head -1 || echo present)"
 else

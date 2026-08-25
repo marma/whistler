@@ -43,6 +43,13 @@ deploy:
           # so it works regardless of the localhost:30080 the port-forward uses.
           portal.service.type: ClusterIP
           portal.ingress.enabled: true
+          # A real cluster Ingress on top of that proxy, so the portal is also
+          # reachable by name through k3s/k3d's own Traefik (default
+          # IngressClass) on its port 80 — no port-forward. Point the name at
+          # the ingress controller's address, e.g. in /etc/hosts:
+          #   kubectl -n kube-system get svc traefik
+          portal.ingress.resource.enabled: true
+          portal.ingress.resource.host: whistler.martinmalmsten.net
           userVolume.accessMode: ReadWriteOnce
           userVolume.size: 10Mi
           whistler.volumes[0].name: data
