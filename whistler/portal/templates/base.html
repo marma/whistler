@@ -37,6 +37,13 @@
       <div class="item">
         <i class="user circle icon"></i> {{ current_user }}
       </div>
+      {# A button, not a link: signing out drops the identity cookie the viewer
+         app shares, so it is a state change and belongs behind a POST. #}
+      <div class="item">
+        <form method="post" action="/logout" style="margin:0">
+          <button class="ui inverted basic mini button" type="submit">Sign out</button>
+        </form>
+      </div>
     </div>
   </div>
 </div>

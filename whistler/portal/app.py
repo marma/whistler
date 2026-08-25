@@ -55,16 +55,21 @@ import aiohttp
 from aiohttp import web
 
 from whistler.config import CHANNEL_TERMINAL
-from whistler.portal import kubevirt, proxy, screenshots, terminal
+from whistler.portal import kiosk, kubevirt, proxy, screenshots, terminal
+from whistler.portal.login import USER_COOKIE as _USER_COOKIE
 
 logger = logging.getLogger("whistler.portal")
 
 
 # --------------------------------------------------------------------------- #
 # Auth — minimal, dev-only this round. Real web SSO/OIDC is a follow-up.       #
+#                                                                              #
+# This app deliberately keeps a fallback identity where the kiosk and the      #
+# management portal now have a login screen (whistler/portal/login.py): its    #
+# pages are linked into from those, and the requests a browser then makes on   #
+# its own — Selkies assets, the display WebSocket, a thumbnail <img> — carry   #
+# no ?user=, so the identity that loaded the page is echoed back by cookie.    #
 # --------------------------------------------------------------------------- #
-
-_USER_COOKIE = "whistler_user"
 
 
 @web.middleware
@@ -818,10 +823,6 @@ async def _proxy_client_ctx(app):
 
 
 def build_app(config_manager):
-    # Imported here, not at module scope: kiosk.py reads this module's cookie
-    # name and the two would otherwise import each other.
-    from whistler.portal import kiosk
-
     # lock_middleware sits inside auth_middleware: a locked kiosk browser is
     # refused every path on this app but the lock screen, which is what makes
     # the lock hold against a live session cookie (whistler/portal/kiosk.py).

@@ -210,6 +210,8 @@ def test_computed_view_offers_no_way_to_edit():
     assert "access-cell" not in html
     assert 'name="access__' not in html
     assert "<form" in html and 'method="get"' in html   # the picker only
-    assert 'method="post"' not in html
+    # The one POST on any page is the nav's Sign out (base.html); nothing on
+    # this view submits a cell.
+    assert html.count('method="post"') == 1 and 'action="/logout"' in html
     # Provenance is the point of the view.
     assert "lab-staff" in html

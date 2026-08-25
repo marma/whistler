@@ -269,13 +269,29 @@ elsewhere is unaffected, which is still the missing half above.
 Two smaller facts follow from where it is built:
 
 - The login form is real but has nothing to check against. Whistler stores no
-  passwords (`User` CRs carry public keys), so `_verify_credentials` accepts
+  passwords (`User` CRs carry public keys), so `verify_credentials` accepts
   any password while the portal's dev auth gate is open and nothing otherwise —
   the same "SSO/OIDC is a follow-up" position the rest of the portal holds.
   That one function is where a real credential lands. **The unlock shares it**,
   so in dev the lock is a working mechanism with no secret behind it. The lock
   screen says so on its face; it must not be described as protecting an
   unattended session until that function does.
+
+  Since 2026-08-25 **the management portal shares it too**: the same form, the
+  same function, moved to
+  [`whistler/portal/login.py`](../whistler/portal/login.py) — minus the second
+  factor below, which guards a screen in a corridor rather than a workstation.
+  The portal previously had no login at all (any request while the dev gate was
+  open was answered as the user named in `?user=`, defaulting to `user`), so
+  this is the first sign-in on that surface; it is still one credential check
+  with nothing behind it, and a real store lands for both surfaces at once.
+  One boundary did move: reaching the management UI needs its own marker cookie
+  (`whistler_portal`), so a kiosk sign-in is not itself a portal sign-in even
+  though both stamp the shared identity cookie. That is a separation between
+  surfaces, **not** the entry-point binding — the same person can sign in on
+  either with the same unchecked password. It is worth having anyway, because
+  the binding, when it arrives, has to be enforced at each entry point, and now
+  there is an entry point to enforce it at.
 - **A second factor is drawn in, at the right point in the flow, and mocked.**
   `/kiosk/otp` stands between the password and the identity cookie, so the
   password alone yields a pending name and no access. The algorithm under it is

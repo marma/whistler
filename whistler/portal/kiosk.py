@@ -78,11 +78,12 @@ What is *not* here yet, deliberately:
 
 * **A password store.** Whistler has none — ``User`` CRs carry public keys, and
   the portal's web auth is still the dev gate the rest of ``app.py`` describes.
-  So the form is real and ``_verify_credentials`` is the one place a real check
-  goes, but today it only answers in dev mode (``WHISTLER_AUTH_ALLOW_ANY``),
-  where any password is accepted. Outside dev mode the middleware 401s this
-  path like every other. The OTP step above is the second factor for that
-  same function, mocked to the same standard: no store, so no assurance.
+  So the form is real and ``verify_credentials`` (whistler/portal/login.py, now
+  shared with the management portal) is the one place a real check goes, but
+  today it only answers in dev mode (``WHISTLER_AUTH_ALLOW_ANY``), where any
+  password is accepted. Outside dev mode the middleware 401s this path like
+  every other. The OTP step above is the second factor for that same function,
+  mocked to the same standard: no store, so no assurance.
 * **A screen lock driven from inside the desktop.** The lock above is entered
   by the *client*, so it covers a person walking away from the browser. A guest
   that locks its own X session is a different and complementary thing.
@@ -102,7 +103,14 @@ import segno
 from aiohttp import web
 
 from whistler.portal import totp
-from whistler.portal.app import _USER_COOKIE
+# The form itself, its furniture and the one credential check all live in
+# whistler/portal/login.py — the management portal shows the same screen (minus
+# the second factor below), and one login is not two screens.
+from whistler.portal.login import BASE_CSS as _BASE_CSS
+from whistler.portal.login import dev_auth as _dev_auth
+from whistler.portal.login import render_login as _render_login_form
+from whistler.portal.login import USER_COOKIE as _USER_COOKIE
+from whistler.portal.login import verify_credentials as _verify_credentials
 from whistler.status import status_group
 
 logger = logging.getLogger("whistler.portal")
@@ -156,12 +164,6 @@ _STATE_COLORS = {
 }
 
 
-def _dev_auth() -> bool:
-    """Whether the portal's dev auth gate is open. Read per request, not at
-    import, so tests and a restarted process agree."""
-    return os.environ.get("WHISTLER_AUTH_ALLOW_ANY") == "true"
-
-
 def _idle_seconds() -> int:
     try:
         return int(os.environ.get("WHISTLER_KIOSK_IDLE_TIMEOUT",
@@ -175,20 +177,6 @@ async def _run(func, *args):
     app's own helper takes a request it never uses; this one doesn't)."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, func, *args)
-
-
-def _verify_credentials(user: str, password: str) -> bool:
-    """The single point where a kiosk login is accepted or refused.
-
-    There is nothing to check against yet: Whistler stores no passwords, so in
-    dev mode any password is accepted for any name, and outside it nothing is
-    (the middleware has already refused the request by then anyway). When a
-    real credential lands — a ``passwordHash`` on the User CR, or an OIDC
-    handoff — it goes here, and the OTP second factor goes here beside it.
-    Keeping the decision in one function is the point of the function."""
-    if not user:
-        return False
-    return _dev_auth()
 
 
 def _identity(request: web.Request):
@@ -289,54 +277,8 @@ def _pending(request: web.Request):
 # replaced rather than .format-ed so the JS braces survive.                    #
 # --------------------------------------------------------------------------- #
 
-_BASE_CSS = """
-  *{box-sizing:border-box}
-  html,body{margin:0;height:100%;background:#1a1a1a;color:#e8e8e8;
-            font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;
-            -webkit-font-smoothing:antialiased}
-  a{color:inherit;text-decoration:none}
-  h1{font-size:1.6rem;font-weight:600;letter-spacing:.01em;margin:0}
-  .muted{color:#8a8a8a}
-"""
-
-_LOGIN_HTML = """<!doctype html><meta charset=utf-8><title>Whistler</title>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<link rel=icon type=image/svg+xml href=/static/favicon.svg>
-<style>__BASE_CSS__
-  body{display:flex;align-items:center;justify-content:center;padding:2rem}
-  form{width:100%;max-width:22rem;display:flex;flex-direction:column;gap:1rem}
-  h1{text-align:center;margin-bottom:.5rem}
-  label{display:flex;flex-direction:column;gap:.35rem;font-size:.82rem;
-        text-transform:uppercase;letter-spacing:.08em;color:#9a9a9a}
-  input{font:inherit;text-transform:none;letter-spacing:normal;color:#e8e8e8;
-        background:#242424;border:1px solid #383838;border-radius:6px;
-        padding:.6rem .7rem}
-  input:focus{outline:none;border-color:#4b8bd6;background:#282828}
-  button{font:inherit;font-weight:600;color:#fff;background:#2f6fb5;border:0;
-         border-radius:6px;padding:.65rem;cursor:pointer}
-  button:hover{background:#3b81cd}
-  .error{background:#3a1e1e;border:1px solid #6e2b2b;border-radius:6px;
-         padding:.55rem .7rem;font-size:.88rem;color:#f3b6b6}
-  .note{font-size:.78rem;text-align:center;margin:0}
-</style>
-<form method=post action=/kiosk/login>
-  <h1>Whistler</h1>
-  __ERROR__
-  <label>User<input name=user autocomplete=username autofocus required></label>
-  <label>Password<input name=password type=password autocomplete=current-password></label>
-  <button type=submit>Sign in</button>
-  <p class="note muted">__NOTE__</p>
-</form>"""
-
-
 def _render_login(error: str = None) -> str:
-    note = ("Development mode — any password is accepted."
-            if _dev_auth() else "")
-    err = (f"<div class=error>{html.escape(error)}</div>" if error else "")
-    return (_LOGIN_HTML
-            .replace("__BASE_CSS__", _BASE_CSS)
-            .replace("__ERROR__", err)
-            .replace("__NOTE__", html.escape(note)))
+    return _render_login_form(action="/kiosk/login", error=error)
 
 
 # The lock screen. Same furniture as the login form, and deliberately a

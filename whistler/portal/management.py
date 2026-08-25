@@ -6,9 +6,24 @@ Routes
 /instances/*    user instance lifecycle (create, connect, stop, delete)
 /admin/*        admin-only: templates, users, volumes, all sessions
 
+/login          the sign-in screen — the kiosk's form, without its second
+                factor (whistler/portal/login.py)
+/logout         drop the cookies, back to /login
+
 Auth (dev-only)
 ---------------
-Set WHISTLER_AUTH_ALLOW_ANY=true and pass ?user=<name> (or X-Whistler-User header).
+There is a real form now, and still no credential store behind it: with
+WHISTLER_AUTH_ALLOW_ANY=true any password is accepted for any name and the page
+says so, and without it nothing is accepted at all. ``verify_credentials`` in
+whistler/portal/login.py is the single place a real check lands, shared with the
+kiosk. Signing in sets the identity cookie the viewer app already reads, so
+/connect, /term and /screenshot authorize the same person without a ?user= on
+every asset request.
+
+?user=<name> (or the X-Whistler-User header) stays as the dev shortcut past the
+form — every internal link carries it, and the integration tests and the
+skaffold loop are built on it.
+
 Set WHISTLER_ADMIN_USERS=alice,bob to grant admin to specific users, or
 WHISTLER_AUTH_ALLOW_ADMIN=true to treat every authenticated user as admin (dev).
 """
@@ -18,15 +33,18 @@ import logging
 import os
 import re
 from typing import Annotated, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from whistler.config import (ACCESS_MODES, CHANNELS, ConfigWriteError,
                              ENFORCED_ACCESS_KINDS, ENFORCED_CHANNELS,
                              GPU_NODE_LABEL, OVERRIDE_GROUPS)
+from whistler.portal.login import (USER_COOKIE, dev_auth, render_login,
+                                   verify_credentials)
 from whistler.status import GROUP_COLORS, status_group
 
 logger = logging.getLogger("whistler.management")
@@ -53,20 +71,50 @@ _ALLOW_ADMIN = os.environ.get("WHISTLER_AUTH_ALLOW_ADMIN", "false").lower() == "
 # Auth helpers                                                                 #
 # --------------------------------------------------------------------------- #
 
+LOGIN_PATH = "/login"
+
+# Marks a browser that signed in *to the management portal*. Identity itself
+# rides USER_COOKIE, shared with the viewer app so the pages this one links into
+# — /connect, /term, /vnc, /screenshot — authorize the same person without a
+# ?user= on requests the browser makes on its own.
+#
+# Deliberately not the kiosk's marker. A kiosk sign-in must not hand someone the
+# management UI: that is the entire point of a kiosk (kiosk.py, "It is the
+# surface, not the binding"), so each surface has its own marker and the shared
+# identity cookie by itself opens neither. It is not a *binding* yet either —
+# nothing stops a kiosk user signing in here with the same name and password —
+# but it does mean the two surfaces are entered separately and one cookie is not
+# a pass to both.
+PORTAL_COOKIE = "whistler_portal"
+
+
+class LoginRequired(Exception):
+    """No identity on the request. Turned into the login screen (or a 401 for a
+    request that could not render one) by ``_login_required``."""
+
+
 def _get_identity(request: Request) -> Optional[str]:
-    if os.environ.get("WHISTLER_AUTH_ALLOW_ANY") != "true":
+    """Who this request is, or None to send them to the login screen.
+
+    There is no fallback identity any more: this used to answer "user" for
+    anyone at all while the dev gate was open, which is right for a portal with
+    no login and wrong for one that has a form — nobody would ever be logged
+    out. The ?user= / X-Whistler-User shortcut stays, dev-gated as before."""
+    if dev_auth():
+        explicit = (request.headers.get("X-Whistler-User")
+                    or request.query_params.get("user"))
+        if explicit:
+            return explicit.split("-")[0]
+    if request.cookies.get(PORTAL_COOKIE) != "1":
         return None
-    raw = request.headers.get("X-Whistler-User") or request.query_params.get("user") or "user"
-    return raw.split("-")[0]
+    raw = request.cookies.get(USER_COOKIE)
+    return raw.split("-")[0] if raw else None
 
 
 def require_user(request: Request):
     user = _get_identity(request)
     if not user:
-        raise HTTPException(
-            status_code=401,
-            detail="Portal auth not configured. Set WHISTLER_AUTH_ALLOW_ANY=true for dev.",
-        )
+        raise LoginRequired()
     return user
 
 
@@ -115,6 +163,110 @@ def _ctx(user: str, is_admin: bool = False, **extra) -> dict:
 def _tr(url: str, user: str) -> RedirectResponse:
     sep = "&" if "?" in url else "?"
     return RedirectResponse(f"{url}{sep}user={user}", status_code=303)
+
+# --------------------------------------------------------------------------- #
+# Sign in / sign out                                                           #
+# --------------------------------------------------------------------------- #
+
+def _safe_next(path) -> str:
+    """Where signing in should land. Only a path on this app is accepted —
+    which also disposes of protocol-relative "//host" and absolute URLs, since
+    neither starts with a single "/" — and anything else falls back to the
+    dashboard rather than being refused, because a stale bookmark should still
+    get someone in."""
+    if not path or not isinstance(path, str) or len(path) > 512:
+        return "/"
+    if any(c in path for c in "\r\n\\") or not path.startswith("/"):
+        return "/"
+    if path.startswith("//") or path.startswith(LOGIN_PATH):
+        return "/"
+    return path
+
+
+def _next_url(path: str, user: str) -> str:
+    """The signed-in name wins over whatever ?user= the target already carried:
+    `next` may well be a link made while someone else was signed in, and
+    ``query_params.get`` returns the *first* value, so a stale one has to be
+    dropped rather than appended beside."""
+    parts = urlsplit(path)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if k != "user"]
+    query.append(("user", user))
+    return urlunsplit(("", "", parts.path, urlencode(query), parts.fragment))
+
+
+def _login_page(next_to: str = "/", error: str = None,
+                status_code: int = 200) -> HTMLResponse:
+    """The kiosk's form, rendered by the kiosk's renderer. No-store because the
+    page is identity-scoped and on a shared machine the Back button is part of
+    the problem."""
+    return HTMLResponse(
+        render_login(action=LOGIN_PATH, error=error,
+                     hidden={"next": "" if next_to == "/" else next_to}),
+        status_code=status_code, headers={"Cache-Control": "no-store"})
+
+
+async def login_form(request: Request):
+    """Show the form — or skip it, for a browser that is already someone."""
+    next_to = _safe_next(request.query_params.get("next"))
+    user = _get_identity(request)
+    if user:
+        return RedirectResponse(_next_url(next_to, user), status_code=303)
+    return _login_page(next_to)
+
+
+async def login_submit(
+    request: Request,
+    user:     Annotated[str, Form()] = "",
+    password: Annotated[str, Form()] = "",
+    next:     Annotated[str, Form()] = "",
+):
+    """Check the credential, and — unlike the kiosk — sign in on the strength
+    of it. The second factor there guards a screen that stands in a corridor;
+    this is the management UI on a workstation, and a mocked code prompt in
+    front of it would be a click, not a control. When the real one arrives it
+    arrives in login.py, for both surfaces."""
+    name = user.strip().split("-")[0]
+    next_to = _safe_next(next)
+    if not verify_credentials(name, password):
+        logger.warning(f"Portal login refused for {user!r}")
+        return _login_page(next_to, "Sign-in failed.", status_code=401)
+    logger.info(f"Portal login for {name}")
+    response = RedirectResponse(_next_url(next_to, name), status_code=303)
+    response.set_cookie(USER_COOKIE, name, path="/", samesite="lax")
+    response.set_cookie(PORTAL_COOKIE, "1", path="/", samesite="lax",
+                        httponly=True)
+    return response
+
+
+async def logout(request: Request):
+    """Drop both cookies. The identity one is shared with the viewer app, so
+    signing out of the portal also ends the desktop pages it linked to."""
+    response = RedirectResponse(LOGIN_PATH, status_code=303)
+    response.delete_cookie(USER_COOKIE, path="/")
+    response.delete_cookie(PORTAL_COOKIE, path="/")
+    return response
+
+
+async def _login_required(request: Request, exc: Exception):
+    """What an unauthenticated request gets.
+
+    A navigation is sent to the form, with where it was going in tow; anything
+    else — an htmx status poll, a fetch — gets a status it can act on, because
+    redirecting those to an HTML page produces a parse error at the far end
+    instead of a login. Same split the kiosk's lock middleware makes."""
+    if (request.headers.get("Sec-Fetch-Mode") == "navigate"
+            or "text/html" in request.headers.get("Accept", "")):
+        query = request.url.query
+        next_to = _safe_next(request.url.path + (f"?{query}" if query else ""))
+        target = LOGIN_PATH
+        if next_to != "/":
+            target += "?" + urlencode({"next": next_to})
+        return RedirectResponse(target, status_code=303)
+    return JSONResponse({"detail": f"Not signed in. Sign in at {LOGIN_PATH}."},
+                        status_code=401)
+
+
 
 
 def _render_status_html(name: str, status: str, user: str, controls: bool,
@@ -1895,6 +2047,15 @@ def build_management_app(config_manager):
     app.state.run = _run
 
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+    # Every route below is gated by require_user, which raises LoginRequired
+    # rather than answering 401 itself — so one handler decides what an
+    # unauthenticated request sees, and /login and /logout below are the only
+    # routes that do not ask.
+    app.add_exception_handler(LoginRequired, _login_required)
+    app.add_api_route(LOGIN_PATH,  login_form,   methods=["GET"], response_class=HTMLResponse)
+    app.add_api_route(LOGIN_PATH,  login_submit, methods=["POST"])
+    app.add_api_route("/logout",   logout,       methods=["POST"])
 
     # User routes
     app.add_api_route("/",                                user_index,            methods=["GET"],  response_class=HTMLResponse)
