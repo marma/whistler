@@ -33,19 +33,6 @@
     <tr>
       <td>
         <a href="/instances/{{ inst.name }}?user={{ current_user }}"><strong>{{ inst.name }}</strong></a>
-        {% if inst.screenshot_url %}
-        {# Latest desktop thumbnail. It 404s until the first capture pass has
-           covered this session (and for sessions that never come up), so drop
-           the image entirely on error instead of showing a broken icon. #}
-        <div style="margin-top:.5rem">
-          <a href="{{ inst.connect_url }}">
-            <img src="{{ inst.screenshot_url }}" alt="" loading="lazy"
-                 onerror="this.parentNode.parentNode.remove()"
-                 style="width:200px;max-width:100%;border-radius:4px;
-                        border:1px solid rgba(34,36,38,.15);display:block">
-          </a>
-        </div>
-        {% endif %}
       </td>
       <td>{{ inst.template or "—" }}</td>
       <td class="collapsing right aligned">

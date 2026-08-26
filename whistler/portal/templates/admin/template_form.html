@@ -163,9 +163,9 @@
         {% endfor %}
       </select>
       <div class="ui pointing label">
-        Egress posture sessions run under (whistler.zones). Users with an allowedZones
-        restriction can only use templates whose zone they're allowed. Takes effect on
-        the next session start.
+        Egress posture sessions run under (whistler.zones). A user can only start a
+        template whose zone they have been granted — including <code>default</code>,
+        which is not exempt. Takes effect on the next session start.
       </div>
     </div>
 

@@ -2,7 +2,7 @@
 import logging
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional, Set, Tuple
 from abc import ABC, abstractmethod
 from kubernetes import client, config as k8s_config
 from kubernetes.client import CoreV1Api, NetworkingV1Api
@@ -146,17 +146,37 @@ KUBEVIRT_VMI_PLURAL = "virtualmachineinstances"
 # does not fail cleanly: virt-handler signals deletion and unmounts the
 # containerDisk while qemu keeps running, leaving a virt-launcher pod stuck at
 # 2/3 with a healthy guest inside and no Service endpoints (so ssh and the
-# portal proxy die while the VNC console still works). 1 GiB pages make that
-# same guest 32 pages.
+# portal proxy die while the VNC console still works). 2 MiB pages make that
+# same guest 16384 pages, and 1 GiB pages make it 32.
 #
 # Only 2Mi and 1Gi exist on x86_64 (/sys/kernel/mm/hugepages); libvirt takes
 # the value verbatim, so anything else is a VM that never schedules.
 #
+# The default is 2Mi rather than 1Gi because of how the *node* reserves them
+# (below): a 1 GiB page needs a gigabyte of physically contiguous memory, so
+# in practice it can only be reserved at boot, while 2 MiB pages can be added
+# to a running host. Both sizes are three orders of magnitude clear of the
+# deadline; the difference between them is pinning work, not admission.
+#
 # Hugepages are NOT overcommittable and NOT allocated on demand: the node must
 # reserve them up front (kernel hugepagesz=/hugepages=, or nr_hugepages plus a
 # kubelet restart), and a VM whose node has none pends forever on Insufficient
-# hugepages-1Gi. Setting the chart's pageSize to "" turns the whole thing off.
-DEFAULT_HUGE_PAGE_SIZE = "1Gi"
+# hugepages-<size>. Setting the chart's pageSize to "" turns the whole thing
+# off.
+DEFAULT_HUGE_PAGE_SIZE = "2Mi"
+
+
+def _format_quantity(num_bytes: int) -> str:
+    """A byte count as the largest binary Kubernetes quantity that divides it
+    exactly (``2147483648`` -> ``"2Gi"``). Pure.
+
+    Round-trips through parse_quantity, and keeps a rounded-up guest memory
+    readable in the manifest — `3Gi` rather than `3221225472`.
+    """
+    for suffix, unit in (("Gi", 1 << 30), ("Mi", 1 << 20), ("Ki", 1 << 10)):
+        if num_bytes >= unit and num_bytes % unit == 0:
+            return f"{num_bytes // unit}{suffix}"
+    return str(num_bytes)
 
 # Optional fields of a VirtualMachine spec that _build_vm_spec owns and may
 # stop emitting between builds (drop a GPU, move to an instancetype, leave a
@@ -319,6 +339,36 @@ CHANNELS = (CHANNEL_SSH, CHANNEL_RELAY, CHANNEL_TERMINAL,
 ENFORCED_CHANNELS = (CHANNEL_SSH, CHANNEL_RELAY, CHANNEL_TERMINAL,
                      CHANNEL_SCREENSHOTS)
 
+# The doors into Whistler itself — the *fourth* axis of design/security.md
+# ("Closing the fourth axis: the kiosk situation"), and a different question
+# from CHANNELS above. Channels ask what a person may do once they are in a
+# session; entry points ask which surface will talk to them at all.
+#
+# `kiosk` is the /kiosk grid and its full-screen desktop; `portal` is the
+# management UI plus the viewer app's ordinary pages (the launch form, the web
+# terminal, the machine console); `gateway` is the SSH server — the launcher
+# TUI, the relay and the jump alike, which is one grant because they are one
+# door on one port.
+#
+# The grant composes like allowedZones: the union of the user's own list and
+# every group's is the set (merge_allow_lists), and **an empty set is no door
+# at all** (2026-08-25, "Every allow is explicit"). So "kiosk only" is
+# `entryPoints: [kiosk]` on the User — and a group that grants `portal` widens
+# its members back out, which is what a grant means everywhere else here and is
+# the one thing to keep in mind when binding somebody.
+ENTRY_KIOSK = "kiosk"
+ENTRY_PORTAL = "portal"
+ENTRY_GATEWAY = "gateway"
+ENTRY_POINTS = (ENTRY_KIOSK, ENTRY_PORTAL, ENTRY_GATEWAY)
+
+# What a brand-new account is created holding, now that an empty list grants
+# nothing. Deliberately not "everything": these are the two grants that decide
+# whether an account can be used *at all* — a door to come in through, and the
+# zone every unzoned template lands in. allowedVolumes and allowedGpuTypes stay
+# empty, because those are the grants an admin means to make one at a time.
+NEW_USER_ENTRY_POINTS = list(ENTRY_POINTS)
+NEW_USER_ZONES = [DEFAULT_ZONE]
+
 # How a zone's legacy `ssh` posture reads as a channel set, so zones written
 # before Zone.spec.channels keep their exact meaning.
 _POSTURE_CHANNELS = {
@@ -343,10 +393,10 @@ ENFORCED_ACCESS_KINDS = ("home",)
 def merge_volume_access(*sources) -> Dict[str, Dict[str, str]]:
     """Merge access matrices, most permissive per cell.
 
-    ``{zone: {volume: mode}}``. Unlike merge_allow_lists this has **no
-    "empty means unrestricted" case**: an absent cell is no access, full stop.
-    That inversion is the point of the matrix, and the two must never be
-    made to look alike (design/security.md, "Every allow is explicit").
+    ``{zone: {volume: mode}}``. An absent cell is no access, full stop —
+    the same rule merge_allow_lists now follows (design/security.md, "Every
+    allow is explicit"). The matrix got there first; the allow-lists were
+    brought into line in 2026-08-25.
 
     Most-permissive-wins because joining a group is a deliberate act whose
     purpose is to confer access; a user who already held something does not
@@ -371,12 +421,18 @@ def merge_volume_access(*sources) -> Dict[str, Dict[str, str]]:
 def merge_allow_lists(*sources) -> List[str]:
     """The effective allow-list from a user's own field and their groups'.
 
-    One rule for volumes, zones and gpuTypes: **empty everywhere means no
-    restriction; otherwise the union bounds you.** So an ungrouped user is
-    unaffected, a user with no list of their own is bounded by their group's,
-    and a user with a list of their own keeps it *and* gains the group's —
-    grants add up, which is what a grant means (design/security.md, "The
-    border has four axes", axis 3).
+    One rule for volumes, zones, gpuTypes and entryPoints: **the union is
+    what you have, and nothing else.** A user with no list of their own holds
+    exactly what their groups grant; a user with a list of their own keeps it
+    *and* gains the group's — grants add up, which is what a grant means
+    (design/security.md, "The border has four axes", axis 3).
+
+    Empty is **no access**, not "no opinion" (2026-08-25). It used to mean
+    unrestricted, which made the safest-looking User CR — no lists at all —
+    the most permissive one there is, and made every enforcement point carry
+    an `if allowed:` guard that read like a null check and acted like a
+    policy. The matrix in merge_volume_access always worked this way; the
+    allow-lists now agree with it.
 
     Order is the caller's: the user's own entries first, then each group's, so
     the portal can show where a name came from without a second lookup.
@@ -802,7 +858,7 @@ class ConfigManager(ABC):
     @abstractmethod
     def get_user_allowed_volumes(self, username: str) -> List[str]:
         """Volumes this user may mount: their own list unioned with every
-        group's. Empty means unrestricted."""
+        group's. Empty means **none** — every allow is explicit."""
         pass
 
     @abstractmethod
@@ -830,6 +886,38 @@ class ConfigManager(ABC):
     @abstractmethod
     def set_user_allowed_zones(self, username: str, zones: List[str]) -> bool:
         pass
+
+    @abstractmethod
+    def get_user_entry_points(self, username: str) -> List[str]:
+        """Entry points this user may use (ENTRY_POINTS): their own list
+        unioned with every group's. Empty means **no door at all** — ask
+        ``may_enter`` rather than reading this, so every caller decides it the
+        same way."""
+        pass
+
+    @abstractmethod
+    def set_user_entry_points(self, username: str, entry_points: List[str]) -> bool:
+        """Set this user's own entry-point grant. An empty list is a real
+        grant of nothing: the account can then only come in through a door one
+        of its groups grants. That is why this field needs no absent-vs-empty
+        distinction the way `channels` does — absent and empty both grant
+        nothing, and only the union is ever asked."""
+        pass
+
+    def may_enter(self, username: str, entry_point: str) -> bool:
+        """Whether this user may come in through ``entry_point``.
+
+        Concrete on the ABC on purpose: this is the identity half of the kiosk
+        situation (design/security.md), it has to be asked at *every* door —
+        the SSH gateway, the management portal, the viewer app — and a rule
+        that each door restates is a rule one of them will restate differently.
+        A missed door is the named failure mode, not a hypothetical one.
+
+        No grant is no entry (2026-08-25). An account nobody has granted a
+        door cannot come in through any of them — including one that has just
+        been created outside the portal, which is the case worth stating
+        because it used to be the most permissive account in the cluster."""
+        return entry_point in self.get_user_entry_points(username)
 
     @abstractmethod
     def get_user_overrides(self, username: str) -> Dict[str, bool]:
@@ -1629,9 +1717,10 @@ class KubeConfigManager(ConfigManager):
             f"({[e['name'] for e in vm_capable]}); the template must pin one "
             f"via its gpuType")
 
-    def _vm_huge_page_size(self, resources: Dict[str, Any]) -> Optional[str]:
-        """Resolve the hugepage size backing this VM's guest RAM, or None to
-        leave it on 4 KiB pages. Pure (reads only self.huge_page_size).
+    def _vm_guest_memory(
+            self, resources: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """``(memory, hugepage size)`` for this VM's guest RAM — the two
+        fields that have to agree. Pure (reads only self.huge_page_size).
 
         The template's ``resources.hugePageSize`` wins over the cluster
         default, and an explicit empty string is how a template opts out —
@@ -1640,16 +1729,24 @@ class KubeConfigManager(ConfigManager):
         A guest with no memory request has nothing to back, so it gets no
         hugepages: KubeVirt's admission webhook rejects that pairing, and it
         would be rejected at VM *creation*, far from the template that caused
-        it. The multiple-of-page-size rule below is that same webhook's, moved
-        forward to where the message can name the field to change."""
+        it.
+
+        Guest RAM must be a whole number of pages (that same webhook's rule)
+        so the memory is **rounded up** to one here, never down: down would
+        silently hand the user less RAM than the template asked for, and the
+        overshoot is at most one page — 2 MiB at the default size. A request
+        below one page becomes one page for the same reason. Rounding rather
+        than refusing is what keeps `hugePages.pageSize` a cluster-level
+        decision: raising it to 1Gi would otherwise invalidate every template
+        whose memory is not a whole number of gigabytes."""
         size = (resources['hugePageSize'] if 'hugePageSize' in resources
                 else self.huge_page_size)
         size = (size or "").strip()
-        if not size:
-            return None
         memory = resources.get('memory')
         if not memory:
-            return None
+            return None, None
+        if not size:
+            return memory, None
         try:
             page_bytes = int(parse_quantity(size))
             memory_bytes = int(parse_quantity(memory))
@@ -1659,12 +1756,17 @@ class KubeConfigManager(ConfigManager):
                 f"(memory={memory!r}, hugePageSize={size!r})")
         if page_bytes <= 0:
             raise PolicyError(f"invalid hugePageSize {size!r}")
-        if memory_bytes < page_bytes or memory_bytes % page_bytes:
-            raise PolicyError(
-                f"template memory {memory} is not a multiple of the "
-                f"{size} hugepage size; round the memory, or set "
-                f"resources.hugePageSize (\"\" opts out of hugepages)")
-        return size
+        if memory_bytes <= 0:
+            raise PolicyError(f"invalid memory {memory!r}")
+        pages = -(-memory_bytes // page_bytes)  # ceil, >= 1
+        rounded_bytes = pages * page_bytes
+        if rounded_bytes == memory_bytes:
+            return memory, size
+        rounded = _format_quantity(rounded_bytes)
+        logger.info(
+            f"Rounding guest memory {memory} up to {rounded} "
+            f"({pages} x {size} hugepages)")
+        return rounded, size
 
     def _load_volumes(self):
         try:
@@ -1735,21 +1837,23 @@ class KubeConfigManager(ConfigManager):
           - image allow-list is enforced when mode=desktop OR runtime=vm. SSH
             container/kata templates may use any image (the check is skipped).
           - GPU type (template_spec.nodeSelector[GPU_NODE_LABEL], set from the
-            gpuTypes catalog by the template editor) is checked against the
-            owning user's allowedGpuTypes, when username is given and the user
-            has a non-empty allow-list configured. An empty/absent allow-list
-            means "no restriction".
-          - Requested volumes (template_spec.volumes keys) are checked against
+            gpuTypes catalog by the template editor) must be named in the
+            owning user's allowedGpuTypes, when username is given. An empty
+            allow-list allows **nothing** (2026-08-25) — it used to mean "no
+            restriction", which made an unconfigured user the least restricted
+            one in the cluster.
+          - Requested volumes (template_spec.volumes keys) must be named in
             the owning user's allowedVolumes the same way. Applies regardless
             of whether the volume came from the template or a session
             override (see _apply_overrides) — the merge happens before this
             runs.
-          - An explicit zone (template-baked or overridden) must exist in the
-            zone catalog — an unknown zone fails closed rather than falling
-            back to default, whose posture may be laxer — and is checked
-            against the owning user's allowedZones like gpuType/volumes. An
-            absent zone (implicit default) skips both checks so a
-            misconfigured allow-list can't brick plain templates."""
+          - A zone must exist in the zone catalog — an unknown zone fails
+            closed rather than falling back to default, whose posture may be
+            laxer — and must be named in the owning user's allowedZones. An
+            *absent* zone is not un-zoned: the session lands in DEFAULT_ZONE,
+            so that is the grant it is checked against. Under explicit access
+            there is no such thing as a session outside the zone model, and a
+            user granted no zone launches nothing."""
         effective_runtime = runtime
         # Desktops are a VM feature. A container session is a throwaway
         # workspace reached through the portal's web terminal; the streamed
@@ -1793,44 +1897,44 @@ class KubeConfigManager(ConfigManager):
         gpu_type = (template_spec.get("nodeSelector") or {}).get(GPU_NODE_LABEL)
         if gpu_type and username:
             allowed_gpu_types = self.get_user_allowed_gpu_types(username)
-            if allowed_gpu_types and gpu_type not in allowed_gpu_types:
+            if gpu_type not in allowed_gpu_types:
                 raise PolicyError(
                     f"GPU type {gpu_type!r} is not allowed for user {username!r} "
-                    f"(allowedGpuTypes: {allowed_gpu_types})"
+                    f"(allowedGpuTypes: {allowed_gpu_types or 'none granted'})"
                 )
 
         requested_volumes = template_spec.get("volumes") or {}
         if requested_volumes and username:
             allowed_volumes = self.get_user_allowed_volumes(username)
-            if allowed_volumes:
-                disallowed = [v for v in requested_volumes if v not in allowed_volumes]
-                if disallowed:
-                    raise PolicyError(
-                        f"volumes {disallowed} are not allowed for user {username!r} "
-                        f"(allowedVolumes: {allowed_volumes})"
-                    )
-
-        zone = template_spec.get("zone")
-        if zone:
-            if zone not in self.zones:
-                # The catalog is admin-editable at runtime (Zone CRs); a miss
-                # may just mean it changed since the last load. (A deleted
-                # zone lingering in the cache is fail-safe the other way: its
-                # policies are already pruned, so the label selects nothing
-                # and the pod gets baseline-only egress.)
-                self._load_zones()
-            if zone not in self.zones:
+            disallowed = [v for v in requested_volumes if v not in allowed_volumes]
+            if disallowed:
                 raise PolicyError(
-                    f"zone {zone!r} is not defined (whistler.zones); "
-                    f"defined zones: {sorted(self.zones)}"
+                    f"volumes {disallowed} are not allowed for user {username!r} "
+                    f"(allowedVolumes: {allowed_volumes or 'none granted'})"
                 )
-            if username:
-                allowed_zones = self.get_user_allowed_zones(username)
-                if allowed_zones and zone not in allowed_zones:
-                    raise PolicyError(
-                        f"zone {zone!r} is not allowed for user {username!r} "
-                        f"(allowedZones: {allowed_zones})"
-                    )
+
+        # An absent zone is DEFAULT_ZONE, not "no zone": that is where the
+        # session actually lands, so that is what has to be granted.
+        zone = template_spec.get("zone") or DEFAULT_ZONE
+        if zone not in self.zones:
+            # The catalog is admin-editable at runtime (Zone CRs); a miss
+            # may just mean it changed since the last load. (A deleted
+            # zone lingering in the cache is fail-safe the other way: its
+            # policies are already pruned, so the label selects nothing
+            # and the pod gets baseline-only egress.)
+            self._load_zones()
+        if zone not in self.zones:
+            raise PolicyError(
+                f"zone {zone!r} is not defined (whistler.zones); "
+                f"defined zones: {sorted(self.zones)}"
+            )
+        if username:
+            allowed_zones = self.get_user_allowed_zones(username)
+            if zone not in allowed_zones:
+                raise PolicyError(
+                    f"zone {zone!r} is not allowed for user {username!r} "
+                    f"(allowedZones: {allowed_zones or 'none granted'})"
+                )
         return effective_runtime
 
     def _apply_overrides(self, template_spec: Dict[str, Any],
@@ -3004,12 +3108,14 @@ class KubeConfigManager(ConfigManager):
         else:
             if 'cpu' in resources:
                 domain["cpu"] = {"cores": int(resources['cpu'])}
-            if 'memory' in resources:
-                domain["resources"] = {"requests": {"memory": resources['memory']}}
             # Guest RAM on hugepages (see DEFAULT_HUGE_PAGE_SIZE): this is
             # what keeps a GPU VM's DMA pinning inside virt-handler's 20s
-            # SyncVMI deadline. The node must have them reserved.
-            huge_page_size = self._vm_huge_page_size(resources)
+            # SyncVMI deadline. The node must have them reserved. The memory
+            # comes back from the same call because hugepages round it up to
+            # a whole number of pages.
+            memory, huge_page_size = self._vm_guest_memory(resources)
+            if memory:
+                domain["resources"] = {"requests": {"memory": memory}}
             if huge_page_size:
                 domain["memory"] = {"hugepages": {"pageSize": huge_page_size}}
 
@@ -3724,11 +3830,9 @@ class KubeConfigManager(ConfigManager):
 
         ``readOnly`` on the Dataset is a CEILING: it wins over any rw grant,
         and it is the whole reason the field exists. Without it a dataset is
-        writable by everyone granted it — which, because an empty allow-list
-        means unrestricted everywhere in Whistler, is every user who has no
-        list at all. Shared data is read-mostly and S3 resolves concurrent
-        writers as a silent last-writer-wins, so the ceiling is the posture to
-        prefer (design/storage.md).
+        writable by everyone granted it. Shared data is read-mostly and S3
+        resolves concurrent writers as a silent last-writer-wins, so the
+        ceiling is the posture to prefer (design/storage.md).
         """
         if (definition or {}).get("readOnly"):
             return "ro"
@@ -4084,10 +4188,9 @@ class KubeConfigManager(ConfigManager):
             username = user.get("name") if isinstance(user, dict) else user
             if not username:
                 continue
-            allowed = self.get_user_allowed_volumes(username)
-            # Empty means unrestricted, matching the composition rule
-            # everywhere else.
-            if allowed and volume not in allowed:
+            # Every allow is explicit: a user granted nothing gets nothing,
+            # so an unconfigured account no longer lands in every rw proxy.
+            if volume not in self.get_user_allowed_volumes(username):
                 continue
             granted = (self.get_user_volume_modes(username) or {}).get(
                 volume, "rw")
@@ -4121,8 +4224,8 @@ class KubeConfigManager(ConfigManager):
             except Exception as e:
                 logger.error(f"Could not re-fence dataset {name!r}: {e}")
         for name, definition in sorted(definitions.items()):
-            # Empty allow-list means unrestricted, as everywhere else.
-            if allowed and name not in allowed:
+            # Every allow is explicit, as everywhere else.
+            if name not in allowed:
                 continue
             # The dataset's readOnly ceiling wins over the grant.
             mode = self.dataset_mode(definition, modes.get(name, "rw"))
@@ -5343,7 +5446,13 @@ class KubeConfigManager(ConfigManager):
         whistler.bootstrapAdmin (values.yaml). Called once by the operator at
         startup (kopf.on.startup); never overwrites an existing User CR of the
         same name, so later edits (via the portal or kubectl) stick across
-        Helm upgrades."""
+        Helm upgrades.
+
+        It seeds NEW_USER_ENTRY_POINTS and NEW_USER_ZONES because an empty
+        list now grants nothing: without them the account this exists to
+        create could not open the portal it exists to be used from. Only on
+        creation — an admin who has since narrowed their own entry points does
+        not get them handed back on the next operator restart."""
         try:
             with open(BOOTSTRAP_ADMIN_FILE, "r") as f:
                 data = yaml.safe_load(f) or {}
@@ -5365,7 +5474,10 @@ class KubeConfigManager(ConfigManager):
                 "apiVersion": f"{self.group}/{self.version}",
                 "kind": "User",
                 "metadata": {"name": name, "namespace": self.namespace},
-                "spec": {"publicKeys": data.get("publicKeys") or [], "admin": True},
+                "spec": {"publicKeys": data.get("publicKeys") or [],
+                         "admin": True,
+                         "entryPoints": list(NEW_USER_ENTRY_POINTS),
+                         "allowedZones": list(NEW_USER_ZONES)},
             }
             try:
                 self.api.create_namespaced_custom_object(
@@ -5387,13 +5499,17 @@ class KubeConfigManager(ConfigManager):
     def _load_groups(self):
         """Load the Group catalog. Like _load_users: on API failure keep the
         previous catalog rather than wiping it, since an empty catalog reads
-        as "nobody is in a project" and would widen every member back to
-        their own (usually empty, i.e. unrestricted) allow-lists.
+        as "nobody is in a project" and would cut every member back to their
+        own (often empty) allow-lists.
 
-        A cluster without the CRD simply has no groups — the pre-Group
-        behaviour, and therefore silent — but it is silent in the *permissive*
-        direction, so it warns once rather than never. This is the state a
-        `helm upgrade` leaves behind, because Helm does not update CRDs."""
+        Since grants became explicit that direction is *fail-closed* — a lost
+        catalog locks people out rather than letting them in, which is the
+        right way round but is also why the previous catalog is kept rather
+        than dropped: a flapping API call must not bounce a project's members
+        out of their own sessions. A cluster without the CRD simply has no
+        groups, and warns once, because "no groups" and "the CRD was never
+        applied" look identical from here. This is the state a `helm upgrade`
+        leaves behind, because Helm does not update CRDs."""
         try:
             resp = self.api.list_namespaced_custom_object(
                 self.group, self.version, self.namespace, GROUP_PLURAL
@@ -5509,8 +5625,8 @@ class KubeConfigManager(ConfigManager):
         """``{volume: "rw"|"ro"}`` for every volume a *group* grants this user.
 
         Only group-granted volumes appear: a volume the user reaches through
-        their own allowedVolumes (or through an unrestricted empty list) is
-        read-write, which is what it has always been. Across groups the most
+        their own allowedVolumes is read-write, which is what it has always
+        been. Across groups the most
         permissive grant wins — a user granted ``rw`` in one project does not
         lose it by also being a read-only guest in another."""
         modes: Dict[str, str] = {}
@@ -5545,6 +5661,19 @@ class KubeConfigManager(ConfigManager):
 
     def set_user_allowed_zones(self, username: str, zones: List[str]) -> bool:
         return self._save_user_spec(username, {"allowedZones": zones})
+
+    def get_user_entry_points(self, username: str) -> List[str]:
+        self._load_users()
+        own = self.users.get(username, {}).get("entryPoints", [])
+        return merge_allow_lists(own, *(g.get("entryPoints")
+                                        for g in self.get_user_groups(username)))
+
+    def set_user_entry_points(self, username: str, entry_points: List[str]) -> bool:
+        # Order the write by ENTRY_POINTS rather than by the form, so the CR
+        # reads the same whichever way the boxes were ticked.
+        return self._save_user_spec(
+            username, {"entryPoints": [e for e in ENTRY_POINTS
+                                       if e in set(entry_points or [])]})
 
     def get_user_overrides(self, username: str) -> Dict[str, bool]:
         self._load_users()

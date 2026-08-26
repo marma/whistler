@@ -113,6 +113,10 @@ EOF
 echo "==> Generating test key and test user"
 ssh-keygen -t ed25519 -N "" -f "$WORK/id" -q
 PUBKEY="$(cat "$WORK/id.pub")"
+# entryPoints and allowedZones are spelled out because every allow is
+# explicit: an empty list grants nothing, so a User CR with only a key on it
+# is refused at the gateway and could not start a session even if it got in.
+# The volumes catalog below is empty, so allowedVolumes has nothing to say.
 kubectl apply -f - <<EOF
 apiVersion: whistler.martinmalmsten.net/v1
 kind: User
@@ -122,6 +126,12 @@ metadata:
 spec:
   publicKeys:
     - "${PUBKEY}"
+  entryPoints:
+    - kiosk
+    - portal
+    - gateway
+  allowedZones:
+    - default
 EOF
 echo "[]" > "$WORK/volumes.yaml"
 echo "[]" > "$WORK/selectors.yaml"

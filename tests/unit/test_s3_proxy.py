@@ -211,22 +211,21 @@ def test_a_user_restricted_to_other_volumes_reaches_neither_proxy():
     assert cm.s3_proxy_users("refdata", "rw") == ["alice"]
 
 
-def test_a_user_with_no_grants_at_all_still_reaches_every_dataset():
-    # Consequence of the composition rule, pinned because it is easy to read
-    # a dataset's fencing as opt-IN when it is opt-OUT: empty everywhere means
-    # UNRESTRICTED, so a user in no group is granted every volume in the
-    # catalog, an S3 dataset included. Adding a dataset therefore hands it to
-    # everyone who has no allow-list, which is the same posture PVC volumes
-    # have always had — consistent, not a new hole, but not "nobody by
-    # default" either. Restricting it means giving those users a list.
+def test_a_user_with_no_grants_at_all_reaches_no_dataset():
+    # A dataset's fencing is opt-IN, and this is the case that says so:
+    # adding a dataset hands it to nobody until somebody is granted it. Until
+    # 2026-08-25 it was the reverse — an empty allow-list meant unrestricted,
+    # so a new dataset was writable by every user in no group the moment it
+    # was defined.
     cm = _granted({"alice": {"name": "alice"}, "mallory": {"name": "mallory"}})
-    assert cm.s3_proxy_users("refdata", "rw") == ["alice", "mallory"]
+    assert cm.s3_proxy_users("refdata", "rw") == []
+    assert cm.s3_proxy_users("refdata", "ro") == []
 
 
-def test_unrestricted_user_defaults_to_read_write():
-    # No allow-list anywhere means no restriction, and a volume named in no
-    # grant is rw — the pre-groups default. The ro proxy must not admit them.
-    cm = _granted({"alice": {"name": "alice"}})
+def test_a_granted_user_with_no_mode_named_defaults_to_read_write():
+    # A volume named in the user's OWN allowedVolumes carries no mode, and
+    # rw is what that has always meant. The ro proxy must not admit them.
+    cm = _granted({"alice": {"name": "alice", "allowedVolumes": ["refdata"]}})
     assert cm.s3_proxy_users("refdata", "rw") == ["alice"]
     assert cm.s3_proxy_users("refdata", "ro") == []
 

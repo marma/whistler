@@ -68,6 +68,7 @@
               {% for v in g.volumes or [] %}
                 <div class="ui tiny label">{{ v.name }} <span class="detail">{{ v.get("mode", "rw") }}</span></div>
               {% endfor %}
+              {% for e in g.entryPoints or [] %}<div class="ui tiny red label">entry: {{ e }}</div>{% endfor %}
               {% for z in g.allowedZones or [] %}<div class="ui tiny blue label">zone: {{ z }}</div>{% endfor %}
               {% for gt in g.allowedGpuTypes or [] %}<div class="ui tiny purple label">gpu: {{ gt }}</div>{% endfor %}
               {% for o in (g.overrides or {}) %}<div class="ui tiny olive label">override: {{ o }}</div>{% endfor %}
@@ -132,6 +133,7 @@
         <p class="ui grey text">Nothing to grant yet. Create a <a href="/admin/volumes/new?user={{ current_user }}">volume</a> or a <a href="/admin/datasets/new?user={{ current_user }}">dataset</a>.</p>
         {% endfor %}
         {% if volumes %}
+        <div class="ui pointing label">This user may mount exactly the volumes and datasets ticked here, plus any their groups grant. No boxes and no group grant means none.</div>
         <div class="ui divider"></div>
         <button type="submit" class="ui teal button"><i class="save icon"></i> Save Volume &amp; Dataset Access</button>
         {% endif %}
@@ -159,7 +161,7 @@
         <p class="ui grey text">No GPU types defined in whistler.gpuTypes.</p>
         {% endfor %}
         {% if gpu_types %}
-        <div class="ui pointing label">Checking one or more boxes restricts this user to those GPU types. Leaving all boxes unchecked applies no restriction (any catalog type is usable).</div>
+        <div class="ui pointing label">This user may request exactly the GPU types ticked here, plus any their groups grant. No boxes and no group grant means no GPU.</div>
         <div class="ui divider"></div>
         <button type="submit" class="ui teal button"><i class="save icon"></i> Save GPU Access</button>
         {% endif %}
@@ -184,7 +186,7 @@
           </div>
         </div>
         {% endfor %}
-        <div class="ui pointing label">Checking one or more boxes restricts this user to those zones — for template-baked zones and the zone override alike. Leaving all boxes unchecked applies no restriction; the implicit default zone is never gated.</div>
+        <div class="ui pointing label">This user may launch in exactly the zones ticked here, plus any their groups grant — for template-baked zones and the zone override alike. A template with no zone lands in <code>default</code>, so that one has to be granted too: no boxes and no group grant means this user can start nothing.</div>
         <div class="ui divider"></div>
         <button type="submit" class="ui teal button"><i class="save icon"></i> Save Zone Access</button>
       </form>
@@ -211,6 +213,56 @@
         {% endfor %}
         <div class="ui divider"></div>
         <button type="submit" class="ui teal button"><i class="save icon"></i> Save Overrides</button>
+      </form>
+    </div>
+
+    <div class="ui segment">
+      <h4 class="ui header"><i class="door open icon"></i> Entry Points</h4>
+      <p class="ui grey text">
+        Which doors this account may come in through. Ticking only
+        <strong>kiosk</strong> is the kiosk binding: the portal, the web
+        terminal, the machine console and SSH are all refused, whatever client
+        the person uses and wherever they connect from. It is one half of a
+        pair — the other is a network on which every device is controlled.
+      </p>
+      <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/entry-points?user={{ current_user }}">
+        {% for e in entry_points %}
+        <div class="field">
+          <div class="ui checkbox">
+            <input type="checkbox" name="entry_points" value="{{ e }}"
+                   id="entry-{{ e }}"
+                   {% if e in own_entry_points %}checked{% endif %}>
+            <label for="entry-{{ e }}">
+              {{ e }}
+              {% if e == "kiosk" %}<span class="ui grey mini label">/kiosk only: their desktops, nothing else</span>
+              {% elif e == "portal" %}<span class="ui grey mini label">this UI, the web terminal, the console</span>
+              {% else %}<span class="ui grey mini label">SSH: launcher, jump, scp/sftp</span>{% endif %}
+              {% if e not in own_entry_points and e in allowed_entry_points %}
+                <span class="ui teal mini label">from group</span>
+              {% endif %}
+            </label>
+          </div>
+        </div>
+        {% endfor %}
+        <div class="ui pointing label">This account may come in through exactly the doors ticked here, plus any its groups grant. Leaving every box unchecked <strong>is</strong> a lockout — no portal, no kiosk, no SSH. A group that grants an entry point widens this user back out, the same way it does for zones and volumes.</div>
+        {% if user_obj.name == current_user %}
+        {# Nothing here stops it: the field means the same thing for every
+           account, including this one. But the way back is kubectl, so say so
+           before the click rather than after it. #}
+        <div class="ui warning message" style="margin-top:.75rem">
+          <i class="exclamation triangle icon"></i>
+          This is your own account. Saving without <strong>portal</strong>
+          ticked shuts you out of this UI — the way back is
+          <code>kubectl edit usr {{ user_obj.name }}</code>.
+        </div>
+        {% endif %}
+        <div class="ui divider"></div>
+        <p class="ui grey text">
+          Effective:
+          {% if allowed_entry_points %}{% for e in allowed_entry_points %}<div class="ui tiny label">{{ e }}</div>{% endfor %}
+          {% else %}<em class="ui red text">no entry point — this account cannot sign in anywhere</em>{% endif %}
+        </p>
+        <button type="submit" class="ui teal button"><i class="save icon"></i> Save Entry Points</button>
       </form>
     </div>
 

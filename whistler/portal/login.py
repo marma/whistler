@@ -77,6 +77,45 @@ _LOGIN_HTML = """<!doctype html><meta charset=utf-8><title>__TITLE__</title>
 </form>"""
 
 
+# A refusal, in the same furniture as the form. Used where a surface has to
+# turn somebody away for *who they are* rather than for a wrong password — a
+# kiosk-bound user reaching the management portal, or a portal user reaching the
+# kiosk. It links to the surface they do have rather than redirecting there:
+# behind the bundled proxy both live on one origin, but in a split-port dev run
+# they do not, and a redirect would land on a 404 instead of an explanation.
+_NOTICE_HTML = """<!doctype html><meta charset=utf-8><title>__TITLE__</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<link rel=icon type=image/svg+xml href=/static/favicon.svg>
+<style>__BASE_CSS__
+  body{display:flex;align-items:center;justify-content:center;padding:2rem}
+  .box{width:100%;max-width:26rem;text-align:center;display:flex;
+       flex-direction:column;gap:1rem}
+  p{margin:0}
+  a.go{align-self:center;font-weight:600;color:#fff;background:#2f6fb5;
+       border-radius:6px;padding:.6rem 1.1rem}
+  a.go:hover{background:#3b81cd}
+</style>
+<div class=box>
+  <h1>__HEADING__</h1>
+  <p class=muted>__MESSAGE__</p>
+  __LINK__
+</div>"""
+
+
+def render_notice(*, heading: str, message: str, href: str = None,
+                  link_label: str = None, title: str = None) -> str:
+    link = ""
+    if href:
+        link = (f'<a class=go href="{html.escape(href, quote=True)}">'
+                f'{html.escape(link_label or href)}</a>')
+    return (_NOTICE_HTML
+            .replace("__BASE_CSS__", BASE_CSS)
+            .replace("__TITLE__", html.escape(title or heading))
+            .replace("__HEADING__", html.escape(heading))
+            .replace("__MESSAGE__", html.escape(message))
+            .replace("__LINK__", link))
+
+
 def dev_auth() -> bool:
     """Whether the portal's dev auth gate is open. Read per request, not at
     import, so tests and a restarted process agree."""

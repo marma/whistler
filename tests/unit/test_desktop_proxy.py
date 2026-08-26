@@ -102,6 +102,11 @@ class FakeCM:
     def is_user_admin(self, username):
         return username in self.admins
 
+    def may_enter(self, username, entry_point):
+        """Entry points this double does not restrict — the binding has its own
+        tests (test_entry_points.py); here every user holds every door."""
+        return True
+
     def session_channels(self, username, name):
         return self.channels.get(username, set(CHANNELS))
 

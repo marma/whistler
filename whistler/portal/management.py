@@ -42,9 +42,11 @@ from fastapi.templating import Jinja2Templates
 
 from whistler.config import (ACCESS_MODES, CHANNELS, ConfigWriteError,
                              ENFORCED_ACCESS_KINDS, ENFORCED_CHANNELS,
-                             GPU_NODE_LABEL, OVERRIDE_GROUPS)
+                             ENTRY_KIOSK, ENTRY_POINTS, ENTRY_PORTAL,
+                             GPU_NODE_LABEL, NEW_USER_ENTRY_POINTS,
+                             NEW_USER_ZONES, OVERRIDE_GROUPS)
 from whistler.portal.login import (USER_COOKIE, dev_auth, render_login,
-                                   verify_credentials)
+                                   render_notice, verify_credentials)
 from whistler.status import GROUP_COLORS, status_group
 
 logger = logging.getLogger("whistler.management")
@@ -93,6 +95,12 @@ class LoginRequired(Exception):
     request that could not render one) by ``_login_required``."""
 
 
+class EntryPointDenied(Exception):
+    """A known user, refused this whole surface: they hold no `portal` entry
+    point (design/security.md, "Closing the fourth axis"). Not a 401 — signing
+    in again cannot help, and offering the form again would suggest it might."""
+
+
 def _get_identity(request: Request) -> Optional[str]:
     """Who this request is, or None to send them to the login screen.
 
@@ -112,9 +120,18 @@ def _get_identity(request: Request) -> Optional[str]:
 
 
 def require_user(request: Request):
+    """Identity, then the door.
+
+    The entry-point check lives here rather than in each route because "here"
+    is every route: this app *is* the portal entry point, so a kiosk-bound user
+    must not reach the dashboard, an admin page, a home volume or an htmx
+    fragment of any of them. One User CR read per request, the same cost as the
+    admin check beside it."""
     user = _get_identity(request)
     if not user:
         raise LoginRequired()
+    if not request.app.state.cm.may_enter(user, ENTRY_PORTAL):
+        raise EntryPointDenied()
     return user
 
 
@@ -231,6 +248,14 @@ async def login_submit(
     if not verify_credentials(name, password):
         logger.warning(f"Portal login refused for {user!r}")
         return _login_page(next_to, "Sign-in failed.", status_code=401)
+    # The password was right and the surface is still wrong. Say which, and
+    # sign nobody in: a cookie for a surface this account cannot use would only
+    # produce the same refusal one navigation later.
+    if not await request.app.state.run(
+            request.app.state.cm.may_enter, name, ENTRY_PORTAL):
+        logger.warning(f"Portal login refused for {name}: no "
+                       f"'{ENTRY_PORTAL}' entry point")
+        return _entry_denied_page()
     logger.info(f"Portal login for {name}")
     response = RedirectResponse(_next_url(next_to, name), status_code=303)
     response.set_cookie(USER_COOKIE, name, path="/", samesite="lax")
@@ -246,6 +271,30 @@ async def logout(request: Request):
     response.delete_cookie(USER_COOKIE, path="/")
     response.delete_cookie(PORTAL_COOKIE, path="/")
     return response
+
+
+def _entry_denied_page() -> HTMLResponse:
+    """What a kiosk-bound account is told when it arrives at the portal. A page
+    rather than a redirect to /kiosk: behind the bundled proxy the kiosk is one
+    origin away, in a split-port dev run it is not, and a 303 would land on a
+    404 instead of an explanation."""
+    return HTMLResponse(
+        render_notice(
+            heading="Kiosk only",
+            message="This account may only be used through the kiosk. The "
+                    "management portal, the web terminal and SSH are not "
+                    "available to it.",
+            href="/kiosk", link_label="Go to the kiosk"),
+        status_code=403, headers={"Cache-Control": "no-store"})
+
+
+async def _entry_point_denied(request: Request, exc: Exception):
+    """Every route on this app funnels here through require_user."""
+    if (request.headers.get("Sec-Fetch-Mode") == "navigate"
+            or "text/html" in request.headers.get("Accept", "")):
+        return _entry_denied_page()
+    return JSONResponse({"detail": f"No '{ENTRY_PORTAL}' entry point."},
+                        status_code=403)
 
 
 async def _login_required(request: Request, exc: Exception):
@@ -298,14 +347,6 @@ def _desktop_viewer_url(user: str, name: str) -> str:
     return f"{_DESKTOP_PORTAL_URL}/connect/{name}?user={user}"
 
 
-def _screenshot_url(user: str, name: str) -> str:
-    """Latest desktop thumbnail, served by the viewer app (same base URL as the
-    connect/terminal links). 404 until the first capture pass covers the
-    session, so the template hides the image on error rather than reserving
-    space for one that may never arrive."""
-    return f"{_DESKTOP_PORTAL_URL}/screenshot/{name}?user={user}"
-
-
 def _terminal_url(user: str, name: str) -> str:
     """Web-terminal (xterm.js) page, served by the same viewer app as the desktop
     relay — so it shares _DESKTOP_PORTAL_URL (empty = same-origin via the proxy)."""
@@ -343,8 +384,6 @@ def _merge_sessions(instances: list, desktop_sessions: list, user: str,
             "status": i.get("status"), "ready": i.get("ready", True),
             "mode": "ssh", "connect_url": None,
             "term_url": _terminal_url(user, i["name"]),
-            # ssh instances have no X display, so nothing to screenshot.
-            "screenshot_url": None,
             "console_url": (_console_url(user, i["name"])
                             if is_vm and is_admin else None),
         })
@@ -355,7 +394,6 @@ def _merge_sessions(instances: list, desktop_sessions: list, user: str,
             "status": s.get("phase"), "ready": True, "mode": "desktop",
             "connect_url": _desktop_viewer_url(user, s["name"]),
             "term_url": _terminal_url(user, s["name"]),
-            "screenshot_url": _screenshot_url(user, s["name"]),
             "console_url": (_console_url(user, s["name"])
                             if is_vm and is_admin else None),
         })
@@ -402,9 +440,15 @@ async def instance_create_form(request: Request, cm: CM, user: User, is_admin: I
             request.app.state.run(cm.get_user_allowed_zones, user),
             request.app.state.run(cm.get_home_volumes, user),
         )
-    # The zone picker offers only what _apply_policy would accept: an empty
-    # allowedZones means every defined zone.
-    selectable_zones = [z for z in zones if not allowed_zones or z in allowed_zones]
+    # The zone picker offers only what _apply_policy would accept, and every
+    # allow is explicit — so a user granted no zone is offered none, and the
+    # form says that rather than silently listing the whole catalog.
+    selectable_zones = [z for z in zones if z in allowed_zones]
+    # Same rule for the GPU picker as the zone picker: offer what would
+    # actually provision. It used to list the whole catalog and let the
+    # failure explain itself, which was survivable while an empty allow-list
+    # meant "any"; now it would offer every type to a user granted none.
+    gpu_types = [g for g in gpu_types if g in allowed_gpu_types]
     return templates.TemplateResponse(
         request=request, name="user/create_instance.html",
         context=_ctx(user, is_admin=is_admin, tpls=ssh_tpls + desk_tpls, volumes=volumes,
@@ -514,7 +558,8 @@ async def instance_edit_form(request: Request, cm: CM, user: User, is_admin: IsA
     if status_group(inst["status"], inst.get("ready", True)) not in ("Stopped", "Error"):
         raise HTTPException(status_code=409, detail="Stop the instance before editing it.")
 
-    selectable_zones = [z for z in zones if not allowed_zones or z in allowed_zones]
+    selectable_zones = [z for z in zones if z in allowed_zones]
+    gpu_types = [g for g in gpu_types if g in allowed_gpu_types]
     return templates.TemplateResponse(
         request=request, name="user/edit_instance.html",
         context=_ctx(user, is_admin=is_admin, inst=inst, cur=cur,
@@ -784,8 +829,7 @@ async def home_volumes(request: Request, cm: CM, user: User, is_admin: IsAdmin):
         request=request, name="user/home_volumes.html",
         context=_ctx(user, is_admin=is_admin,
                      volumes=await _home_volume_rows(request, cm, user),
-                     zones=[z for z in zones
-                            if not allowed_zones or z in allowed_zones],
+                     zones=[z for z in zones if z in allowed_zones],
                      access=access),
     )
 
@@ -812,7 +856,7 @@ async def home_volume_create(
         request.app.state.run(cm.get_zones),
         request.app.state.run(cm.get_user_allowed_zones, user),
     )
-    if zone not in zones or (allowed_zones and zone not in allowed_zones):
+    if zone not in zones or zone not in allowed_zones:
         raise HTTPException(
             status_code=400,
             detail=f"You do not have access to zone '{zone}'.")
@@ -991,6 +1035,14 @@ async def admin_user_create(
 ):
     user_data = _build_user_data(name, public_keys, run_as_user, run_as_group, fs_group,
                                   uid, is_admin_flag)
+    # Every allow is explicit, so a user created with nothing ticked holds
+    # nothing — including a door to come in through and a zone to launch in.
+    # Seed those two here rather than in _build_user_data, which the *edit*
+    # form shares: handing them back on every save would make narrowing them
+    # impossible. The grants that cost something (volumes, GPU types) stay
+    # empty; the admin lands on the detail page and grants them there.
+    user_data["entryPoints"] = list(NEW_USER_ENTRY_POINTS)
+    user_data["allowedZones"] = list(NEW_USER_ZONES)
     ok = await request.app.state.run(cm.save_user, user_data)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to create user.")
@@ -1036,6 +1088,10 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
                      user_groups=user_groups, volume_modes=volume_modes,
                      channels=CHANNELS, enforced_channels=ENFORCED_CHANNELS,
                      own_channels=user_obj.get("channels"),
+                     entry_points=ENTRY_POINTS,
+                     own_entry_points=user_obj.get("entryPoints") or [],
+                     allowed_entry_points=await request.app.state.run(
+                         cm.get_user_entry_points, username),
                      channel_grant=sorted(channel_grant) if channel_grant is not None else None,
                      access_sections=access_sections,
                      own_volumes=user_obj.get("allowedVolumes") or [],
@@ -1098,6 +1154,27 @@ async def admin_user_set_overrides(
     checked = set(override_groups or [])
     overrides = {g: g in checked for g in OVERRIDE_GROUPS}
     await request.app.state.run(cm.set_user_overrides, username, overrides)
+    return _tr(f"/admin/users/{username}", admin)
+
+
+async def admin_user_set_entry_points(
+    request: Request, cm: CM, admin: Admin, username: str,
+    entry_points: Annotated[Optional[list[str]], Form()] = None,
+):
+    """Which doors this user may use. No boxes means **no door** — the same
+    explicit-allow rule as zones and volumes, and the reason the form says so
+    next to the checkboxes rather than leaving an admin to discover that
+    unchecking everything is a lockout.
+
+    An admin can bind *themselves* out of the portal here. That is allowed on
+    purpose: the alternative is a special case that makes the field mean
+    something different for one account, and `kubectl edit usr` is the way
+    back."""
+    await request.app.state.run(cm.set_user_entry_points, username,
+                                entry_points or [])
+    if username == admin and ENTRY_PORTAL not in (entry_points or []):
+        logger.warning(f"Admin {admin} just removed their own "
+                       f"'{ENTRY_PORTAL}' entry point")
     return _tr(f"/admin/users/{username}", admin)
 
 
@@ -1175,6 +1252,7 @@ async def _group_form_context(request, admin, group=None):
         await _matrix_sections(request, cm), zones, own_access, own_access)
     return _ctx(admin, is_admin=True, group=group, volumes=volumes, zones=zones,
                 gpu_types=gpu_types, all_users=all_users,
+                entry_points=ENTRY_POINTS,
                 channels=CHANNELS, enforced_channels=ENFORCED_CHANNELS,
                 override_groups=OVERRIDE_GROUPS,
                 access_sections=access_sections,
@@ -1768,7 +1846,7 @@ def _template_form_data(*, name, display_name, image, description, cpu, memory,
     resources.gpu; gpu_type (from the live GPU catalog) maps to
     nodeSelector[GPU_NODE_LABEL], the key _apply_policy checks against a
     user's allowedGpuTypes. zone names a network zone; empty means the
-    implicit default."""
+    implicit default, which is "default" and gated like any other zone."""
     data = {
         "name": name,
         "displayName": display_name.strip(),
@@ -1921,6 +1999,13 @@ def _build_group_data(name: str, form) -> dict:
     if gpu_types:
         data["allowedGpuTypes"] = gpu_types
 
+    entry_points = set(form.getlist("entry_points"))
+    if entry_points:
+        # Omitted when nothing is ticked, unlike `channels` above: a group
+        # only ever widens, so an empty list and an absent one grant the same
+        # nothing, and the absent one says it without looking like a decision.
+        data["entryPoints"] = [e for e in ENTRY_POINTS if e in entry_points]
+
     if form.get("restrict_channels"):
         checked = set(form.getlist("channels"))
         data["channels"] = [c for c in CHANNELS if c in checked]
@@ -2053,6 +2138,7 @@ def build_management_app(config_manager):
     # unauthenticated request sees, and /login and /logout below are the only
     # routes that do not ask.
     app.add_exception_handler(LoginRequired, _login_required)
+    app.add_exception_handler(EntryPointDenied, _entry_point_denied)
     app.add_api_route(LOGIN_PATH,  login_form,   methods=["GET"], response_class=HTMLResponse)
     app.add_api_route(LOGIN_PATH,  login_submit, methods=["POST"])
     app.add_api_route("/logout",   logout,       methods=["POST"])
@@ -2088,6 +2174,7 @@ def build_management_app(config_manager):
     app.add_api_route("/admin/users/{username}/gpu-types",        admin_user_set_gpu_types, methods=["POST"])
     app.add_api_route("/admin/users/{username}/zones",            admin_user_set_zones, methods=["POST"])
     app.add_api_route("/admin/users/{username}/overrides",        admin_user_set_overrides, methods=["POST"])
+    app.add_api_route("/admin/users/{username}/entry-points",     admin_user_set_entry_points, methods=["POST"])
     app.add_api_route("/admin/users/{username}/channels",         admin_user_set_channels, methods=["POST"])
     app.add_api_route("/admin/groups",                            admin_groups,           methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/groups/new",                        admin_group_new,        methods=["GET"],  response_class=HTMLResponse)

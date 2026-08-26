@@ -360,6 +360,17 @@ class FakeConfigManager(ConfigManager):
         return merge_allow_lists(own, *(g.get("allowedZones")
                                         for g in self.get_user_groups(username)))
 
+    def get_user_entry_points(self, username):
+        own = (self.users.get(username) or {}).get("entryPoints", [])
+        return merge_allow_lists(own, *(g.get("entryPoints")
+                                        for g in self.get_user_groups(username)))
+
+    def set_user_entry_points(self, username, entry_points):
+        if username in self.users:
+            self.users[username]["entryPoints"] = list(entry_points or [])
+            return True
+        return False
+
     def set_user_allowed_zones(self, username, zones):
         if username in self.users:
             self.users[username]["allowedZones"] = zones

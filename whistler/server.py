@@ -22,8 +22,9 @@ from whistler.logsetup import quiet_chatty_libraries
 import argparse
 from functools import partial
 from whistler.config import (CHANNEL_RELAY, CHANNEL_SSH, ConfigManager,
-                             KubeConfigManager, SESSION_SSH_PORT,
-                             SSH_POSTURE_DIRECT, target_channels)
+                             ENTRY_GATEWAY, KubeConfigManager,
+                             SESSION_SSH_PORT, SSH_POSTURE_DIRECT,
+                             target_channels)
 from asyncio import Event
 
 logger = logging.getLogger("whistler.server")
@@ -324,8 +325,7 @@ class SSHServer(asyncssh.SSHServer):
             
         logger.warning(f"Dev mode: allowing {username} via password auth")
         real_user, parts = self._split_username(username)
-        self._resolve_target(real_user, parts)
-        return True
+        return self._accept(real_user, parts)
 
     def public_key_auth_supported(self):
         return True
@@ -379,14 +379,35 @@ class SSHServer(asyncssh.SSHServer):
         parts = username.split('-')
         return parts[0], parts
 
+    def _accept(self, real_user, parts):
+        """The one place authentication succeeds — and therefore the one place
+        the gateway asks whether this user may come in *here*.
+
+        Refusing at auth rather than at each channel is deliberate: the
+        gateway's three doors (the launcher TUI, the relay behind it, and the
+        jump) are one entry point on one port, and a check placed at any one of
+        them is a check the other two could outlive. The design's named failure
+        mode is exactly this — "a grant missed at one entry point, the classic
+        being the SSH gateway" (design/security.md, "Closing the fourth axis").
+
+        The client sees an ordinary auth failure, which is all SSH can say at
+        this stage; the reason is logged here."""
+        if not self.config_manager.may_enter(real_user, ENTRY_GATEWAY):
+            logger.warning(
+                f"Refusing {real_user}: no '{ENTRY_GATEWAY}' entry point "
+                f"(entryPoints="
+                f"{self.config_manager.get_user_entry_points(real_user)})")
+            return False
+        self._resolve_target(real_user, parts)
+        return True
+
     def validate_public_key(self, username, key):
         real_user, parts = self._split_username(username)
 
         # Check for dev mode bypass
         if os.environ.get("WHISTLER_AUTH_ALLOW_ANY") == "true":
             logger.warning(f"Dev mode: allowing {real_user} without key check")
-            self._resolve_target(real_user, parts)
-            return True
+            return self._accept(real_user, parts)
 
         # Check if user exists and key matches
         if not self.config_manager.user_exists(real_user):
@@ -406,7 +427,8 @@ class SSHServer(asyncssh.SSHServer):
                 logger.warning(f"Skipping malformed authorized key for {real_user}: {e}")
                 continue
             if allowed_key.public_data == presented:
-                self._resolve_target(real_user, parts)
+                if not self._accept(real_user, parts):
+                    return False
                 logger.info(f"User {real_user} authenticated via public key. Target: {self.target_type} {self.target_name}")
                 return True
 

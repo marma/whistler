@@ -7,9 +7,12 @@ of the portal runs on — any password while WHISTLER_AUTH_ALLOW_ANY is set, and
 nothing at all without it — so these tests also pin the "no credential store"
 answer in both directions.
 """
+from types import SimpleNamespace
+
 import pytest
 from starlette.requests import Request
 
+from whistler.config import ENTRY_PORTAL
 from whistler.portal import login
 from whistler.portal.login import USER_COOKIE
 from whistler.portal.management import (LOGIN_PATH, LoginRequired,
@@ -29,7 +32,33 @@ def no_dev(monkeypatch):
     monkeypatch.delenv("WHISTLER_AUTH_ALLOW_ANY", raising=False)
 
 
-def _request(path="/", query="", cookies=None, headers=None, method="GET"):
+class _CM:
+    """Enough config manager for the sign-in path. `entry_points` maps a user
+    to their grant; anyone absent falls back to `default_grant`, which is the
+    portal, because this file is about what the *form* does and not about who
+    may use it — the refusal has its own tests in test_entry_points.py. Note
+    the fallback is the fixture's, not the rule's: on a real ConfigManager an
+    absent grant is no door at all."""
+
+    def __init__(self, entry_points=None, default_grant=(ENTRY_PORTAL,)):
+        self.entry_points = entry_points or {}
+        self.default_grant = list(default_grant)
+
+    def get_user_entry_points(self, username):
+        return list(self.entry_points.get(username, self.default_grant))
+
+    def may_enter(self, username, entry_point):
+        return entry_point in self.get_user_entry_points(username)
+
+
+def _app(cm=None):
+    async def run(func, *args):
+        return func(*args)
+    return SimpleNamespace(state=SimpleNamespace(cm=cm or _CM(), run=run))
+
+
+def _request(path="/", query="", cookies=None, headers=None, method="GET",
+             cm=None):
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
     if cookies:
         raw.append((b"cookie",
@@ -37,7 +66,8 @@ def _request(path="/", query="", cookies=None, headers=None, method="GET"):
     return Request({"type": "http", "http_version": "1.1", "method": method,
                     "scheme": "http", "server": ("portal", 80), "root_path": "",
                     "path": path, "raw_path": path.encode(),
-                    "query_string": query.encode(), "headers": raw})
+                    "query_string": query.encode(), "headers": raw,
+                    "app": _app(cm)})
 
 
 def _cookies(response):

@@ -79,13 +79,14 @@ spec:
                       description: >-
                         VM-only. Page size backing this guest's RAM
                         (domain.memory.hugepages.pageSize), overriding the
-                        cluster default (whistler.hugePages.pageSize, 1Gi).
+                        cluster default (whistler.hugePages.pageSize, 2Mi).
                         Hugepages are what keep VFIO's DMA pinning of a large
                         GPU guest inside virt-handler's 20s SyncVMI deadline.
-                        Only 2Mi and 1Gi exist on x86_64, `memory` must be a
-                        multiple of it, and the node must have that many pages
-                        reserved or the VM never schedules. Set to "" to opt
-                        this template out and run it on 4KiB pages.
+                        Only 2Mi and 1Gi exist on x86_64; `memory` is
+                        rounded UP to a whole number of pages, and the node
+                        must have that many reserved or the VM never
+                        schedules. Set to "" to opt this template out and run
+                        it on 4KiB pages.
                 nodeSelector:
                   type: object
                   additionalProperties:
@@ -364,19 +365,20 @@ spec:
                     type: string
                   description: >-
                     Allow-list of gpuTypes this user may request on a template.
-                    Omitted/empty means no restriction here; the effective
-                    list is the union with every Group this user belongs to,
-                    so an empty list still ends up bounded when a group
-                    defines one.
+                    Every allow is explicit: omitted/empty grants NOTHING
+                    here, and the effective list is the union with every Group
+                    this user belongs to — so a user with no list of their own
+                    may request exactly what their groups grant, and a user in
+                    no group may request no GPU at all.
                 volumeAccess:
                   type: object
                   description: >-
                     The access matrix: which volumes may be mounted in which
                     zones, and how. Keyed zone -> volume -> mode. An ABSENT
-                    entry is NO ACCESS — this field has no defaults, which
-                    deliberately inverts the convention every other allow-list
-                    here follows (where empty means unrestricted). It is
-                    therefore not an allow-list and must not be read as one.
+                    entry is NO ACCESS — this field has no defaults, the
+                    same explicit-allow rule the allow-lists here follow. It
+                    is still not an allow-list and must not be read as one:
+                    a cell is (zone, volume, mode), not a name.
                     A user's effective access is the most permissive entry
                     across their own table and every group's, ordered
                     allowed > read-only > absent; joining a group is a
@@ -397,21 +399,42 @@ spec:
                     type: string
                   description: >-
                     Allow-list of the volumes catalog this user's templates may
-                    request, all read-write. Omitted/empty means no restriction
-                    here; the effective list is the union with the volumes
-                    granted by every Group this user belongs to (which may
-                    grant read-only access — a name granted rw anywhere is
-                    mounted rw).
+                    request, all read-write. Every allow is explicit:
+                    omitted/empty grants NOTHING here, and the effective list
+                    is the union with the volumes granted by every Group this
+                    user belongs to (which may grant read-only access — a name
+                    granted rw anywhere is mounted rw).
                 allowedZones:
                   type: array
                   items:
                     type: string
                   description: >-
-                    Allow-list of network zones this user's sessions may
-                    explicitly request (template-baked or via the zone
-                    override). Omitted/empty means no restriction here; the
-                    effective list is the union with every Group this user
-                    belongs to. The implicit default zone is never gated.
+                    Allow-list of network zones this user's sessions may run
+                    in. Every allow is explicit: omitted/empty grants NOTHING
+                    here, and the effective list is the union with every Group
+                    this user belongs to. This covers the zone a template
+                    bakes in, the zone override, AND the implicit default — a
+                    template with no zone lands in "default", so "default"
+                    must be granted like any other. A user granted no zone can
+                    start no session.
+                entryPoints:
+                  type: array
+                  items:
+                    type: string
+                    enum: ["kiosk", "portal", "gateway"]
+                  description: >-
+                    Which doors into Whistler this user may use: the kiosk
+                    surface, the management portal (and the viewer app's
+                    ordinary pages), and the SSH gateway. Every allow is
+                    explicit: omitted/empty is NO DOOR — the account cannot
+                    sign in anywhere — and [kiosk] is the kiosk binding of
+                    design/security.md, "Closing the fourth axis". Composed
+                    like allowedZones, NOT like channels: the effective set is
+                    the union with every Group this user belongs to, so a group
+                    that grants `portal` widens a kiosk-bound member back out.
+                    The operator seeds this on the bootstrap admin, and the
+                    portal seeds it on users it creates, so an account made
+                    the ordinary way is not born locked out.
                 channels:
                   type: array
                   items:
@@ -474,9 +497,10 @@ spec:
               description: >-
                 A set of users sharing a project's grants. Every field here is
                 unioned with the member's own User CR fields and with every
-                other group they belong to: empty everywhere still means
-                "no restriction", but a group with a list bounds a member who
-                had none. Membership lives here and only here — there is no
+                other group they belong to. Every allow is explicit, so a
+                group is the only thing that can widen a member who has
+                granted themselves nothing, and empty everywhere is access to
+                nothing. Membership lives here and only here — there is no
                 `groups` field on User — so a project is edited in one place.
                 See design/security.md, "Group".
               properties:
@@ -495,10 +519,10 @@ spec:
                   description: >-
                     The access matrix: which volumes may be mounted in which
                     zones, and how. Keyed zone -> volume -> mode. An ABSENT
-                    entry is NO ACCESS — this field has no defaults, which
-                    deliberately inverts the convention every other allow-list
-                    here follows (where empty means unrestricted). It is
-                    therefore not an allow-list and must not be read as one.
+                    entry is NO ACCESS — this field has no defaults, the
+                    same explicit-allow rule the allow-lists here follow. It
+                    is still not an allow-list and must not be read as one:
+                    a cell is (zone, volume, mode), not a name.
                     A user's effective access is the most permissive entry
                     across their own table and every group's, ordered
                     allowed > read-only > absent; joining a group is a
@@ -553,6 +577,16 @@ spec:
                   items:
                     type: string
                   description: gpuTypes members may request (unioned).
+                entryPoints:
+                  type: array
+                  items:
+                    type: string
+                    enum: ["kiosk", "portal", "gateway"]
+                  description: >-
+                    Entry points members may use (unioned with their own, see
+                    above). A grant, so this WIDENS a member whose own list is
+                    narrower — a group is not the place to bind someone to the
+                    kiosk, only to say which doors a project's members need.
                 channels:
                   type: array
                   items:
@@ -771,9 +805,7 @@ spec:
                     read-mostly and S3 resolves concurrent writers as a
                     silent last-writer-wins, so this is the posture to
                     prefer. Without it, a dataset is writable by anyone
-                    granted it — including every user with no allow-list at
-                    all, since empty means unrestricted everywhere in
-                    Whistler.
+                    granted it.
   scope: Namespaced
   names:
     plural: datasets

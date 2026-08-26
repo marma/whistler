@@ -46,7 +46,7 @@ and it was taken because the overview was, in practice, too coarse to be worth
 looking at. Set ``WHISTLER_SCREENSHOT_WIDTH``/``_HEIGHT`` back down to get that
 posture, or toward the native resolution to get full readable monitoring.
 The setting is the policy, so it is documented as such rather than buried as a
-rendering detail. **The stored size is the boundary, not the CSS the dashboard
+rendering detail. **The stored size is the boundary, not the CSS a kiosk card
 displays it at** — anything this module holds is retrievable at full stored
 resolution from ``/screenshot/<id>``.
 

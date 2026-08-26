@@ -54,9 +54,10 @@ from functools import partial
 import aiohttp
 from aiohttp import web
 
-from whistler.config import CHANNEL_TERMINAL
+from whistler.config import CHANNEL_TERMINAL, ENTRY_KIOSK, ENTRY_PORTAL
 from whistler.portal import kiosk, kubevirt, proxy, screenshots, terminal
 from whistler.portal.login import USER_COOKIE as _USER_COOKIE
+from whistler.portal.login import render_notice
 
 logger = logging.getLogger("whistler.portal")
 
@@ -99,6 +100,91 @@ async def _run(request, func, *args):
     """Run a blocking KubeConfigManager method off the event loop."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, func, *args)
+
+
+# --------------------------------------------------------------------------- #
+# Entry points — the identity half of the kiosk situation (design/security.md, #
+# "Closing the fourth axis"), enforced here for this app's share of the doors. #
+# --------------------------------------------------------------------------- #
+
+# This app serves *both* surfaces, so which entry point a request belongs to is
+# a path question. Three sets, and the interesting one is the middle:
+#
+# - Open: the lock screen is made of /static, and a binding must not take a pod
+#   out of service, so /healthz stays reachable.
+# - Shared: the desktop itself. Both the kiosk's session page and the portal's
+#   connect page end up here, so these carry no entry point of their own —
+#   which is also what keeps a Selkies asset or WebSocket frame off the
+#   per-request User CR read below.
+# - Everything else is the portal's: the launch form on /, the web terminal,
+#   the machine console. Written as "everything else" on purpose: a route added
+#   later is checked by default rather than exempt by omission.
+_OPEN_PREFIXES = ("/static/",)
+_SHARED_PREFIXES = ("/connect", "/desktop", "/vnc", "/ws-vnc", "/status",
+                    "/screenshot")
+
+# The kiosk's own way in and out, always reachable — the same reasoning as the
+# lock's _LOCK_ALLOWED. A browser holding a kiosk cookie for an account the
+# surface now refuses has to be able to sign out, or nobody else can sign in on
+# that machine; and refusing the login *POST* is the form's job (kiosk_login),
+# which can say why instead of showing a wall.
+_KIOSK_OPEN = ("/kiosk/login", "/kiosk/logout")
+
+
+def _required_entry_point(path: str):
+    """Which entry point ``path`` needs, or None when it needs none."""
+    if path == "/healthz" or path.startswith(_OPEN_PREFIXES):
+        return None
+    if path in _KIOSK_OPEN or path.startswith(_SHARED_PREFIXES):
+        return None
+    if path == "/kiosk" or path.startswith("/kiosk/"):
+        return ENTRY_KIOSK
+    return ENTRY_PORTAL
+
+
+@web.middleware
+async def entry_point_middleware(request: web.Request, handler):
+    """Refuse a surface this user is not granted.
+
+    The check costs one User CR read, so it deliberately runs only on requests
+    that *have* an entry point — never on the desktop paths above, which is
+    where the request volume is (every Selkies asset, every WebSocket frame's
+    handshake, every thumbnail).
+
+    A refusal is a page, not a redirect: behind the bundled proxy the other
+    surface is one origin away, but in a split-port dev run it is not, and a
+    303 would land on a 404 instead of an explanation. Non-navigations get a
+    bare 403 for the same reason the lock returns 423 to them."""
+    needed = _required_entry_point(request.path)
+    # On the kiosk paths, "who is this" is the *kiosk's* answer, not the auth
+    # middleware's: that one falls back to a cookie (and then to a default
+    # name), so a browser that once visited the portal would be turned away
+    # from the kiosk's own login screen — on a shared machine, with no way to
+    # become somebody else. Nobody signed in is nobody to refuse; the form
+    # refuses the wrong account when it is offered one.
+    user = (kiosk.kiosk_identity(request) if needed == ENTRY_KIOSK
+            else request.get("user"))
+    if needed is None or not user:
+        return await handler(request)
+    if await _run(request, request.app["cm"].may_enter, user, needed):
+        return await handler(request)
+    logger.warning(f"Refusing {user} at {request.path}: no '{needed}' entry point")
+    if (request.headers.get("Sec-Fetch-Mode") == "navigate"
+            or "text/html" in request.headers.get("Accept", "")):
+        if needed == ENTRY_PORTAL:
+            heading, href, label = ("Kiosk only", "/kiosk", "Go to the kiosk")
+            message = ("This account may only be used through the kiosk. "
+                       "The portal, the web terminal and SSH are not available "
+                       "to it.")
+        else:
+            heading, href, label = ("Not a kiosk account", "/", "Go to the portal")
+            message = ("This account is not granted the kiosk surface. "
+                       "Use the portal instead.")
+        return web.Response(text=render_notice(heading=heading, message=message,
+                                               href=href, link_label=label),
+                            status=403, content_type="text/html",
+                            headers={"Cache-Control": "no-store"})
+    return web.Response(status=403, text=f"no '{needed}' entry point")
 
 
 # Admin overrides, read the same way the management app reads them so the two
@@ -823,10 +909,12 @@ async def _proxy_client_ctx(app):
 
 
 def build_app(config_manager):
-    # lock_middleware sits inside auth_middleware: a locked kiosk browser is
-    # refused every path on this app but the lock screen, which is what makes
-    # the lock hold against a live session cookie (whistler/portal/kiosk.py).
-    app = web.Application(middlewares=[auth_middleware, kiosk.lock_middleware])
+    # Order matters. auth_middleware resolves the identity the other two ask
+    # about; entry_point_middleware then decides whether this user gets this
+    # surface at all, and lock_middleware — innermost — whether this browser
+    # gets anything right now (whistler/portal/kiosk.py).
+    app = web.Application(middlewares=[auth_middleware, entry_point_middleware,
+                                       kiosk.lock_middleware])
     app["cm"] = config_manager
     app.cleanup_ctx.append(_proxy_client_ctx)
     app.cleanup_ctx.append(kubevirt.kube_ws_client_ctx)

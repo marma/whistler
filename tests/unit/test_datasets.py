@@ -20,9 +20,8 @@ def _manager(**attrs):
 
 def test_read_only_dataset_overrides_a_read_write_grant():
     # A ceiling, not a default. This is the only way to say "nobody writes
-    # this", and it matters because the composition rule cuts the other way:
-    # an empty allow-list means unrestricted, so without it a dataset is
-    # writable by every user who has no list at all.
+    # this": a grant is per-user, and without the ceiling every user granted
+    # the dataset writes it.
     ro_dataset = {"bucket": "b", "readOnly": True}
     assert KubeConfigManager.dataset_mode(ro_dataset, "rw") == "ro"
     assert KubeConfigManager.dataset_mode(ro_dataset, "ro") == "ro"
@@ -121,7 +120,7 @@ def test_one_broken_dataset_does_not_block_the_others():
 
     cm.ensure_s3_proxy = _ensure
     cm._refresh_s3_proxy_policies = lambda name: None
-    cm.get_user_allowed_volumes = lambda u: []
+    cm.get_user_allowed_volumes = lambda u: ["broken", "good"]
     cm.get_user_volume_modes = lambda u: {}
     assert cm.session_shared_datasets("alice") == []
     # "broken" raised and was skipped; "good" was still reached.

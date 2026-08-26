@@ -3,10 +3,10 @@
 Three rules are under test here, and they are the whole model
 (design/security.md, "Group"):
 
-  1. **Allow-lists union.** Empty everywhere means no restriction; otherwise
-     the union of the user's own list and every group's bounds them. So a
-     group *restricts* a user who had no list of their own, and *widens* one
-     who did — grants add up.
+  1. **Allow-lists union.** The union of the user's own list and every
+     group's is what they hold, and nothing else — every allow is explicit
+     (2026-08-25), so a group is the only thing that can widen a user who has
+     been granted nothing of their own. Grants add up; empty is empty.
   2. **Volume access modes.** A group grants each member `rw` or `ro` per
      volume, with per-member exceptions; `ro` becomes a read-only mount.
   3. **Channels narrow, never widen.** A zone carries a ceiling, the union of
@@ -54,13 +54,15 @@ def _manager(*, users=None, groups=None, zones=None):
 
 # --- The union rule, in the abstract --------------------------------------- #
 
-def test_empty_everywhere_is_still_unrestricted():
+def test_empty_everywhere_is_empty():
+    # And empty is now no access at all, not "no opinion" — the enforcement
+    # points below are where that shows.
     assert merge_allow_lists([], None, []) == []
 
 
-def test_a_group_bounds_a_user_who_had_no_list():
-    # The case that makes a group a *restriction* and not only a grant: the
-    # user's own empty list contributes nothing, so the union is the group's.
+def test_a_group_is_the_only_thing_that_widens_a_user_with_no_list():
+    # The user's own empty list contributes nothing, so the union is the
+    # group's — which is the whole of what they hold.
     assert merge_allow_lists([], ["restricted"]) == ["restricted"]
 
 
@@ -96,7 +98,7 @@ def test_zone_allow_list_is_the_union_of_user_and_groups():
                                 "alice") == "container"
 
 
-def test_a_group_zone_bounds_an_otherwise_unrestricted_user():
+def test_a_group_zone_is_all_an_ungranted_user_has():
     cm = _manager(
         users={"alice": {"name": "alice"}},
         groups={"lab": {"members": ["alice"], "allowedZones": ["restricted"]}},
@@ -108,21 +110,24 @@ def test_a_group_zone_bounds_an_otherwise_unrestricted_user():
         cm._apply_policy({"image": "x", "zone": "open"}, "ssh", "container", "alice")
 
 
-def test_a_non_member_is_untouched_by_the_group():
+def test_a_non_member_gets_nothing_from_the_group():
     cm = _manager(
         users={"alice": {"name": "alice"}, "bob": {"name": "bob"}},
         groups={"lab": {"members": ["alice"], "allowedZones": ["restricted"]}},
         zones={"default": {}, "open": {}, "restricted": {}},
     )
-    # bob has no list of his own and no group, so nothing is gated for him.
+    # bob has no list of his own and no group, so he holds nothing — neither
+    # the group's zone nor any other. Before explicit access this same state
+    # made him the one user who could start a session anywhere.
     assert cm.get_user_allowed_zones("bob") == []
-    assert cm._apply_policy({"image": "x", "zone": "open"}, "ssh", "container",
-                            "bob") == "container"
+    for zone in ("open", "restricted"):
+        with pytest.raises(PolicyError, match="none granted"):
+            cm._apply_policy({"image": "x", "zone": zone}, "ssh", "container", "bob")
 
 
 def test_gpu_types_compose_the_same_way():
     cm = _manager(
-        users={"alice": {"name": "alice"}},
+        users={"alice": {"name": "alice", "allowedZones": ["default"]}},
         groups={"lab": {"members": ["alice"], "allowedGpuTypes": ["A100"]}},
     )
     spec = {"image": "x", "nodeSelector": {GPU_NODE_LABEL: "A100"}}
@@ -195,7 +200,7 @@ def test_a_users_own_volume_is_never_downgraded_by_a_group():
 
 def test_group_volume_appears_in_the_allow_list_and_gates_the_rest():
     cm = _manager(
-        users={"alice": {"name": "alice"}},
+        users={"alice": {"name": "alice", "allowedZones": ["default"]}},
         groups={"lab": {"members": ["alice"],
                         "volumes": [{"name": "project", "mode": "ro"}]}},
     )

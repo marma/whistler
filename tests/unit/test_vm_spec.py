@@ -250,13 +250,13 @@ def _domain(**overrides):
 
 def test_guest_memory_is_backed_by_hugepages_by_default():
     domain = _domain(template_spec={"image": "x", "resources": {"memory": "8Gi"}})
-    assert domain["memory"] == {"hugepages": {"pageSize": "1Gi"}}
+    assert domain["memory"] == {"hugepages": {"pageSize": "2Mi"}}
 
 
 def test_template_may_pick_another_page_size():
     domain = _domain(template_spec={"image": "x", "resources": {
-        "memory": "8Gi", "hugePageSize": "2Mi"}})
-    assert domain["memory"] == {"hugepages": {"pageSize": "2Mi"}}
+        "memory": "8Gi", "hugePageSize": "1Gi"}})
+    assert domain["memory"] == {"hugepages": {"pageSize": "1Gi"}}
 
 
 def test_template_opts_out_with_an_empty_page_size():
@@ -287,15 +287,44 @@ def test_instancetype_owns_memory_including_hugepages():
     assert "memory" not in domain
 
 
-def test_memory_that_is_not_a_multiple_of_the_page_size_fails_closed():
-    # KubeVirt would reject this at VM creation, far from the template that
-    # caused it; failing here names the field to change.
-    with pytest.raises(PolicyError) as e:
-        _build(template_spec={"image": "x", "resources": {"memory": "1536Mi"}})
-    assert "hugePageSize" in str(e.value)
-    # ... and a guest smaller than one page is the same mistake.
-    with pytest.raises(PolicyError):
-        _build(template_spec={"image": "x", "resources": {"memory": "512Mi"}})
+def test_memory_is_rounded_up_to_a_whole_number_of_pages():
+    # KubeVirt's webhook rejects guest RAM that isn't a whole number of pages,
+    # at VM creation and far from the template that caused it. Rounding *up*
+    # rather than refusing keeps pageSize a cluster-level decision (raising it
+    # to 1Gi would otherwise invalidate every template not sized in whole
+    # gigabytes) — and up, never down, so nobody silently gets less RAM than
+    # the template asked for.
+    domain = _domain(template_spec={"image": "x", "resources": {"memory": "9Mi"}})
+    assert domain["resources"]["requests"]["memory"] == "10Mi"
+    assert domain["memory"] == {"hugepages": {"pageSize": "2Mi"}}
+
+
+def test_memory_below_one_page_becomes_one_page():
+    domain = _domain(template_spec={"image": "x", "resources": {"memory": "1Mi"}})
+    assert domain["resources"]["requests"]["memory"] == "2Mi"
+
+
+def test_rounding_follows_the_page_size_in_force():
+    # Same memory, a page size 512x larger: the rounding is not against a
+    # constant.
+    domain = _domain(template_spec={"image": "x", "resources": {
+        "memory": "1536Mi", "hugePageSize": "1Gi"}})
+    assert domain["resources"]["requests"]["memory"] == "2Gi"
+
+
+def test_memory_that_already_fits_is_left_exactly_as_written():
+    # No reformatting of a value that needs no change: the manifest should
+    # keep saying what the template says.
+    domain = _domain(template_spec={"image": "x", "resources": {"memory": "8192Mi"}})
+    assert domain["resources"]["requests"]["memory"] == "8192Mi"
+
+
+def test_no_hugepages_means_no_rounding():
+    # An opted-out template runs on 4KiB pages, where any size is legal.
+    domain = _domain(template_spec={"image": "x", "resources": {
+        "memory": "9Mi", "hugePageSize": ""}})
+    assert domain["resources"]["requests"]["memory"] == "9Mi"
+    assert "memory" not in domain
 
 
 def test_gpu_devices_present_only_when_requested():

@@ -1,7 +1,14 @@
-"""Public-key auth and username -> target resolution (SSHServer)."""
+"""Public-key auth and username -> target resolution (SSHServer).
+
+Users here carry `entryPoints: [gateway]` because every allow is explicit: the
+gateway refuses at authentication, so an account granted no door never gets as
+far as the routing this file is about. Which accounts hold that grant is
+test_entry_points.py's subject, not this one's.
+"""
 import asyncssh
 import pytest
 
+from whistler.config import ENTRY_GATEWAY
 from whistler.server import SSHServer
 
 
@@ -12,9 +19,14 @@ def _keypair(comment="user@host"):
     return key, line
 
 
+def _user(name, keys):
+    return {name: {"name": name, "publicKeys": keys,
+                   "entryPoints": [ENTRY_GATEWAY]}}
+
+
 def test_authorized_key_authenticates_and_routes_to_tui(make_config):
     key, line = _keypair()
-    cm = make_config(users={"alice": {"name": "alice", "publicKeys": [line]}})
+    cm = make_config(users=_user("alice", [line]))
     srv = SSHServer(config_manager=cm)
 
     assert srv.validate_public_key("alice", key) is True
@@ -44,7 +56,7 @@ def test_wrong_key_is_rejected(make_config):
 
 def test_malformed_authorized_key_is_skipped_not_fatal(make_config):
     key, good_line = _keypair()
-    cm = make_config(users={"alice": {"name": "alice", "publicKeys": ["not-a-key", good_line]}})
+    cm = make_config(users=_user("alice", ["not-a-key", good_line]))
     srv = SSHServer(config_manager=cm)
 
     # The garbage entry is skipped; the valid one still authenticates.
@@ -91,8 +103,7 @@ def test_username_with_a_dash_authenticates_as_itself(make_config):
     """The bug the old unconditional split had: `alice-smith` could never log
     in, because it was read as user `alice` wanting instance `smith`."""
     key, line = _keypair()
-    cm = make_config(users={"alice-smith": {"name": "alice-smith",
-                                            "publicKeys": [line]}})
+    cm = make_config(users=_user("alice-smith", [line]))
     srv = SSHServer(config_manager=cm)
 
     assert srv.validate_public_key("alice-smith", key) is True
@@ -103,10 +114,8 @@ def test_username_with_a_dash_authenticates_as_itself(make_config):
 def test_dashed_user_wins_over_a_same_named_instance(make_config):
     """Both readings are possible for `alice-box`; the real user wins."""
     key, line = _keypair()
-    cm = make_config(users={
-        "alice-box": {"name": "alice-box", "publicKeys": [line]},
-        "alice": {"name": "alice", "publicKeys": [line]},
-    })
+    cm = make_config(users={**_user("alice-box", [line]),
+                            **_user("alice", [line])})
     srv = SSHServer(config_manager=cm)
 
     assert srv.validate_public_key("alice-box", key) is True
@@ -116,7 +125,7 @@ def test_dashed_user_wins_over_a_same_named_instance(make_config):
 
 def test_legacy_routing_still_works_for_non_users(make_config):
     key, line = _keypair()
-    cm = make_config(users={"alice": {"name": "alice", "publicKeys": [line]}})
+    cm = make_config(users=_user("alice", [line]))
     srv = SSHServer(config_manager=cm)
 
     assert srv.validate_public_key("alice-box", key) is True

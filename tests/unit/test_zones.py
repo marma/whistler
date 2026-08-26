@@ -24,6 +24,7 @@ def _manager(*, zones=None, users=None):
     cm.kata_runtime_class = "kata"
     cm.images = {"ssh": [], "desktop": [], "vm": []}
     cm.users = users or {}
+    cm.groups = {}
     cm.zones = zones if zones is not None else {"default": {}}
     return cm
 
@@ -38,9 +39,17 @@ def test_unknown_zone_fails_closed():
         cm._apply_policy({"image": "x", "zone": "red"}, "ssh", "container")
 
 
-def test_implicit_default_zone_skips_all_checks():
-    cm = _manager(users={"alice": {"name": "alice", "allowedZones": ["green"]}})
-    # No zone on the template: never gated, even with a non-empty allow-list.
+def test_implicit_default_zone_is_gated_like_any_other():
+    # A template with no `zone` lands in "default", so "default" is the grant
+    # it is checked against. It used to skip the check entirely, which meant a
+    # user allowed only "green" could still start a session in "default" —
+    # the one hole left by explicit access (2026-08-25).
+    cm = _manager(users={"alice": {"name": "alice", "allowedZones": ["green"]}},
+                  zones={"default": {}, "green": {}})
+    with pytest.raises(PolicyError,
+                       match="zone 'default' is not allowed for user 'alice'"):
+        cm._apply_policy({"image": "x"}, "ssh", "container", "alice")
+    cm = _manager(users={"alice": {"name": "alice", "allowedZones": [DEFAULT_ZONE]}})
     assert cm._apply_policy({"image": "x"}, "ssh", "container", "alice") == "container"
 
 
@@ -53,11 +62,15 @@ def test_explicit_zone_requires_allow_list_membership():
         cm._apply_policy({"image": "x", "zone": "red"}, "ssh", "container", "alice")
 
 
-def test_empty_allow_list_means_no_restriction():
+def test_empty_allow_list_grants_no_zone_at_all():
+    # Every allow is explicit: an unconfigured user starts nothing anywhere,
+    # not everything everywhere.
     cm = _manager(zones={"default": {}, "red": {}},
                   users={"alice": {"name": "alice"}})
-    assert cm._apply_policy(
-        {"image": "x", "zone": "red"}, "ssh", "container", "alice") == "container"
+    with pytest.raises(PolicyError, match="none granted"):
+        cm._apply_policy({"image": "x", "zone": "red"}, "ssh", "container", "alice")
+    with pytest.raises(PolicyError, match="none granted"):
+        cm._apply_policy({"image": "x"}, "ssh", "container", "alice")
 
 
 # --- _apply_overrides: the "zone" grant ------------------------------------ #

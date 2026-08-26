@@ -234,7 +234,7 @@ so the routing seam exists — but the proxy does not know who the user is, so
 path routing alone is all-or-nothing for a deployment. **The identity check is
 the boundary; the address check is the location control.**
 
-#### What exists today: the surface, not the binding
+#### What exists today: the surface, and the binding
 
 `/kiosk` ([`whistler/portal/kiosk.py`](../whistler/portal/kiosk.py), 2026-08-24)
 is the **surface** described above, built on the viewer app so its session page
@@ -245,14 +245,56 @@ to the grid and from the grid to a logged-out login screen. There is no
 template picker, no launch form, no web terminal and no admin surface on it —
 not as a policy check, but because the pages have nothing else on them.
 
-**It is not yet the binding.** Serving a user the kiosk does not stop that same
-account from opening the ordinary portal, the web terminal, or SSH; the surface
-is a place to send someone, not a restriction on where else they can go. The
-binding is the identity half of this section — a per-user or per-group grant
-enforced *at every entry point* — and it is the part still to build. Until then
-the kiosk's containment rests entirely on the deployment's half, which is the
-failure mode named above ("the network half is doing all the work"), and it
-should be described that way rather than as a control.
+**The binding exists too, since 2026-08-25**: `User.spec.entryPoints` (and
+`Group.spec.entryPoints`), a grant naming which doors an account may use —
+`kiosk`, `portal`, `gateway`. `[kiosk]` is the binding this section asks for:
+the kiosk surface and nothing else. Empty is **no door at all** — the account
+cannot sign in anywhere — which is why the operator seeds the grant on the
+bootstrap admin and the portal seeds it on users it creates.
+
+It is composed like `allowedZones` and *not* like `channels`: the effective set
+is the union of the user's own list and every group's, so **a group that grants
+`portal` widens a kiosk-bound member back out.** That is the same rule as every
+other grant here and it is the one thing to know before binding somebody — a
+binding is a narrow *own* list plus the absence of a widening group, not a flag
+that overrides one.
+
+Three doors, three enforcement points, and the reason they are listed
+individually is the failure mode named above:
+
+- **The gateway** refuses at *authentication*
+  ([`whistler/server.py`](../whistler/server.py) `_accept`), not per channel.
+  The launcher TUI, the relay behind it and the jump are one entry point on one
+  port, so a check at any one of them is a check the other two could outlive.
+  The dev auth bypass does not open it: `WHISTLER_AUTH_ALLOW_ANY` skips the
+  *key* check, and a binding is not a credential.
+- **The management portal** refuses in `require_user`, which every route on it
+  passes through — the dashboard, the admin pages and every htmx fragment of
+  them alike. The dev `?user=` shortcut is an identity shortcut, not a grant,
+  so it does not get around it either.
+- **The viewer app** serves both surfaces, so there the binding is a path
+  question (`_required_entry_point` in
+  [`whistler/portal/app.py`](../whistler/portal/app.py)): `/kiosk*` needs
+  `kiosk`, the desktop paths themselves (`/connect`, `/desktop`, `/vnc`,
+  `/ws-vnc`, `/status`, `/screenshot`) need nothing because both surfaces end
+  in them, and **everything else needs `portal`** — written as "everything
+  else" so a route added later is checked by default rather than exempt by
+  omission. That is also what keeps the per-request User CR read off the
+  Selkies asset and WebSocket paths, where the volume is.
+
+A refusal is a page naming the other surface, not a redirect to it: behind the
+bundled proxy both surfaces are one origin, in a split-port dev run they are
+not, and a 303 would land on a 404 instead of an explanation. Non-navigations
+get a bare 403, the same reasoning as the lock's 423.
+
+What this does **not** do, and what the honest claim therefore still is: the
+binding says which surface Whistler will serve an account, and nothing about
+the device it is served to. A kiosk-bound user opening `/kiosk` from an
+ordinary laptop gets the kiosk surface in an ordinary browser, with a clipboard
+and a filesystem behind it. The device claim is still entirely the deployment's
+half — the controlled network — and the conjunction is still the containment.
+What has changed is that the identity half is now a check rather than a plan,
+so a leak in the network half no longer means *nothing* is enforced.
 
 **The lock is the one part that is enforced rather than merely offered.** The
 thin client decides the person has gone and navigates to
@@ -402,6 +444,71 @@ internal helper and the external researcher meet in the same zone, on the
 same instance, and must not get the same channels. A maximally restricted
 zone sets its ceiling to the desktop stream alone, and no grant can widen it.
 
+## Empty means nothing, everywhere
+
+**Decided and implemented 2026-08-25.** Every allow-list in Whistler grants
+exactly what it names. An empty list — `allowedVolumes`, `allowedZones`,
+`allowedGpuTypes`, `entryPoints`, on a `User` or on a `Group` — grants nothing.
+
+It used to mean the opposite. Empty was read as "the admin has expressed no
+opinion", so an empty list was *no restriction*, and every enforcement point
+carried the same guard:
+
+```python
+if allowed and requested not in allowed:      # before
+    raise PolicyError(...)
+```
+
+That `if allowed` reads like a null check and acts like a policy, and it made
+the safest-looking User CR in the cluster — the one with no lists on it at all
+— the most permissive object in the system. The account nobody had configured
+could enter through any door, run in any zone, mount any volume in the catalog
+and request any GPU on any node. A newly defined S3 dataset was writable, on
+the day it was defined, by every user who happened to be in no group. None of
+that was anyone's decision; it was the default falling out of a convention.
+
+The rule is now the matrix's rule, which was right first: **an absent grant is
+not a missing opinion, it is a no.** The guard is gone from every enforcement
+point, and the composition rule loses a clause rather than gaining one — *the
+union of the user's own list and every group's is what they hold*, full stop.
+
+Three consequences worth stating, because each is a place the change is
+visible:
+
+- **The implicit default zone is gated like any other.** A template with no
+  `zone` does not run outside the zone model; it runs in `default`. That is
+  now the grant it is checked against, closing the one path by which a user
+  granted no zone could still start a session.
+- **A brand-new account has to be given a door.** Two creation paths seed the
+  two grants that decide whether an account is usable at all — every entry
+  point and the `default` zone (`NEW_USER_ENTRY_POINTS`, `NEW_USER_ZONES`):
+  the operator's `ensure_bootstrap_admin`, so a fresh install is not locked
+  out of itself, and the portal's *New User* form. Volumes and GPU types are
+  **not** seeded: those are grants an admin means to make. The seed is a
+  creation default and never a floor — narrowing it afterwards sticks, or the
+  kiosk binding would be undone by the next operator restart.
+- **Losing the Group catalog now fails closed.** `_load_groups` keeps the
+  previous catalog on an API error, which used to be about not *widening*
+  members back to their own empty lists. The direction has flipped: a lost
+  catalog would now cut a project's members off from their own sessions, which
+  is the right way round but is exactly why the previous catalog is still kept
+  rather than dropped.
+
+**There is no migration.** Existing `User` CRs with empty lists hold nothing
+from the moment this ships — including admins, whose account was created
+before the seed existed. The way back in is `kubectl`:
+
+```bash
+kubectl -n whistler patch usr <name> --type merge -p \
+  '{"spec":{"entryPoints":["kiosk","portal","gateway"],"allowedZones":["default"]}}'
+```
+
+A backfill was considered and rejected: it would write the old implicit grants
+onto every account as explicit ones, which is a worse record than none — an
+admin reading `allowedZones: [default, restricted, secure]` cannot tell
+whether anybody decided that. The point of the change is that a grant is
+something somebody wrote down.
+
 ## Core model: the access matrix
 
 Access to data is one table, and the table is the whole model.
@@ -418,17 +525,21 @@ their own table and the tables of every group they belong to, ordered
 
 That is the entire rule. What follows is why each part is shaped that way.
 
-### Every allow is explicit, and that inverts the house convention
+### Every allow is explicit
 
-Everywhere else in Whistler an empty allow-list means *no restriction*: the
-admin has expressed no opinion, so the user is unrestricted. Here an empty
-cell means the admin has not said yes, so the answer is no.
+An empty cell means the admin has not said yes, so the answer is no.
 
-The inversion is deliberate and it is the reason this is a table rather than
-another allow-list. The two conventions must therefore never be made to look
-alike: this field is not called an allow-list, and the UI renders **the whole
-grid including its empty cells**, because a policy visible only through its
-exceptions is one nobody audits.
+This used to be an *inversion*: everywhere else in Whistler an empty allow-list
+meant no restriction — the admin had expressed no opinion, so the user was
+unrestricted — and the matrix was the one field that read the other way. That
+inversion is gone as of **2026-08-25**: `allowedVolumes`, `allowedZones`,
+`allowedGpuTypes` and `entryPoints` all now grant exactly what they name and
+nothing when they name nothing. See [Empty means nothing, everywhere](#empty-means-nothing-everywhere).
+
+What survives is the shape of the field. A cell is `(zone, volume, mode)`, not
+a name, so this is still a table and not an allow-list, and the UI renders
+**the whole grid including its empty cells** — a policy visible only through
+its exceptions is one nobody audits.
 
 What it costs: a subject's table is zones × volumes, and a new zone or a new
 volume starts closed everywhere until someone opens it. Accepted knowingly.
@@ -731,10 +842,11 @@ else — there is no `groups` field on `User` — so a project is edited in one
 place.
 
 **The composition rule is a union, and it is the same rule for every field:**
-empty everywhere means no restriction; otherwise the union of the user's own
-list and every group's bounds them. That single sentence carries both halves
-of what a group is for. A user with no list of their own is *restricted* by
-joining a group that has one — which is how a project fences its people in —
+the union of the user's own list and every group's is what they hold, and
+nothing else. Since 2026-08-25 empty is empty ([Empty means nothing,
+everywhere](#empty-means-nothing-everywhere)), which sharpens what a group is
+for rather than changing it: a user with no list of their own holds *exactly*
+what their groups grant, so a group is the only thing that can widen them,
 while a user who already had a list *gains* the group's, because grants add
 up. Override grants OR together; nothing a group says can take away what a
 user holds in their own right. `KubeConfigManager.get_user_allowed_volumes`

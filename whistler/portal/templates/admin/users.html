@@ -27,7 +27,18 @@
   <tbody>
     {% for u in users %}
     <tr>
-      <td><strong>{{ u.name }}</strong></td>
+      <td><strong>{{ u.name }}</strong>
+        {# This user's own entryPoints. Shown here because a binding an admin
+           cannot see while scanning the list is one they will forget; a group
+           may still widen it, which the details page resolves. #}
+        {% if u.entryPoints %}
+          {% if u.entryPoints == ["kiosk"] %}
+            <span class="ui orange mini label" title="Bound to the kiosk: no portal, no web terminal, no SSH">kiosk only</span>
+          {% else %}
+            {% for e in u.entryPoints %}<span class="ui basic mini label" title="Entry points granted on this user">{{ e }}</span>{% endfor %}
+          {% endif %}
+        {% endif %}
+      </td>
       <td>
         <span class="ui grey label">{{ u.publicKeys | length }} key(s)</span>
       </td>

@@ -15,9 +15,10 @@
 
 <p class="ui grey text">
   A project's shared grants. Everything a group grants is <strong>added to</strong>
-  what its members already have: empty everywhere still means no restriction, but
-  a group with a list bounds a member who had none. Volume, zone and GPU grants
-  apply at a session's next start; channel grants apply at the next connection.
+  what its members already have, and a group is the only thing that can widen
+  someone: every allow is explicit, so a member with no grants of their own holds
+  exactly what their groups give them. Volume, zone and GPU grants apply at a
+  session's next start; channel grants apply at the next connection.
 </p>
 
 {% if groups %}

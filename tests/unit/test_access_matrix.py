@@ -1,9 +1,11 @@
 """The access matrix: (subject, zone, volume) -> allowed | read-only.
 
-An absent entry is NO ACCESS. That inverts the convention every other
-allow-list in Whistler follows — where empty means unrestricted — and the
-inversion is the point, so these tests pin it hard. See design/security.md,
-"Core model: the access matrix".
+An absent entry is NO ACCESS. This table got there first: it was the one
+place in Whistler where empty meant nothing while every allow-list around it
+meant "unrestricted". The allow-lists were brought into line on 2026-08-25, so
+the rule is now uniform — but a cell is (zone, volume, mode) and not a name,
+so the table is still not an allow-list. See design/security.md, "Core model:
+the access matrix".
 """
 import pytest
 
@@ -24,8 +26,8 @@ def _manager(users=None, groups=None):
 def test_absent_is_no_access_and_there_is_nothing_below_it():
     cm = _manager({"alice": {"name": "alice"}})
     assert cm.volume_access("alice", "open", "anything") is None
-    # Emphatically NOT the allow-list rule: an empty table grants nothing at
-    # all, where an empty allowedVolumes would mean unrestricted.
+    # An empty table grants nothing at all — the same explicit-allow rule
+    # allowedVolumes now follows, arrived at from the other direction.
     assert cm.get_user_volume_access("alice") == {}
 
 

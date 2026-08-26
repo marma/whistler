@@ -30,6 +30,11 @@ class FakeCM:
     def is_user_admin(self, username):
         return False
 
+    def may_enter(self, username, entry_point):
+        """Unrestricted here: what the kiosk surface *is* belongs in this file,
+        who may reach it in test_entry_points.py."""
+        return True
+
     def trigger_instance_start(self, username, name):
         return True
 

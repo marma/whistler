@@ -102,6 +102,7 @@ import os
 import segno
 from aiohttp import web
 
+from whistler.config import ENTRY_KIOSK
 from whistler.portal import totp
 # The form itself, its furniture and the one credential check all live in
 # whistler/portal/login.py — the management portal shows the same screen (minus
@@ -131,7 +132,7 @@ LOCK_COOKIE = "whistler_kiosk_lock"
 
 # Set between "the password was right" and "the second factor was right". It
 # holds the half-authenticated name, and nothing else on this app reads it —
-# _identity keys on KIOSK_COOKIE, so a browser that stops at the OTP step has
+# kiosk_identity keys on KIOSK_COOKIE, so a browser that stops at the OTP step has
 # no identity and reaches nothing. HttpOnly for the same reason as the lock: the
 # page it gates must not be able to write it.
 #
@@ -179,8 +180,13 @@ async def _run(func, *args):
     return await loop.run_in_executor(None, func, *args)
 
 
-def _identity(request: web.Request):
+def kiosk_identity(request: web.Request):
     """Who this kiosk request is, or None to show the login screen.
+
+    Public because the viewer app's entry-point middleware asks it: on a kiosk
+    path the kiosk's answer is the identity that matters, and the auth
+    middleware's fallback would refuse an anonymous browser its own login
+    screen (whistler/portal/app.py, entry_point_middleware).
 
     Deliberately *not* the middleware's answer: that falls back to a default
     name so the viewer pages always have one, which for a login screen would
@@ -781,7 +787,7 @@ async def kiosk_index(request: web.Request):
 
     A locked browser never gets here — lock_middleware sends it to the lock
     screen first."""
-    user = _identity(request)
+    user = kiosk_identity(request)
     if user is None:
         # Mid-flow: a reload between the two factors returns to the code prompt
         # rather than starting the login over. Cancelling is the button on that
@@ -805,7 +811,7 @@ async def kiosk_lock(request: web.Request):
 
     Locking someone who was never signed in is a no-op: there is nothing to
     lock, and the login screen is already the strictest thing to show."""
-    user = _identity(request)
+    user = kiosk_identity(request)
     if user is None:
         raise _sign_out(web.HTTPSeeOther("/kiosk"))
     if "next" in request.query:
@@ -832,7 +838,7 @@ async def kiosk_login(request: web.Request):
     return_to = _locked(request)
 
     if return_to is not None:
-        user = _identity(request)
+        user = kiosk_identity(request)
         if user is None:                     # lock outlived the identity
             raise _sign_out(web.HTTPSeeOther("/kiosk"))
         if not _verify_credentials(user, password):
@@ -845,6 +851,14 @@ async def kiosk_login(request: web.Request):
     if not _verify_credentials(user, password):
         logger.warning(f"Kiosk login refused for {user!r}")
         return _html(_render_login("Sign-in failed."), status=401)
+    # The password was right and this is the wrong door. entry_point_middleware
+    # would refuse the grid a moment later anyway (it is the boundary); saying
+    # so here is the difference between an explanation and a bounce.
+    if not await _run(request.app["cm"].may_enter, user, ENTRY_KIOSK):
+        logger.warning(f"Kiosk login refused for {user}: no "
+                       f"'{ENTRY_KIOSK}' entry point")
+        return _html(_render_login("This account cannot use the kiosk."),
+                     status=403)
     if _otp_required(user):
         # Not signed in yet: the password only earns the pending cookie, so a
         # browser stopped here has no identity and can reach nothing.
@@ -915,7 +929,7 @@ async def kiosk_sessions(request: web.Request):
     to open a desktop, and an ssh-mode session has none — offering one here
     would mean offering a web terminal, which is exactly the surface a
     kiosk-bound user is not supposed to have."""
-    user = _identity(request)
+    user = kiosk_identity(request)
     if user is None:
         return web.json_response({"error": "not signed in"}, status=401)
     sessions = await _run(request.app["cm"].get_user_desktop_sessions, user)
@@ -928,7 +942,7 @@ async def kiosk_session(request: web.Request):
     """The desktop page. Resolves the name against this user's own sessions
     first: an unknown name must be a 404 here rather than a frame pointed at
     /connect, which would leave the user staring at a page that polls forever."""
-    user = _identity(request)
+    user = kiosk_identity(request)
     if user is None:
         raise web.HTTPSeeOther("/kiosk")
     name = request.match_info["id"]

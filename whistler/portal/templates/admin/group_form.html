@@ -120,6 +120,23 @@
     {% endfor %}
 
     <div class="ui divider"></div>
+    <h4 class="ui header">Entry points</h4>
+    <p class="ui grey text">
+      Doors granted to members, unioned with their own. A grant, so it
+      <em>widens</em>: a member bound to the kiosk on their own User is
+      un-bound by a group that grants the portal. Leave all unchecked unless
+      the group is meant to hand out access.
+    </p>
+    {% for e in entry_points %}
+    <div class="field">
+      <div class="ui checkbox">
+        <input type="checkbox" name="entry_points" value="{{ e }}" id="gentry-{{ e }}"
+               {% if group and group.entryPoints and e in group.entryPoints %}checked{% endif %}>
+        <label for="gentry-{{ e }}">{{ e }}</label>
+      </div>
+    </div>
+    {% endfor %}
+
     <h4 class="ui header">Access channels</h4>
     <p class="ui grey text">
       Which ways members may move bytes in and out of a session. This narrows the

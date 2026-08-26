@@ -172,6 +172,11 @@ whistler:
   # `helm upgrade` will NOT overwrite it — manage the account via the portal or
   # `kubectl edit user <name>` after the first install. Further users are
   # created by an admin through the portal, not through values.yaml.
+  #
+  # The seeded CR carries every entryPoint and the `default` zone, because an
+  # empty grant list now means NO access: without them the account this exists
+  # to create could not open the portal it exists to be used from. Seeded at
+  # creation only — narrowing them later sticks.
   bootstrapAdmin:
     name: ""
     publicKeys: []
@@ -268,10 +273,11 @@ whistler:
     #     clusterOnly: true
 
   # Groups: a project's shared grants. Every field is UNIONED with the
-  # member's own User fields and with any other group they are in — empty
-  # everywhere still means "no restriction", but a group with a list bounds a
-  # member who had none. Membership lives on the group, not on the user, so a
-  # project is edited in one place.
+  # member's own User fields and with any other group they are in. Every allow
+  # is explicit, so a group is the only way to widen a member who has been
+  # granted nothing of their own, and empty everywhere is access to nothing.
+  # Membership lives on the group, not on the user, so a project is edited in
+  # one place.
   #
   # Groups defined here render as Group CRs (templates/groups.yaml) and are
   # Helm-owned: an upgrade overwrites portal edits to them. Groups created in
@@ -315,6 +321,13 @@ whistler:
     #       mode: ro
     #   allowedZones: [restricted]
     #   channels: [screenshots]   # no shell, no relay, no web terminal
+    #   entryPoints: [kiosk]      # and only through the kiosk (see below)
+    #
+    # entryPoints is which *door* members may use — kiosk, portal, gateway.
+    # Like allowedZones it is a grant, so it WIDENS: a member bound to the
+    # kiosk on their own User CR is un-bound by a group that grants `portal`.
+    # Bind an individual on the User (the portal's user page); use a group here
+    # only to hand a whole project a door it would not otherwise have.
 
   node_selectors:
     - name: Node name
@@ -389,27 +402,32 @@ whistler:
   # SyncVMI deadline, which is not exposed on the KubeVirt CR and cannot be
   # raised. Over it, virt-handler signals deletion while qemu keeps running,
   # so the guest boots fine inside a virt-launcher pod stuck at 2/3 forever
-  # and the session's Service has no endpoints. 1Gi pages make that guest 32
-  # pages instead.
+  # and the session's Service has no endpoints. 2Mi pages make that guest
+  # 16384 pages instead, and 1Gi pages make it 32.
   #
   # Applies to EVERY VM, not just GPU ones; a template opts out or picks
   # another size with `resources.hugePageSize`.
   #
   # PREREQUISITE: hugepages are reserved on the node, never allocated on
   # demand, and are not overcommittable. A node with none pends every VM on
-  # `Insufficient hugepages-1Gi`. Reserve them on the kernel command line
-  # (`default_hugepagesz=1G hugepagesz=1G hugepages=<count>`) or at runtime
-  # into /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages followed by
-  # a kubelet restart; scripts/metal_k3s_create.sh reports what a node has. A
-  # template's `memory` must be a multiple of the page size (KubeVirt's
-  # webhook rejects the rest; Whistler checks first so the error names the
-  # template).
+  # `Insufficient hugepages-2Mi`. Reserve them on the kernel command line
+  # (`hugepagesz=2M hugepages=<count>`, count in 2 MiB units — 16384 is 32GiB)
+  # or at runtime into
+  # /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages followed by a
+  # kubelet restart; scripts/metal_k3s_create.sh reports what a node has. A
+  # session's guest RAM must be a whole number of pages (KubeVirt's webhook
+  # rejects the rest), so Whistler rounds `memory` UP to one when it isn't —
+  # at most one page of overshoot, and never down, so nobody quietly gets
+  # less RAM than the template asked for.
   #
   # Only 2Mi and 1Gi exist on x86_64 — libvirt takes this value verbatim, so
-  # any other size is a VM that never schedules. Set to "" to disable
-  # hugepages cluster-wide.
+  # any other size is a VM that never schedules. 1Gi is the fewer-pages
+  # option, but a gigabyte of physically contiguous memory is not something a
+  # running host can usually find, so it is a boot-time reservation
+  # (`default_hugepagesz=1G hugepagesz=1G hugepages=<count>`) in practice.
+  # Set to "" to disable hugepages cluster-wide.
   hugePages:
-    pageSize: 1Gi
+    pageSize: 2Mi
 
   # Per-user NFS storage gateway (built from images/storage-gateway).
   #
@@ -494,9 +512,9 @@ whistler:
   # `rclone` and `fuse3` baked in — the images do.
   #
   # A dataset is granted by NAME, the same way a volume is (whistler.groups
-  # or a user's allowedVolumes). Note the composition rule cuts the usual way:
-  # an empty allow-list means UNRESTRICTED, so a dataset without `readOnly` is
-  # writable by every user who has no allow-list at all.
+  # or a user's allowedVolumes), and every allow is explicit — a user granted
+  # nothing reaches no dataset. `readOnly` is still the posture to prefer:
+  # without it, everyone who IS granted the dataset can write it.
   datasets: {}
     # reference-data:
     #   description: Imaging corpus
