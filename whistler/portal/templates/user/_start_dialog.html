@@ -1,0 +1,89 @@
+{#
+  Start, with the overrides the user is allowed to change.
+
+  The instance's own values are the defaults — every field is prefilled from
+  spec.overrides — and what is submitted lands in spec.runOverrides, which
+  belongs to this run and is replaced or cleared by the next start. So changing
+  a value here changes what starts now and nothing about what the instance
+  starts with next time; the edit form is still the only thing that moves a
+  default. It has to be recorded somewhere, mind: the operator reads the CR at
+  reconcile, so a start-time value that isn't on the session is a value that
+  doesn't happen (config.effective_session_overrides).
+
+  Offered only when the user holds at least one override grant (the buttons
+  decide), and only ever in the portal — the launcher TUI's `s` key stays the
+  one-keystroke start it is.
+
+  `then` names where the browser is headed once it has started — the desktop,
+  the web terminal or the machine console — because each of those buttons
+  starts a stopped instance on its way in, and so is a moment worth asking at.
+  That mode submits as a plain form into a new tab, the way the button it stood
+  in front of would have opened one: a window.open() after an htmx response is
+  not a user gesture any more and popup blockers treat it accordingly.
+
+  With nowhere to go, `hx` picks instead: the dashboard swaps the status badge
+  in place, the detail page posts normally and gets its redirect.
+#}
+<div class="ui modal" id="whistler-modal">
+  <i class="close icon"></i>
+  {% set door = {"desktop": ("desktop", "Start and open the desktop"),
+                 "terminal": ("terminal", "Start and open the web terminal"),
+                 "console": ("microchip", "Start and open the machine console")}
+                .get(then, ("play", "Start " ~ name)) %}
+  <div class="header">
+    <i class="{{ door[0] }} icon"></i> {{ door[1] }}
+  </div>
+  {# The message sits *outside* the form on purpose: Fomantic hides
+     `.ui.form .info.message` unless the form is in a validation state, so a
+     note put inside renders as display:none. And the fields scroll rather than
+     the modal growing — with every override granted this is taller than a
+     laptop viewport, which pushed the Start button off the bottom of the
+     screen. #}
+  <div class="scrolling content">
+    {% if has_overrides %}
+    <div class="ui info message" style="margin-top:0">
+      <i class="info circle icon"></i>
+      Prefilled with this instance's saved settings. Anything you change here
+      applies to <strong>this start only</strong> — the instance's own settings
+      are left alone, and the next start uses them again. Clearing a field runs
+      without that override.
+    </div>
+    {% endif %}
+    <form id="start-form" class="ui form"
+          {% if then %}
+          method="post" target="_blank"
+          action="/instances/{{ name }}/connect?user={{ current_user }}&then={{ then }}"
+          onsubmit="$('#modal-host .ui.modal').modal('hide')"
+          {% elif hx %}
+          hx-post="/instances/{{ name }}/connect?user={{ current_user }}"
+          hx-target="#status-{{ name }}" hx-swap="outerHTML"
+          hx-on::after-request="$('#modal-host .ui.modal').modal('hide')"
+          {% else %}
+          method="post" action="/instances/{{ name }}/connect?user={{ current_user }}"
+          {% endif %}>
+      {% if has_overrides %}
+      {# Without this a submit from the confirm-only branch — or from a form
+         whose fields are all blank — would be indistinguishable from the plain
+         play button, which starts the instance as configured. With it, an
+         all-blank submission still says something: "this run, no overrides". #}
+      <input type="hidden" name="apply_overrides" value="1">
+      {% include "user/_override_fields.html" %}
+      {% else %}
+      {# The dialog is only linked when something is overridable, but a grant can
+         be withdrawn between the page render and the press. #}
+      <p>Start <strong>{{ name }}</strong>? Nothing on this instance is yours to
+         override, so there is nothing to choose here.</p>
+      {% endif %}
+      {% if then %}
+      <p>It has to boot first, so the page you land on will wait for it.</p>
+      {% endif %}
+    </form>
+  </div>
+  <div class="actions">
+    <div class="ui cancel button">Cancel</div>
+    <button type="submit" form="start-form" class="ui green button">
+      <i class="play icon"></i> {% if then %}Start &amp; open{% else %}Start{% endif %}
+    </button>
+  </div>
+</div>
+{% include "user/_modal_show.html" %}

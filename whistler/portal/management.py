@@ -321,16 +321,21 @@ async def _login_required(request: Request, exc: Exception):
 def _render_status_html(name: str, status: str, user: str, controls: bool,
                         connect_url: str = None, term_url: str = None,
                         ready: bool = True, editable: bool = False,
-                        console_url: str = None) -> str:
+                        console_url: str = None, can_override: bool = False) -> str:
     """Render the polling status badge. With `controls`, also emit an out-of-band
     swap that re-renders the action buttons (connect/ssh/start/stop/edit) so they
     stay enabled/disabled in step with the status (used on the dashboard; the
-    detail view omits it)."""
+    detail view omits it).
+
+    `can_override` has to travel with them for the same reason the console URL
+    does: these buttons are re-rendered on every poll, so a flag left out here
+    silently reverts the play button to a plain one-click start the first time
+    the row refreshes."""
     tpl = "user/_status_controls.html" if controls else "user/_status_badge.html"
     return templates.env.get_template(tpl).render(
         name=name, status=status, user=user, controls=controls,
         connect_url=connect_url, term_url=term_url, ready=ready, editable=editable,
-        console_url=console_url,
+        console_url=console_url, can_override=can_override,
     )
 
 
@@ -351,6 +356,18 @@ def _terminal_url(user: str, name: str) -> str:
     """Web-terminal (xterm.js) page, served by the same viewer app as the desktop
     relay — so it shares _DESKTOP_PORTAL_URL (empty = same-origin via the proxy)."""
     return f"{_DESKTOP_PORTAL_URL}/term/{name}?user={user}"
+
+
+# Where a start can be headed. The desktop, the web terminal and the machine
+# console all *start* a stopped instance on their way in (the viewer app fires
+# the same reconcile nudge), so each is a moment the start dialog has to be
+# able to precede — and then hand the browser on to. Keyed by the name the
+# button puts in `?then=`, so an unknown value simply isn't a door.
+_START_DESTINATIONS = {
+    "desktop":  lambda user, name: _desktop_viewer_url(user, name),
+    "terminal": lambda user, name: _terminal_url(user, name),
+    "console":  lambda user, name: _console_url(user, name),
+}
 
 
 def _console_url(user: str, name: str) -> str:
@@ -401,23 +418,82 @@ def _merge_sessions(instances: list, desktop_sessions: list, user: str,
     return rows
 
 
+async def _user_templates(request: Request, cm, user: str) -> list:
+    """Every template this user may launch, ssh and desktop alike — one list,
+    since the picker offers them together and the create form resolves the
+    chosen name against the same set."""
+    ssh_tpls, desk_tpls = await asyncio.gather(
+        request.app.state.run(cm.get_user_templates, user),
+        request.app.state.run(cm.get_user_desktop_templates, user),
+    )
+    return ssh_tpls + desk_tpls
+
+
+async def _override_form_context(request: Request, cm, user: str) -> dict:
+    """The context every override form needs: the user's grants, plus the
+    catalogs filtered to what they hold.
+
+    Three surfaces ask for this — create, edit, and the start dialog — and the
+    filtering is the part that must not drift between them: the pickers offer
+    only what _apply_policy would accept, so a user granted no zone is offered
+    none rather than being shown the whole catalog and refused at reconcile.
+    Every allow is explicit (2026-08-25), which is why there is no "empty means
+    any" branch here."""
+    (volumes, allowed_volumes, gpu_types, allowed_gpu_types,
+     overrides, zones, allowed_zones) = await asyncio.gather(
+        request.app.state.run(cm.get_volumes),
+        request.app.state.run(cm.get_user_allowed_volumes, user),
+        request.app.state.run(cm.get_gpu_types),
+        request.app.state.run(cm.get_user_allowed_gpu_types, user),
+        request.app.state.run(cm.get_user_overrides, user),
+        request.app.state.run(cm.get_zones),
+        request.app.state.run(cm.get_user_allowed_zones, user),
+    )
+    return {
+        "volumes": volumes,
+        "allowed_volumes": allowed_volumes,
+        "gpu_types": [g for g in gpu_types if g in allowed_gpu_types],
+        "allowed_gpu_types": allowed_gpu_types,
+        "overrides": overrides,
+        "zones": [z for z in zones if z in allowed_zones],
+    }
+
+
+def _may_override(grants: dict) -> bool:
+    """Whether this user can change anything for a run. Decides both the shape
+    of the play button and whether the start dialog has a question to ask; with
+    no grant at all, start stays one click."""
+    return any((grants or {}).values())
+
+
 # --------------------------------------------------------------------------- #
 # User — dashboard                                                             #
 # --------------------------------------------------------------------------- #
 
 async def user_index(request: Request, cm: CM, user: User, is_admin: IsAdmin):
-    instances, ssh_tpls, desk_tpls, desktop_sessions = await asyncio.gather(
+    instances, desktop_sessions, grants = await asyncio.gather(
         request.app.state.run(cm.get_user_instances, user),
-        request.app.state.run(cm.get_user_templates, user),
-        request.app.state.run(cm.get_user_desktop_templates, user),
         request.app.state.run(cm.get_user_desktop_sessions, user),
+        request.app.state.run(cm.get_user_overrides, user),
     )
     return templates.TemplateResponse(
         request=request, name="user/index.html",
         context=_ctx(user, is_admin=is_admin,
                      instances=_merge_sessions(instances, desktop_sessions, user,
                                                is_admin=is_admin),
-                     tpls=ssh_tpls + desk_tpls),
+                     can_override=_may_override(grants)),
+    )
+
+
+async def instance_template_picker(request: Request, cm: CM, user: User,
+                                   is_admin: IsAdmin):
+    """The template catalog, as a modal fragment. It left the dashboard when
+    "New Instance" grew a picker — the list of machines you have should not be
+    sitting on top of the list of machines you could make."""
+    return templates.TemplateResponse(
+        request=request, name="user/_template_picker.html",
+        context=_ctx(user, is_admin=is_admin,
+                     tpls=await _user_templates(request, cm, user)),
     )
 
 
@@ -426,36 +502,25 @@ async def user_index(request: Request, cm: CM, user: User, is_admin: IsAdmin):
 # --------------------------------------------------------------------------- #
 
 async def instance_create_form(request: Request, cm: CM, user: User, is_admin: IsAdmin):
-    (ssh_tpls, desk_tpls, volumes, allowed, gpu_types, allowed_gpu_types,
-     overrides, zones, allowed_zones, home_volumes_) = \
-        await asyncio.gather(
-            request.app.state.run(cm.get_user_templates, user),
-            request.app.state.run(cm.get_user_desktop_templates, user),
-            request.app.state.run(cm.get_volumes),
-            request.app.state.run(cm.get_user_allowed_volumes, user),
-            request.app.state.run(cm.get_gpu_types),
-            request.app.state.run(cm.get_user_allowed_gpu_types, user),
-            request.app.state.run(cm.get_user_overrides, user),
-            request.app.state.run(cm.get_zones),
-            request.app.state.run(cm.get_user_allowed_zones, user),
-            request.app.state.run(cm.get_home_volumes, user),
-        )
-    # The zone picker offers only what _apply_policy would accept, and every
-    # allow is explicit — so a user granted no zone is offered none, and the
-    # form says that rather than silently listing the whole catalog.
-    selectable_zones = [z for z in zones if z in allowed_zones]
-    # Same rule for the GPU picker as the zone picker: offer what would
-    # actually provision. It used to list the whole catalog and let the
-    # failure explain itself, which was survivable while an empty allow-list
-    # meant "any"; now it would offer every type to a user granted none.
-    gpu_types = [g for g in gpu_types if g in allowed_gpu_types]
+    tpls, form_ctx, home_volumes_ = await asyncio.gather(
+        _user_templates(request, cm, user),
+        _override_form_context(request, cm, user),
+        request.app.state.run(cm.get_home_volumes, user),
+    )
+    # Normally the picker sent us here with a template already chosen, so the
+    # form shows what was picked. An unresolvable (or absent) ?template= falls
+    # back to the select rather than 404ing — a stale bookmark should still be
+    # able to create something.
+    wanted = request.query_params.get("template")
+    selected_tpl = next((t for t in tpls
+                         if t.get("fullName") == wanted or t.get("name") == wanted),
+                        None) if wanted else None
     return templates.TemplateResponse(
         request=request, name="user/create_instance.html",
-        context=_ctx(user, is_admin=is_admin, tpls=ssh_tpls + desk_tpls, volumes=volumes,
-                     allowed_volumes=allowed, gpu_types=gpu_types,
-                     allowed_gpu_types=allowed_gpu_types, overrides=overrides,
-                     zones=selectable_zones, home_volumes=home_volumes_,
-                     current_home_volume=None),
+        context=_ctx(user, is_admin=is_admin, tpls=tpls,
+                     selected_template=wanted, selected_tpl=selected_tpl,
+                     home_volumes=home_volumes_, current_home_volume=None,
+                     **form_ctx),
     )
 
 
@@ -480,25 +545,12 @@ async def instance_create(
     name = instance_name.strip()
     # The template carries the access mode; create the matching Session. Desktop
     # sessions are connected from the desktop portal, ssh ones via the SSH bridge.
-    ssh_tpls, desk_tpls = await asyncio.gather(
-        request.app.state.run(cm.get_user_templates, user),
-        request.app.state.run(cm.get_user_desktop_templates, user),
-    )
-    tpl = next((t for t in (ssh_tpls + desk_tpls)
+    tpls = await _user_templates(request, cm, user)
+    tpl = next((t for t in tpls
                 if t.get("fullName") == template_name or t.get("name") == template_name), None)
     mode = (tpl or {}).get("mode", "ssh")
 
-    # Volume mount paths are keyed per-volume (mount_path__<name>) rather than
-    # a parallel list, since volume_names only carries the *checked* boxes —
-    # a positional zip would misalign whenever a box in the middle is left
-    # unchecked.
-    volumes_override = None
-    if volume_names:
-        form = await request.form()
-        volumes_override = {
-            v: (form.get(f"mount_path__{v}") or f"/mnt/{v}").strip()
-            for v in volume_names
-        }
+    volumes_override = await _volume_mounts_from_form(request, volume_names)
     overrides = _build_session_overrides(
         volumes=volumes_override,
         cpu=override_cpu, memory=override_memory,
@@ -526,20 +578,12 @@ async def instance_create(
 
 
 async def instance_edit_form(request: Request, cm: CM, user: User, is_admin: IsAdmin, name: str):
-    (instances, desktop_sessions, ssh_tpls, desk_tpls, volumes, allowed, gpu_types,
-     allowed_gpu_types, overrides, zones, allowed_zones, cur, home_volumes_) = \
+    (instances, desktop_sessions, tpls, form_ctx, cur, home_volumes_) = \
         await asyncio.gather(
             request.app.state.run(cm.get_user_instances, user),
             request.app.state.run(cm.get_user_desktop_sessions, user),
-            request.app.state.run(cm.get_user_templates, user),
-            request.app.state.run(cm.get_user_desktop_templates, user),
-            request.app.state.run(cm.get_volumes),
-            request.app.state.run(cm.get_user_allowed_volumes, user),
-            request.app.state.run(cm.get_gpu_types),
-            request.app.state.run(cm.get_user_allowed_gpu_types, user),
-            request.app.state.run(cm.get_user_overrides, user),
-            request.app.state.run(cm.get_zones),
-            request.app.state.run(cm.get_user_allowed_zones, user),
+            _user_templates(request, cm, user),
+            _override_form_context(request, cm, user),
             request.app.state.run(cm.get_instance_config, user, name),
             request.app.state.run(cm.get_home_volumes, user),
         )
@@ -558,16 +602,11 @@ async def instance_edit_form(request: Request, cm: CM, user: User, is_admin: IsA
     if status_group(inst["status"], inst.get("ready", True)) not in ("Stopped", "Error"):
         raise HTTPException(status_code=409, detail="Stop the instance before editing it.")
 
-    selectable_zones = [z for z in zones if z in allowed_zones]
-    gpu_types = [g for g in gpu_types if g in allowed_gpu_types]
     return templates.TemplateResponse(
         request=request, name="user/edit_instance.html",
-        context=_ctx(user, is_admin=is_admin, inst=inst, cur=cur,
-                     tpls=ssh_tpls + desk_tpls, volumes=volumes,
-                     allowed_volumes=allowed, gpu_types=gpu_types,
-                     allowed_gpu_types=allowed_gpu_types, overrides=overrides,
-                     zones=selectable_zones, home_volumes=home_volumes_,
-                     current_home_volume=cur.get("homeVolume")),
+        context=_ctx(user, is_admin=is_admin, inst=inst, cur=cur, tpls=tpls,
+                     home_volumes=home_volumes_,
+                     current_home_volume=cur.get("homeVolume"), **form_ctx),
     )
 
 
@@ -587,15 +626,7 @@ async def instance_update(
     override_fs_group:     Annotated[Optional[str], Form()] = None,
     override_zone:         Annotated[Optional[str], Form()] = None,
 ):
-    # Same override-assembly as instance_create (per-volume mount paths keyed by
-    # name so unchecked boxes don't misalign a positional zip).
-    volumes_override = None
-    if volume_names:
-        form = await request.form()
-        volumes_override = {
-            v: (form.get(f"mount_path__{v}") or f"/mnt/{v}").strip()
-            for v in volume_names
-        }
+    volumes_override = await _volume_mounts_from_form(request, volume_names)
     overrides = _build_session_overrides(
         volumes=volumes_override,
         cpu=override_cpu, memory=override_memory,
@@ -614,9 +645,10 @@ async def instance_update(
 
 
 async def instance_detail(request: Request, cm: CM, user: User, is_admin: IsAdmin, name: str):
-    instances, desktop_sessions = await asyncio.gather(
+    instances, desktop_sessions, grants = await asyncio.gather(
         request.app.state.run(cm.get_user_instances, user),
         request.app.state.run(cm.get_user_desktop_sessions, user),
+        request.app.state.run(cm.get_user_overrides, user),
     )
     inst = next((i for i in instances if i["name"] == name), None)
     if inst is None:
@@ -632,7 +664,8 @@ async def instance_detail(request: Request, cm: CM, user: User, is_admin: IsAdmi
     inst = {**inst, "editable": True}
     return templates.TemplateResponse(
         request=request, name="user/instance_detail.html",
-        context=_ctx(user, is_admin=is_admin, inst=inst),
+        context=_ctx(user, is_admin=is_admin, inst=inst,
+                     can_override=_may_override(grants)),
     )
 
 
@@ -641,10 +674,12 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
                                  is_admin: bool = False) -> HTMLResponse:
     """Look up the current consolidated status (ssh pod phase or desktop CR phase)
     and render the polling badge (with Start/Stop buttons when `controls`)."""
-    instances, desktop_sessions = await asyncio.gather(
+    instances, desktop_sessions, grants = await asyncio.gather(
         request.app.state.run(cm.get_user_instances, user),
         request.app.state.run(cm.get_user_desktop_sessions, user),
+        request.app.state.run(cm.get_user_overrides, user),
     )
+    can_override = _may_override(grants)
     inst = next((i for i in instances if i["name"] == name), None)
     # Both ssh instances and desktop/VM sessions are Session CRs with an editable
     # spec.overrides, so both get an Edit action.
@@ -679,7 +714,7 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
             ready = True
     return HTMLResponse(
         _render_status_html(name, status, user, controls, connect_url, term_url,
-                            ready, editable, console_url))
+                            ready, editable, console_url, can_override))
 
 
 async def instance_status_badge(request: Request, cm: CM, user: User, name: str,
@@ -691,11 +726,100 @@ async def instance_status_badge(request: Request, cm: CM, user: User, name: str,
     return await _status_badge_response(request, cm, user, name, controls, is_admin)
 
 
-async def instance_connect(request: Request, cm: CM, user: User, name: str,
-                           is_admin: IsAdmin):
-    ok = await request.app.state.run(cm.trigger_instance_start, user, name)
+async def instance_start_dialog(request: Request, cm: CM, user: User,
+                                is_admin: IsAdmin, name: str):
+    """The start dialog: the instance's saved overrides, editable, as a modal
+    fragment.
+
+    Prefilled from spec.overrides because those are the instance's *defaults*,
+    and answered into spec.runOverrides, which lives for one run — so this is
+    the last moment before a run where a value can still be changed, and
+    changing it costs the instance nothing. Portal only: the launcher TUI's `s`
+    key stays a single keystroke (design/proxyjump.md, "TUI diet").
+
+    `then=` names where the browser is headed once it has started: the desktop,
+    the web terminal or the machine console, each of which starts a stopped
+    instance on its way in and so has to be able to ask first. `hx=` picks how
+    a dialog with nowhere to go submits — the dashboard swaps the status badge
+    in place, the detail page posts normally and follows its redirect."""
+    form_ctx, cur = await asyncio.gather(
+        _override_form_context(request, cm, user),
+        request.app.state.run(cm.get_instance_config, user, name),
+    )
+    if cur is None:
+        raise HTTPException(status_code=404, detail="Instance not found.")
+    return templates.TemplateResponse(
+        request=request, name="user/_start_dialog.html",
+        context=_ctx(user, is_admin=is_admin, name=name, cur=cur,
+                     has_overrides=_may_override(form_ctx["overrides"]),
+                     hx=request.query_params.get("hx", "1") != "0",
+                     then=_start_destination(request.query_params.get("then")),
+                     **form_ctx),
+    )
+
+
+def _start_destination(then: Optional[str]) -> Optional[str]:
+    """The `?then=` a button asked for, or None. Unknown values are dropped
+    rather than refused: the parameter only decides which of three of our own
+    pages the browser lands on next, so a stale or mangled one should still
+    start the instance — and it can never be turned into a URL we do not own."""
+    return then if then in _START_DESTINATIONS else None
+
+
+async def instance_connect(
+    request: Request, cm: CM, user: User, name: str, is_admin: IsAdmin,
+    apply_overrides: Annotated[Optional[str], Form()] = None,
+    volume_names:  Annotated[Optional[list[str]], Form()] = None,
+    override_cpu:          Annotated[Optional[str], Form()] = None,
+    override_memory:       Annotated[Optional[str], Form()] = None,
+    override_gpu_type:     Annotated[Optional[str], Form()] = None,
+    override_gpu_count:    Annotated[Optional[str], Form()] = None,
+    override_uid:          Annotated[Optional[str], Form()] = None,
+    override_gid:          Annotated[Optional[str], Form()] = None,
+    override_run_as_user:  Annotated[Optional[str], Form()] = None,
+    override_run_as_group: Annotated[Optional[str], Form()] = None,
+    override_fs_group:     Annotated[Optional[str], Form()] = None,
+    override_zone:         Annotated[Optional[str], Form()] = None,
+):
+    """Start an instance, with the overrides this run is to use.
+
+    The plain play button posts nothing and this is the annotation bump it
+    always was. The start dialog posts `apply_overrides=1`, and the fields it
+    submitted become the run's overrides — **for that run only**. They do not
+    touch spec.overrides, so what the instance starts with next time is
+    unchanged; the edit form is still the only thing that moves an instance's
+    defaults. The dialog is prefilled from those defaults and submits the whole
+    picture, so a cleared field means "not this run" rather than an unanswered
+    question, and `or {}` is what lets a dialog with everything cleared say
+    "this run: nothing" instead of falling back to the defaults.
+
+    Both slices are written in the same act as the start (see
+    trigger_instance_start), which is what keeps a run's values from outliving
+    its run."""
+    run_overrides = None
+    if apply_overrides == "1":
+        run_overrides = _build_session_overrides(
+            volumes=await _volume_mounts_from_form(request, volume_names),
+            cpu=override_cpu, memory=override_memory,
+            gpu_type=override_gpu_type, gpu_count=override_gpu_count,
+            uid=override_uid, gid=override_gid,
+            run_as_user=override_run_as_user, run_as_group=override_run_as_group,
+            fs_group=override_fs_group, zone=override_zone,
+        ) or {}
+
+    ok = await request.app.state.run(cm.trigger_instance_start, user, name,
+                                     run_overrides)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to start instance.")
+    # A dialog opened from the desktop/terminal/console button submits into a
+    # new tab and is sent on to that page, which is where the click was going
+    # before the dialog stood in front of it. The viewer app does its own
+    # authorization there (the console's admin check included), so this is a
+    # hand-off, not a grant.
+    then = _start_destination(request.query_params.get("then"))
+    if then:
+        return RedirectResponse(_START_DESTINATIONS[then](user, name),
+                                status_code=303)
     # Dashboard buttons post via HTMX: swap the status badge (and buttons) in place
     # instead of navigating to the detail view. Plain form posts (detail) redirect.
     if request.headers.get("HX-Request"):
@@ -1789,6 +1913,22 @@ def _nonempty(d: dict) -> dict:
     return {k: v.strip() for k, v in d.items() if v and v.strip()}
 
 
+async def _volume_mounts_from_form(request: Request, volume_names) -> Optional[dict]:
+    """Volume mount paths, read out of the raw form.
+
+    They are keyed per-volume (``mount_path__<name>``) rather than posted as a
+    parallel list, because ``volume_names`` only carries the *checked* boxes — a
+    positional zip would misalign the moment a box in the middle is left
+    unchecked. Shared by create, update and the start dialog."""
+    if not volume_names:
+        return None
+    form = await request.form()
+    return {
+        v: (form.get(f"mount_path__{v}") or f"/mnt/{v}").strip()
+        for v in volume_names
+    }
+
+
 def _build_session_overrides(*, volumes=None, cpu=None, memory=None,
                              gpu_type=None, gpu_count=None,
                              uid=None, gid=None,
@@ -2147,11 +2287,13 @@ def build_management_app(config_manager):
     app.add_api_route("/",                                user_index,            methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/dashboard",                       dashboard,             methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/instances/new",                   instance_create_form,  methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/instances/templates",             instance_template_picker, methods=["GET"], response_class=HTMLResponse)
     app.add_api_route("/instances",                       instance_create,       methods=["POST"])
     app.add_api_route("/instances/{name}",                instance_detail,       methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/instances/{name}/edit",           instance_edit_form,    methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/instances/{name}/update",         instance_update,       methods=["POST"])
     app.add_api_route("/instances/{name}/status-badge",   instance_status_badge, methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/instances/{name}/start-dialog",   instance_start_dialog, methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/instances/{name}/connect",        instance_connect,      methods=["POST"])
     app.add_api_route("/instances/{name}/stop",           instance_stop,         methods=["POST"])
     app.add_api_route("/instances/{name}/delete",         instance_delete,       methods=["POST"])

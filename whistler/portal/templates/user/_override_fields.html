@@ -1,0 +1,144 @@
+{#
+  The override fields, once. Three surfaces ask the same question — the create
+  form, the edit form, and the start dialog — and each one used to carry its own
+  copy of these blocks, which is how the create form ended up without the
+  `value=` attributes the edit form had.
+
+  Context:
+    overrides       the user's *grants* (get_user_overrides) — a field only
+                    exists here if its group is granted, so the form offers
+                    exactly what _apply_overrides would accept.
+    volumes,
+    allowed_volumes the volume catalog and the subset this user holds
+    gpu_types,
+    zones           already filtered to what the user is granted by the route
+    cur             the instance's current spec slice (get_instance_config), or
+                    absent on the create form — its overrides are the defaults
+                    every field is prefilled with.
+#}
+{% set ov = (cur or {}).get('overrides') or {} %}
+{% set ov_res = ov.get('resources') or {} %}
+{% set ov_sec = ov.get('securityContext') or {} %}
+{% set ov_vols = ov.get('volumes') or {} %}
+
+{% set user_volumes = [] %}
+{% if overrides.volumes %}
+  {% for vol in volumes %}
+    {% if vol.name in allowed_volumes %}{% set _ = user_volumes.append(vol) %}{% endif %}
+  {% endfor %}
+{% endif %}
+
+{% if user_volumes %}
+<div class="field">
+  <label>Volumes to mount</label>
+  {% for vol in user_volumes %}
+  <div class="ui segment" style="padding:.75rem;margin-bottom:.5rem">
+    <div class="two fields">
+      <div class="field">
+        <div class="ui checkbox">
+          <input type="checkbox" name="volume_names" value="{{ vol.name }}" id="vol-{{ vol.name }}"
+                 {% if vol.name in ov_vols %}checked{% endif %}>
+          <label for="vol-{{ vol.name }}">
+            <strong>{{ vol.name }}</strong>
+            {% if vol.persistentVolumeClaim %}
+              <span class="ui grey mini label">{{ vol.persistentVolumeClaim.claimName }}</span>
+            {% endif %}
+          </label>
+        </div>
+      </div>
+      <div class="field">
+        <input type="text" name="mount_path__{{ vol.name }}" placeholder="/mnt/{{ vol.name }}"
+               value="{{ ov_vols.get(vol.name, '') }}">
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if overrides.resources %}
+<div class="field">
+  <label>Resource overrides</label>
+  <div class="two fields">
+    <div class="field">
+      <input name="override_cpu" type="text" placeholder="cpu, e.g. 1000m"
+             value="{{ ov_res.get('cpu') or '' }}">
+    </div>
+    <div class="field">
+      <input name="override_memory" type="text" placeholder="memory, e.g. 2Gi"
+             value="{{ ov_res.get('memory') or '' }}">
+    </div>
+  </div>
+  <div class="ui pointing label">Leave blank to keep the template's value.</div>
+</div>
+{% endif %}
+
+{% if overrides.gpuType %}
+<div class="field">
+  <label>GPU type override</label>
+  <select name="override_gpu_type" class="ui dropdown">
+    <option value="">— keep template's value —</option>
+    {% for gt in gpu_types %}
+    <option value="{{ gt }}" {% if ov.get('gpuType') == gt %}selected{% endif %}>{{ gt }}</option>
+    {% endfor %}
+  </select>
+  <div class="ui pointing label">Only the GPU types you have been granted are listed. If the list is empty, ask an admin to grant you one.</div>
+</div>
+{% endif %}
+
+{% if overrides.gpuCount %}
+<div class="field">
+  <label>GPU count override</label>
+  <input name="override_gpu_count" type="number" min="0" placeholder="e.g. 1"
+         value="{{ ov.gpuCount if ov.get('gpuCount') is not none else '' }}">
+</div>
+{% endif %}
+
+{% if overrides.zone %}
+<div class="field">
+  <label>Network zone override</label>
+  <select name="override_zone" class="ui dropdown">
+    <option value="">— keep template's zone —</option>
+    {% for z in zones %}
+    <option value="{{ z }}" {% if ov.get('zone') == z %}selected{% endif %}>{{ z }}</option>
+    {% endfor %}
+  </select>
+  <div class="ui pointing label">Egress posture the instance runs under; applies from the next start/reboot.</div>
+</div>
+{% endif %}
+
+{% if overrides.uidGid %}
+<div class="field">
+  <label>VM guest identity override (uid/gid)</label>
+  <div class="two fields">
+    <div class="field">
+      <input name="override_uid" type="number" placeholder="uid"
+             value="{{ ov.uid if ov.get('uid') is not none else '' }}">
+    </div>
+    <div class="field">
+      <input name="override_gid" type="number" placeholder="gid"
+             value="{{ ov.gid if ov.get('gid') is not none else '' }}">
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% if overrides.securityContext %}
+<div class="field">
+  <label>Pod security context override</label>
+  <div class="three fields">
+    <div class="field">
+      <input name="override_run_as_user" type="number" placeholder="runAsUser"
+             value="{{ ov_sec.runAsUser if ov_sec.get('runAsUser') is not none else '' }}">
+    </div>
+    <div class="field">
+      <input name="override_run_as_group" type="number" placeholder="runAsGroup"
+             value="{{ ov_sec.runAsGroup if ov_sec.get('runAsGroup') is not none else '' }}">
+    </div>
+    <div class="field">
+      <input name="override_fs_group" type="number" placeholder="fsGroup"
+             value="{{ ov_sec.fsGroup if ov_sec.get('fsGroup') is not none else '' }}">
+    </div>
+  </div>
+</div>
+{% endif %}

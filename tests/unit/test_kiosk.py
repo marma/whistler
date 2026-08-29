@@ -35,7 +35,7 @@ class FakeCM:
         who may reach it in test_entry_points.py."""
         return True
 
-    def trigger_instance_start(self, username, name):
+    def trigger_instance_start(self, username, name, run_overrides=None):
         return True
 
 

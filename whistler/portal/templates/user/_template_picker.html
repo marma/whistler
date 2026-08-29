@@ -1,0 +1,70 @@
+{#
+  The template picker, as a modal. Loaded by htmx into #modal-host when "New
+  Instance" is pressed, rather than sitting on the dashboard as a permanent wall
+  of cards: the catalog is what you consult *while* creating an instance, not
+  something the list of running machines needs to carry underneath it.
+
+  Picking a card navigates to the create form with the template chosen, so the
+  form no longer has to offer a select nobody was choosing from.
+#}
+<div class="ui modal" id="whistler-modal">
+  <i class="close icon"></i>
+  <div class="header">
+    <i class="copy outline icon"></i> Choose a template
+  </div>
+  {% if tpls %}
+  <div class="scrolling content">
+    <div class="ui three stackable cards">
+      {% for t in tpls %}
+      <div class="card">
+        <div class="content">
+          <div class="header">
+            {{ t.displayName or t.name }}
+            <span class="ui {{ 'blue' if t.source == 'system' else 'teal' }} tiny label" style="float:right">
+              {{ t.source }}
+            </span>
+          </div>
+          <div class="meta">
+            <span class="ui {{ 'purple' if t.mode == 'desktop' else 'grey' }} mini label">{{ t.mode or 'ssh' }}</span>
+            <span class="ui grey mini label">{{ t.runtime or 'container' }}</span>
+          </div>
+          {% if t.description %}
+          <div class="meta">{{ t.description }}</div>
+          {% endif %}
+          <div class="description">
+            <code>{{ t.image or "" }}</code>
+            {% if t.resources %}
+            <div class="ui mini horizontal divided list" style="margin-top:.5em">
+              {% if t.resources.cpu %}<div class="item"><i class="microchip icon"></i>{{ t.resources.cpu }}</div>{% endif %}
+              {% if t.resources.memory %}<div class="item"><i class="database icon"></i>{{ t.resources.memory }}</div>{% endif %}
+            </div>
+            {% endif %}
+          </div>
+        </div>
+        <div class="extra content">
+          <a href="/instances/new?user={{ current_user }}&template={{ t.fullName }}"
+             class="ui primary fluid button">
+            <i class="plus icon"></i> Use Template
+          </a>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% else %}
+  <div class="content">
+    <div class="ui placeholder segment">
+      <div class="ui icon header">
+        <i class="copy outline icon"></i>
+        No templates available to you
+      </div>
+      <p>A template is what an instance is made from. Ask an admin to grant you
+         one, or to define one under Admin → Templates.</p>
+    </div>
+  </div>
+  {% endif %}
+  <div class="actions">
+    <div class="ui cancel button">Cancel</div>
+  </div>
+</div>
+{% include "user/_modal_show.html" %}

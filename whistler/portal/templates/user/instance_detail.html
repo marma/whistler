@@ -65,6 +65,19 @@
           <i class="stop icon"></i> Stop Instance
         </button>
       </form>
+      {% elif can_override %}
+      {# Same reasoning as the dashboard row: with an override grant, start is
+         the last moment the instance's defaults can still be changed for the
+         run about to happen, so it asks (user/_start_dialog.html). #}
+      <button class="ui green fluid button" style="margin-bottom:.75rem"
+              {# hx=0: this page has no #actions- span for the badge's
+                 out-of-band swap, so the dialog posts plainly and follows the
+                 redirect back here. #}
+              hx-get="/instances/{{ inst.name }}/start-dialog?user={{ current_user }}&hx=0"
+              hx-target="#modal-host" hx-swap="innerHTML">
+        <i class="play icon"></i>
+        {% if status_label(inst.status, inst.get('ready', true)) == "Stopped" %}Start &amp; Connect{% else %}Connect{% endif %}
+      </button>
       {% else %}
       <form method="post" action="/instances/{{ inst.name }}/connect?user={{ current_user }}">
         <button class="ui green fluid button" style="margin-bottom:.75rem">
@@ -101,5 +114,8 @@
     {% endif %}
   </div>
 </div>
+
+{# The start dialog, when this page opens one. #}
+<div id="modal-host"></div>
 
 {% endblock %}

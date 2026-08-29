@@ -255,6 +255,53 @@ spec:
                         Network zone override (requires the "zone" grant;
                         further gated by the user's allowedZones). Takes
                         effect on the next session start/reboot.
+                runOverrides:
+                  type: object
+                  description: >-
+                    The overrides for the run that is currently starting, set
+                    by the portal's start dialog and replaced (or removed) by
+                    every start. Same fields, same grants and same checks as
+                    `overrides` — the difference is lifetime: this slice
+                    belongs to one run and does not change what the instance
+                    starts with next time, whereas `overrides` is the
+                    instance's own default. Present-and-empty is meaningful
+                    ("this run: no overrides at all"); absent means the
+                    defaults apply. See config.effective_session_overrides.
+                  properties:
+                    resources:
+                      type: object
+                      properties:
+                        cpu:
+                          type: string
+                        memory:
+                          type: string
+                    gpuType:
+                      type: string
+                    gpuCount:
+                      type: integer
+                    uid:
+                      type: integer
+                    gid:
+                      type: integer
+                    securityContext:
+                      type: object
+                      properties:
+                        fsGroup:
+                          type: integer
+                        runAsUser:
+                          type: integer
+                        runAsGroup:
+                          type: integer
+                    volumes:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    zone:
+                      type: string
+                      description: >-
+                        Network zone override (requires the "zone" grant;
+                        further gated by the user's allowedZones). Takes
+                        effect on the next session start/reboot.
             status:
               type: object
               properties:

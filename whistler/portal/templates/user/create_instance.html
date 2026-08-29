@@ -17,130 +17,35 @@
       <div class="ui pointing label">Lowercase letters, numbers, and hyphens only.</div>
     </div>
 
+    {# The picker on the dashboard is the normal way in, and it arrives here with
+       the template already chosen — so show what was picked rather than a select
+       to choose it again. The select is still the answer for a bare
+       /instances/new (a bookmark, or a picker with nothing to offer). #}
+    {% if selected_tpl %}
+    <div class="field">
+      <label>Template</label>
+      <input type="text" disabled
+             value="{{ selected_tpl.displayName or selected_tpl.name }} [{{ selected_tpl.mode or 'ssh' }}/{{ selected_tpl.runtime or 'container' }}]{% if selected_tpl.image %} — {{ selected_tpl.image }}{% endif %}">
+      <input type="hidden" name="template_name" value="{{ selected_tpl.fullName }}">
+      <div class="ui pointing label">
+        Chosen from the picker — <a href="/?user={{ current_user }}">pick a different one</a>.
+      </div>
+    </div>
+    {% else %}
     <div class="field">
       <label>Template</label>
       <select name="template_name" class="ui dropdown" required>
         <option value="">— select a template —</option>
         {% for t in tpls %}
-        <option value="{{ t.fullName }}"
-          {% if request.query_params.get('template') == t.fullName %}selected{% endif %}>
+        <option value="{{ t.fullName }}" {% if selected_template == t.fullName %}selected{% endif %}>
           {{ t.name }} [{{ t.mode or 'ssh' }}/{{ t.runtime or 'container' }}]{% if t.source == 'system' %} (system){% endif %}{% if t.image %} — {{ t.image }}{% endif %}
         </option>
         {% endfor %}
       </select>
     </div>
-
-    {% set user_volumes = [] %}
-    {% if overrides.volumes %}
-      {% for vol in volumes %}
-        {% if vol.name in allowed_volumes %}{% set _ = user_volumes.append(vol) %}{% endif %}
-      {% endfor %}
     {% endif %}
 
-    {% if user_volumes %}
-    <div class="field">
-      <label>Volumes to mount</label>
-      {% for vol in user_volumes %}
-      <div class="ui segment" style="padding:.75rem;margin-bottom:.5rem">
-        <div class="two fields">
-          <div class="field">
-            <div class="ui checkbox">
-              <input type="checkbox" name="volume_names" value="{{ vol.name }}" id="vol-{{ vol.name }}">
-              <label for="vol-{{ vol.name }}">
-                <strong>{{ vol.name }}</strong>
-                {% if vol.persistentVolumeClaim %}
-                  <span class="ui grey mini label">{{ vol.persistentVolumeClaim.claimName }}</span>
-                {% endif %}
-              </label>
-            </div>
-          </div>
-          <div class="field">
-            <input type="text" name="mount_path__{{ vol.name }}" placeholder="/mnt/{{ vol.name }}">
-          </div>
-        </div>
-      </div>
-      {% endfor %}
-    </div>
-    {% endif %}
-
-    {% if overrides.resources %}
-    <div class="field">
-      <label>Resource overrides</label>
-      <div class="two fields">
-        <div class="field">
-          <input name="override_cpu" type="text" placeholder="cpu, e.g. 1000m">
-        </div>
-        <div class="field">
-          <input name="override_memory" type="text" placeholder="memory, e.g. 2Gi">
-        </div>
-      </div>
-      <div class="ui pointing label">Leave blank to keep the template's value.</div>
-    </div>
-    {% endif %}
-
-    {% if overrides.gpuType %}
-    <div class="field">
-      <label>GPU type override</label>
-      <select name="override_gpu_type" class="ui dropdown">
-        <option value="">— keep template's value —</option>
-        {% for gt in gpu_types %}
-        <option value="{{ gt }}">{{ gt }}</option>
-        {% endfor %}
-      </select>
-      <div class="ui pointing label">Only the GPU types you have been granted are listed. If the list is empty, ask an admin to grant you one.</div>
-    </div>
-    {% endif %}
-
-    {% if overrides.gpuCount %}
-    <div class="field">
-      <label>GPU count override</label>
-      <input name="override_gpu_count" type="number" min="0" placeholder="e.g. 1">
-    </div>
-    {% endif %}
-
-    {% if overrides.zone %}
-    <div class="field">
-      <label>Network zone override</label>
-      <select name="override_zone" class="ui dropdown">
-        <option value="">— keep template's zone —</option>
-        {% for z in zones %}
-        <option value="{{ z }}">{{ z }}</option>
-        {% endfor %}
-      </select>
-      <div class="ui pointing label">Egress posture the instance runs under; applies from the next start/reboot.</div>
-    </div>
-    {% endif %}
-
-    {% if overrides.uidGid %}
-    <div class="field">
-      <label>VM guest identity override (uid/gid)</label>
-      <div class="two fields">
-        <div class="field">
-          <input name="override_uid" type="number" placeholder="uid">
-        </div>
-        <div class="field">
-          <input name="override_gid" type="number" placeholder="gid">
-        </div>
-      </div>
-    </div>
-    {% endif %}
-
-    {% if overrides.securityContext %}
-    <div class="field">
-      <label>Pod security context override</label>
-      <div class="three fields">
-        <div class="field">
-          <input name="override_run_as_user" type="number" placeholder="runAsUser">
-        </div>
-        <div class="field">
-          <input name="override_run_as_group" type="number" placeholder="runAsGroup">
-        </div>
-        <div class="field">
-          <input name="override_fs_group" type="number" placeholder="fsGroup">
-        </div>
-      </div>
-    </div>
-    {% endif %}
+    {% include "user/_override_fields.html" %}
 
     <div class="field">
       <label>Home volume</label>

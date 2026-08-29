@@ -2,35 +2,56 @@
 {% set can_connect = state in ("Stopped", "Running") %}
 {% set can_start = state == "Stopped" %}
 {% set can_stop = state not in ("Stopped", "Stopping") %}
-{% if connect_url %}
-<a class="ui blue tiny icon button{% if not can_connect %} disabled{% endif %}" title="Connect to desktop"
-   {% if can_connect %}href="{{ connect_url }}" target="_blank"{% endif %}>
-  <i class="desktop icon"></i>
+
+{#
+  The three viewer buttons each *start* a stopped instance on the way in (the
+  viewer app fires the same reconcile nudge the play button does), so on a
+  stopped row they are start buttons wearing a destination — and a user who may
+  choose something for a run should be asked before one of them starts it
+  without asking. Hence `asks`: with a grant, and only while there is a start to
+  precede, the button opens the dialog with `?then=` naming where it was going;
+  the dialog hands the browser on afterwards. A running instance is not being
+  started by the click, so there is nothing to choose and the link stays a link.
+#}
+{% set asks = can_start and can_override|default(false) %}
+{% macro viewer_button(url, colour, icon, label, door) %}
+{% if url %}
+<a class="ui {{ colour }} tiny icon button{% if not can_connect %} disabled{% endif %}"
+   title="{{ label }}{% if asks %} (with overrides){% endif %}"
+   {% if asks %}
+   hx-get="/instances/{{ name }}/start-dialog?user={{ user }}&then={{ door }}"
+   hx-target="#modal-host" hx-swap="innerHTML" style="cursor:pointer"
+   {% elif can_connect %}href="{{ url }}" target="_blank"{% endif %}>
+  <i class="{{ icon }} icon"></i>
 </a>
 {% endif %}
-{% if term_url %}
-<a class="ui teal tiny icon button{% if not can_connect %} disabled{% endif %}" title="Connect using SSH"
-   {% if can_connect %}href="{{ term_url }}" target="_blank"{% endif %}>
-  <i class="terminal icon"></i>
-</a>
-{% endif %}
+{% endmacro %}
+
+{{ viewer_button(connect_url, "blue", "desktop", "Connect to desktop", "desktop") }}
+{{ viewer_button(term_url, "teal", "terminal", "Connect using SSH", "terminal") }}
 {# Admin only, and only for VMs: the machine's console rather than its desktop
    — firmware, bootloader and kernel messages, i.e. the view that exists
    before (and after) anything else works. The server enforces this too; the
    template only decides whether to show it. #}
-{% if console_url %}
-<a class="ui grey tiny icon button{% if not can_connect %} disabled{% endif %}"
-   title="Machine console (admin) — firmware and boot output, not the desktop"
-   {% if can_connect %}href="{{ console_url }}" target="_blank"{% endif %}>
-  <i class="microchip icon"></i>
-</a>
-{% endif %}
+{{ viewer_button(console_url, "grey",
+                 "microchip",
+                 "Machine console (admin) — firmware and boot output, not the desktop",
+                 "console") }}
 <button class="ui yellow tiny icon button{% if not can_stop %} disabled{% endif %}" title="Stop"
         {% if can_stop %}hx-post="/instances/{{ name }}/stop?user={{ user }}" hx-target="#status-{{ name }}" hx-swap="outerHTML"{% else %}disabled{% endif %}>
   <i class="stop icon"></i>
 </button>
-<button class="ui green tiny icon button{% if not can_start %} disabled{% endif %}" title="Start"
-        {% if can_start %}hx-post="/instances/{{ name }}/connect?user={{ user }}" hx-target="#status-{{ name }}" hx-swap="outerHTML"{% else %}disabled{% endif %}>
+{# Start opens the override dialog when the user holds a grant, because the
+   instance's saved values are only *defaults* — this is the one moment before a
+   run where a value can still be changed, and what is chosen applies to that
+   run alone (spec.runOverrides). With no grant there is nothing to ask, so the
+   button stays the single click it always was. #}
+<button class="ui green tiny icon button{% if not can_start %} disabled{% endif %}"
+        title="{% if can_override|default(false) %}Start (with overrides){% else %}Start{% endif %}"
+        {% if not can_start %}disabled
+        {% elif can_override|default(false) %}hx-get="/instances/{{ name }}/start-dialog?user={{ user }}" hx-target="#modal-host" hx-swap="innerHTML"
+        {% else %}hx-post="/instances/{{ name }}/connect?user={{ user }}" hx-target="#status-{{ name }}" hx-swap="outerHTML"
+        {% endif %}>
   <i class="play icon"></i>
 </button>
 {% if editable|default(false) %}

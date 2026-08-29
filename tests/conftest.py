@@ -37,6 +37,9 @@ class FakeConfigManager(ConfigManager):
         self._ssh_targets: Dict[str, Dict[str, Any]] = ssh_targets or {}
         self.ssh_domain_suffix = ssh_domain_suffix
         self.started: List[tuple] = []
+        # (user, instance, run_overrides) for each start — see
+        # trigger_instance_start.
+        self.run_overrides: List[tuple] = []
         self.stopped: List[tuple] = []
         self.created: List[tuple] = []
         self.deleted: List[tuple] = []
@@ -127,26 +130,37 @@ class FakeConfigManager(ConfigManager):
         holder = self._home_volume_holders.get(volume.get("name"))
         return None if holder == ignore_instance else holder
 
-    def get_instance_config(self, username, instance_name):
-        for inst in self._instances.get(username, []):
-            if inst["name"] == instance_name:
-                return {
-                    "templateRef": inst.get("template"),
-                    "preemptible": inst.get("preemptible", False),
-                    "homeVolume": inst.get("homeVolume"),
-                    "overrides": inst.get("overrides") or {},
-                }
+    def _session(self, username, name):
+        """An ssh instance or a desktop session by name. Both are one Session CR
+        in the real manager, which looks them up by name and neither knows nor
+        cares which kind it found — so anything here that stands in for a CR
+        read has to span both pools too."""
+        for inst in (self._instances.get(username, [])
+                     + self._desktop_sessions.get(username, [])):
+            if inst["name"] == name:
+                return inst
         return None
+
+    def get_instance_config(self, username, instance_name):
+        inst = self._session(username, instance_name)
+        if inst is None:
+            return None
+        return {
+            "templateRef": inst.get("template"),
+            "preemptible": inst.get("preemptible", False),
+            "homeVolume": inst.get("homeVolume"),
+            "overrides": inst.get("overrides") or {},
+        }
 
     def update_instance(self, username, instance_name, preemptible=False,
                         overrides=None, home_volume=None):
-        for inst in self._instances.get(username, []):
-            if inst["name"] == instance_name:
-                inst["preemptible"] = preemptible
-                inst["overrides"] = overrides
-                inst["homeVolume"] = home_volume
-                return True
-        return False
+        inst = self._session(username, instance_name)
+        if inst is None:
+            return False
+        inst["preemptible"] = preemptible
+        inst["overrides"] = overrides
+        inst["homeVolume"] = home_volume
+        return True
 
     def save_template(self, username, template_data):
         return True
@@ -428,8 +442,18 @@ class FakeConfigManager(ConfigManager):
         self.stopped.append((username, instance_name))
         return True
 
-    def trigger_instance_start(self, username, instance_name):
+    def trigger_instance_start(self, username, instance_name, run_overrides=None):
+        # Recorded on the instance the way the CR holds it — set, or removed by
+        # a plain start — so a test can assert that a run's overrides neither
+        # touched the defaults nor outlived the run that chose them.
         self.started.append((username, instance_name))
+        self.run_overrides.append((username, instance_name, run_overrides))
+        inst = self._session(username, instance_name)
+        if inst is not None:
+            if run_overrides is None:
+                inst.pop("runOverrides", None)
+            else:
+                inst["runOverrides"] = run_overrides
         return True
 
 

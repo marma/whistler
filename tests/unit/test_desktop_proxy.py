@@ -129,7 +129,7 @@ class FakeCM:
         mine.append({**_session(session_name, 1), "template": template_name})
         return True
 
-    def trigger_instance_start(self, username, name):
+    def trigger_instance_start(self, username, name, run_overrides=None):
         return True
 
 

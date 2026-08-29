@@ -1,0 +1,23 @@
+{#
+  Shows the modal that was just swapped into #modal-host. htmx evaluates scripts
+  in swapped content, so the fragment can open itself and the page needs no
+  per-button JS.
+
+  detachable:false matters: Fomantic's default moves the modal out of its parent
+  and into a dimmer on <body>, which would leave the old one behind every time
+  htmx replaces #modal-host — one accumulating modal per press. Keeping it in
+  place means the host holds exactly the modal that is open, and emptying the
+  host on hide (next tick, so Fomantic is done with the element) disposes of it.
+#}
+<script>
+  (function () {
+    var $m = $('#modal-host .ui.modal');
+    $m.modal({
+      detachable: false,
+      observeChanges: true,
+      onHidden: function () { setTimeout(function () { $('#modal-host').empty(); }, 0); },
+    }).modal('show');
+    $m.find('.ui.dropdown').dropdown();
+    $m.find('.ui.checkbox').checkbox();
+  })();
+</script>

@@ -116,6 +116,33 @@ def run_intent(annotations: Optional[Dict[str, Any]]) -> bool:
         return False
     return started > stopped
 
+def effective_session_overrides(spec: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The overrides a Session is actually built from.
+
+    Two slices, and the newer one wins outright rather than merging:
+      - ``spec.overrides`` are the instance's *defaults*, edited on the portal's
+        edit form and meant to persist.
+      - ``spec.runOverrides`` is the answer the portal's start dialog gave for
+        **this run only**. Every start writes it — the dialog's answer, or
+        nothing at all — so it never outlives the run it was chosen for, and
+        changing a value there does not change what the instance starts with
+        next time.
+
+    Absent and empty are different, which is why this tests for None rather
+    than truthiness: an absent key means "nobody chose for this run, use the
+    defaults", while ``{}`` means "chosen: no overrides at all", which is what a
+    dialog submitted with every field cleared has to be able to say. Same
+    distinction `channels` makes, for the same reason.
+
+    Replacing rather than merging is what makes clearing a field work. The
+    dialog is prefilled from the defaults and submits the whole picture, so a
+    field left blank is a deliberate "not this run" — merging would quietly put
+    the default back."""
+    spec = spec or {}
+    run = spec.get("runOverrides")
+    return run if run is not None else spec.get("overrides")
+
+
 # Config file locations. Defaults match the in-cluster mount paths used by the
 # Helm chart; override via env so the server/operator can run as host processes
 # (e.g. local k3d integration testing) without writing to /etc.
@@ -957,8 +984,16 @@ class ConfigManager(ABC):
         pass
 
     @abstractmethod
-    def trigger_instance_start(self, username: str, instance_name: str) -> bool:
-        """Bump an annotation on the Session CR to fire the operator's reconcile."""
+    def trigger_instance_start(self, username: str, instance_name: str,
+                               run_overrides: Optional[Dict[str, Any]] = None) -> bool:
+        """Bump an annotation on the Session CR to fire the operator's reconcile.
+
+        ``run_overrides`` is the overrides *this run* uses, written in the same
+        act as the start and gone by the next one: a dict (``{}`` included —
+        "no overrides this run") sets spec.runOverrides, and None removes it so
+        the instance falls back to its own spec.overrides. Only the portal's
+        start dialog passes one; the launcher, the jump and the plain play
+        button start an instance the way it is configured."""
         pass
 
 class KubeConfigManager(ConfigManager):
@@ -3306,12 +3341,16 @@ class KubeConfigManager(ConfigManager):
         # templates express it via persistence. Honor either.
         preemptible = bool(spec.get('preemptible')) or persistence == 'preemptible'
 
-        # Merge any session-level spec.overrides into the template/user
-        # details used to build the workload, gated by the owning user's
-        # granted override groups (raises PolicyError if ungranted).
+        # Merge this run's overrides into the template/user details used to
+        # build the workload, gated by the owning user's granted override
+        # groups (raises PolicyError if ungranted). Which slice that is —
+        # the instance's defaults or the start dialog's one-shot answer — is
+        # effective_session_overrides' rule, shared with resolve_ssh_target so
+        # the gateway cannot disagree with the workload about, say, its zone.
         user_details = self.get_user(username)
         template_spec, user_details = self._apply_overrides(
-            template_spec, user_details, spec.get('overrides'), username)
+            template_spec, user_details, effective_session_overrides(spec),
+            username)
 
         # Authoritative policy (may raise PolicyError, may coerce runtime->kata).
         effective_runtime = self._apply_policy(template_spec, mode, runtime, username)
@@ -5162,7 +5201,9 @@ class KubeConfigManager(ConfigManager):
         self._load_zones()
         template = self._resolve_template(user_ns, spec.get("templateRef")) or {}
         template_spec = template.get("spec", {})
-        zone = ((spec.get("overrides") or {}).get("zone")
+        # The *running* session's zone, so a one-shot zone chosen at start is
+        # the one whose ssh posture and channels the gateway enforces.
+        zone = ((effective_session_overrides(spec) or {}).get("zone")
                 or template_spec.get("zone") or DEFAULT_ZONE)
         return {
             "name": name,
@@ -6184,24 +6225,45 @@ class KubeConfigManager(ConfigManager):
             logger.error(f"Failed to request stop of {full_name}: {e}")
             return False
 
-    def trigger_instance_start(self, username: str, instance_name: str) -> bool:
-        """Bump the start annotation to fire the operator's reconcile.
+    def trigger_instance_start(self, username: str, instance_name: str,
+                               run_overrides: Optional[Dict[str, Any]] = None) -> bool:
+        """Bump the start annotation to fire the operator's reconcile, and set
+        (or clear) the overrides this run is to use.
 
-        An epoch float, like the stop annotation and like the gateway's own
-        bump: the two marks are compared against each other (run_intent), so
-        writing them in the same units keeps that comparison obvious. Older
-        CRs hold an ISO string here and still parse."""
+        The annotation is an epoch float, like the stop annotation and like the
+        gateway's own bump: the two marks are compared against each other
+        (run_intent), so writing them in the same units keeps that comparison
+        obvious. Older CRs hold an ISO string here and still parse.
+
+        The two writes are one act on purpose — a run's overrides must never
+        outlive the start that chose them, and must never be visible without
+        one. A plain start (the launcher, the jump, the play button with no
+        dialog) sends an explicit null, which is how a merge patch removes a
+        key, so it always runs the instance as configured no matter what the
+        previous run chose. A start that *carries* overrides has to
+        read-modify-replace instead: merge-patching a map cannot delete
+        entries, so a volume mount from the previous run would survive into a
+        run that did not ask for it."""
         user_ns = self._get_user_namespace(username)
         full_name = f"{username}-{instance_name}"
-        patch = {
-            "metadata": {
-                "annotations": {START_ANNOTATION: str(time.time())}
-            }
-        }
+        started = str(time.time())
         try:
-            self.api.patch_namespaced_custom_object(
-                self.group, self.version, user_ns, SESSION_PLURAL, full_name, patch
-            )
+            if run_overrides is None:
+                self.api.patch_namespaced_custom_object(
+                    self.group, self.version, user_ns, SESSION_PLURAL, full_name,
+                    {"metadata": {"annotations": {START_ANNOTATION: started}},
+                     "spec": {"runOverrides": None}},
+                )
+            else:
+                cr = self.api.get_namespaced_custom_object(
+                    self.group, self.version, user_ns, SESSION_PLURAL, full_name
+                )
+                cr.setdefault("spec", {})["runOverrides"] = run_overrides
+                cr.setdefault("metadata", {}).setdefault(
+                    "annotations", {})[START_ANNOTATION] = started
+                self.api.replace_namespaced_custom_object(
+                    self.group, self.version, user_ns, SESSION_PLURAL, full_name, cr
+                )
             logger.info(f"Triggered reconcile for {full_name}")
             return True
         except ApiException as e:

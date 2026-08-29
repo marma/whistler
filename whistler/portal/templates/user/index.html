@@ -2,6 +2,12 @@
 {% block title %}My Instances — Whistler{% endblock %}
 {% block content %}
 
+{# The template catalog used to sit under this table as a permanent wall of
+   cards. It is what you consult while *making* an instance, not something the
+   list of machines you already have needs to carry underneath it — so both
+   entry points below open it as a picker instead (user/_template_picker.html). #}
+{% set new_instance_attrs %}hx-get="/instances/templates?user={{ current_user }}" hx-target="#modal-host" hx-swap="innerHTML"{% endset %}
+
 <div class="ui stackable grid">
   <div class="row">
     <div class="twelve wide column">
@@ -11,9 +17,9 @@
       </h2>
     </div>
     <div class="four wide column" style="text-align:right;padding-top:1.2rem">
-      <a href="/instances/new?user={{ current_user }}" class="ui primary button">
+      <button class="ui primary button" {{ new_instance_attrs }}>
         <i class="plus icon"></i> New Instance
-      </a>
+      </button>
     </div>
   </div>
 </div>
@@ -44,7 +50,8 @@
         <span id="actions-{{ inst.name }}">
           {% with name=inst.name, status=inst.status, ready=inst.ready, user=current_user,
                   connect_url=inst.connect_url, term_url=inst.term_url,
-                  console_url=inst.console_url, editable=true %}
+                  console_url=inst.console_url, editable=true,
+                  can_override=can_override %}
           {% include "user/_instance_buttons.html" %}
           {% endwith %}
         </span>
@@ -59,52 +66,14 @@
     <i class="server icon"></i>
     No instances yet
   </div>
-  <a href="/instances/new?user={{ current_user }}" class="ui primary button">
+  <button class="ui primary button" {{ new_instance_attrs }}>
     Create your first instance
-  </a>
+  </button>
 </div>
 {% endif %}
 
-{% if tpls %}
-<h3 class="ui header" style="margin-top:2rem">
-  <i class="copy outline icon"></i>
-  <div class="content">Available Templates</div>
-</h3>
-<div class="ui three stackable cards">
-  {% for t in tpls %}
-  <div class="card">
-    <div class="content">
-      <div class="header">
-        {{ t.displayName or t.name }}
-        <span class="ui {{ 'blue' if t.source == 'system' else 'teal' }} tiny label" style="float:right">
-          {{ t.source }}
-        </span>
-      </div>
-      <div class="meta">
-        <span class="ui {{ 'purple' if t.mode == 'desktop' else 'grey' }} mini label">{{ t.mode or 'ssh' }}</span>
-        <span class="ui grey mini label">{{ t.runtime or 'container' }}</span>
-      </div>
-      {% if t.description %}
-      <div class="meta">{{ t.description }}</div>
-      {% endif %}
-      <div class="description">
-        <code>{{ t.image or "" }}</code>
-        {% if t.resources %}
-        <div class="ui mini horizontal divided list" style="margin-top:.5em">
-          {% if t.resources.cpu %}<div class="item"><i class="microchip icon"></i>{{ t.resources.cpu }}</div>{% endif %}
-          {% if t.resources.memory %}<div class="item"><i class="database icon"></i>{{ t.resources.memory }}</div>{% endif %}
-        </div>
-        {% endif %}
-      </div>
-    </div>
-    <div class="extra content">
-      <a href="/instances/new?user={{ current_user }}&template={{ t.fullName }}" class="ui primary fluid button">
-        <i class="plus icon"></i> Use Template
-      </a>
-    </div>
-  </div>
-  {% endfor %}
-</div>
-{% endif %}
+{# Whatever modal is open lives here: the template picker, or the start dialog
+   for one row. htmx replaces the contents, and the fragment opens itself. #}
+<div id="modal-host"></div>
 
 {% endblock %}
