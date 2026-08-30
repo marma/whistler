@@ -112,11 +112,57 @@ probe_desktop() {
   return 1
 }
 
+# The data WebSocket, not just the page. /websockets is where selkies does its
+# per-connection setup, and a crash in there drops the socket before a single
+# frame while `/` keeps answering 200 — the client then reloads the page on a
+# ~6s loop, and a session the portal calls Ready never shows a desktop. That is
+# exactly how the CUDA image behaved on a GPU-less boot (this one's): GPUtil
+# parsed the driver-less nvidia-smi's error text and raised inside the handler
+# — see the no-GPU branch in guest/usr/local/bin/whistler-streamer. Stdlib
+# handshake, then hold the socket open: a close or EOF is the failure, silence
+# is a pass (an idle streamer sends nothing).
+probe_stream_socket() {
+  ../../.venv/bin/python - "$PORT" 8 <<'WSPROBE' || { echo "FAIL: data WebSocket did not survive — check 'journalctl -u whistler-streamer' in the guest" >&2; return 1; }
+import base64, os, socket, sys, time
+
+port, hold = int(sys.argv[1]), float(sys.argv[2])
+key = base64.b64encode(os.urandom(16)).decode()
+sock = socket.create_connection(("localhost", port), timeout=15)
+sock.sendall((
+    "GET /websockets HTTP/1.1\r\n"
+    f"Host: localhost:{port}\r\n"
+    "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+    f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+).encode())
+
+head = b""
+while b"\r\n\r\n" not in head:
+    chunk = sock.recv(4096)
+    if not chunk:
+        sys.exit("no response to the WebSocket handshake")
+    head += chunk
+status = head.split(b"\r\n")[0].decode(errors="replace")
+if " 101 " not in status:
+    sys.exit(f"handshake refused: {status}")
+
+sock.settimeout(1.0)
+deadline = time.monotonic() + hold
+while time.monotonic() < deadline:
+    try:
+        if sock.recv(65536) == b"":
+            sys.exit("server closed the data WebSocket")
+    except socket.timeout:
+        pass
+print(f"PASS: data WebSocket stayed up for {hold:.0f}s")
+WSPROBE
+}
+
 echo "booting (console: $BUILD_DIR/test-console.log) ..."
 for i in $(seq 1 120); do
   if curl -fsS -o /dev/null "http://localhost:$PORT/" 2>/dev/null; then
     echo "PASS: Selkies serving on http://localhost:$PORT/"
     rc=0
+    probe_stream_socket || rc=1
     probe_desktop || rc=1
     if [ "$KEEP" = "1" ]; then
       echo "VM left running for a browser check — Ctrl-C to tear down."

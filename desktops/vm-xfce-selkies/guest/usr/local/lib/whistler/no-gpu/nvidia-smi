@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stand-in for nvidia-smi, put on PATH by whistler-streamer *only* when no GPU
+# answers (see the comment there). The point is to look ABSENT rather than
+# broken: the real nvidia-smi on a driver-with-no-card guest prints its failure
+# on STDOUT and exits 9, and GPUtil — which selkies calls on every data
+# WebSocket connect — ignores the exit status and int()s that sentence, killing
+# the handler. Silence plus a non-zero status makes GPUtil.getGPUs() return [].
+exit 1

@@ -18,7 +18,7 @@ import pytest
 from kubernetes.client.rest import ApiException
 
 from whistler.config import (KubeConfigManager, START_ANNOTATION,
-                             effective_session_overrides)
+                             STOP_ANNOTATION, effective_session_overrides)
 
 
 # --- the rule --------------------------------------------------------------- #
@@ -114,6 +114,50 @@ def test_a_failed_read_does_not_start_anything():
     cm.api.get_namespaced_custom_object.side_effect = ApiException(status=404)
     assert cm.trigger_instance_start("alice", "gone", {"gpuCount": 1}) is False
     assert cm.api.replace_namespaced_custom_object.call_count == 0
+
+
+# --- the nudge that must not answer the question ---------------------------- #
+#
+# The viewer pages (/connect, /term, /vnc, /console) start the instance they are
+# about to show. When the start dialog stands in front of one of those buttons,
+# the browser lands on the viewer page by 303 *milliseconds after* the dialog's
+# own start — so a plain start there erased the run's overrides before the
+# operator ever read them (a GPU picked in the dialog booted with none).
+
+def test_a_viewer_nudge_leaves_a_running_instances_run_slice_alone():
+    cm = _manager()
+    cm.api.get_namespaced_custom_object.return_value = {
+        "metadata": {"annotations": {START_ANNOTATION: "1000.0"}},
+        "spec": {"runOverrides": {"gpuType": "NVIDIA-GeForce-RTX-4090"}},
+    }
+    assert cm.ensure_instance_running("alice", "box") is True
+
+    body = cm.api.patch_namespaced_custom_object.call_args[0][5]
+    assert float(body["metadata"]["annotations"][START_ANNOTATION]) > 1000.0
+    assert "spec" not in body           # the run's answers are not this call's business
+    assert cm.api.replace_namespaced_custom_object.call_count == 0
+
+
+def test_a_viewer_nudge_on_a_stopped_instance_is_an_ordinary_start():
+    # Nothing chose anything for this run, so it must not inherit what the
+    # previous one chose: a plain start, clearing the slice.
+    cm = _manager()
+    cm.api.get_namespaced_custom_object.return_value = {
+        "metadata": {"annotations": {START_ANNOTATION: "1000.0",
+                                     STOP_ANNOTATION: "2000.0"}},
+        "spec": {"runOverrides": {"gpuType": "__none__"}},
+    }
+    assert cm.ensure_instance_running("alice", "box") is True
+
+    body = cm.api.patch_namespaced_custom_object.call_args[0][5]
+    assert body["spec"]["runOverrides"] is None
+
+
+def test_a_viewer_nudge_on_an_unreadable_instance_reports_failure():
+    cm = _manager()
+    cm.api.get_namespaced_custom_object.side_effect = ApiException(status=404)
+    assert cm.ensure_instance_running("alice", "gone") is False
+    assert cm.api.patch_namespaced_custom_object.call_count == 0
 
 
 # --- what reads it ---------------------------------------------------------- #

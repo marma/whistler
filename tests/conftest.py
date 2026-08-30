@@ -442,6 +442,18 @@ class FakeConfigManager(ConfigManager):
         self.stopped.append((username, instance_name))
         return True
 
+    def ensure_instance_running(self, username, instance_name):
+        # The real one asks run_intent (the two annotations); there are none
+        # here, so the phase stands in for the same question. An instance that
+        # is already up is only re-nudged — keeping whatever runOverrides the
+        # start dialog just wrote — while a stopped one gets a plain start,
+        # which clears them.
+        inst = self._session(username, instance_name)
+        if inst is not None and inst.get("phase") not in (None, "Stopped", "Stopping"):
+            self.started.append((username, instance_name))
+            return True
+        return self.trigger_instance_start(username, instance_name)
+
     def trigger_instance_start(self, username, instance_name, run_overrides=None):
         # Recorded on the instance the way the CR holds it — set, or removed by
         # a plain start — so a test can assert that a run's overrides neither

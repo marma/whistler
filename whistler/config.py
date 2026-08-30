@@ -996,6 +996,27 @@ class ConfigManager(ABC):
         button start an instance the way it is configured."""
         pass
 
+    @abstractmethod
+    def ensure_instance_running(self, username: str, instance_name: str) -> bool:
+        """Make sure an instance is running, without answering *what it runs
+        as*.
+
+        This is the nudge the viewer pages (/connect, /term, /vnc, /console)
+        fire on load: the click that opened them was aimed at a desktop, not at
+        a start, but a stopped instance has to boot before the page can show
+        anything. What it must not do is overwrite the answer the start dialog
+        just gave — `trigger_instance_start` writes a run's overrides and the
+        start mark in one act, and the browser then follows a 303 to the viewer
+        page milliseconds later, where a plain start would erase them (it did:
+        a GPU chosen in the dialog was gone before the operator ever read it).
+
+        So the rule is the run intent: an instance already meant to run keeps
+        its spec.runOverrides untouched and only has its start mark refreshed,
+        which re-fires reconcile; a stopped one gets an ordinary plain start,
+        clearing whatever a previous run chose — which is the rule that keeps a
+        run's values from outliving its run."""
+        pass
+
 class KubeConfigManager(ConfigManager):
     # Class-level so an instance built with __new__ (the unit tests do this to
     # exercise the pure builders without a cluster — see _load_users) still has
@@ -6264,6 +6285,32 @@ class KubeConfigManager(ConfigManager):
                 self.api.replace_namespaced_custom_object(
                     self.group, self.version, user_ns, SESSION_PLURAL, full_name, cr
                 )
+            logger.info(f"Triggered reconcile for {full_name}")
+            return True
+        except ApiException as e:
+            logger.error(f"Failed to trigger start for {full_name}: {e}")
+            return False
+
+    def ensure_instance_running(self, username: str, instance_name: str) -> bool:
+        """Start the instance only if it is not already meant to be running;
+        otherwise just re-fire reconcile. See the ABC for why the difference
+        matters (a viewer page must not undo the start dialog)."""
+        user_ns = self._get_user_namespace(username)
+        full_name = f"{username}-{instance_name}"
+        try:
+            cr = self.api.get_namespaced_custom_object(
+                self.group, self.version, user_ns, SESSION_PLURAL, full_name
+            )
+        except ApiException as e:
+            logger.error(f"Failed to read {full_name} before start: {e}")
+            return False
+        if not run_intent((cr.get("metadata") or {}).get("annotations")):
+            return self.trigger_instance_start(username, instance_name)
+        try:
+            self.api.patch_namespaced_custom_object(
+                self.group, self.version, user_ns, SESSION_PLURAL, full_name,
+                {"metadata": {"annotations": {START_ANNOTATION: str(time.time())}}},
+            )
             logger.info(f"Triggered reconcile for {full_name}")
             return True
         except ApiException as e:

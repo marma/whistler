@@ -132,6 +132,9 @@ class FakeCM:
     def trigger_instance_start(self, username, name, run_overrides=None):
         return True
 
+    def ensure_instance_running(self, username, name):
+        return True
+
 
 def _session(name, port, phase="Ready", address="127.0.0.1"):
     return {"name": name, "namespace": "ns", "phase": phase, "runtime": "container",

@@ -57,18 +57,33 @@ pactl set-default-source output.monitor 2>/dev/null || \
 # can reach the socket Xvfb drops in it. Sticky like a real X11 dir.
 mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
-# The CUDA image ships the NVIDIA EGL ICD (glvnd vendor file). On a boot with
-# NO GPU visible (test.sh's qemu, or a -cuda session without passthrough),
-# glvnd probing that ICD segfaults Xvfb inside its GLX init (crash in
-# InitExtensions via libEGL) — the streamer then "runs" with Selkies serving
-# but no X, and the desktop unit loops on "no X server on :0". Pin EGL to the
-# Mesa ICD for this process tree when no GPU answers: Xvfb's GLX is Mesa
-# swrast either way, so GPU sessions (where nvidia-smi succeeds and this
-# branch is skipped) lose nothing. Lean images take the branch too, where
-# Mesa is already the only vendor — a no-op.
-if ! nvidia-smi -L >/dev/null 2>&1 \
-   && [ -e /usr/share/glvnd/egl_vendor.d/50_mesa.json ]; then
-  export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+# No GPU answers here: test.sh's qemu, a lean image, or a -cuda session started
+# with No GPU (an ordinary choice since the GPU-type picker learned to say so).
+# Two consequences, both scoped to this process tree.
+#
+# 1. On the CUDA image nvidia-smi must look ABSENT, not broken. Selkies calls
+#    GPUtil.getGPUs() on every data-WebSocket connect, and GPUtil ignores
+#    nvidia-smi's exit status: with the driver installed but no card, nvidia-smi
+#    prints "NVIDIA-SMI has failed because it couldn't communicate with the
+#    NVIDIA driver" on STDOUT and exits 9, GPUtil parses that line as a CSV row,
+#    and int() raises ValueError *inside the WebSocket handler*. The socket dies
+#    with a 1006 before a single frame, the client reloads the page, and the
+#    session loops at ~6s forever — while the portal, which only sees a live
+#    /status, still calls it Ready. The silent, non-zero shim in
+#    /usr/local/lib/whistler/no-gpu goes on PATH ahead of it, which makes
+#    GPUtil return [] — the answer it should have had.
+# 2. The CUDA image ships the NVIDIA EGL ICD (glvnd vendor file), and glvnd
+#    probing that ICD with no device segfaults Xvfb inside its GLX init (crash
+#    in InitExtensions via libEGL) — the streamer then "runs" with Selkies
+#    serving but no X, and the desktop unit loops on "no X server on :0". Pin
+#    EGL to the Mesa ICD instead: Xvfb's GLX is Mesa swrast either way, so GPU
+#    sessions (where nvidia-smi succeeds and this whole branch is skipped) lose
+#    nothing, and on a lean image Mesa is already the only vendor — a no-op.
+if ! nvidia-smi -L >/dev/null 2>&1; then
+  export PATH=/usr/local/lib/whistler/no-gpu:$PATH
+  if [ -e /usr/share/glvnd/egl_vendor.d/50_mesa.json ]; then
+    export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+  fi
 fi
 
 # Headless X server (software framebuffer) that pixelflux captures — the

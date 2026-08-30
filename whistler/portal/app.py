@@ -582,12 +582,15 @@ async def launch(request):
 
 
 async def connect(request):
-    """Serve the desktop viewer page and nudge the session's pod awake (same
-    reconcile trigger the SSH server / web terminal fire on connect) so it
-    becomes Ready while the page polls /status."""
+    """Serve the desktop viewer page and nudge the session awake so it becomes
+    Ready while the page polls /status.
+
+    The nudge is `ensure_instance_running`, not a plain start: this page is
+    very often arrived at by a 303 from the portal's start dialog, and a plain
+    start clears spec.runOverrides — the answers that dialog just gave."""
     cm, user = request.app["cm"], request["user"]
     name = request.match_info["id"]
-    await _run(request, cm.trigger_instance_start, user, name)
+    await _run(request, cm.ensure_instance_running, user, name)
     return web.Response(text=_render_connect(user, name), content_type="text/html")
 
 
@@ -668,9 +671,9 @@ async def desktop_proxy(request):
 
 
 async def term(request):
-    """Serve the web-terminal page and nudge the session's pod awake (same
-    reconcile trigger the SSH server fires on connect) so it's Ready by the time
-    the page finishes polling."""
+    """Serve the web-terminal page and nudge the session awake so it's Ready by
+    the time the page finishes polling. `ensure_instance_running` for the same
+    reason as /connect: the start dialog may have just chosen this run."""
     cm, user = request.app["cm"], request["user"]
     name = request.match_info["id"]
     denied = await _channel_denied(request, user, name, CHANNEL_TERMINAL)
@@ -678,7 +681,7 @@ async def term(request):
         # Refuse before the reconcile nudge: a channel the user may not use is
         # not a reason to boot their session.
         return denied
-    await _run(request, cm.trigger_instance_start, user, name)
+    await _run(request, cm.ensure_instance_running, user, name)
     return web.Response(text=_render_term(user, name), content_type="text/html")
 
 
@@ -784,7 +787,7 @@ async def vnc_page(request):
     websocket and attaches without waiting for Ready."""
     cm, user = request.app["cm"], request["user"]
     name = request.match_info["id"]
-    await _run(request, cm.trigger_instance_start, user, name)
+    await _run(request, cm.ensure_instance_running, user, name)
     return web.Response(text=_render_vnc(user, name), content_type="text/html")
 
 
@@ -801,7 +804,7 @@ async def console_page(request):
     if not await _is_admin(request, user):
         return web.Response(status=403, text="The machine console is admin-only")
     name = request.match_info["id"]
-    await _run(request, cm.trigger_instance_start, user, name)
+    await _run(request, cm.ensure_instance_running, user, name)
     return web.Response(text=_render_vnc(user, name, console=True),
                         content_type="text/html")
 

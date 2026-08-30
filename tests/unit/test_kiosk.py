@@ -38,6 +38,9 @@ class FakeCM:
     def trigger_instance_start(self, username, name, run_overrides=None):
         return True
 
+    def ensure_instance_running(self, username, name):
+        return True
+
 
 async def _signed_in(portal, user="alice"):
     """Get a browser all the way in: password, then the second factor. Both
