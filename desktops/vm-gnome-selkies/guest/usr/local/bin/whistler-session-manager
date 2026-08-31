@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+# A minimal org.gnome.SessionManager for this desktop, and nothing more.
+#
+# WHY IT EXISTS. gnome-session-launch.sh runs `gnome-shell --x11` directly
+# instead of under gnome-session, for reasons that have not changed (read the
+# comment there: gnome.session's RequiredComponents include daemons that
+# crash-loop headless and take the whole session to the "Oh no" screen). The
+# cost was invisible until someone opened the system menu: gnome-shell gates
+# **Power Off and Restart** on `CanShutdown()` called on the bus name
+# `org.gnome.SessionManager` (js/misc/systemActions.js, _updateHaveShutdown) —
+# and with no gnome-session, nothing owns that name. The call threw, the catch
+# set `_canHavePowerOff = false`, and both items vanished from the menu with no
+# error anywhere. Suspend stayed, because that one asks logind directly.
+#
+# Log Out was worse than missing: its visibility comes from account heuristics
+# rather than from the session manager, so it was in the menu the whole time
+# and did nothing at all when clicked.
+#
+# WHAT IT IS NOT. Not a session manager. It registers no clients, tracks no
+# inhibitors, runs no autostarts, arbitrates no shutdown and shows no
+# end-session countdown. It answers the four things gnome-shell asks of the
+# session manager here and maps them onto logind — which, on a single-user VM
+# whose desktop is a systemd service, is the whole of what those menu items
+# should mean. Anything else the shell may call on this name gets
+# UnknownMethod, exactly as it got ServiceUnknown before.
+#
+# If this process is not running the desktop is precisely as it was: the menu
+# loses Power Off and Restart again. It is never in the path of anything else.
+"""Serve org.gnome.SessionManager on the desktop's session bus."""
+import os
+import signal
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402  (must follow require_version)
+
+BUS_NAME = "org.gnome.SessionManager"
+OBJECT_PATH = "/org/gnome/SessionManager"
+
+# Verbatim from gnome-shell's own data/dbus-interfaces/org.gnome.SessionManager
+# .xml — the shell builds its proxy from that file, so matching it exactly is
+# what keeps the argument types right. The signals are declared and never
+# emitted: we have no inhibitors to announce.
+INTERFACE_XML = """
+<node>
+  <interface name="org.gnome.SessionManager">
+    <method name="Logout">
+      <arg type="u" direction="in"/>
+    </method>
+    <method name="Shutdown"/>
+    <method name="Reboot"/>
+    <method name="CanShutdown">
+      <arg type="b" direction="out"/>
+    </method>
+    <method name="IsInhibited">
+      <arg type="u" direction="in"/>
+      <arg type="b" direction="out"/>
+    </method>
+    <property name="SessionIsActive" type="b" access="read"/>
+    <signal name="InhibitorAdded">
+      <arg type="o" direction="out"/>
+    </signal>
+    <signal name="InhibitorRemoved">
+      <arg type="o" direction="out"/>
+    </signal>
+  </interface>
+</node>
+"""
+
+
+def log(message):
+    print(f"[whistler-session-manager] {message}", file=sys.stderr, flush=True)
+
+
+def logind(method):
+    """Ask logind to do the thing, falling back to sudo.
+
+    The D-Bus call is the right one and needs polkit to allow this user the
+    org.freedesktop.login1.power-off / .reboot actions — which is what
+    etc/polkit-1/rules.d/49-whistler-power.rules grants, on the same footing
+    the user already has: passwordless sudo. The fallback is there because the
+    failure mode of getting this wrong is the disease we are curing, a menu
+    item that quietly does nothing; an image with no polkitd at all would land
+    exactly back there.
+    """
+    try:
+        Gio.bus_get_sync(Gio.BusType.SYSTEM, None).call_sync(
+            "org.freedesktop.login1", "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager", method,
+            GLib.Variant("(b)", (False,)), None,
+            Gio.DBusCallFlags.NONE, 25000, None)
+        return
+    except GLib.Error as error:
+        log(f"logind {method} refused ({error.message}); trying sudo")
+    command = {"PowerOff": "poweroff", "Reboot": "reboot"}[method]
+    try:
+        subprocess.run(["sudo", "-n", "systemctl", command], check=True,
+                       timeout=25)
+    except (subprocess.SubprocessError, OSError) as error:
+        log(f"sudo systemctl {command} failed too: {error}")
+
+
+def logout():
+    """End the session by tearing down its process group.
+
+    gnome-session-launch.sh execs gnome-shell, so the group leader this shim
+    was started under *is* the shell: signalling the group stops the Shell and
+    the gsd plugins together, dbus-run-session drops the bus, and the unit
+    exits. whistler-desktop@.service is Restart=always, so what the user gets
+    is a fresh desktop a couple of seconds later — the same thing Log Out means
+    on a single-user kiosk. Never signals outside our own group, so there is no
+    way for this to reach init.
+    """
+    group = os.getpgrp()
+    if group <= 1:
+        log("refusing to signal process group %d" % group)
+        return
+    log("logout: stopping the session")
+    os.killpg(group, signal.SIGTERM)
+
+
+def on_call(_connection, _sender, _path, _iface, method, parameters, invocation):
+    if method == "CanShutdown":
+        invocation.return_value(GLib.Variant("(b)", (True,)))
+    elif method == "IsInhibited":
+        # Nothing here holds inhibitors, and answering "yes" would make the
+        # shell offer to override an inhibitor that does not exist.
+        invocation.return_value(GLib.Variant("(b)", (False,)))
+    elif method in ("Shutdown", "Reboot"):
+        # Answer first: the caller should not wait on a machine going down.
+        invocation.return_value(None)
+        log(f"{method.lower()} requested from the desktop")
+        logind("PowerOff" if method == "Shutdown" else "Reboot")
+    elif method == "Logout":
+        invocation.return_value(None)
+        logout()
+    else:
+        invocation.return_error_literal(
+            Gio.dbus_error_quark(), Gio.DBusError.UNKNOWN_METHOD,
+            f"{BUS_NAME} shim does not implement {method}")
+
+
+def on_get_property(_connection, _sender, _path, _iface, prop):
+    if prop == "SessionIsActive":
+        return GLib.Variant("b", True)
+    return None
+
+
+def main():
+    node = Gio.DBusNodeInfo.new_for_xml(INTERFACE_XML)
+    connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    connection.register_object(
+        OBJECT_PATH, node.interfaces[0], on_call, on_get_property, None)
+
+    loop = GLib.MainLoop()
+
+    def acquired(*_args):
+        log(f"owning {BUS_NAME} (Power Off / Restart / Log Out are live)")
+
+    def lost(*_args):
+        # Either the bus went away with the session, or a real gnome-session
+        # turned up and should win. Either way this shim has no further job.
+        log(f"lost {BUS_NAME}; exiting")
+        loop.quit()
+
+    Gio.bus_own_name_on_connection(
+        connection, BUS_NAME,
+        # ALLOW_REPLACEMENT and *not* REPLACE: if a real gnome-session is
+        # ever run here it takes the name, both when it is already up (we
+        # never acquire, `lost` fires, we exit) and when it arrives later.
+        # A shim should always lose to the thing it stands in for.
+        Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT,
+        acquired, lost)
+    loop.run()
+
+
+if __name__ == "__main__":
+    main()

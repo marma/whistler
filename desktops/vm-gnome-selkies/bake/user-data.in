@@ -90,6 +90,12 @@ write_files:
       # every lookup chain anyway — that is what covers the icons Yaru doesn't
       # define. (yaru-theme-icon Breaks gnome-shell-extension-ubuntu-dock
       # << 90~; noble ships 90ubuntu1+, so the dock above is fine.)
+      # python3-gi backs /usr/local/bin/whistler-session-manager, the shim that
+      # owns org.gnome.SessionManager so the system menu has Power Off and
+      # Restart at all (gnome-session is deliberately not run — see
+      # guest/usr/local/bin/gnome-session-launch.sh). polkitd is already here
+      # via gnome-control-center, which is what makes the polkit rule in
+      # guest/etc/polkit-1/rules.d effective.
       $APT install -y --no-install-recommends \
         gnome-session gnome-shell gnome-settings-daemon \
         gnome-shell-extension-ubuntu-dock \
@@ -104,7 +110,7 @@ write_files:
         xvfb x11-xserver-utils xcvt x11-utils xclip xdotool \
         x11-apps \
         pulseaudio pulseaudio-utils \
-        python3 python3-venv libxkbcommon0 \
+        python3 python3-venv python3-gi libxkbcommon0 \
         ssl-cert ca-certificates curl \
         rclone fuse3 \
         nfs-common
@@ -167,6 +173,7 @@ write_files:
       curl -fsS "$SEED/artifacts.tar.gz" | tar -xz --no-overwrite-dir -C /
       chmod 0755 /usr/local/bin/whistler-streamer \
                  /usr/local/bin/whistler-desktop-session \
+                 /usr/local/bin/whistler-session-manager \
                  /usr/local/bin/gnome-session-launch.sh \
                  /usr/local/bin/wtype \
                  /usr/local/bin/vgl

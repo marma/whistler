@@ -74,6 +74,19 @@ spec:
                       type: string
                     gpu:
                       type: string
+                    shutdownGraceSeconds:
+                      type: integer
+                      minimum: 0
+                      description: >-
+                        VM-only. Seconds this guest gets to shut down cleanly
+                        after KubeVirt presses the virtual ACPI power button,
+                        before the domain is destroyed under it (the VMI's
+                        terminationGracePeriodSeconds). Overrides the cluster
+                        default (whistler.vm.shutdownGraceSeconds, 30). A
+                        ceiling, not a wait — a guest that shuts down in two
+                        seconds takes two seconds. Raise it for an image that
+                        genuinely has to drain; 0 destroys the domain at once,
+                        with no attempt at a clean shutdown.
                     hugePageSize:
                       type: string
                       description: >-

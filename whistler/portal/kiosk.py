@@ -87,12 +87,16 @@ What is *not* here yet, deliberately:
 * **A screen lock driven from inside the desktop.** The lock above is entered
   by the *client*, so it covers a person walking away from the browser. A guest
   that locks its own X session is a different and complementary thing.
-* **Reacting to the guest's own "Log off" / "Power off".** Those are XFCE/GNOME
-  menu items; the portal only ever sees them indirectly (the stream drops, or
-  the phase leaves Ready while ``runStrategy: Always`` reboots the VM out from
-  under the user). Detecting and acting on that is its own decision and is
-  deferred. The way back to the grid today is the corner control on the session
-  page, or the idle timer.
+* **Reacting to the guest's own "Log off".** That one is an XFCE/GNOME menu
+  item the portal only sees indirectly, and since the desktop runs as a
+  ``Restart=always`` system service it simply respawns a fresh session two
+  seconds later — which is a reasonable kiosk answer, but it is not the portal
+  noticing anything. **"Power off" now works**: VMs run under
+  ``runStrategy: RerunOnFailure``, so a guest that shuts itself down stays
+  down, and the operator records it as an ordinary stop
+  (``_record_guest_shutdown``) instead of KubeVirt booting the machine back up
+  under the user. The way back to the grid remains the corner control on the
+  session page, or the idle timer.
 """
 import asyncio
 import html

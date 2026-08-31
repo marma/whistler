@@ -64,6 +64,10 @@ spec:
             # "" disables hugepages for VM guest RAM (whistler.hugePages).
             - name: WHISTLER_VM_HUGE_PAGE_SIZE
               value: {{ .Values.whistler.hugePages.pageSize | quote }}
+            # Seconds a VM guest gets to shut down cleanly before the
+            # domain is destroyed (whistler.vm.shutdownGraceSeconds).
+            - name: WHISTLER_VM_SHUTDOWN_GRACE_SECONDS
+              value: {{ .Values.whistler.vm.shutdownGraceSeconds | quote }}
             - name: WHISTLER_S3_PROXY_IMAGE
               value: {{ .Values.whistler.s3Proxy.image | quote }}
             - name: WHISTLER_S3_PROXY_RESOURCES

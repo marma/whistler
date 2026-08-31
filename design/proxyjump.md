@@ -489,8 +489,9 @@ So stop became a declaration too:
 `run_intent()` reads both and the newer one wins (ties go to stopped, which is
 the state that runs nothing and holds no home volume). `ensure_session` calls
 it, and now reconciles **toward** the answer in both directions: an existing
-VM has its `runStrategy` set to `Always` *or* `Halted`, and a pod session that
-should be down has its pod deleted. `stop_instance` is a single CR patch.
+VM has its `runStrategy` set to the running strategy *or* `Halted`, and a pod
+session that should be down has its pod deleted. `stop_instance` is a single
+CR patch.
 
 Two timestamps rather than one `desired-state: running|stopped` field, for two
 reasons. An annotation patch has to *differ* to produce an update event, so a
@@ -509,6 +510,127 @@ The RBAC that follows is the point of the exercise. Neither the gateway nor the
 portal holds a write verb on `kubevirt.io` any more — they read VMs and VMIs
 for status, and the console/VNC subresources for the viewer. **The only
 process that writes to KubeVirt is the operator.**
+
+## Shutting down gracefully
+
+Added 2026-08-30. Two questions that turn out to be one mechanism: can a user
+power the machine off from inside it, and is the portal's stop a plug-pull?
+
+**The stop was never a plug-pull.** Halting a VM makes KubeVirt delete the
+VMI, and virt-handler presses the virtual ACPI power button and waits
+`terminationGracePeriodSeconds` before destroying the domain. What was wrong
+was the budget: **5 seconds**, on a comment reasoning that "`$HOME` is a
+network mount the gateway owns" — true when a VM's home came over NFS from the
+storage gateway, and false since [storage.md](storage.md) moved homes onto a
+per-instance ext4 filesystem on a virtio-blk disk. The guest's page cache now
+holds the user's unwritten data. So the default is **30s**
+(`whistler.vm.shutdownGraceSeconds`, per-template `resources.
+shutdownGraceSeconds`, 0 for an immediate destroy). It is a ceiling and not a
+wait — virt-handler proceeds the moment the domain is gone — so the cost of
+raising it is zero on a guest that shuts down promptly. A stop that reliably
+burns the *whole* window is a guest that never acted on the power button at
+all (nothing handling it, or a desktop power manager holding the logind
+inhibitor); that is an image bug, and shortening the window only hides it
+behind a faster destroy.
+
+**Power Off from the desktop menu did not work, and the reason was one word.**
+`runStrategy: Always` means "respawn the VMI whenever it terminates", so a
+guest that shut itself down was restarted immediately: the user chose Power
+Off and got a reboot. The running strategy is now **`RerunOnFailure`**, which
+KubeVirt documents for exactly this — a VMI that reaches `Succeeded` (a
+graceful domain exit) is left alone, while one that `Failed` (crash, OOM, node
+loss) is still restarted automatically. An in-guest `reboot` is unaffected
+either way: qemu resets the domain without the VMI ever terminating.
+
+That single change is not enough, and the reason is worth writing down because
+it is invisible from the outside. virt-controller starts a `RerunOnFailure` VM
+that has no VMI only when `hasStartRequest(vm) || vm.Status.RunStrategy !=
+runStrategy` — i.e. when the strategy just **changed**, or when something asked
+outright. Whistler's ordinary start is a `Halted` -> `RerunOnFailure` patch, so
+it is a change and it works. But a guest that powered *itself* off leaves the
+spec already saying `RerunOnFailure`, and re-patching a field to the value it
+already holds starts nothing at all. The play button would have become a
+silent no-op in exactly the situation this feature creates.
+
+Two things answer that, and they cover each other:
+
+- **The operator records the power-off as a stop.** The phase timer already
+  probes the VMI; when a VM is stopped while its CR still intends to run, it
+  re-reads the VM and asks `_guest_powered_off` — observed `status.runStrategy`
+  is the running one (not the one we just asked for, which is what separates
+  this from a start still in flight), KubeVirt's own `printableStatus` says
+  `Stopped` (which accounts for its start expectations, where "is there a VMI"
+  does not), and there is no queued `stateChangeRequests` (which is how a crash
+  KubeVirt is about to restart is excluded). Then it writes `whistler/last-stop`
+  — an ordinary annotation, needing no new privilege — and the next reconcile
+  puts the spec back to `Halted`, which re-arms the transition for next time.
+  Without this the CR would go on saying "run", and the pre-2026-08-23 bug
+  would be back in a new costume: any reconcile that happened to touch the CR
+  would boot the guest back up.
+- **`ensure_session` asks explicitly when a patch will not do.** If the VM it
+  read already shows the running strategy with nothing under it, it PUTs the
+  `subresources.kubevirt.io` `virtualmachines/start` endpoint — the one
+  `virtctl start` uses. Conditional, not unconditional: a start request is a
+  durable mark in the VM's status, and writing one on every reconcile would
+  let any reconcile restart a machine somebody had switched off.
+
+This is the only RBAC change, and it keeps the property above: the operator
+gains `virtualmachines/start`, and **the only process that writes to KubeVirt
+is still the operator**.
+
+### The menu item, which is a separate bug
+
+Reported once the above shipped and worked: the GNOME desktop offered
+**Suspend and Log Out and nothing else** — no Power Off, no Restart.
+
+Nothing to do with runStrategy. gnome-shell gates Power Off *and* Restart on a
+single call, `CanShutdown()` on the bus name `org.gnome.SessionManager`
+(`js/misc/systemActions.js`, `_updateHaveShutdown`), and
+`vm-gnome-selkies` deliberately runs `gnome-shell` **without gnome-session** —
+so nothing owned that name, the call threw, the `catch` set
+`_canHavePowerOff = false`, and both items disappeared with no error in any
+log. Suspend survived because it asks logind directly. Log Out was worse than
+absent: its visibility comes from account heuristics rather than the session
+manager, so it sat in the menu doing nothing when clicked.
+
+Running gnome-session to fix this is the one thing that image must not do (its
+`RequiredComponents` crash-loop headless and take the session to the "Oh no"
+screen — the launcher's header has the detail). So
+`guest/usr/local/bin/whistler-session-manager` owns that name and answers the
+four things the Shell asks: `CanShutdown` → true, `IsInhibited` → false,
+`Shutdown`/`Reboot` → logind, `Logout` → SIGTERM to its own process group,
+which stops the session and lets `Restart=always` bring up a fresh desktop.
+It is not a session manager: no clients, no inhibitors, no autostarts, no
+end-session dialog, and it yields the name to a real gnome-session if one ever
+appears. If it is not running the desktop is exactly what it is today.
+
+Underneath that sat a second, quieter half. These desktops are `User=` system
+services, so they are not logind *sessions* — polkit's shipped
+`allow_active: yes` never applied to them, and every login1 power action came
+back a challenge with no agent to answer it. `49-whistler-power.rules` grants
+power-off and reboot to the `sudo` group, which the session user is already in
+with NOPASSWD, so it hands out nothing a terminal did not already have. XFCE
+needs the same rule and no shim (it runs a real `xfce4-session`), plus
+`polkitd`, which nothing in that image was pulling in.
+
+And it **denies suspend and hibernate**, which is the one deliberate removal
+here. A suspended KubeVirt guest does not stop: the domain stays up, the VMI
+stays Running, the readiness probe fails, the portal shows a Ready session
+behind a frozen screen — and Whistler has no wake affordance anywhere, no
+button in the portal and nothing over SSH, because the guest is not listening.
+The only way back is stopping the instance, which is the power-off the user
+was trying to choose in the first place. Denying it in polkit is also what
+takes it out of the menu rather than leaving it there to fail.
+
+`test.sh` asserts both answers over the desktop's own session bus, making the
+same `CanShutdown` call the Shell makes.
+
+What is deliberately *not* here: a **pod** session's stop is still an
+unconditional kill. Its PID 1 is `sleep`, which ignores SIGTERM, so the 5s
+grace is always burned in full and the container is SIGKILLed — fine by
+design, since a container session is a throwaway workspace whose state lives
+on a PVC the kubelet unmounts afterwards. If that ever needs to change, the
+fix is a signal-forwarding PID 1, not a longer grace period.
 
 ## Username parsing
 

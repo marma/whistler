@@ -19,6 +19,7 @@ KEEP="${KEEP:-1}"
 TEST_USER="${TEST_USER:-marma}"
 BUILD_DIR="$PWD/build"
 HTTP_PORT=8099
+QMP_PORT="${QMP_PORT:-4444}"
 
 [ -s "$BUILD_DIR/disk.qcow2" ] || { echo "ERROR: no build/disk.qcow2 — run build.sh first" >&2; exit 1; }
 
@@ -59,6 +60,7 @@ docker run -d --name "$CTR" \
   --user "$(id -u):$(id -g)" --group-add "$(stat -c %g /dev/kvm)" \
   -v "$BUILD_DIR:/build" -v "$SEED_DIR:/seed:ro" \
   -p "127.0.0.1:$PORT:$PORT" -p "127.0.0.1:2222:2222" \
+  -p "127.0.0.1:$QMP_PORT:$QMP_PORT" \
   --entrypoint /bin/sh \
   whistler-vm-bake -c "
     set -eu
@@ -70,6 +72,7 @@ docker run -d --name "$CTR" \
       -netdev user,id=n0,hostfwd=tcp:0.0.0.0:$PORT-:8082,hostfwd=tcp:0.0.0.0:2222-:22 \
       -device virtio-net-pci,netdev=n0 \
       -smbios 'type=1,serial=ds=nocloud-net;s=http://10.0.2.2:$HTTP_PORT/' \
+      -qmp tcp:0.0.0.0:$QMP_PORT,server=on,wait=off \
       -display none -serial file:/build/test-console.log
   " >/dev/null
 
@@ -157,6 +160,64 @@ print(f"PASS: data WebSocket stayed up for {hold:.0f}s")
 WSPROBE
 }
 
+# Whistler stops a VM by halting it, and that is KubeVirt pressing the virtual
+# ACPI power button and destroying the domain when the grace period runs out
+# (whistler.vm.shutdownGraceSeconds, 30s). The budget only buys a clean
+# unmount if the guest ACTS on that button: with nothing handling it — or a
+# desktop power manager sitting on the logind inhibitor — the guest is simply
+# killed when the window closes, every time, and $HOME (ext4 on a virtio-blk
+# disk) comes back needing journal recovery. It is also what `Power off` in
+# the desktop menu ends up doing, so this covers both.
+#
+# `system_powerdown` over QMP is the same press. qemu exits when the guest
+# actually powers off, so the container stopping is the signal, and how long
+# it took is the number worth printing: this is a check on the guest, not on
+# the timeout.
+probe_graceful_shutdown() {
+  local budget=30 started elapsed
+  ../../.venv/bin/python - "$QMP_PORT" <<'QMPPROBE' || { echo "FAIL: could not ask qemu for an ACPI shutdown" >&2; return 1; }
+import json, socket, sys
+
+sock = socket.create_connection(("localhost", int(sys.argv[1])), timeout=15)
+conn = sock.makefile("rwb")
+conn.readline()  # QMP greeting
+
+
+def run(command):
+    conn.write((json.dumps({"execute": command}) + "\n").encode())
+    conn.flush()
+    while True:
+        line = conn.readline()
+        if not line:
+            sys.exit(f"qemu closed the QMP socket during {command}")
+        message = json.loads(line)
+        if "error" in message:
+            sys.exit(f"{command}: {message['error']}")
+        if "return" in message:
+            return message["return"]
+        # anything else is an asynchronous event; keep reading
+
+
+run("qmp_capabilities")
+run("system_powerdown")
+QMPPROBE
+  started=$(date +%s)
+  for _ in $(seq 1 "$budget"); do
+    if ! docker inspect -f '{{.State.Running}}' "$CTR" 2>/dev/null | grep -q true; then
+      elapsed=$(( $(date +%s) - started ))
+      echo "PASS: guest powered off ${elapsed}s after the ACPI button"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "FAIL: guest ignored the ACPI power button for ${budget}s — a stop would" >&2
+  echo "      destroy the domain under it and $HOME would need fsck. Check" >&2
+  echo "      'systemctl show -p HandlePowerKey systemd-logind' and whether a" >&2
+  echo "      power manager holds a handle-power-key inhibitor, in the guest." >&2
+  tail -20 "$BUILD_DIR/test-console.log" >&2
+  return 1
+}
+
 echo "booting (console: $BUILD_DIR/test-console.log) ..."
 for i in $(seq 1 120); do
   if curl -fsS -o /dev/null "http://localhost:$PORT/" 2>/dev/null; then
@@ -165,8 +226,13 @@ for i in $(seq 1 120); do
     probe_stream_socket || rc=1
     probe_desktop || rc=1
     if [ "$KEEP" = "1" ]; then
+      # probe_graceful_shutdown powers the guest off, so it is the one thing
+      # that cannot run while the VM is being kept for the browser check.
+      echo "SKIP: graceful-shutdown probe (VM kept; KEEP=0 runs it)"
       echo "VM left running for a browser check — Ctrl-C to tear down."
       docker wait "$CTR" >/dev/null
+    else
+      probe_graceful_shutdown || rc=1
     fi
     exit "$rc"
   fi

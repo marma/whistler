@@ -53,6 +53,12 @@ write_files:
       # xfce4 depends on adwaita-icon-theme, which stays as the
       # fallback for icons Yaru doesn't define (Yaru inherits Humanity/hicolor,
       # never Adwaita — but GTK appends Adwaita to every lookup chain anyway).
+      # polkitd is what makes the power actions possible at all: nothing else
+      # here pulls it, and logind refuses power-off/reboot outright when it is
+      # absent, so xfce4-session's Log Out dialog offers dead buttons. With it
+      # installed, guest/etc/polkit-1/rules.d/49-whistler-power.rules is what
+      # grants them (this desktop is not a logind session, so the shipped
+      # allow_active default does not apply to it).
       $APT install -y --no-install-recommends \
         xfce4 xfce4-terminal dbus-x11 \
         ubuntu-wallpapers yaru-theme-icon \
@@ -60,6 +66,7 @@ write_files:
         x11-apps \
         pulseaudio pulseaudio-utils \
         python3 python3-venv libxkbcommon0 \
+        polkitd \
         ssl-cert ca-certificates curl \
         rclone fuse3 \
         nfs-common

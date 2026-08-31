@@ -27,6 +27,7 @@ KEEP="${KEEP:-1}"
 TEST_USER="${TEST_USER:-marma}"
 BUILD_DIR="$PWD/build"
 HTTP_PORT=8099
+QMP_PORT="${QMP_PORT:-4444}"
 
 [ -s "$BUILD_DIR/disk.qcow2" ] || { echo "ERROR: no build/disk.qcow2 — run build.sh first" >&2; exit 1; }
 
@@ -70,6 +71,7 @@ docker run -d --name "$CTR" \
   --user "$(id -u):$(id -g)" --group-add "$(stat -c %g /dev/kvm)" \
   -v "$BUILD_DIR:/build" -v "$SEED_DIR:/seed:ro" \
   -p "127.0.0.1:$PORT:$PORT" -p "127.0.0.1:2222:2222" \
+  -p "127.0.0.1:$QMP_PORT:$QMP_PORT" \
   --entrypoint /bin/sh \
   whistler-vm-bake -c "
     set -eu
@@ -81,6 +83,7 @@ docker run -d --name "$CTR" \
       -netdev user,id=n0,hostfwd=tcp:0.0.0.0:$PORT-:8082,hostfwd=tcp:0.0.0.0:2222-:22 \
       -device virtio-net-pci,netdev=n0 \
       -smbios 'type=1,serial=ds=nocloud-net;s=http://10.0.2.2:$HTTP_PORT/' \
+      -qmp tcp:0.0.0.0:$QMP_PORT,server=on,wait=off \
       -display none -serial file:/build/test-console.log
   " >/dev/null
 
@@ -117,6 +120,7 @@ probe_desktop() {
         || { echo "FAIL: gnome-shell died shortly after starting" >&2; return 1; }
       echo "PASS: gnome-shell running, $windows window(s) in the streamer X, ssh sane post-mount"
       echo "NOTE: HTTP/window checks can't see frame coherence — do the browser check below."
+      probe_power_menu || return 1
       return 0
     fi
     sleep 2
@@ -173,6 +177,104 @@ print(f"PASS: data WebSocket stayed up for {hold:.0f}s")
 WSPROBE
 }
 
+# Whistler stops a VM by halting it, and that is KubeVirt pressing the virtual
+# ACPI power button and destroying the domain when the grace period runs out
+# (whistler.vm.shutdownGraceSeconds, 30s). The budget only buys a clean
+# unmount if the guest ACTS on that button: with nothing handling it — or a
+# desktop power manager sitting on the logind inhibitor — the guest is simply
+# killed when the window closes, every time, and $HOME (ext4 on a virtio-blk
+# disk) comes back needing journal recovery. It is also what `Power off` in
+# the desktop menu ends up doing, so this covers both.
+#
+# `system_powerdown` over QMP is the same press. qemu exits when the guest
+# actually powers off, so the container stopping is the signal, and how long
+# it took is the number worth printing: this is a check on the guest, not on
+# the timeout.
+probe_graceful_shutdown() {
+  local budget=30 started elapsed
+  ../../.venv/bin/python - "$QMP_PORT" <<'QMPPROBE' || { echo "FAIL: could not ask qemu for an ACPI shutdown" >&2; return 1; }
+import json, socket, sys
+
+sock = socket.create_connection(("localhost", int(sys.argv[1])), timeout=15)
+conn = sock.makefile("rwb")
+conn.readline()  # QMP greeting
+
+
+def run(command):
+    conn.write((json.dumps({"execute": command}) + "\n").encode())
+    conn.flush()
+    while True:
+        line = conn.readline()
+        if not line:
+            sys.exit(f"qemu closed the QMP socket during {command}")
+        message = json.loads(line)
+        if "error" in message:
+            sys.exit(f"{command}: {message['error']}")
+        if "return" in message:
+            return message["return"]
+        # anything else is an asynchronous event; keep reading
+
+
+run("qmp_capabilities")
+run("system_powerdown")
+QMPPROBE
+  started=$(date +%s)
+  for _ in $(seq 1 "$budget"); do
+    if ! docker inspect -f '{{.State.Running}}' "$CTR" 2>/dev/null | grep -q true; then
+      elapsed=$(( $(date +%s) - started ))
+      echo "PASS: guest powered off ${elapsed}s after the ACPI button"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "FAIL: guest ignored the ACPI power button for ${budget}s — a stop would" >&2
+  echo "      destroy the domain under it and $HOME would need fsck. Check" >&2
+  echo "      'systemctl show -p HandlePowerKey systemd-logind' and whether a" >&2
+  echo "      power manager holds a handle-power-key inhibitor, in the guest." >&2
+  tail -20 "$BUILD_DIR/test-console.log" >&2
+  return 1
+}
+
+# What the system menu will offer. Both answers are asked of the guest exactly
+# the way gnome-shell asks them, on the desktop's own session bus:
+#
+#   CanShutdown -> true   Power Off and Restart appear. gnome-shell gates both
+#                         on this one call to org.gnome.SessionManager, and
+#                         since this image runs gnome-shell WITHOUT
+#                         gnome-session, nothing owned that name and the call
+#                         threw — so the menu lost both items with no error
+#                         anywhere, while Suspend (which asks logind directly)
+#                         stayed. whistler-session-manager owns it now.
+#   CanSuspend  -> no     Suspend is hidden, deliberately: a suspended KubeVirt
+#                         guest keeps its VMI Running with a frozen desktop and
+#                         Whistler has no way to wake it.
+probe_power_menu() {
+  local ssh_cmd=(ssh -q -i "$SEED_DIR/id" -p 2222 -o StrictHostKeyChecking=no
+                 -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5
+                 "$TEST_USER@localhost")
+  local can_shutdown can_suspend rc=0
+  # The desktop's bus is dbus-run-session's, not one XDG_RUNTIME_DIR knows
+  # about, so the address is read out of the Shell's own environment. Every
+  # step is checked: an unset address would otherwise fall through to the
+  # ambient bus and report a confident answer about the wrong session.
+  can_shutdown=$("${ssh_cmd[@]}" 'p=$(pgrep -x gnome-shell | head -1); [ -n "$p" ] || { echo "no gnome-shell process"; exit 1; }; a=$(tr "\0" "\n" < /proc/$p/environ | sed -n "s/^DBUS_SESSION_BUS_ADDRESS=//p"); [ -n "$a" ] || { echo "no session bus address in gnome-shell pid $p"; exit 1; }; DBUS_SESSION_BUS_ADDRESS="$a" gdbus call --session --dest org.gnome.SessionManager --object-path /org/gnome/SessionManager --method org.gnome.SessionManager.CanShutdown' 2>&1) || true
+  case "$can_shutdown" in
+    *true*) echo "PASS: system menu can power off (CanShutdown -> true)" ;;
+    *) echo "FAIL: CanShutdown said '$can_shutdown' — the menu will have no" >&2
+       echo "      Power Off or Restart. Is whistler-session-manager running" >&2
+       echo "      (python3-gi installed)?" >&2
+       rc=1 ;;
+  esac
+  can_suspend=$("${ssh_cmd[@]}" 'gdbus call --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 --method org.freedesktop.login1.Manager.CanSuspend' 2>&1) || true
+  case "$can_suspend" in
+    *no*) echo "PASS: suspend refused, so the menu will not offer it" ;;
+    *) echo "FAIL: CanSuspend said '$can_suspend' — the menu will offer a" >&2
+       echo "      suspend this VM cannot be woken from (polkit rule missing?)" >&2
+       rc=1 ;;
+  esac
+  return "$rc"
+}
+
 echo "booting (console: $BUILD_DIR/test-console.log) ..."
 for i in $(seq 1 120); do
   if curl -fsS -o /dev/null "http://localhost:$PORT/" 2>/dev/null; then
@@ -181,8 +283,13 @@ for i in $(seq 1 120); do
     probe_stream_socket || rc=1
     probe_desktop || rc=1
     if [ "$KEEP" = "1" ]; then
+      # probe_graceful_shutdown powers the guest off, so it is the one thing
+      # that cannot run while the VM is being kept for the browser check.
+      echo "SKIP: graceful-shutdown probe (VM kept; KEEP=0 runs it)"
       echo "VM left running for a browser check — Ctrl-C to tear down."
       docker wait "$CTR" >/dev/null
+    else
+      probe_graceful_shutdown || rc=1
     fi
     exit "$rc"
   fi

@@ -429,6 +429,29 @@ whistler:
   hugePages:
     pageSize: 2Mi
 
+  # KubeVirt VM sessions.
+  vm:
+    # How long a guest has to shut down cleanly after KubeVirt presses the
+    # virtual ACPI power button — a portal/launcher stop, or the VM being
+    # halted for any other reason — before the domain is destroyed under it.
+    #
+    # This is a ceiling, not a wait: virt-handler proceeds the moment the
+    # domain is actually gone, so a guest that powers off in two seconds
+    # takes two seconds whatever this says. What it buys is the room for
+    # systemd to stop the session and unmount $HOME, which since VM homes
+    # became ext4 on a virtio-blk disk is the difference between a clean
+    # unmount and journal recovery plus whatever was still in page cache.
+    #
+    # If stops routinely take this whole window, the setting is not the
+    # problem: the guest is not acting on the power button at all (nothing
+    # handling it, or a desktop power manager sitting on the logind
+    # inhibitor). Fix that in the image — lowering this just destroys the
+    # domain sooner.
+    #
+    # A template may override it with `resources.shutdownGraceSeconds`. 0
+    # means destroy at once, with no attempt at a clean shutdown.
+    shutdownGraceSeconds: 30
+
   # Per-user NFS storage gateway (built from images/storage-gateway).
   #
   # NO LONGER ON THE HOME PATH — VM homes are disks now (homeDisk above),

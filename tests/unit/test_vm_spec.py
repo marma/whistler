@@ -4,7 +4,8 @@ Pure manifest assertions (no cluster); the e2e path is exercised by
 tests/integration/test_vm.py on clusters that have KubeVirt installed."""
 import pytest
 
-from whistler.config import KubeConfigManager, PolicyError
+from whistler.config import (KubeConfigManager, PolicyError,
+                             VM_RUN_STRATEGY_RUNNING)
 
 
 # What get_gpu_catalog would derive from a single-4090 passthrough cluster
@@ -59,17 +60,20 @@ def test_kind_apiversion_and_run_strategy():
     vm = _build()
     assert vm["apiVersion"] == "kubevirt.io/v1"
     assert vm["kind"] == "VirtualMachine"
-    # runStrategy (not `running`): stop/start is a spec patch Halted/Always.
-    # Default is Halted — VMs boot on first connect, not on session creation.
+    # runStrategy (not `running`): stop/start is a spec patch, Halted or
+    # RerunOnFailure. Default is Halted — VMs boot on first connect, not on
+    # session creation.
     assert vm["spec"]["runStrategy"] == "Halted"
     assert "running" not in vm["spec"]
 
 
-def test_run_strategy_always_when_start_requested():
-    # ensure_session passes Always when the last-connect annotation is already
-    # present (create + connect coalesced into one reconcile).
-    vm = _build(run_strategy="Always")
-    assert vm["spec"]["runStrategy"] == "Always"
+def test_run_strategy_rerun_on_failure_when_start_requested():
+    # ensure_session passes the running strategy when the last-connect
+    # annotation is already present (create + connect coalesced into one
+    # reconcile). NOT Always: that respawns the VMI whenever it terminates, so
+    # a guest choosing Power Off got a reboot instead of a shutdown.
+    vm = _build(run_strategy=VM_RUN_STRATEGY_RUNNING)
+    assert vm["spec"]["runStrategy"] == "RerunOnFailure"
 
 
 def test_owner_reference_to_session():
@@ -213,11 +217,37 @@ def test_readiness_probe_falls_back_to_sshd_without_a_streamer():
     assert spec["readinessProbe"]["tcpSocket"] == {"port": 22}
 
 
-def test_termination_grace_period_is_short():
-    # Left unset KubeVirt 1.8 renders the launcher pod at 60s, so a stop sat
-    # for a minute after the guest was already down.
+def test_termination_grace_period_is_the_cluster_default():
+    # The window a guest gets to act on the ACPI power button. It is a
+    # ceiling, not a wait — but it has to be long enough for systemd to
+    # unmount an ext4 $HOME, which the old 5s was not.
     spec = _build()["spec"]["template"]["spec"]
-    assert spec["terminationGracePeriodSeconds"] == 5
+    assert spec["terminationGracePeriodSeconds"] == 30
+
+
+def test_a_template_may_set_its_own_shutdown_grace():
+    spec = _build(template_spec={"image": "x",
+                                 "resources": {"shutdownGraceSeconds": 120}}
+                  )["spec"]["template"]["spec"]
+    assert spec["terminationGracePeriodSeconds"] == 120
+
+
+def test_a_template_may_ask_for_no_grace_at_all():
+    # 0 is a real answer (destroy at once), so presence decides, not truth.
+    spec = _build(template_spec={"image": "x",
+                                 "resources": {"shutdownGraceSeconds": 0}}
+                  )["spec"]["template"]["spec"]
+    assert spec["terminationGracePeriodSeconds"] == 0
+
+
+def test_a_nonsense_shutdown_grace_falls_back_to_the_default():
+    # Refusing the session over it would turn a typo into a VM that never
+    # starts, reported by KubeVirt far from the template that caused it.
+    for bad in ("soon", -5, None):
+        spec = _build(template_spec={"image": "x",
+                                     "resources": {"shutdownGraceSeconds": bad}}
+                      )["spec"]["template"]["spec"]
+        assert spec["terminationGracePeriodSeconds"] == 30
 
 
 def test_instancetype_set_omits_inline_cpu_memory():

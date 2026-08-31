@@ -37,6 +37,14 @@ rules:
   - apiGroups: [kubevirt.io]
     resources: [virtualmachines, virtualmachineinstances]
     verbs: [create, delete, get, list, watch, patch, update]
+  # The one thing a runStrategy patch cannot do: start a VM that is already
+  # RerunOnFailure and stopped, which is what a guest that powered itself off
+  # leaves behind (virt-controller only acts on a strategy that *changed*).
+  # Same grant `virtctl start` needs; see _ensure_vm_start_requested. Still
+  # operator-only — no other process gained a KubeVirt write.
+  - apiGroups: [subresources.kubevirt.io]
+    resources: [virtualmachines/start]
+    verbs: [update]
   # GPU-type catalog (config.py get_gpu_catalog): node labels/allocatable
   # plus the KubeVirt CR's permittedHostDevices resolve a VM template's GPU
   # request to the per-type passthrough resource name at build time.

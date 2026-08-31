@@ -21,6 +21,7 @@ KEEP="${KEEP:-0}"
 TEST_USER="${TEST_USER:-marma}"
 BUILD_DIR="$PWD/build"
 HTTP_PORT=8099
+QMP_PORT="${QMP_PORT:-4444}"
 
 [ -s "$BUILD_DIR/disk.qcow2" ] || { echo "ERROR: no build/disk.qcow2 — run build.sh first" >&2; exit 1; }
 
@@ -53,7 +54,7 @@ docker run -d --name "$CTR" \
   --device /dev/kvm \
   --user "$(id -u):$(id -g)" --group-add "$(stat -c %g /dev/kvm)" \
   -v "$BUILD_DIR:/build" -v "$SEED_DIR:/seed:ro" \
-  -p "127.0.0.1:$PORT:$PORT" \
+  -p "127.0.0.1:$PORT:$PORT" -p "127.0.0.1:$QMP_PORT:$QMP_PORT" \
   --entrypoint /bin/sh \
   whistler-vm-bake -c "
     set -eu
@@ -65,6 +66,7 @@ docker run -d --name "$CTR" \
       -netdev user,id=n0,hostfwd=tcp:0.0.0.0:$PORT-:22 \
       -device virtio-net-pci,netdev=n0 \
       -smbios 'type=1,serial=ds=nocloud-net;s=http://10.0.2.2:$HTTP_PORT/' \
+      -qmp tcp:0.0.0.0:$QMP_PORT,server=on,wait=off \
       -display none -serial file:/build/test-console.log
   " >/dev/null
 
@@ -146,9 +148,65 @@ fi
 check "home mount stand-in" "mountpoint -q /home/$TEST_USER || { sudo mount -t tmpfs -o mode=0755 tmpfs /home/$TEST_USER && sudo chown $TEST_USER: /home/$TEST_USER && echo 'tmpfs home mounted'; }"
 check "ssh auth post-mount" 'echo "authorized_keys.d path still authenticates"'
 
+# Graceful shutdown. Whistler stops a VM by halting it, which is KubeVirt
+# pressing the virtual ACPI power button and then destroying the domain when
+# whistler.vm.shutdownGraceSeconds runs out. That window only buys a clean
+# unmount if the guest acts on the button — otherwise every stop is a kill and
+# $HOME (ext4 on a virtio-blk disk) needs journal recovery afterwards. It is
+# also the same path as `sudo poweroff` from inside. `system_powerdown` over
+# QMP is that press; qemu exiting is the guest having gone down.
 if [ "$KEEP" = "1" ]; then
   echo
+  echo "SKIP: graceful-shutdown probe (VM kept; KEEP=0 runs it)"
   echo "VM left running. ssh -i $SEED_DIR/id -p $PORT $TEST_USER@localhost"
   echo "Tear down with: docker rm -f $CTR"
+  exit "$rc"
+fi
+
+if ../../.venv/bin/python - "$QMP_PORT" <<'QMPPROBE'
+import json, socket, sys
+
+sock = socket.create_connection(("localhost", int(sys.argv[1])), timeout=15)
+conn = sock.makefile("rwb")
+conn.readline()  # QMP greeting
+
+
+def run(command):
+    conn.write((json.dumps({"execute": command}) + "\n").encode())
+    conn.flush()
+    while True:
+        line = conn.readline()
+        if not line:
+            sys.exit(f"qemu closed the QMP socket during {command}")
+        message = json.loads(line)
+        if "error" in message:
+            sys.exit(f"{command}: {message['error']}")
+        if "return" in message:
+            return message["return"]
+        # anything else is an asynchronous event; keep reading
+
+
+run("qmp_capabilities")
+run("system_powerdown")
+QMPPROBE
+then
+  started=$(date +%s)
+  powered_off=0
+  for _ in $(seq 1 30); do
+    if ! docker inspect -f '{{.State.Running}}' "$CTR" 2>/dev/null | grep -q true; then
+      powered_off=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$powered_off" = 1 ]; then
+    printf 'PASS: %-28s %s\n' "acpi shutdown" "guest down $(( $(date +%s) - started ))s after the power button"
+  else
+    printf 'FAIL: %-28s %s\n' "acpi shutdown" "guest ignored the power button for 30s; a stop would destroy it mid-write" >&2
+    rc=1
+  fi
+else
+  printf 'FAIL: %-28s %s\n' "acpi shutdown" "could not reach qemu on QMP :$QMP_PORT" >&2
+  rc=1
 fi
 exit "$rc"

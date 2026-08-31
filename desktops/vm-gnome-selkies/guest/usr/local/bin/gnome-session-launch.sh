@@ -17,7 +17,25 @@
 # this session UNPRIVILEGED — the whole reason design/creating_desktops.md §8
 # picks GNOME 46/24.04. The cost is only the logind-tied features (lock/suspend/
 # seat switching), which are meaningless for a single-user streamed desktop.
+#
+# One cost was NOT meaningless and is bought back below: with no gnome-session
+# there is no org.gnome.SessionManager, and that is the name gnome-shell asks
+# CanShutdown() on — so Power Off and Restart silently disappeared from the
+# system menu, and Log Out stayed in it while doing nothing.
+# whistler-session-manager answers those, and only those.
 set -e
+
+# The system menu's Power Off / Restart / Log Out. gnome-shell asks
+# org.gnome.SessionManager whether the session can shut down, and not running
+# gnome-session means nothing answers — so the shell hid both items and left a
+# Log Out that did nothing (see the script's own header for the full account).
+# This owns that name and maps those three onto logind. Started BEFORE the
+# Shell and waited for: the shell asks once, early, and does not re-ask when
+# the name later appears.
+/usr/local/bin/whistler-session-manager &
+gdbus wait --session --timeout 10 org.gnome.SessionManager \
+  || echo "[whistler] WARNING: no org.gnome.SessionManager — the system menu" \
+          "will have no Power Off / Restart (is python3-gi installed?)" >&2
 
 # gnome-settings-daemon plugins that run cleanly without logind/upower/hardware.
 # These provide the things you'd actually notice missing:

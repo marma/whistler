@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 
 import kopf
 from kubernetes import client
@@ -8,6 +9,10 @@ from whistler.logsetup import quiet_chatty_libraries
 from whistler.config import (
     KubeConfigManager,
     PolicyError,
+    STOP_ANNOTATION,
+    VM_RUN_STRATEGY_RUNNING,
+    VM_RUN_STRATEGY_STOPPED,
+    run_intent,
     KUBEVIRT_GROUP,
     KUBEVIRT_VERSION,
     KUBEVIRT_VM_PLURAL,
@@ -166,14 +171,18 @@ def _probe_vmi(namespace, name, logger):
     if phase == "Failed":
         return ("Failed", name, None)
     if phase == "Succeeded":
-        # Guest shut itself down under runStrategy Halted.
+        # The domain exited gracefully — the guest shut itself down (Power Off
+        # in the desktop menu, `poweroff`), or Whistler halted the VM and it
+        # obeyed. Under VM_RUN_STRATEGY_RUNNING the first of those sticks
+        # instead of being restarted, and the timer records it as a stop.
         return ("Stopped", name, None)
     return ("Booting", name, None)
 
 
 def _probe_vm_without_vmi(api, namespace, name, logger):
-    """Disambiguate a missing VMI: Stopped (VM absent or halted), Importing
-    (CDI still pulling the root disk), else Booting (VMI not up yet)."""
+    """Disambiguate a missing VMI: Stopped (VM absent, halted, or shut down
+    from inside the guest), Importing (CDI still pulling the root disk), else
+    Booting (VMI not up yet)."""
     try:
         vm = api.get_namespaced_custom_object(
             KUBEVIRT_GROUP, KUBEVIRT_VERSION, namespace, KUBEVIRT_VM_PLURAL, name
@@ -183,7 +192,13 @@ def _probe_vm_without_vmi(api, namespace, name, logger):
             logger.warning(f"Error reading VM {name}: {e}")
             return ("Booting", name, None)
         return ("Stopped", None, None)
-    if (vm.get("spec") or {}).get("runStrategy") == "Halted":
+    if (vm.get("spec") or {}).get("runStrategy") == VM_RUN_STRATEGY_STOPPED:
+        return ("Stopped", name, None)
+    if _guest_powered_off(vm):
+        # Not halted by us and no VMI under it: the guest shut itself down
+        # (RerunOnFailure leaves it that way — VM_RUN_STRATEGY_RUNNING). Before
+        # this, that state fell through to Booting and stuck there forever,
+        # because nothing was ever going to boot.
         return ("Stopped", name, None)
     try:
         dv = api.get_namespaced_custom_object(
@@ -194,6 +209,76 @@ def _probe_vm_without_vmi(api, namespace, name, logger):
     except client.rest.ApiException:
         pass  # no DataVolume (containerDisk boot) or CDI absent
     return ("Booting", name, None)
+
+
+def _guest_powered_off(vm) -> bool:
+    """Whether this VirtualMachine is stopped because the guest shut *itself*
+    down — Power Off in the desktop menu, `sudo poweroff`, a `shutdown` that
+    reached its deadline.
+
+    Three readings of the VM's own status, and each one excludes a state that
+    would otherwise be mistaken for this:
+
+    - `status.runStrategy` is the strategy virt-controller has **observed**,
+      not the one this reconcile just asked for. It is what separates a guest
+      power-off from a start still in flight: a VM Whistler is starting says
+      Halted here until the controller catches up, and a VM Whistler has
+      stopped says Halted for good.
+    - `printableStatus == "Stopped"` is KubeVirt's own answer to "is anything
+      running", and the only one that accounts for its start expectations:
+      between deciding to create a VMI and that object existing it says
+      Starting, where a bare "is there a VMI" test would say stopped and
+      restart the machine out from under itself. It also covers the ~10s in
+      which a Succeeded VMI has not been reaped yet, so the stop is recorded
+      on the first tick rather than the second.
+    - an empty `stateChangeRequests` means KubeVirt is not itself about to
+      start this VM. That is the difference between a guest that chose to shut
+      down and one that crashed: RerunOnFailure answers a Failed VMI by
+      queueing a start, and calling that a stop would take away the automatic
+      restart that is the whole reason for the strategy.
+
+    Fails closed on anything unexpected (a field absent, a status KubeVirt
+    words differently): the cost of a false negative is a session that reads
+    Stopped while its CR still intends to run, which the next start fixes. A
+    false positive stops a machine nobody asked to stop."""
+    status = (vm or {}).get("status") or {}
+    return (status.get("runStrategy") == VM_RUN_STRATEGY_RUNNING
+            and status.get("printableStatus") == "Stopped"
+            and not status.get("stateChangeRequests"))
+
+
+def _record_guest_shutdown(namespace, name, patch, logger) -> None:
+    """Turn a guest's own power-off into the same stop the portal button makes.
+
+    Without this the Session CR would go on saying "run" (last-connect newer
+    than last-stop) while the machine is off, and the two halves of that
+    disagreement both bite. Any later reconcile that happens to touch the CR —
+    an admin editing overrides, a viewer page nudging the instance — would
+    read the intent and boot the guest back up, which is the exact bug the two
+    annotations were introduced to kill. And the *next* deliberate start would
+    be a no-op: KubeVirt only acts on a runStrategy patch that changes
+    something, and a VM the guest halted still says RerunOnFailure (see
+    VM_RUN_STRATEGY_RUNNING). Writing the stop mark fixes both — the following
+    reconcile puts the spec back to Halted, which re-arms that transition.
+
+    The write is an annotation on the CR, so it goes through the same path a
+    portal stop does and needs no new privilege anywhere.
+
+    Reads the VirtualMachine itself rather than trusting the probed phase:
+    Stopped is also what a VM reports in the moments before a start lands, and
+    turning that into a stop would cancel the start that was on its way."""
+    try:
+        vm = client.CustomObjectsApi().get_namespaced_custom_object(
+            KUBEVIRT_GROUP, KUBEVIRT_VERSION, namespace, KUBEVIRT_VM_PLURAL, name
+        )
+    except client.rest.ApiException as e:
+        if e.status != 404:
+            logger.warning(f"Error reading VM {name}: {e}")
+        return
+    if not _guest_powered_off(vm):
+        return
+    logger.info(f"Session {name}: guest shut itself down; recording a stop")
+    patch.meta['annotations'] = {STOP_ANNOTATION: str(time.time())}
 
 
 @kopf.on.create('whistler.martinmalmsten.net', 'v1', 'sessions')
@@ -281,6 +366,11 @@ def session_phase_timer(spec, name, namespace, meta, status, patch, logger, **kw
     if runtime == 'vm':
         new_phase, child_name, address = _probe_vmi(namespace, name, logger)
         patch.status['vmiName'] = child_name
+        # A VM that is down while the CR still says run is either a guest that
+        # powered itself off or a start still on its way; only the first is a
+        # stop, and only the VM's own status can tell them apart.
+        if new_phase == 'Stopped' and run_intent(meta.get('annotations')):
+            _record_guest_shutdown(namespace, name, patch, logger)
     else:
         new_phase, child_name, address = _probe_pod(namespace, name, logger)
         patch.status['podName'] = child_name

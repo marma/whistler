@@ -192,6 +192,75 @@ KUBEVIRT_VMI_PLURAL = "virtualmachineinstances"
 # off.
 DEFAULT_HUGE_PAGE_SIZE = "2Mi"
 
+# What `runStrategy` a VM carries in each of the two directions run_intent can
+# point.
+#
+# The running one is NOT `Always`, and the difference is the whole of
+# guest-initiated shutdown. `Always` means "respawn the VMI whenever it
+# terminates", so a user choosing Power Off in the desktop menu, or typing
+# `sudo poweroff`, got a reboot: the guest went down and KubeVirt brought it
+# straight back. `RerunOnFailure` is the strategy KubeVirt documents for
+# exactly this — a VMI that reaches Succeeded (a graceful domain exit) is left
+# stopped, while one that Failed (a crash, an OOM, a node going away) is still
+# restarted automatically. So the guest decides when it is done, and an
+# infrastructure fault still self-heals. An in-guest `reboot` is unaffected
+# either way: qemu resets the domain without the VMI ever terminating.
+#
+# The cost is a subtlety in the *start* path, and it is a sharp one
+# (virt-controller, RunStrategyRerunOnFailure: `hasStartRequest(vm) ||
+# vm.Status.RunStrategy != runStrategy`). With no VMI, KubeVirt starts a
+# RerunOnFailure VM only when the strategy just *changed* — or when something
+# asked for a start explicitly. Whistler's ordinary start is a
+# Halted -> RerunOnFailure patch, which is such a change, so it works. But a
+# guest that powered itself off leaves the spec already saying RerunOnFailure,
+# and re-patching the same value is a no-op that starts nothing. Two things
+# answer that, and they cover each other: the operator turns a guest power-off
+# into a real stop (STOP_ANNOTATION, so the next reconcile writes Halted back
+# and re-arms the transition), and ensure_session issues an explicit start
+# request when it sees a VM whose observed strategy is already the running one
+# with no VMI under it (_request_vm_start).
+VM_RUN_STRATEGY_RUNNING = "RerunOnFailure"
+VM_RUN_STRATEGY_STOPPED = "Halted"
+
+# How long a guest gets to shut down cleanly after KubeVirt presses the
+# virtual ACPI power button (the VMI's terminationGracePeriodSeconds), before
+# the domain is destroyed under it.
+#
+# This was 5s, on the reasoning that "$HOME is a network mount the gateway
+# owns" — true when a VM's home came over NFS, and false since it became a
+# per-instance ext4 filesystem on a virtio-blk disk (whistler.cloudinit). The
+# guest's page cache now holds the user's unwritten data, so a hard destroy
+# costs them up to /proc/sys/vm/dirty_expire_centisecs of writes and an ext4
+# journal recovery on the next boot. 30s is the room systemd needs to stop a
+# desktop session and unmount that filesystem; it is a ceiling, not a timer,
+# and virt-handler proceeds the moment the domain is actually gone.
+#
+# So a stop that reliably takes the WHOLE window is not a sign this is too
+# high — it is a guest that never acted on the power button at all (nothing
+# handling it, or a desktop power manager holding the logind inhibitor).
+# Diagnose that in the image; lowering this only hides it behind a faster
+# destroy.
+DEFAULT_VM_SHUTDOWN_GRACE_SECONDS = 30
+
+
+def _non_negative_int_env(name: str, default: int) -> int:
+    """An integer setting from the environment, falling back to ``default``
+    when it is absent, unparseable or negative — and saying so when it was
+    set to something meaningless, since silence here would look exactly like
+    the setting having been applied."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logger.warning(f"{name}={raw!r} is not an integer; using {default}")
+        return default
+    if value < 0:
+        logger.warning(f"{name}={value} is negative; using {default}")
+        return default
+    return value
+
 
 def _format_quantity(num_bytes: int) -> str:
     """A byte count as the largest binary Kubernetes quantity that divides it
@@ -1020,6 +1089,9 @@ class KubeConfigManager(ConfigManager):
     # environment. Class-level for the same reason `groups` is — the pure
     # builders are unit-tested on an instance made with __new__.
     huge_page_size: str = DEFAULT_HUGE_PAGE_SIZE
+    # Cluster-wide ACPI shutdown window for VM guests (see
+    # DEFAULT_VM_SHUTDOWN_GRACE_SECONDS); class-level for the same reason.
+    vm_shutdown_grace_seconds: int = DEFAULT_VM_SHUTDOWN_GRACE_SECONDS
 
     def __init__(self, kubeconfig: str = None):
         try:
@@ -1142,6 +1214,12 @@ class KubeConfigManager(ConfigManager):
                 f"VM hugepage size {self.huge_page_size!r} is not one x86_64 "
                 f"provides (2Mi, 1Gi); VMs will pend unless these nodes are "
                 f"arm64 with that size available")
+        # How long a VM guest gets to shut down cleanly before the domain is
+        # destroyed (see DEFAULT_VM_SHUTDOWN_GRACE_SECONDS). A template may
+        # raise or lower it with `resources.shutdownGraceSeconds`.
+        self.vm_shutdown_grace_seconds = _non_negative_int_env(
+            "WHISTLER_VM_SHUTDOWN_GRACE_SECONDS",
+            DEFAULT_VM_SHUTDOWN_GRACE_SECONDS)
         # S3 dataset proxies (design/storage.md).
         self.s3_proxy_image = os.environ.get(
             "WHISTLER_S3_PROXY_IMAGE", "rclone/rclone:latest")
@@ -1757,6 +1835,39 @@ class KubeConfigManager(ConfigManager):
             f"multiple VM GPU types available "
             f"({[e['name'] for e in vm_capable]}); the template must pin one "
             f"via its gpuType")
+
+    def _vm_shutdown_grace(self, resources: Dict[str, Any]) -> int:
+        """Seconds this guest gets to shut down cleanly before the domain is
+        destroyed. Pure (reads only self.vm_shutdown_grace_seconds).
+
+        The template's ``resources.shutdownGraceSeconds`` wins over the
+        cluster default, which is what lets one image that genuinely needs to
+        drain (a devbase VM mid-build) differ from a kiosk desktop without
+        making every VM wait for the slowest. `in` decides rather than
+        truthiness so a template can ask for ``0`` — destroy at once, no ACPI
+        attempt — and mean it.
+
+        A value that is not a non-negative integer is the template's mistake,
+        but refusing the session over it would be a worse answer than running
+        it on the cluster default, so it warns and falls back: the failure it
+        would otherwise cause is a VM that never starts, arriving as a
+        KubeVirt admission error nowhere near the template that caused it."""
+        if 'shutdownGraceSeconds' not in resources:
+            return self.vm_shutdown_grace_seconds
+        raw = resources['shutdownGraceSeconds']
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"template shutdownGraceSeconds={raw!r} is not an integer; "
+                f"using {self.vm_shutdown_grace_seconds}")
+            return self.vm_shutdown_grace_seconds
+        if value < 0:
+            logger.warning(
+                f"template shutdownGraceSeconds={value} is negative; using "
+                f"{self.vm_shutdown_grace_seconds}")
+            return self.vm_shutdown_grace_seconds
+        return value
 
     def _vm_guest_memory(
             self, resources: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
@@ -2981,7 +3092,7 @@ class KubeConfigManager(ConfigManager):
     def _build_vm_spec(self, *, session_name, hostname, username, uid,
                        template_spec, display_port, instancetype,
                        preemptible, home_pvc=None, shared_datasets=None,
-                       user_details=None, run_strategy="Halted",
+                       user_details=None, run_strategy=VM_RUN_STRATEGY_STOPPED,
                        portal_public_key=None, viewer=None,
                        host_key=None, host_cert=None):
         """Build a KubeVirt VirtualMachine manifest from resolved inputs.
@@ -3125,7 +3236,9 @@ class KubeConfigManager(ConfigManager):
         domain = {"devices": devices}
         vm_spec = {
             # runStrategy (not `running`) so stop/start is a spec patch:
-            # Halted = stopped-but-existing, Always = running/restarted.
+            # Halted = stopped-but-existing, RerunOnFailure = running (and
+            # restarted after a crash, but NOT after the guest shuts itself
+            # down — see VM_RUN_STRATEGY_RUNNING).
             # VMs default to Halted at creation — unlike pods they are
             # expensive, so they boot on first connect (the connect/term/vnc
             # pages bump whistler/last-connect), not on session creation.
@@ -3138,15 +3251,18 @@ class KubeConfigManager(ConfigManager):
                     },
                 },
                 "spec": {
-                    # The ACPI shutdown window. Left unset this is NOT KubeVirt's
-                    # documented 30s: v1.8.4 renders the virt-launcher pod at 60s,
-                    # so a stop sat for a full minute after the guest was already
-                    # down. Systemd shuts these desktop guests down in ~2s (no
-                    # databases, no long drains — $HOME is a network mount the
-                    # gateway owns), so spend a few seconds on a clean ACPI
-                    # shutdown and force off after that rather than waiting on a
-                    # guest that has already gone.
-                    "terminationGracePeriodSeconds": 5,
+                    # The ACPI shutdown window: how long the guest has to act on
+                    # the virtual power button before the domain is destroyed
+                    # under it. A ceiling, not a timer — virt-handler proceeds as
+                    # soon as the domain is gone, so this costs nothing on a guest
+                    # that shuts down promptly and is the difference between a
+                    # clean unmount and ext4 journal recovery on one that doesn't.
+                    # Cluster default plus a per-template override; see
+                    # DEFAULT_VM_SHUTDOWN_GRACE_SECONDS for why it is no longer 5.
+                    # (Left unset entirely it is not KubeVirt's documented 30s
+                    # either: v1.8.4 renders the launcher pod at 60s.)
+                    "terminationGracePeriodSeconds": self._vm_shutdown_grace(
+                        resources),
                     # Readiness = "the guest is actually serving", not "qemu
                     # started". A VMI reaches phase Running the moment the domain
                     # boots, ~20s before cloud-init has brought up the streamer
@@ -4604,7 +4720,8 @@ class KubeConfigManager(ConfigManager):
             instancetype=instancetype,
             preemptible=preemptible,
             user_details=user_details if user_details is not None else self.get_user(username),
-            run_strategy="Always" if start else "Halted",
+            run_strategy=(VM_RUN_STRATEGY_RUNNING if start
+                          else VM_RUN_STRATEGY_STOPPED),
             portal_public_key=self._ensure_vm_access_key(username, user_ns),
             viewer=viewer,
             host_key=host_key,
@@ -4646,7 +4763,8 @@ class KubeConfigManager(ConfigManager):
                 # spec.template changes to the *next* VMI, so a running guest
                 # picks them up on reboot — the same change-on-reboot contract
                 # zones already have.
-                self._patch_vm_spec(user_ns, full_name, vm_body["spec"])
+                current = self._patch_vm_spec(
+                    user_ns, full_name, vm_body["spec"])
                 # Drive runStrategy to the run intent, in BOTH directions.
                 # It used to only ever flip a VM on, which left stopping to
                 # whoever asked for it — meaning the gateway and the portal
@@ -4655,7 +4773,8 @@ class KubeConfigManager(ConfigManager):
                 # KubeVirt writes inside the operator, where lifecycle already
                 # lives. Cheap and idempotent: the patch is a no-op when the
                 # VM is already in the wanted state.
-                desired = "Always" if start else "Halted"
+                desired = (VM_RUN_STRATEGY_RUNNING if start
+                           else VM_RUN_STRATEGY_STOPPED)
                 try:
                     self.api.patch_namespaced_custom_object(
                         KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns,
@@ -4665,19 +4784,29 @@ class KubeConfigManager(ConfigManager):
                 except ApiException as pe:
                     logger.warning(f"Could not set runStrategy={desired} on "
                                    f"VirtualMachine {full_name}: {pe}")
+                if start:
+                    self._ensure_vm_start_requested(
+                        user_ns, full_name, current)
                 return True
             # 404 here means the KubeVirt CRDs are not installed in this cluster.
             logger.error(f"Failed to create VirtualMachine {full_name} "
                          f"(is KubeVirt installed?): {e}")
             return False
 
-    def _patch_vm_spec(self, user_ns, full_name, desired_spec) -> None:
+    def _patch_vm_spec(self, user_ns, full_name,
+                       desired_spec) -> Optional[Dict[str, Any]]:
         """Reconcile an existing VirtualMachine toward the freshly built spec.
         Best-effort: a failure here leaves the VM on its old shape and the next
         reconcile retries. KubeVirt hands spec.template to the *next* VMI, so
         the guest sees the change on its next boot (the VM carries a
         RestartRequired condition meanwhile) — CPU/memory edits to a running VM
-        therefore need a stop/start, matching how zones already behave."""
+        therefore need a stop/start, matching how zones already behave.
+
+        Returns the VirtualMachine **as it was read**, before either this
+        patch or the caller's runStrategy patch, or None if it could not be
+        read. The caller needs that pre-patch view to decide whether KubeVirt
+        will act on a start on its own (_ensure_vm_start_requested), and
+        reading it twice would race with its own write."""
         try:
             current = self.api.get_namespaced_custom_object(
                 KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns,
@@ -4697,6 +4826,69 @@ class KubeConfigManager(ConfigManager):
                         f"(applies on next boot): {json.dumps(patch)}")
         except ApiException as e:
             logger.warning(f"Could not update VirtualMachine {full_name}: {e}")
+        return current
+
+    def _ensure_vm_start_requested(self, user_ns: str, full_name: str,
+                                   before: Optional[Dict[str, Any]]) -> None:
+        """Ask KubeVirt to start a VM that patching runStrategy will not.
+
+        `before` is the VirtualMachine as read *before* this reconcile's
+        runStrategy patch. Under RerunOnFailure, virt-controller starts a
+        VM with no VMI only when the strategy just changed
+        (`vm.Status.RunStrategy != spec.runStrategy`) or when something asked
+        explicitly. Whistler's normal start is a Halted -> RerunOnFailure
+        patch, so it is the former and nothing more is needed. The case that
+        needs this is a guest that powered itself off: the spec still says
+        RerunOnFailure, so re-patching it is a no-op and the play button would
+        do nothing at all — silently, which is the failure mode worth spending
+        an API call to avoid.
+
+        Deliberately conditional rather than unconditional. A start request is
+        a durable mark in the VM's status, so writing one on every reconcile
+        would mean any reconcile could restart a machine the guest had shut
+        down. What is left is a ~10s window: between a guest powering off and
+        the operator's phase timer recording that as a stop, the CR still says
+        run, and a reconcile in that gap does start the VM again. That is the
+        right answer for the common cause of one (a user opening the desktop
+        page, which nudges the instance awake on purpose) and a rare, harmless
+        one otherwise.
+
+        The endpoint is the one `virtctl start` uses. Best-effort throughout:
+        a Conflict is KubeVirt saying the VM is already running (someone else
+        won the race, which is the outcome we wanted), and a 404 is a cluster
+        whose virt-api does not serve subresources — neither is worth failing
+        a reconcile that has otherwise done its job."""
+        if not before:
+            return  # could not read it; the transition is the best we can do
+        status = before.get("status") or {}
+        # Not "no VMI", but KubeVirt's own "Stopped": that is the one reading
+        # that excludes the moment between virt-controller deciding to start a
+        # VMI and the object existing, which `created` alone would call
+        # stopped and restart out from under itself.
+        if status.get("runStrategy") != VM_RUN_STRATEGY_RUNNING:
+            return  # the runStrategy patch is itself the start
+        if status.get("created") or status.get("printableStatus") != "Stopped":
+            return  # running, or on its way up
+        try:
+            self.api.api_client.call_api(
+                "/apis/subresources.kubevirt.io/{version}/namespaces"
+                "/{namespace}/virtualmachines/{name}/start",
+                "PUT",
+                {"version": KUBEVIRT_VERSION, "namespace": user_ns,
+                 "name": full_name},
+                {}, {"Accept": "application/json",
+                     "Content-Type": "application/json"},
+                body={}, auth_settings=["BearerToken"],
+                _return_http_data_only=True, _preload_content=True,
+            )
+            logger.info(f"Requested start of VirtualMachine {full_name} "
+                        f"(stopped under {VM_RUN_STRATEGY_RUNNING}, so a "
+                        f"runStrategy patch alone would not boot it)")
+        except ApiException as e:
+            if e.status == 409:
+                return
+            logger.warning(
+                f"Could not request start of VirtualMachine {full_name}: {e}")
 
     def get_user_desktop_templates(self, username: str) -> List[Dict[str, Any]]:
         templates = []

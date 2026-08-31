@@ -70,6 +70,26 @@ forgoes lock/suspend/idle, meaningless here). So this image **does not** shadow
 `XDG_RUNTIME_DIR` is still a systemd `RuntimeDirectory` — a `User=` system
 service gets no logind-managed `/run/user/<uid>` regardless.
 
+**Two consequences of "not a logind session" show up in the system menu**, and
+both are handled rather than tolerated:
+
+- **Power Off and Restart were missing.** Not a logind problem at all — the
+  shell gates those two on `CanShutdown()` against `org.gnome.SessionManager`,
+  and this image runs `gnome-shell` without `gnome-session` (§ the launcher's
+  header), so nothing owned that name and the call threw. Suspend, which asks
+  logind directly, stayed — which is exactly the shape a user reports as "only
+  Suspend and Log off". `guest/usr/local/bin/whistler-session-manager` owns
+  that name and maps Shutdown/Reboot/Logout onto logind; `test.sh` makes the
+  same `CanShutdown` call the shell does and fails if it is not `true`.
+- **The power actions still needed permission.** With no active session,
+  polkit's `allow_active: yes` default does not apply and every login1 power
+  action came back a challenge with no agent to answer it.
+  `guest/etc/polkit-1/rules.d/49-whistler-power.rules` grants power-off and
+  reboot to the `sudo` group — which the session user is already in, with
+  NOPASSWD — and **denies suspend/hibernate outright**, because a suspended
+  KubeVirt guest keeps its VMI Running with a frozen desktop and Whistler has
+  no way to wake it. Denying it is also what removes it from the menu.
+
 **If** a bake shows gnome-shell dying at startup or apps refusing to launch from
 the overview (the one place it might want `systemd-run --user`), the documented
 fallback in

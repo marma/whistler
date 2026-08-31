@@ -1,0 +1,48 @@
+// Who may power this machine off from the desktop, and who may suspend it.
+//
+// The desktop here is a systemd *system* service with User=, not a PAM login,
+// so the session it runs in is not a logind session and has no seat. polkit's
+// shipped defaults for the login1 actions read `allow_active: yes` and
+// `allow_any: auth_admin_keep` — and with no active session this desktop is
+// "any", so every power action came back as a challenge nobody can answer
+// (there is no polkit agent on a streamed desktop). The result is a GUI whose
+// power items are missing or inert while `sudo poweroff` in a terminal works
+// fine, which is a confusing way to tell a user their machine cannot be
+// switched off.
+//
+// So: grant it to the group that can already do it. The session user is in
+// `sudo` with NOPASSWD:ALL (whistler/cloudinit.py), so this hands out nothing
+// they did not already have from a shell — it just lets the menu item reach
+// it. The -multiple-sessions and -ignore-inhibit variants are the ones logind
+// actually checks when another session exists or something holds a shutdown
+// inhibitor, hence the prefix match rather than two exact ids.
+polkit.addRule(function (action, subject) {
+    if (!subject.isInGroup("sudo"))
+        return undefined;
+
+    if (action.id.indexOf("org.freedesktop.login1.power-off") === 0 ||
+        action.id.indexOf("org.freedesktop.login1.reboot") === 0)
+        return polkit.Result.YES;
+
+    // Suspend and hibernate are refused ON PURPOSE, which is why they are
+    // named here rather than left to the default challenge.
+    //
+    // A suspended KubeVirt guest does not stop: the domain stays up, the VMI
+    // stays Running, the readiness probe fails, and the portal goes on showing
+    // a session whose desktop is frozen. Whistler has no wake affordance
+    // anywhere — no ACPI wake button in the portal, none over SSH, and the
+    // stream is dead — so the only way back is stopping the instance, i.e.
+    // exactly the power-off the user did not choose. Offering it is offering a
+    // way to strand your own session.
+    //
+    // Denying it is also what REMOVES it from the menu rather than leaving it
+    // there to fail: gnome-shell hides Suspend when logind answers no.
+    // To bring it back, delete this clause — nothing else depends on it.
+    if (action.id == "org.freedesktop.login1.suspend" ||
+        action.id == "org.freedesktop.login1.hibernate" ||
+        action.id == "org.freedesktop.login1.hybrid-sleep" ||
+        action.id == "org.freedesktop.login1.suspend-then-hibernate")
+        return polkit.Result.NO;
+
+    return undefined;
+});
