@@ -286,16 +286,16 @@ whistler:
   #
   # Each group supports:
   #   members:          usernames. A name with no User CR grants nothing.
-  #   volumes:          [{name, mode: rw|ro|none, access: {user: rw|ro}}] —
-  #                     what members may mount and how. `access` overrides
-  #                     `mode` per member; `mode: none` grants only to the
-  #                     people named in `access`. What `ro` is worth depends
-  #                     on the volume: a real read-only mount for container
-  #                     sessions; for an S3 DATASET it is enforced by the
-  #                     proxy, which runs --read-only server-side, so it holds
-  #                     even against root in a VM (verified 2026-08-17). For a
-  #                     PVC on a VM it is still only a mount flag the guest's
-  #                     root can drop (design/security.md, design/storage.md).
+  #                     This is the only thing that makes someone a member.
+  #   volumeAccess:     the access matrix — {zone: {dataset: allowed|read-only}}.
+  #                     What members may mount, in which zone. An ABSENT cell
+  #                     is a refusal; there are no defaults. Merged with the
+  #                     member's own table, most permissive per cell, so a
+  #                     group only ever widens. Datasets only: a home volume's
+  #                     name resolves in its owner's namespace alone, so a
+  #                     group could never grant one. `read-only` is enforced by
+  #                     the proxy, which runs --read-only server-side, so it
+  #                     holds even against root in a VM (verified 2026-08-17).
   #   allowedZones / allowedGpuTypes: added to each member's own allow-list.
   #   channels:         which of the zone's permitted access channels members
   #                     actually get: ssh, relay, terminal, clipboard,
@@ -309,16 +309,16 @@ whistler:
     # lab-staff:
     #   description: Internal staff on the imaging project
     #   members: [alice, bob]
-    #   volumes:
-    #     - name: project-data
-    #       mode: rw
+    #   volumeAccess:
+    #     restricted:
+    #       project-data: allowed
     #   allowedZones: [restricted]
     # visiting-researchers:
     #   description: External, same zone and instance as the staff above
     #   members: [carol]
-    #   volumes:
-    #     - name: project-data
-    #       mode: ro
+    #   volumeAccess:
+    #     restricted:
+    #       project-data: read-only
     #   allowedZones: [restricted]
     #   channels: [screenshots]   # no shell, no relay, no web terminal
     #   entryPoints: [kiosk]      # and only through the kiosk (see below)
@@ -511,10 +511,14 @@ whistler:
   # semantics on shared data, the answer is Ceph, not this. Guests need
   # `rclone` and `fuse3` baked in — the images do.
   #
-  # A dataset is granted by NAME, the same way a volume is (whistler.groups
-  # or a user's allowedVolumes), and every allow is explicit — a user granted
-  # nothing reaches no dataset. `readOnly` is still the posture to prefer:
-  # without it, everyone who IS granted the dataset can write it.
+  # A dataset is granted PER ZONE, in the access matrix (User/Group
+  # `volumeAccess`, edited in the portal's Access grid): a cell says
+  # (zone, dataset, allowed|read-only) and an absent cell is a refusal. So the
+  # same person can hold a dataset read-write in one zone and not at all in
+  # another, and the proxy's NetworkPolicy admits only their pods carrying
+  # that zone's label. `readOnly` below is still the posture to prefer: it is a
+  # ceiling over every cell, and without it everyone granted the dataset can
+  # write it.
   datasets: {}
     # reference-data:
     #   description: Imaging corpus

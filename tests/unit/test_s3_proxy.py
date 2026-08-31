@@ -7,7 +7,7 @@ and so the bucket credential never enters a guest whose user has root. See
 design/storage.md; the guest side is in tests/unit/test_cloud_init.py.
 """
 from whistler.cloudinit import S3_PROXY_BUCKET
-from whistler.config import KubeConfigManager, USER_NS_LABEL
+from whistler.config import KubeConfigManager, USER_NS_LABEL, ZONE_LABEL
 
 
 DEFINITION = {
@@ -127,18 +127,30 @@ def test_host_is_the_proxy_not_the_real_server():
 
 # --- fencing --------------------------------------------------------------- #
 
-def test_only_granted_users_may_reach_a_proxy():
+def test_only_granted_users_in_the_granted_zone_may_reach_a_proxy():
     policy = _manager()._build_s3_proxy_network_policy(
-        "refdata", "ro", ["bob", "alice"])
+        "refdata", "ro", [("bob", "restricted"), ("alice", "open")])
     assert policy["spec"]["policyTypes"] == ["Ingress"]
     (rule,) = policy["spec"]["ingress"]
-    (src,) = rule["from"]
-    (expr,) = src["namespaceSelector"]["matchExpressions"]
-    assert expr["key"] == USER_NS_LABEL
-    assert expr["operator"] == "In"
-    # Sorted so an unchanged grant set doesn't churn the policy on reconcile.
-    assert expr["values"] == ["alice", "bob"]
+    # One peer per (user, zone) cell. NetworkPolicy ANDs the two selectors
+    # inside a peer and ORs the peers, which is the shape the access matrix
+    # has: selecting the namespace alone would hand a user their most
+    # permissive zone's access in every zone they can enter.
+    assert rule["from"] == [
+        {"namespaceSelector": {"matchLabels": {USER_NS_LABEL: "alice"}},
+         "podSelector": {"matchLabels": {ZONE_LABEL: "open"}}},
+        {"namespaceSelector": {"matchLabels": {USER_NS_LABEL: "bob"}},
+         "podSelector": {"matchLabels": {ZONE_LABEL: "restricted"}}},
+    ]
     assert rule["ports"] == [{"port": 8080, "protocol": "TCP"}]
+
+
+def test_the_same_user_gets_a_peer_per_zone_they_hold_it_in():
+    policy = _manager()._build_s3_proxy_network_policy(
+        "refdata", "rw", [("alice", "open"), ("alice", "restricted")])
+    (rule,) = policy["spec"]["ingress"]
+    assert [p["podSelector"]["matchLabels"][ZONE_LABEL] for p in rule["from"]] \
+        == ["open", "restricted"]
 
 
 def test_a_dataset_nobody_is_granted_denies_everyone():
@@ -150,7 +162,7 @@ def test_a_dataset_nobody_is_granted_denies_everyone():
 
 def test_policy_selects_its_own_proxy_only():
     policy = _manager()._build_s3_proxy_network_policy(
-        "refdata", "ro", ["alice"])
+        "refdata", "ro", [("alice", "open")])
     assert policy["spec"]["podSelector"]["matchLabels"] == {
         "app": "whistler-s3-proxy", "volume": "refdata", "mode": "ro"}
 
@@ -170,8 +182,9 @@ def test_only_type_s3_entries_are_datasets():
 
 # --- who a proxy admits ----------------------------------------------------- #
 #
-# s3_proxy_users is what turns grants into the policy's `from` list, so it has
-# to answer the same question the mount does. These run the REAL user/group
+# s3_proxy_peers is what turns the access matrix into the policy's `from` list,
+# so it has to answer the same question the mount does — including the zone,
+# since a cell is (zone, dataset, mode). These run the REAL user/group
 # resolution (only the API loaders are bypassed, by constructing via __new__
 # and setting the catalogs directly, which both loaders tolerate) — a version
 # of this calling a method that does not exist shipped once precisely because
@@ -184,31 +197,41 @@ def _granted(users, groups=None):
     return cm
 
 
-def test_proxy_admits_exactly_the_users_granted_that_mode():
+def test_proxy_admits_exactly_the_cells_resolving_to_that_mode():
     cm = _granted(
         {"alice": {"name": "alice"}, "bob": {"name": "bob"},
-         "carol": {"name": "carol"}},
-        {"proj": {"members": ["alice", "bob", "carol"],
-                  "volumes": [{"name": "refdata", "mode": "ro",
-                               "access": {"bob": "rw"}}]}},
+         "carol": {"name": "carol",
+                   "volumeAccess": {"open": {"refdata": "allowed"}}}},
+        {"proj": {"members": ["alice", "bob"],
+                  "volumeAccess": {"open": {"refdata": "read-only"}}}},
     )
-    # The group grants ro, except bob who is named rw. Each lands on the
-    # proxy that enforces its own mode, and on no other.
-    assert cm.s3_proxy_users("refdata", "ro") == ["alice", "carol"]
-    assert cm.s3_proxy_users("refdata", "rw") == ["bob"]
+    # The group grants read-only; carol holds it read-write in her own right.
+    # Each lands on the proxy that enforces its own mode, and on no other.
+    assert cm.s3_proxy_peers("refdata", "ro") == [("alice", "open"),
+                                                  ("bob", "open")]
+    assert cm.s3_proxy_peers("refdata", "rw") == [("carol", "open")]
 
 
-def test_a_user_restricted_to_other_volumes_reaches_neither_proxy():
+def test_a_cell_admits_only_the_zone_it_names():
+    # The reason the peer carries a podSelector at all: alice holds refdata
+    # read-write in `open` and nothing in `restricted`, so a session she
+    # starts in `restricted` must not reach the proxy her `open` cell earned.
+    cm = _granted({"alice": {"name": "alice", "volumeAccess": {
+        "open": {"refdata": "allowed"},
+        "restricted": {"scratch": "allowed"}}}})
+    assert cm.s3_proxy_peers("refdata", "rw") == [("alice", "open")]
+
+
+def test_a_user_granted_other_datasets_reaches_neither_proxy():
     cm = _granted(
         {"alice": {"name": "alice"}, "mallory": {"name": "mallory"}},
         {"proj": {"members": ["alice"],
-                  "volumes": [{"name": "refdata", "mode": "rw"}]},
+                  "volumeAccess": {"open": {"refdata": "allowed"}}},
          "other": {"members": ["mallory"],
-                   "volumes": [{"name": "scratch", "mode": "rw"}]}},
+                   "volumeAccess": {"open": {"scratch": "allowed"}}}},
     )
-    # What excludes mallory is being restricted TO something else: her group
-    # gives her an allow-list, and refdata is not on it.
-    assert cm.s3_proxy_users("refdata", "rw") == ["alice"]
+    # What excludes mallory is that no cell of hers names refdata.
+    assert cm.s3_proxy_peers("refdata", "rw") == [("alice", "open")]
 
 
 def test_a_user_with_no_grants_at_all_reaches_no_dataset():
@@ -218,16 +241,8 @@ def test_a_user_with_no_grants_at_all_reaches_no_dataset():
     # so a new dataset was writable by every user in no group the moment it
     # was defined.
     cm = _granted({"alice": {"name": "alice"}, "mallory": {"name": "mallory"}})
-    assert cm.s3_proxy_users("refdata", "rw") == []
-    assert cm.s3_proxy_users("refdata", "ro") == []
-
-
-def test_a_granted_user_with_no_mode_named_defaults_to_read_write():
-    # A volume named in the user's OWN allowedVolumes carries no mode, and
-    # rw is what that has always meant. The ro proxy must not admit them.
-    cm = _granted({"alice": {"name": "alice", "allowedVolumes": ["refdata"]}})
-    assert cm.s3_proxy_users("refdata", "rw") == ["alice"]
-    assert cm.s3_proxy_users("refdata", "ro") == []
+    assert cm.s3_proxy_peers("refdata", "rw") == []
+    assert cm.s3_proxy_peers("refdata", "ro") == []
 
 
 def test_downgrading_a_user_re_fences_the_mode_they_lost():
@@ -238,7 +253,7 @@ def test_downgrading_a_user_re_fences_the_mode_they_lost():
     cm = _granted(
         {"alice": {"name": "alice"}},
         {"proj": {"members": ["alice"],
-                  "volumes": [{"name": "refdata", "mode": "ro"}]}},
+                  "volumeAccess": {"open": {"refdata": "read-only"}}}},
     )
     seen = {}
     cm.namespace = "whistler"
@@ -263,5 +278,5 @@ def test_downgrading_a_user_re_fences_the_mode_they_lost():
 
     # ro keeps her; rw — the mode she lost — is fenced to nobody.
     assert seen["whistler-s3-refdata-ro"][0]["from"][0][
-        "namespaceSelector"]["matchExpressions"][0]["values"] == ["alice"]
+        "namespaceSelector"]["matchLabels"][USER_NS_LABEL] == "alice"
     assert seen["whistler-s3-refdata-rw"] == []

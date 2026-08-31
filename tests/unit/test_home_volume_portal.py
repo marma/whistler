@@ -66,7 +66,7 @@ def test_picker_defaults_to_a_new_home_for_this_instance(template, path):
     # The default reproduces the pre-named-volumes behaviour exactly, so it
     # has to be the selected option rather than merely available.
     html = _render(template, path=path, current_user="alice", is_admin=False,
-                   tpls=[], volumes=[], allowed_volumes=[], gpu_types=[],
+                   tpls=[], gpu_types=[],
                    allowed_gpu_types=[], overrides={}, zones=["default"],
                    home_volumes=[{"name": "research", "size": "50Gi"}],
                    current_home_volume=None,
@@ -79,8 +79,8 @@ def test_picker_defaults_to_a_new_home_for_this_instance(template, path):
 
 def test_picker_preselects_the_instances_current_volume():
     html = _render("user/edit_instance.html", path="/instances/x/edit",
-                   current_user="alice", is_admin=False, tpls=[], volumes=[],
-                   allowed_volumes=[], gpu_types=[], allowed_gpu_types=[],
+                   current_user="alice", is_admin=False, tpls=[],
+                   gpu_types=[], allowed_gpu_types=[],
                    overrides={}, zones=["default"],
                    home_volumes=[{"name": "research", "size": "50Gi"}],
                    current_home_volume="research",

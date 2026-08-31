@@ -8,53 +8,21 @@
     overrides       the user's *grants* (get_user_overrides) — a field only
                     exists here if its group is granted, so the form offers
                     exactly what _apply_overrides would accept.
-    volumes,
-    allowed_volumes the volume catalog and the subset this user holds
     gpu_types,
     zones           already filtered to what the user is granted by the route
     cur             the instance's current spec slice (get_instance_config), or
                     absent on the create form — its overrides are the defaults
                     every field is prefilled with.
 #}
+{# There is no volume picker here. A session used to be able to name entries
+   from the legacy volumes.yaml catalog and choose their mount paths, gated by
+   an allowedVolumes list; both are gone (2026-08-29). What a session reaches
+   is its home volume — chosen on the create/edit form, not per run — and the
+   datasets granted in the zone it runs in, which is an administrator's cell in
+   the access matrix and never a field on this form. #}
 {% set ov = (cur or {}).get('overrides') or {} %}
 {% set ov_res = ov.get('resources') or {} %}
 {% set ov_sec = ov.get('securityContext') or {} %}
-{% set ov_vols = ov.get('volumes') or {} %}
-
-{% set user_volumes = [] %}
-{% if overrides.volumes %}
-  {% for vol in volumes %}
-    {% if vol.name in allowed_volumes %}{% set _ = user_volumes.append(vol) %}{% endif %}
-  {% endfor %}
-{% endif %}
-
-{% if user_volumes %}
-<div class="field">
-  <label>Volumes to mount</label>
-  {% for vol in user_volumes %}
-  <div class="ui segment" style="padding:.75rem;margin-bottom:.5rem">
-    <div class="two fields">
-      <div class="field">
-        <div class="ui checkbox">
-          <input type="checkbox" name="volume_names" value="{{ vol.name }}" id="vol-{{ vol.name }}"
-                 {% if vol.name in ov_vols %}checked{% endif %}>
-          <label for="vol-{{ vol.name }}">
-            <strong>{{ vol.name }}</strong>
-            {% if vol.persistentVolumeClaim %}
-              <span class="ui grey mini label">{{ vol.persistentVolumeClaim.claimName }}</span>
-            {% endif %}
-          </label>
-        </div>
-      </div>
-      <div class="field">
-        <input type="text" name="mount_path__{{ vol.name }}" placeholder="/mnt/{{ vol.name }}"
-               value="{{ ov_vols.get(vol.name, '') }}">
-      </div>
-    </div>
-  </div>
-  {% endfor %}
-</div>
-{% endif %}
 
 {% if overrides.resources %}
 <div class="field">
@@ -76,22 +44,55 @@
 {% if overrides.gpuType %}
 <div class="field">
   <label>GPU type override</label>
-  <select name="override_gpu_type" class="ui dropdown">
+  {# Three answers. Empty is "don't override" — the template's own GPU, which
+     is what the plain play button does. GPU_NONE is the opposite of a type:
+     run this without a GPU at all, which is the one thing the count box could
+     say before and only if you also held the gpuCount grant. #}
+  <select name="override_gpu_type" class="ui dropdown" id="override-gpu-type">
     <option value="">— keep template's value —</option>
+    <option value="{{ GPU_NONE }}" {% if ov.get('gpuType') == GPU_NONE %}selected{% endif %}>No GPU</option>
     {% for gt in gpu_types %}
     <option value="{{ gt }}" {% if ov.get('gpuType') == gt %}selected{% endif %}>{{ gt }}</option>
     {% endfor %}
   </select>
-  <div class="ui pointing label">Only the GPU types you have been granted are listed. If the list is empty, ask an admin to grant you one.</div>
+  <div class="ui pointing label">
+    Only the GPU types you have been granted are listed. If the list is empty,
+    ask an admin to grant you one — <strong>No GPU</strong> needs no grant, since
+    giving a card back is not a thing to be allowed.
+  </div>
 </div>
 {% endif %}
 
 {% if overrides.gpuCount %}
-<div class="field">
+<div class="field" id="override-gpu-count-field">
   <label>GPU count override</label>
   <input name="override_gpu_count" type="number" min="0" placeholder="e.g. 1"
          value="{{ ov.gpuCount if ov.get('gpuCount') is not none else '' }}">
+  <div class="ui pointing label">A count of 0 is the same as picking <strong>No GPU</strong> above.</div>
 </div>
+{% endif %}
+
+{% if overrides.gpuType and overrides.gpuCount %}
+<script>
+  // "No GPU" already answers "how many", so the count box stops being a
+  // question. Greyed rather than hidden: a field that vanishes reads as a bug,
+  // and the value is still there when the user picks a type again. The server
+  // ignores the count on this path regardless — this is the explanation, not
+  // the enforcement.
+  (function () {
+    var sel = document.getElementById("override-gpu-type");
+    var field = document.getElementById("override-gpu-count-field");
+    if (!sel || !field) return;
+    var input = field.querySelector("input");
+    function sync() {
+      var none = sel.value === {{ GPU_NONE | tojson }};
+      field.classList.toggle("disabled", none);
+      input.disabled = none;
+    }
+    sel.addEventListener("change", sync);
+    sync();
+  })();
+</script>
 {% endif %}
 
 {% if overrides.zone %}

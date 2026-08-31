@@ -1,14 +1,15 @@
 """Group form parsing (whistler.portal.management).
 
-The admin group editor speaks flat text (a members textarea, one select and
-one access field per catalog volume); these helpers translate to and from the
-Group CR's spec. Two encodings carry meaning and are easy to get wrong:
+The admin group editor speaks flat text (a members textarea, checkbox lists,
+and the access grid's `access__<zone>__<volume>` hidden inputs); these helpers
+translate to and from the Group CR's spec. The encoding that carries meaning
+and is easy to get wrong: an **omitted** `channels` key means "this group
+narrows nothing", while an empty list means "nothing but the desktop stream" —
+the toggle is what keeps both writable.
 
-  * an **omitted** `channels` key means "this group narrows nothing", while an
-    empty list means "nothing but the desktop stream" — the toggle is what
-    keeps both writable;
-  * `mode: none` with a per-member `access` map is how a volume reaches one
-    named person and no other member.
+The editor had a second volume panel until 2026-08-29 — a `volumes` allow-list
+with per-member rw/ro exceptions, which was the one actually enforced while the
+access grid beside it was only recorded. The grid is now the only one.
 """
 from types import SimpleNamespace
 
@@ -16,14 +17,11 @@ import pytest
 from fastapi import HTTPException
 
 from whistler.config import (CHANNELS, ConfigWriteError, ENFORCED_CHANNELS,
-                             OVERRIDE_GROUPS)
+                             ENTRY_POINTS, OVERRIDE_GROUPS)
 from whistler.portal import management as mgmt
 from whistler.portal.management import (
     _build_group_data,
-    _format_volume_access,
     _parse_members,
-    _parse_volume_access,
-    _volume_grants_by_name,
 )
 
 
@@ -39,29 +37,13 @@ def test_members_parse_from_lines_or_commas_without_duplicates():
     assert _parse_members("alice\n bob ,carol\n\nalice") == ["alice", "bob", "carol"]
 
 
-def test_volume_access_round_trips():
-    text = "alice:rw, carol:ro"
-    assert _parse_volume_access(text) == {"alice": "rw", "carol": "ro"}
-    assert _format_volume_access(_parse_volume_access(text)) == text
-
-
-@pytest.mark.parametrize("bad", ["alice", "alice:write", ":ro", "alice:rw:ro"])
-def test_bad_volume_access_is_a_400_not_a_silent_drop(bad):
-    # A typo'd mode that fell through as "rw" would hand out write access
-    # nobody asked for.
-    with pytest.raises(HTTPException) as exc:
-        _parse_volume_access(bad)
-    assert exc.value.status_code == 400
-
-
 def test_build_group_data_assembles_the_cr_spec_shape():
     data = _build_group_data("lab-staff", _Form({
         "description": " Imaging project ",
         "members": "alice\nbob",
-        "vol_mode_project": "rw",
-        "vol_access_project": "carol:ro",
-        "vol_mode_scratch": "none",
-        "vol_access_scratch": "",
+        "access__restricted__project": "allowed",
+        "access__restricted__corpus": "read-only",
+        "access__default__project": "",
         "zone_names": ["restricted"],
         "gpu_types": ["A100"],
         "restrict_channels": "on",
@@ -72,7 +54,8 @@ def test_build_group_data_assembles_the_cr_spec_shape():
         "name": "lab-staff",
         "description": "Imaging project",
         "members": ["alice", "bob"],
-        "volumes": [{"name": "project", "mode": "rw", "access": {"carol": "ro"}}],
+        "volumeAccess": {"restricted": {"project": "allowed",
+                                        "corpus": "read-only"}},
         "allowedZones": ["restricted"],
         "allowedGpuTypes": ["A100"],
         "channels": ["ssh", "terminal"],
@@ -80,17 +63,16 @@ def test_build_group_data_assembles_the_cr_spec_shape():
     }
 
 
-def test_an_ungranted_volume_is_left_out_entirely():
-    data = _build_group_data("g", _Form({"vol_mode_scratch": "none",
-                                         "vol_access_scratch": ""}))
-    assert "volumes" not in data
+def test_a_grid_with_every_cell_blank_writes_no_matrix_at_all():
+    # Absent means the group grants nothing here, which is not the same
+    # statement as an empty object and reads better in `kubectl get grp -o yaml`.
+    data = _build_group_data("g", _Form({"access__restricted__project": ""}))
+    assert "volumeAccess" not in data
 
 
-def test_mode_none_with_an_exception_grants_only_that_person():
-    data = _build_group_data("g", _Form({"vol_mode_secret": "none",
-                                         "vol_access_secret": "carol:ro"}))
-    assert data["volumes"] == [
-        {"name": "secret", "mode": "none", "access": {"carol": "ro"}}]
+def test_an_unrecognised_cell_mode_is_dropped_rather_than_granted():
+    data = _build_group_data("g", _Form({"access__restricted__project": "rw"}))
+    assert "volumeAccess" not in data
 
 
 def test_channels_are_omitted_unless_the_restrict_box_is_ticked():
@@ -109,12 +91,6 @@ def test_channels_keep_the_canonical_order_and_drop_unknowns():
         "channels": ["screenshots", "telepathy", "ssh"],
     }))
     assert data["channels"] == ["ssh", "screenshots"]
-
-
-def test_volume_grants_by_name_carries_the_editable_access_text():
-    grants = _volume_grants_by_name({"volumes": [
-        {"name": "project", "mode": "ro", "access": {"alice": "rw"}}]})
-    assert grants["project"]["accessText"] == "alice:rw"
 
 
 # --------------------------------------------------------------------------- #
@@ -218,11 +194,16 @@ async def test_user_channel_toggle_clears_and_sets_the_grant(make_config):
 # --------------------------------------------------------------------------- #
 
 _GROUP = {"name": "lab", "description": "Imaging", "members": ["alice"],
-          "volumes": [{"name": "project", "mode": "ro", "access": {"carol": "rw"}}],
+          "volumeAccess": {"restricted": {"project": "read-only"}},
           "allowedZones": ["restricted"], "channels": ["ssh"],
           "overrides": {"zone": True}}
-_VOLUMES = [{"name": "project", "persistentVolumeClaim": {"claimName": "p"}},
-            {"name": "scratch", "persistentVolumeClaim": {"claimName": "s"}}]
+_SECTIONS = [{"kind": "dataset", "title": "Datasets", "enforced": True,
+              "note": "Enforced.",
+              "rows": [{"key": "project", "label": "project",
+                        "description": None,
+                        "own": {"default": None, "restricted": "read-only"},
+                        "effective": {"default": None,
+                                      "restricted": "read-only"}}]}]
 
 
 def _render(name, **context):
@@ -239,11 +220,12 @@ def test_groups_list_renders(groups):
 @pytest.mark.parametrize("group", [_GROUP, None])
 def test_group_form_renders_for_new_and_existing(group):
     html = _render("admin/group_form.html", current_user="alice", is_admin=True,
-                   group=group, volumes=_VOLUMES, zones=["default", "restricted"],
+                   group=group, zones=["default", "restricted"],
                    gpu_types=["A100"], all_users=[{"name": "alice"}],
+                   entry_points=ENTRY_POINTS,
                    channels=CHANNELS, enforced_channels=ENFORCED_CHANNELS,
                    override_groups=OVERRIDE_GROUPS,
-                   volume_grants=_volume_grants_by_name(group))
+                   access_sections=_SECTIONS)
     # The clipboard channel must be visibly marked as not enforced wherever it
     # is offered — an admin ticking it deserves to know it is a declaration.
     assert "not enforced" in html
@@ -253,16 +235,22 @@ def test_user_detail_shows_group_provenance():
     html = _render(
         "admin/user_detail.html", current_user="alice", is_admin=True,
         user_obj={"name": "alice", "publicKeys": [], "admin": True},
-        instances=[], volumes=_VOLUMES, allowed_volumes=["project"],
+        instances=[],
         gpu_types=["A100"], allowed_gpu_types=["A100"],
         user_overrides={"zone": True}, override_groups=OVERRIDE_GROUPS,
         zones=["default", "restricted"], allowed_zones=["restricted"],
-        user_groups=[_GROUP], volume_modes={"project": "ro"},
+        user_groups=[_GROUP],
         channels=CHANNELS, enforced_channels=ENFORCED_CHANNELS,
         own_channels=None, channel_grant=["ssh"],
-        own_volumes=[], own_zones=[], own_gpu_types=[], own_overrides={})
-    # Every grant on this page comes from the group, so each one says so —
-    # and none of the checkboxes is ticked, because the user holds nothing in
-    # their own right.
+        entry_points=ENTRY_POINTS, own_entry_points=[],
+        allowed_entry_points=["portal"],
+        access_sections=[{**_SECTIONS[0],
+                          "rows": [{**_SECTIONS[0]["rows"][0], "own": {
+                              "default": None, "restricted": None}}]}],
+        own_zones=[], own_gpu_types=[], own_overrides={})
+    # Every checkbox grant on this page comes from the group, so each one says
+    # so, and none of the boxes is ticked — the user holds nothing in their own
+    # right. The access grid says it with an icon instead, which is the one
+    # marker the user page renders and the group page does not.
     assert html.count("from group") == 4
-    assert "checked" not in html.split("Dataset Access")[1].split("Groups")[0]
+    assert "Granted by a group" in html

@@ -41,7 +41,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from whistler.config import (ACCESS_MODES, CHANNELS, ConfigWriteError,
-                             ENFORCED_ACCESS_KINDS, ENFORCED_CHANNELS,
+                             ENFORCED_CHANNELS, GPU_NONE,
                              ENTRY_KIOSK, ENTRY_POINTS, ENTRY_PORTAL,
                              GPU_NODE_LABEL, NEW_USER_ENTRY_POINTS,
                              NEW_USER_ZONES, OVERRIDE_GROUPS)
@@ -62,6 +62,10 @@ templates = Jinja2Templates(directory=_TEMPLATE_DIR)
 templates.env.globals["status_label"] = status_group
 templates.env.globals["status_color"] = lambda s, ready=True: GROUP_COLORS[status_group(s, ready)]
 templates.env.globals["GPU_NODE_LABEL"] = GPU_NODE_LABEL
+# The "No GPU" sentinel every GPU-type picker offers. A global rather than a
+# per-route context value because three templates need it and a picker that
+# omitted it would silently lose the option.
+templates.env.globals["GPU_NONE"] = GPU_NONE
 
 _ADMIN_USERS: set[str] = set(
     u.strip() for u in os.environ.get("WHISTLER_ADMIN_USERS", "").split(",") if u.strip()
@@ -439,10 +443,8 @@ async def _override_form_context(request: Request, cm, user: str) -> dict:
     none rather than being shown the whole catalog and refused at reconcile.
     Every allow is explicit (2026-08-25), which is why there is no "empty means
     any" branch here."""
-    (volumes, allowed_volumes, gpu_types, allowed_gpu_types,
+    (gpu_types, allowed_gpu_types,
      overrides, zones, allowed_zones) = await asyncio.gather(
-        request.app.state.run(cm.get_volumes),
-        request.app.state.run(cm.get_user_allowed_volumes, user),
         request.app.state.run(cm.get_gpu_types),
         request.app.state.run(cm.get_user_allowed_gpu_types, user),
         request.app.state.run(cm.get_user_overrides, user),
@@ -450,8 +452,6 @@ async def _override_form_context(request: Request, cm, user: str) -> dict:
         request.app.state.run(cm.get_user_allowed_zones, user),
     )
     return {
-        "volumes": volumes,
-        "allowed_volumes": allowed_volumes,
         "gpu_types": [g for g in gpu_types if g in allowed_gpu_types],
         "allowed_gpu_types": allowed_gpu_types,
         "overrides": overrides,
@@ -530,7 +530,6 @@ async def instance_create(
     instance_name: Annotated[str, Form()],
     preemptible:   Annotated[Optional[str], Form()] = None,
     home_volume:   Annotated[Optional[str], Form()] = None,
-    volume_names:  Annotated[Optional[list[str]], Form()] = None,
     override_cpu:          Annotated[Optional[str], Form()] = None,
     override_memory:       Annotated[Optional[str], Form()] = None,
     override_gpu_type:     Annotated[Optional[str], Form()] = None,
@@ -550,9 +549,7 @@ async def instance_create(
                 if t.get("fullName") == template_name or t.get("name") == template_name), None)
     mode = (tpl or {}).get("mode", "ssh")
 
-    volumes_override = await _volume_mounts_from_form(request, volume_names)
     overrides = _build_session_overrides(
-        volumes=volumes_override,
         cpu=override_cpu, memory=override_memory,
         gpu_type=override_gpu_type, gpu_count=override_gpu_count,
         uid=override_uid, gid=override_gid,
@@ -614,7 +611,6 @@ async def instance_update(
     request: Request, cm: CM, user: User, name: str,
     preemptible:   Annotated[Optional[str], Form()] = None,
     home_volume:   Annotated[Optional[str], Form()] = None,
-    volume_names:  Annotated[Optional[list[str]], Form()] = None,
     override_cpu:          Annotated[Optional[str], Form()] = None,
     override_memory:       Annotated[Optional[str], Form()] = None,
     override_gpu_type:     Annotated[Optional[str], Form()] = None,
@@ -626,9 +622,7 @@ async def instance_update(
     override_fs_group:     Annotated[Optional[str], Form()] = None,
     override_zone:         Annotated[Optional[str], Form()] = None,
 ):
-    volumes_override = await _volume_mounts_from_form(request, volume_names)
     overrides = _build_session_overrides(
-        volumes=volumes_override,
         cpu=override_cpu, memory=override_memory,
         gpu_type=override_gpu_type, gpu_count=override_gpu_count,
         uid=override_uid, gid=override_gid,
@@ -769,7 +763,6 @@ def _start_destination(then: Optional[str]) -> Optional[str]:
 async def instance_connect(
     request: Request, cm: CM, user: User, name: str, is_admin: IsAdmin,
     apply_overrides: Annotated[Optional[str], Form()] = None,
-    volume_names:  Annotated[Optional[list[str]], Form()] = None,
     override_cpu:          Annotated[Optional[str], Form()] = None,
     override_memory:       Annotated[Optional[str], Form()] = None,
     override_gpu_type:     Annotated[Optional[str], Form()] = None,
@@ -799,7 +792,6 @@ async def instance_connect(
     run_overrides = None
     if apply_overrides == "1":
         run_overrides = _build_session_overrides(
-            volumes=await _volume_mounts_from_form(request, volume_names),
             cpu=override_cpu, memory=override_memory,
             gpu_type=override_gpu_type, gpu_count=override_gpu_count,
             uid=override_uid, gid=override_gid,
@@ -1186,15 +1178,12 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
     if not user_obj:
         raise HTTPException(status_code=404, detail="User not found.")
     instances = await request.app.state.run(cm.get_user_instances, username)
-    volumes   = await _grantable_volumes(request, cm)
-    allowed   = await request.app.state.run(cm.get_user_allowed_volumes, username)
     gpu_types = await request.app.state.run(cm.get_gpu_types)
     allowed_gpu_types = await request.app.state.run(cm.get_user_allowed_gpu_types, username)
     user_overrides = await request.app.state.run(cm.get_user_overrides, username)
     zones = await request.app.state.run(cm.get_zones)
     allowed_zones = await request.app.state.run(cm.get_user_allowed_zones, username)
     user_groups = await request.app.state.run(cm.get_user_groups, username)
-    volume_modes = await request.app.state.run(cm.get_user_volume_modes, username)
     own_access = (user_obj.get("volumeAccess") or {})
     effective_access = await request.app.state.run(
         cm.get_user_volume_access, username)
@@ -1205,11 +1194,10 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
     return templates.TemplateResponse(
         request=request, name="admin/user_detail.html",
         context=_ctx(admin, is_admin=True, user_obj=user_obj, instances=instances,
-                     volumes=volumes, allowed_volumes=allowed,
                      gpu_types=gpu_types, allowed_gpu_types=allowed_gpu_types,
                      user_overrides=user_overrides, override_groups=OVERRIDE_GROUPS,
                      zones=zones, allowed_zones=allowed_zones,
-                     user_groups=user_groups, volume_modes=volume_modes,
+                     user_groups=user_groups,
                      channels=CHANNELS, enforced_channels=ENFORCED_CHANNELS,
                      own_channels=user_obj.get("channels"),
                      entry_points=ENTRY_POINTS,
@@ -1218,7 +1206,6 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
                          cm.get_user_entry_points, username),
                      channel_grant=sorted(channel_grant) if channel_grant is not None else None,
                      access_sections=access_sections,
-                     own_volumes=user_obj.get("allowedVolumes") or [],
                      own_zones=user_obj.get("allowedZones") or [],
                      own_gpu_types=user_obj.get("allowedGpuTypes") or [],
                      own_overrides=user_obj.get("overrides") or {}),
@@ -1245,14 +1232,6 @@ async def admin_user_update(
 async def admin_user_delete(request: Request, cm: CM, admin: Admin, username: str):
     await request.app.state.run(cm.delete_user, username)
     return _tr("/admin/users", admin)
-
-
-async def admin_user_set_volumes(
-    request: Request, cm: CM, admin: Admin, username: str,
-    volume_names: Annotated[Optional[list[str]], Form()] = None,
-):
-    await request.app.state.run(cm.set_user_allowed_volumes, username, volume_names or [])
-    return _tr(f"/admin/users/{username}", admin)
 
 
 async def admin_user_set_gpu_types(
@@ -1333,54 +1312,29 @@ async def admin_groups(request: Request, cm: CM, admin: Admin):
     )
 
 
-async def _grantable_volumes(request, cm):
-    """The datasets a grant may name.
-
-    This is the OLD grant path and it is still the one that enforces dataset
-    access — `session_shared_datasets` reads allowedVolumes and the group
-    volume modes, not the access matrix. It stays until fencing moves, and the
-    matrix rows for datasets are labelled "not enforced yet" so the two are
-    not mistaken for each other.
-
-    PVC volumes are deliberately absent: the primitive remains in the code,
-    but it is not something to hand out from the UI.
-    """
-    dataset_defs = await request.app.state.run(cm.get_dataset_definitions)
-    dataset_defs = dataset_defs or {}
-    # PVC volumes are no longer offered in the UI (the primitive stays in the
-    # code). What remains here is datasets, and this list is still what
-    # ENFORCES dataset access until fencing moves to the access matrix.
-    rows = []
-    for name, spec in sorted(dataset_defs.items()):
-        spec = spec or {}
-        rows.append({"name": name, "isDataset": True,
-                     "description": spec.get("description"),
-                     "readOnly": bool(spec.get("readOnly"))})
-    return rows
-
-
 async def _group_form_context(request, admin, group=None):
     """Everything the group editor needs to render: the catalogs it grants
-    from, plus the group itself when editing."""
+    from, plus the group itself when editing.
+
+    There is no separate volume catalog any more. A group used to carry both a
+    `volumes` allow-list (with per-member rw/ro) and a `volumeAccess` matrix,
+    and only the first was enforced; the matrix is now the only one, so the
+    editor has one table where it had two panels."""
     cm = request.app.state.cm
-    volumes, (zones, gpu_types, all_users) = await asyncio.gather(
-        _grantable_volumes(request, cm),
-        asyncio.gather(
-            request.app.state.run(cm.get_zones),
-            request.app.state.run(cm.get_gpu_types),
-            request.app.state.run(cm.list_all_users),
-        ),
+    zones, gpu_types, all_users = await asyncio.gather(
+        request.app.state.run(cm.get_zones),
+        request.app.state.run(cm.get_gpu_types),
+        request.app.state.run(cm.list_all_users),
     )
     own_access = ((group or {}).get("volumeAccess") or {})
     access_sections = _sections_with_values(
         await _matrix_sections(request, cm), zones, own_access, own_access)
-    return _ctx(admin, is_admin=True, group=group, volumes=volumes, zones=zones,
+    return _ctx(admin, is_admin=True, group=group, zones=zones,
                 gpu_types=gpu_types, all_users=all_users,
                 entry_points=ENTRY_POINTS,
                 channels=CHANNELS, enforced_channels=ENFORCED_CHANNELS,
                 override_groups=OVERRIDE_GROUPS,
-                access_sections=access_sections,
-                volume_grants=_volume_grants_by_name(group))
+                access_sections=access_sections)
 
 
 async def admin_group_new(request: Request, cm: CM, admin: Admin):
@@ -1591,8 +1545,9 @@ async def _matrix_sections(request: Request, cm, username: str = None):
     A group grid has no home volumes on purpose: a home's name only resolves
     in its owner's own namespace, so a group granting one could never be
     honoured by any member. Groups grant shared data, which is what datasets
-    are. PVC volumes are no longer offered anywhere — the primitive stays in
-    the code, but it is not something to hand out from this screen.
+    are. PVC volumes are not offered anywhere — the primitive stays in the
+    code for templates to use, but it is not something to hand out from this
+    screen, and nothing here gates it.
     """
     datasets = await request.app.state.run(cm.get_dataset_definitions)
     sections = []
@@ -1606,9 +1561,10 @@ async def _matrix_sections(request: Request, cm, username: str = None):
                       "description": v.get("description")} for v in homes],
         })
     sections.append({
-        "kind": "dataset", "title": "Datasets", "enforced": False,
-        "note": "Recorded, not yet enforced — dataset access is still decided "
-                "by the grants below until fencing moves to this table.",
+        "kind": "dataset", "title": "Datasets", "enforced": True,
+        "note": "Enforced twice over: the mount is only written for a cell "
+                "that exists, and the dataset proxy's NetworkPolicy admits "
+                "only this user's pods carrying this zone's label.",
         "rows": [{"key": n, "label": n,
                   "description": (spec or {}).get("description")}
                  for n, spec in sorted((datasets or {}).items())],
@@ -1913,23 +1869,7 @@ def _nonempty(d: dict) -> dict:
     return {k: v.strip() for k, v in d.items() if v and v.strip()}
 
 
-async def _volume_mounts_from_form(request: Request, volume_names) -> Optional[dict]:
-    """Volume mount paths, read out of the raw form.
-
-    They are keyed per-volume (``mount_path__<name>``) rather than posted as a
-    parallel list, because ``volume_names`` only carries the *checked* boxes — a
-    positional zip would misalign the moment a box in the middle is left
-    unchecked. Shared by create, update and the start dialog."""
-    if not volume_names:
-        return None
-    form = await request.form()
-    return {
-        v: (form.get(f"mount_path__{v}") or f"/mnt/{v}").strip()
-        for v in volume_names
-    }
-
-
-def _build_session_overrides(*, volumes=None, cpu=None, memory=None,
+def _build_session_overrides(*, cpu=None, memory=None,
                              gpu_type=None, gpu_count=None,
                              uid=None, gid=None,
                              run_as_user=None, run_as_group=None,
@@ -1946,10 +1886,16 @@ def _build_session_overrides(*, volumes=None, cpu=None, memory=None,
     if resources:
         overrides["resources"] = resources
 
-    if gpu_type and gpu_type.strip():
-        overrides["gpuType"] = gpu_type.strip()
+    gpu_type = (gpu_type or "").strip()
+    if gpu_type:
+        overrides["gpuType"] = gpu_type
 
-    if gpu_count not in (None, ""):
+    # "No GPU" answers the count question too, so the count field is ignored
+    # rather than fought with — the form disables it, but a submission that
+    # slipped past that must not end up asking for a card and forbidding one
+    # in the same breath. _apply_overrides would resolve it the same way; it
+    # is cheaper not to write the contradiction down.
+    if gpu_count not in (None, "") and gpu_type != GPU_NONE:
         overrides["gpuCount"] = int(gpu_count)
 
     if uid not in (None, ""):
@@ -1967,9 +1913,6 @@ def _build_session_overrides(*, volumes=None, cpu=None, memory=None,
     if security_context:
         overrides["securityContext"] = security_context
 
-    if volumes:
-        overrides["volumes"] = volumes
-
     if zone and zone.strip():
         overrides["zone"] = zone.strip()
 
@@ -1986,14 +1929,30 @@ def _template_form_data(*, name, display_name, image, description, cpu, memory,
     resources.gpu; gpu_type (from the live GPU catalog) maps to
     nodeSelector[GPU_NODE_LABEL], the key _apply_policy checks against a
     user's allowedGpuTypes. zone names a network zone; empty means the
-    implicit default, which is "default" and gated like any other zone."""
+    implicit default, which is "default" and gated like any other zone.
+
+    Every GPU answer names something. ``gpu_type`` is either GPU_NONE — **No
+    GPU**: no node selector and no resources.gpu, whatever the count box said —
+    or a type from the live catalog. There is no "any available type": it read
+    as a choice but was the absence of one, working by luck on a single-GPU
+    cluster and meaning nothing on a mixed one.
+
+    So an absent or empty ``gpu_type`` is No GPU too. The form cannot submit
+    one (the select is `required`, and the only blank option is the disabled
+    placeholder shown for a legacy template that names no type), and treating
+    it as "no GPU" rather than "some GPU, unspecified" is the reading that
+    keeps every saved template answerable. A count of 0 is No GPU said the long
+    way round, normalised here so the two spellings cannot produce different
+    specs."""
+    no_gpu = (gpu_type or "").strip() in ("", GPU_NONE) or str(gpu or "").strip() == "0"
     data = {
         "name": name,
         "displayName": display_name.strip(),
         "image": image.strip(),
         "description": (description or "").strip(),
-        "resources": _nonempty({"cpu": cpu, "memory": memory, "gpu": gpu}),
-        "nodeSelector": _nonempty({GPU_NODE_LABEL: gpu_type}),
+        "resources": _nonempty({"cpu": cpu, "memory": memory,
+                                "gpu": "" if no_gpu else gpu}),
+        "nodeSelector": _nonempty({GPU_NODE_LABEL: "" if no_gpu else gpu_type}),
         "personalMountPath": personal_mount or "/userdata",
         "mode": mode if mode in ("ssh", "desktop") else "ssh",
         "runtime": runtime if runtime in ("container", "kata", "vm") else "container",
@@ -2031,16 +1990,6 @@ def _build_user_data(name, public_keys, run_as_user, run_as_group, fs_group,
     return data
 
 
-def _volume_grants_by_name(group) -> dict:
-    """``{volume: entry}`` from a Group's ``volumes`` list, so the editor can
-    render each catalog volume's current grant without scanning the list per
-    row. ``accessText`` is the per-member map in the form's flat notation."""
-    return {entry["name"]: {**entry,
-                            "accessText": _format_volume_access(entry.get("access"))}
-            for entry in ((group or {}).get("volumes") or [])
-            if isinstance(entry, dict) and entry.get("name")}
-
-
 def _parse_members(text) -> list:
     """One username per line (blank lines and stray commas tolerated). A
     textarea rather than a checkbox list of existing users on purpose: a group
@@ -2054,36 +2003,11 @@ def _parse_members(text) -> list:
     return members
 
 
-def _parse_volume_access(text) -> dict:
-    """``alice:ro, bob:rw`` -> ``{"alice": "ro", "bob": "rw"}`` — the
-    per-member exceptions to a volume's default mode."""
-    access = {}
-    for token in (text or "").replace("\n", ",").split(","):
-        token = token.strip()
-        if not token:
-            continue
-        member, _, mode = token.partition(":")
-        member, mode = member.strip(), mode.strip().lower()
-        if not member or mode not in ("rw", "ro"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid per-member access {token!r} "
-                       f"(expected <user>:rw or <user>:ro)")
-        access[member] = mode
-    return access
-
-
-def _format_volume_access(access) -> str:
-    """Inverse of _parse_volume_access, for re-rendering the edit form."""
-    return ", ".join(f"{member}:{mode}" for member, mode in sorted((access or {}).items()))
-
-
 def _build_group_data(name: str, form) -> dict:
     """Build a Group spec from the editor's form.
 
-    Volume grants are read per catalog volume (``vol_mode_<name>`` /
-    ``vol_access_<name>``) because the set of volumes is dynamic, which is
-    also why this takes the raw form rather than typed parameters.
+    Takes the raw form rather than typed parameters because the access grid's
+    field names are dynamic (``access__<zone>__<volume>``).
 
     ``channels`` is omitted entirely unless the "restrict channels" box is
     ticked: absent means "this group does not narrow the zone ceiling", while
@@ -2094,27 +2018,6 @@ def _build_group_data(name: str, form) -> dict:
         "description": (form.get("description") or "").strip(),
         "members": _parse_members(form.get("members")),
     }
-
-    volumes = []
-    for key in form.keys():
-        if not key.startswith("vol_mode_"):
-            continue
-        vol_name = key[len("vol_mode_"):]
-        mode = (form.get(key) or "").strip().lower()
-        access = _parse_volume_access(form.get(f"vol_access_{vol_name}"))
-        if mode not in ("rw", "ro"):
-            # "none": no default grant for members, but a per-member exception
-            # still stands on its own — one named person gets a look at a
-            # volume the rest of the project cannot see.
-            if access:
-                volumes.append({"name": vol_name, "mode": "none", "access": access})
-            continue
-        entry: dict = {"name": vol_name, "mode": mode}
-        if access:
-            entry["access"] = access
-        volumes.append(entry)
-    if volumes:
-        data["volumes"] = volumes
 
     # The access matrix, read the same way the user grid is. Absent means the
     # group grants nothing there — no defaults, as everywhere in this table.
@@ -2312,7 +2215,6 @@ def build_management_app(config_manager):
     app.add_api_route("/admin/users/{username}",                  admin_user_detail,      methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/users/{username}/update",           admin_user_update,      methods=["POST"])
     app.add_api_route("/admin/users/{username}/delete",           admin_user_delete,      methods=["POST"])
-    app.add_api_route("/admin/users/{username}/volumes",          admin_user_set_volumes, methods=["POST"])
     app.add_api_route("/admin/users/{username}/gpu-types",        admin_user_set_gpu_types, methods=["POST"])
     app.add_api_route("/admin/users/{username}/zones",            admin_user_set_zones, methods=["POST"])
     app.add_api_route("/admin/users/{username}/overrides",        admin_user_set_overrides, methods=["POST"])

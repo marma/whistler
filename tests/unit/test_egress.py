@@ -8,7 +8,7 @@ is only as tight as its port-53 rule.
 """
 import ipaddress
 
-from whistler.config import KubeConfigManager
+from whistler.config import KubeConfigManager, USER_NS_LABEL, ZONE_LABEL
 
 
 def _manager(zones):
@@ -65,10 +65,14 @@ def test_reaching_a_proxy_is_not_reaching_a_dataset():
     cm = _manager({"default": {}})
     denied = cm._build_s3_proxy_network_policy("refdata", "ro", [])
     assert denied["spec"]["ingress"] == []
-    allowed = cm._build_s3_proxy_network_policy("refdata", "ro", ["alice"])
+    allowed = cm._build_s3_proxy_network_policy(
+        "refdata", "ro", [("alice", "restricted")])
     (rule,) = allowed["spec"]["ingress"]
     (src,) = rule["from"]
-    assert src["namespaceSelector"]["matchExpressions"][0]["values"] == ["alice"]
+    # And it is narrower still than "alice": only her sessions in the zone the
+    # grant was made in, since a cell is (zone, dataset, mode).
+    assert src["namespaceSelector"]["matchLabels"] == {USER_NS_LABEL: "alice"}
+    assert src["podSelector"]["matchLabels"] == {ZONE_LABEL: "restricted"}
 
 
 # --- per-zone rules --------------------------------------------------------- #

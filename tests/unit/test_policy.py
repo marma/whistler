@@ -10,8 +10,8 @@ that includes the zone — a template with no `zone` lands in "default", so
 zone grant every test here would otherwise have to repeat."""
 import pytest
 
-from whistler.config import (DEFAULT_ZONE, GPU_NODE_LABEL, KubeConfigManager,
-                             PolicyError)
+from whistler.config import (DEFAULT_ZONE, GPU_NODE_LABEL, GPU_NONE,
+                             KubeConfigManager, PolicyError)
 
 
 def _manager(*, force_kata=False, images=None, users=None, zones=None):
@@ -168,39 +168,37 @@ def test_no_gpu_requested_skips_check_even_with_allow_list():
     assert cm._apply_policy({"image": "x"}, "ssh", "container", "alice") == "container"
 
 
-# --- volumes allow-list --------------------------------------------------- #
-
-def test_volumes_allowed_when_no_username_given():
-    cm = _manager()
-    spec = {"image": "x", "volumes": {"scratch": "/mnt/scratch"}}
-    assert cm._apply_policy(spec, "ssh", "container") == "container"
-
-
-def test_volumes_rejected_when_user_has_no_allow_list():
-    # As for GPU types: no grant is no access, not "no opinion".
-    cm = _manager(users=_user())
-    spec = {"image": "x", "volumes": {"scratch": "/mnt/scratch"}}
-    with pytest.raises(PolicyError) as e:
-        cm._apply_policy(spec, "ssh", "container", "alice")
-    assert "none granted" in str(e.value)
-
-
-def test_volumes_allowed_when_in_users_allow_list():
-    cm = _manager(users=_user(allowedVolumes=["scratch"]))
-    spec = {"image": "x", "volumes": {"scratch": "/mnt/scratch"}}
+def test_turning_a_gpu_off_needs_no_grant_on_the_type():
+    """alice may override gpuType but is granted no type at all. Picking
+    "No GPU" still starts: _apply_overrides removed the nodeSelector key, so
+    by the time this runs there is no type to check — which is the only
+    sensible direction for the check to run, since giving a card back is not
+    a thing that needs allowing."""
+    cm = _manager(users=_user(overrides={"gpuType": True}, allowedGpuTypes=[]))
+    tpl = {"image": "x", "resources": {"gpu": 1},
+           "nodeSelector": {GPU_NODE_LABEL: "A100"}}
+    spec, _ = cm._apply_overrides(tpl, {}, {"gpuType": GPU_NONE}, "alice")
     assert cm._apply_policy(spec, "ssh", "container", "alice") == "container"
+    # The same template untouched is refused, which is what makes the above
+    # a statement about "No GPU" rather than about a check that never fires.
+    with pytest.raises(PolicyError, match="not allowed"):
+        cm._apply_policy(tpl, "ssh", "container", "alice")
 
 
-def test_volumes_rejected_when_not_in_users_allow_list():
-    cm = _manager(users=_user(allowedVolumes=["scratch"]))
-    spec = {"image": "x", "volumes": {"other": "/mnt/other"}}
-    with pytest.raises(PolicyError):
-        cm._apply_policy(spec, "ssh", "container", "alice")
+# --- template volumes are not a per-user allow-list ------------------------ #
 
-
-def test_no_volumes_requested_skips_check_even_with_allow_list():
-    cm = _manager(users=_user(allowedVolumes=["scratch"]))
-    assert cm._apply_policy({"image": "x"}, "ssh", "container", "alice") == "container"
+def test_template_volumes_are_not_checked_against_the_user():
+    """There was an allowedVolumes list here until 2026-08-29, and the reason
+    it existed was the `volumes` session override: a user could name catalog
+    entries and mount paths for themselves, so the request had to be bounded.
+    That override is gone, so the only thing that can put an entry in
+    template_spec['volumes'] is a template — which an admin wrote. What a
+    session reaches beyond the template is its home volume and its datasets,
+    and both are checked against the access matrix per zone, elsewhere."""
+    cm = _manager(users=_user(allowedZones=["default"]))
+    spec = {"image": "x", "volumes": {"anything": "/mnt/anything"}}
+    assert cm._apply_policy(spec, "ssh", "container", "alice") == "container"
+    assert cm._apply_policy(spec, "ssh", "container") == "container"
 
 
 # --- the implicit default zone is a grant like any other ------------------ #

@@ -7,8 +7,10 @@ Three rules are under test here, and they are the whole model
      group's is what they hold, and nothing else — every allow is explicit
      (2026-08-25), so a group is the only thing that can widen a user who has
      been granted nothing of their own. Grants add up; empty is empty.
-  2. **Volume access modes.** A group grants each member `rw` or `ro` per
-     volume, with per-member exceptions; `ro` becomes a read-only mount.
+  2. **Access cells compose, most permissive per cell.** A group's
+     `volumeAccess` matrix merges with the member's own — see
+     test_access_matrix.py for the table itself; what is tested here is that
+     belonging to the group is what brings the cells.
   3. **Channels narrow, never widen.** A zone carries a ceiling, the union of
      the user's and their groups' grants narrows it, and the intersection is
      what the gateway and the portal decide on.
@@ -29,7 +31,6 @@ from whistler.config import (
     PolicyError,
     SSH_POSTURE_NONE,
     SSH_POSTURE_RELAY,
-    group_volume_grants,
     merge_allow_lists,
     merge_channel_grants,
     merge_override_grants,
@@ -148,87 +149,84 @@ def test_override_grant_can_come_from_a_group():
     assert spec["zone"] == "restricted"
 
 
-# --- Volumes: per-member access modes -------------------------------------- #
+# --- Volumes: the access matrix arrives through membership ----------------- #
 
-def test_volume_mode_defaults_to_rw_for_members():
-    grants = group_volume_grants({"members": ["alice"],
-                                  "volumes": [{"name": "data"}]}, "alice")
-    assert grants == {"data": "rw"}
-
-
-def test_per_member_access_overrides_the_default_mode():
-    spec = {"members": ["alice", "carol"],
-            "volumes": [{"name": "data", "mode": "rw", "access": {"carol": "ro"}}]}
-    assert group_volume_grants(spec, "alice") == {"data": "rw"}
-    assert group_volume_grants(spec, "carol") == {"data": "ro"}
-
-
-def test_mode_none_grants_only_to_the_named_exceptions():
-    spec = {"members": ["alice", "carol"],
-            "volumes": [{"name": "secret", "mode": "none", "access": {"carol": "ro"}}]}
-    assert group_volume_grants(spec, "alice") == {}
-    assert group_volume_grants(spec, "carol") == {"secret": "ro"}
+def test_a_groups_cells_reach_its_members():
+    cm = _manager(
+        users={"alice": {"name": "alice"}},
+        groups={"lab": {"members": ["alice"],
+                        "volumeAccess": {"restricted": {"refdata": "allowed"}}}},
+        zones={"default": {}, "restricted": {}},
+    )
+    assert cm.volume_access("alice", "restricted", "refdata") == "allowed"
+    # And only in the zone the cell names: the table is per (zone, volume),
+    # which is the whole reason it is a table and not a list.
+    assert cm.volume_access("alice", "default", "refdata") is None
 
 
-def test_someone_named_in_access_need_not_be_a_member():
-    spec = {"members": ["alice"],
-            "volumes": [{"name": "data", "mode": "rw", "access": {"dan": "ro"}}]}
-    assert group_volume_grants(spec, "dan") == {"data": "ro"}
-
-
-def test_rw_anywhere_beats_ro_elsewhere():
+def test_most_permissive_cell_wins_across_groups():
     cm = _manager(
         users={"alice": {"name": "alice"}},
         groups={
             "lab": {"members": ["alice"],
-                    "volumes": [{"name": "data", "mode": "rw"}]},
+                    "volumeAccess": {"restricted": {"data": "allowed"}}},
             "guests": {"members": ["alice"],
-                       "volumes": [{"name": "data", "mode": "ro"}]},
+                       "volumeAccess": {"restricted": {"data": "read-only"}}},
         },
+        zones={"default": {}, "restricted": {}},
     )
-    assert cm.get_user_volume_modes("alice") == {"data": "rw"}
+    assert cm.volume_access("alice", "restricted", "data") == "allowed"
 
 
-def test_a_users_own_volume_is_never_downgraded_by_a_group():
+def test_a_users_own_cell_is_never_downgraded_by_a_group():
     cm = _manager(
-        users={"alice": {"name": "alice", "allowedVolumes": ["data"]}},
+        users={"alice": {"name": "alice",
+                         "volumeAccess": {"restricted": {"data": "allowed"}}}},
         groups={"guests": {"members": ["alice"],
-                           "volumes": [{"name": "data", "mode": "ro"}]}},
+                           "volumeAccess": {"restricted": {"data": "read-only"}}}},
+        zones={"default": {}, "restricted": {}},
     )
-    assert cm.get_user_volume_modes("alice") == {"data": "rw"}
+    assert cm.volume_access("alice", "restricted", "data") == "allowed"
 
 
-def test_group_volume_appears_in_the_allow_list_and_gates_the_rest():
+def test_membership_is_the_members_list_and_nothing_else():
+    """A group used to also count someone named in a volume grant's per-member
+    `access` map as a member — a second way of belonging, which existed only
+    because that grant carried exceptions. The matrix has no such field, so
+    the only way in is `members`."""
     cm = _manager(
-        users={"alice": {"name": "alice", "allowedZones": ["default"]}},
+        users={"dan": {"name": "dan"}},
         groups={"lab": {"members": ["alice"],
-                        "volumes": [{"name": "project", "mode": "ro"}]}},
+                        "volumeAccess": {"restricted": {"data": "read-only"}},
+                        "allowedZones": ["restricted"]}},
+        zones={"default": {}, "restricted": {}},
     )
-    assert cm.get_user_allowed_volumes("alice") == ["project"]
-    assert cm._apply_policy({"image": "x", "volumes": {"project": "/p"}},
+    assert cm.get_user_groups("dan") == []
+    assert cm.volume_access("dan", "restricted", "data") is None
+    assert cm.get_user_allowed_zones("dan") == []
+
+
+def test_template_volumes_are_no_longer_gated_per_user():
+    """The `volumes` override is gone, so the only thing that can put an entry
+    in template_spec['volumes'] is the template — an admin's decision already.
+    _apply_policy checks the zone, not a per-user volume allow-list."""
+    cm = _manager(users={"alice": {"name": "alice", "allowedZones": ["default"]}})
+    assert cm._apply_policy({"image": "x", "volumes": {"anything": "/a"}},
                             "ssh", "container", "alice") == "container"
-    with pytest.raises(PolicyError, match=r"volumes \['other'\] are not allowed"):
-        cm._apply_policy({"image": "x", "volumes": {"other": "/o"}},
-                         "ssh", "container", "alice")
 
 
-def test_read_only_grant_becomes_a_read_only_mount():
+def test_every_wired_mount_is_read_write():
+    """The `ro` grant that made a mount read-only belonged to the allow-list
+    that is gone. A dataset's read-only is enforced in its proxy instead,
+    where it holds against a root guest — a mount flag never did."""
     cm = _manager()
-    pod_volumes, mounts = cm._build_volume_wiring(
+    _, mounts = cm._build_volume_wiring(
         pvc_name="pvc-alice", personal_mount_path="/userdata",
-        requested_volumes={"project": "/project", "scratch": "/scratch"},
+        requested_volumes={"project": "/project"},
         available_volumes={"project": {"name": "project",
-                                       "persistentVolumeClaim": {"claimName": "p"}},
-                           "scratch": {"name": "scratch",
-                                       "persistentVolumeClaim": {"claimName": "s"}}},
-        volume_modes={"project": "ro"},
+                                       "persistentVolumeClaim": {"claimName": "p"}}},
     )
-    by_name = {m["name"]: m for m in mounts}
-    assert by_name["project"]["readOnly"] is True
-    # Anything not named is read-write, which is what every volume was before
-    # groups existed.
-    assert "readOnly" not in by_name["scratch"]
-    assert "readOnly" not in by_name["data"]
+    assert all("readOnly" not in m for m in mounts)
 
 
 # --- Channels --------------------------------------------------------------- #

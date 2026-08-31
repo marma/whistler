@@ -247,6 +247,20 @@ HOME_VOLUME_PLURAL = "homevolumes"
 # set by hand, unlike the "accelerator" shorthand this used to be.
 GPU_NODE_LABEL = "nvidia.com/gpu.product"
 
+# The value a GPU-type picker submits for "No GPU" — the explicit way to say a
+# template or a run wants none, rather than leaving a count box empty and
+# hoping. It is not a type from the catalog, and it cannot collide with one:
+# catalog names are `nvidia.com/gpu.product` label VALUES, and a label value
+# must start with an alphanumeric, so no cluster can ever produce this string.
+#
+# It resolves to the ABSENCE of resources.gpu, never to `gpu: 0`. Both the pod
+# and the VM path key on presence (`'gpu' in resources`), so a zero count would
+# request `nvidia.com/gpu: 0` from the scheduler and — worse — hand a VM a real
+# `devices.gpus` entry. `requested_gpu_count` below is the one place that
+# decides, and it reads a literal 0 the same way for the CRs that already
+# carry one.
+GPU_NONE = "__none__"
+
 # The pod-mode GPU resource (NVIDIA device plugin). A node in VM-passthrough
 # mode advertises 0 of these and instead exposes a product-specific vfio
 # resource (e.g. "nvidia.com/AD102_GEFORCE_RTX_4090") via the sandbox device
@@ -331,16 +345,22 @@ CLUSTER_DNS_POD_LABELS = {"k8s-app": "kube-dns"}
 
 # Groups of template values a user may be granted permission to override per-
 # session (User CR `overrides`, session spec.overrides). Booleans only —
-# granting a group does not bound the requested value; allowedGpuTypes /
-# allowedVolumes remain the value-level allow-lists for the two groups that
-# have one. See KubeConfigManager._apply_overrides.
+# granting a group does not bound the requested value; allowedGpuTypes and
+# allowedZones remain the value-level allow-lists for the two groups that have
+# one. See KubeConfigManager._apply_overrides.
+#
+# There is no `volumes` group (removed 2026-08-29). It let a session name
+# arbitrary entries from the legacy volumes.yaml catalog and mount them where
+# it liked, gated by an allowedVolumes list no admin screen writes any more.
+# What a session may reach is now the access matrix — a home volume chosen at
+# creation, plus the datasets granted in the zone it runs in — and neither is
+# a free-text mount path.
 OVERRIDE_GROUPS = (
     "resources",        # resources.cpu / resources.memory
     "gpuType",          # nodeSelector[GPU_NODE_LABEL] (still gated by allowedGpuTypes)
     "gpuCount",         # resources.gpu
     "uidGid",           # user_details.uid / .gid (VM guest identity)
     "securityContext",  # user_details.securityContext.{fsGroup,runAsUser,runAsGroup}
-    "volumes",          # template volumes (still gated by allowedVolumes)
     "zone",             # network zone (still gated by allowedZones)
 )
 
@@ -391,8 +411,8 @@ ENTRY_POINTS = (ENTRY_KIOSK, ENTRY_PORTAL, ENTRY_GATEWAY)
 # What a brand-new account is created holding, now that an empty list grants
 # nothing. Deliberately not "everything": these are the two grants that decide
 # whether an account can be used *at all* — a door to come in through, and the
-# zone every unzoned template lands in. allowedVolumes and allowedGpuTypes stay
-# empty, because those are the grants an admin means to make one at a time.
+# zone every unzoned template lands in. The access matrix and allowedGpuTypes
+# stay empty, because those are the grants an admin means to make one at a time.
 NEW_USER_ENTRY_POINTS = list(ENTRY_POINTS)
 NEW_USER_ZONES = [DEFAULT_ZONE]
 
@@ -407,14 +427,13 @@ _POSTURE_CHANNELS = {
 
 #: Ordered most permissive first. Absent (None) is no access at all, which is
 #: why it is not in the list — it is the absence of an entry, not a value.
+#:
+#: The matrix governs every kind of volume a session can reach (2026-08-29):
+#: home volumes at attach, and datasets at both the mount and the S3 proxy's
+#: fencing policy. It used to govern homes alone while datasets were decided
+#: by a parallel allowedVolumes/group-volumes allow-list; two tables answering
+#: one question is how they end up disagreeing, so the allow-list is gone.
 ACCESS_MODES = ("allowed", "read-only")
-#: Which volume kinds the access matrix actually governs today. Everything
-#: else is recorded and displayed but still decided by allowedVolumes and the
-#: group volume grants, exactly the way `clipboard` sits in CHANNELS but not
-#: ENFORCED_CHANNELS. Widening this is a deliberate migration, not a tweak:
-#: the matrix has no defaults, so anything moved into it stops working the
-#: moment a grant is missing.
-ENFORCED_ACCESS_KINDS = ("home",)
 
 
 def merge_volume_access(*sources) -> Dict[str, Dict[str, str]]:
@@ -515,35 +534,17 @@ def target_channels(target: Dict[str, Any]) -> Set[str]:
     return set(_POSTURE_CHANNELS.get(posture, ()))
 
 
-def group_volume_grants(group_spec: Dict[str, Any], username: str) -> Dict[str, str]:
-    """What one group grants ``username`` on each volume: ``{name: "rw"|"ro"}``.
+def requested_gpu_count(resources: Optional[Dict[str, Any]]) -> int:
+    """How many GPUs ``resources`` asks for: 0 when it asks for none.
 
-    A member's mode is the per-member entry in ``access`` when present, else
-    the volume's ``mode`` (default ``rw``, and ``none`` for a volume only the
-    named exceptions reach). Someone named in ``access`` but not in
-    ``members`` still gets that volume — the CRD says so, and it is the
-    natural way to hand one outsider a read-only look at a project — while
-    someone in neither gets nothing from this entry."""
-    members = group_spec.get("members") or []
-    grants = {}
-    for entry in group_spec.get("volumes") or []:
-        if not isinstance(entry, dict):
-            continue
-        name = entry.get("name")
-        if not name:
-            continue
-        access = entry.get("access") or {}
-        if username in access:
-            mode = access[username]
-        elif username in members:
-            mode = entry.get("mode") or "rw"
-        else:
-            continue
-        mode = str(mode).strip().lower()
-        if mode == "none":
-            continue
-        grants[name] = "ro" if mode == "ro" else "rw"
-    return grants
+    Absent, empty, ``0`` and ``"0"`` are all none — which matters because the
+    spec builders used to ask ``'gpu' in resources``, so a template saved with
+    a zero count attached a card to a VM anyway. Anything unparseable is also
+    0: a GPU request nobody can read is one nobody should be given."""
+    try:
+        return max(0, int(str((resources or {}).get("gpu", 0) or 0).strip()))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _dig(obj, path):
@@ -880,22 +881,6 @@ class ConfigManager(ABC):
 
     @abstractmethod
     def delete_group(self, group_name: str) -> bool:
-        pass
-
-    @abstractmethod
-    def get_user_allowed_volumes(self, username: str) -> List[str]:
-        """Volumes this user may mount: their own list unioned with every
-        group's. Empty means **none** — every allow is explicit."""
-        pass
-
-    @abstractmethod
-    def get_user_volume_modes(self, username: str) -> Dict[str, str]:
-        """``{volume: "rw"|"ro"}`` for group-granted volumes; anything absent
-        is read-write."""
-        pass
-
-    @abstractmethod
-    def set_user_allowed_volumes(self, username: str, volume_names: List[str]) -> bool:
         pass
 
     @abstractmethod
@@ -1894,15 +1879,22 @@ class KubeConfigManager(ConfigManager):
             container/kata templates may use any image (the check is skipped).
           - GPU type (template_spec.nodeSelector[GPU_NODE_LABEL], set from the
             gpuTypes catalog by the template editor) must be named in the
-            owning user's allowedGpuTypes, when username is given. An empty
+            owning user's allowedGpuTypes, when username is given. A session
+            that asked for GPU_NONE has no such key by the time this runs —
+            _apply_overrides removed it — so turning a GPU *off* never needs a
+            grant on the type being turned off, which is the only sensible
+            direction for that check to run. An empty
             allow-list allows **nothing** (2026-08-25) — it used to mean "no
             restriction", which made an unconfigured user the least restricted
             one in the cluster.
-          - Requested volumes (template_spec.volumes keys) must be named in
-            the owning user's allowedVolumes the same way. Applies regardless
-            of whether the volume came from the template or a session
-            override (see _apply_overrides) — the merge happens before this
-            runs.
+          - Template volumes (template_spec.volumes) are NOT checked here.
+            They used to be, against a per-user allowedVolumes list, because a
+            session could name its own via the `volumes` override; that
+            override is gone (OVERRIDE_GROUPS) so the only thing that can put
+            an entry there is the template, which is an admin's decision
+            already. What a session reaches beyond that — its home volume and
+            its datasets — is checked against the access matrix, per zone, in
+            ensure_session and session_shared_datasets.
           - A zone must exist in the zone catalog — an unknown zone fails
             closed rather than falling back to default, whose posture may be
             laxer — and must be named in the owning user's allowedZones. An
@@ -1959,16 +1951,6 @@ class KubeConfigManager(ConfigManager):
                     f"(allowedGpuTypes: {allowed_gpu_types or 'none granted'})"
                 )
 
-        requested_volumes = template_spec.get("volumes") or {}
-        if requested_volumes and username:
-            allowed_volumes = self.get_user_allowed_volumes(username)
-            disallowed = [v for v in requested_volumes if v not in allowed_volumes]
-            if disallowed:
-                raise PolicyError(
-                    f"volumes {disallowed} are not allowed for user {username!r} "
-                    f"(allowedVolumes: {allowed_volumes or 'none granted'})"
-                )
-
         # An absent zone is DEFAULT_ZONE, not "no zone": that is where the
         # session actually lands, so that is what has to be granted.
         zone = template_spec.get("zone") or DEFAULT_ZONE
@@ -2004,11 +1986,10 @@ class KubeConfigManager(ConfigManager):
         owning user's User CR `overrides` (see get_user_overrides); an
         ungranted key raises PolicyError rather than being silently dropped —
         a live CR with an override the user isn't (or is no longer) granted
-        is worth surfacing loudly. gpuType/volumes/zone values are further
-        gated by allowedGpuTypes/allowedVolumes/allowedZones, but that happens
-        afterwards in _apply_policy against the merged spec this method
-        returns, so it applies uniformly whether the value came from the
-        template or here.
+        is worth surfacing loudly. gpuType and zone values are further gated by
+        allowedGpuTypes/allowedZones, but that happens afterwards in
+        _apply_policy against the merged spec this method returns, so it
+        applies uniformly whether the value came from the template or here.
 
         Returns (effective_template_spec, effective_user_details); neither
         input dict is mutated."""
@@ -2038,19 +2019,35 @@ class KubeConfigManager(ConfigManager):
                     merged_resources[key] = requested[key]
             effective_spec["resources"] = merged_resources
 
-        if "gpuType" in overrides:
-            _require("gpuType")
-            effective_spec["nodeSelector"] = {
-                **(template_spec.get("nodeSelector") or {}),
-                GPU_NODE_LABEL: overrides["gpuType"],
-            }
-
+        # gpuCount first so the "No GPU" branch below can overrule it: the two
+        # can only disagree in one direction, and "none" is the answer that
+        # cannot be wrong.
         if "gpuCount" in overrides:
             _require("gpuCount")
             merged_resources = dict(effective_spec.get("resources")
                                     or template_spec.get("resources") or {})
             merged_resources["gpu"] = overrides["gpuCount"]
             effective_spec["resources"] = merged_resources
+
+        if "gpuType" in overrides:
+            _require("gpuType")
+            if overrides["gpuType"] == GPU_NONE:
+                # "No GPU": drop BOTH halves of the request. Zero GPUs is the
+                # absence of resources.gpu, not `gpu: 0` (requested_gpu_count),
+                # and the node selector has to go with it or the session is
+                # still pinned to GPU nodes it has no use for.
+                effective_spec["nodeSelector"] = {
+                    k: v for k, v in (template_spec.get("nodeSelector") or {}).items()
+                    if k != GPU_NODE_LABEL}
+                merged_resources = dict(effective_spec.get("resources")
+                                        or template_spec.get("resources") or {})
+                merged_resources.pop("gpu", None)
+                effective_spec["resources"] = merged_resources
+            else:
+                effective_spec["nodeSelector"] = {
+                    **(template_spec.get("nodeSelector") or {}),
+                    GPU_NODE_LABEL: overrides["gpuType"],
+                }
 
         if "uid" in overrides or "gid" in overrides:
             _require("uidGid")
@@ -2065,10 +2062,6 @@ class KubeConfigManager(ConfigManager):
                 **(user_details.get("securityContext") or {}),
                 **(overrides["securityContext"] or {}),
             }
-
-        if "volumes" in overrides:
-            _require("volumes")
-            effective_spec["volumes"] = dict(overrides["volumes"] or {})
 
         if "zone" in overrides:
             _require("zone")
@@ -2674,6 +2667,48 @@ class KubeConfigManager(ConfigManager):
                         f"(granted in zone {zone or 'none'})")
         return {**spec, "user": username}
 
+    def home_volume_refusal(self, username: str, zone: str,
+                            volume: str) -> str:
+        """Why this home cannot be mounted in this zone, and what to do.
+
+        Its own method because the text IS the remedy path: it surfaces only as
+        status.statusMessage on a Failed session, where there is nothing else
+        to go on. "not granted in zone 'default'" alone is a dead end — a home
+        is granted in the zone it was made for, so the usual cause is that the
+        instance has since moved, and naming the zones it IS granted in is the
+        difference between "add this cell" and "why is my machine broken".
+        """
+        held = sorted(z for z, cells in
+                      (self.get_user_volume_access(username) or {}).items()
+                      if (cells or {}).get(volume))
+        where = (f"It is granted in: {', '.join(held)}." if held
+                 else "It is granted in no zone at all.")
+        patch = json.dumps({"spec": {"volumeAccess": {zone: {volume: "allowed"}}}})
+        return (
+            f"Home volume {volume!r} is not granted to {username} in zone "
+            f"{zone!r}. {where} A home is granted in the zone it was made "
+            f"for, and moving one to another zone moves its data there too, "
+            f"so it is an administrator's decision — the portal's Access "
+            f"grid, or: kubectl -n {self.namespace} patch usr {username} "
+            f"--type merge -p '{patch}'")
+
+    def _record_session_home_volume(self, user_ns: str, full_name: str,
+                                    volume_name: str, logger=None) -> None:
+        """Patch spec.homeVolume onto a Session that resolved a default home.
+
+        Never fatal: the session is already using the right disk and the only
+        thing lost is the UI knowing about it, so a failed patch must not stop
+        a guest from booting. Idempotent — the caller only reaches this when
+        the field is empty, and the patch writes the same name every time."""
+        try:
+            self.api.patch_namespaced_custom_object(
+                self.group, self.version, user_ns, SESSION_PLURAL, full_name,
+                {"spec": {"homeVolume": volume_name}})
+        except ApiException as e:
+            (logger or globals()["logger"]).warning(
+                f"Could not record home volume {volume_name!r} on "
+                f"{full_name}: {e}")
+
     def ensure_home_volume_pvc(self, username: str, volume: Dict[str, Any],
                                fallback_size: str = None,
                                logger=None) -> str:
@@ -2744,19 +2779,18 @@ class KubeConfigManager(ConfigManager):
             return {}
 
     def _build_volume_wiring(self, *, pvc_name, personal_mount_path,
-                             requested_volumes, available_volumes,
-                             volume_modes=None):
+                             requested_volumes, available_volumes):
         """Build (pod_volumes, volume_mounts) for the home PVC plus any requested
         named volumes. Pure; the single source shared by every pod backend
         (ssh / desktop, container / kata).
 
-        ``volume_modes`` ({name: "rw"|"ro"}) carries the per-member access a
-        Group granted (KubeConfigManager.get_user_volume_modes); a volume not
-        named there is read-write, which is what every volume was before
-        groups existed. A read-only grant becomes ``readOnly`` on the mount —
-        a real control for a container that cannot remount it, and one the
-        NFS export set will have to take over for VMs, where the guest has
-        root (design/security.md)."""
+        Every mount here is read-write. There used to be a ``volume_modes``
+        argument carrying a Group's per-member ``ro`` grant on these volumes;
+        that grant is gone with the allow-list it belonged to, and the access
+        matrix that replaced it governs home volumes and datasets, not the
+        template's own named volumes. Read-only for a *dataset* is enforced
+        where it holds even against a root guest — in the S3 proxy — rather
+        than as a mount flag (design/security.md)."""
         pod_volumes = [{
             "name": "data",
             "persistentVolumeClaim": {"claimName": pvc_name},
@@ -2784,8 +2818,6 @@ class KubeConfigManager(ConfigManager):
                 mount_def = {"name": vol_name, "mountPath": mount_path}
                 if sub_path:
                     mount_def["subPath"] = sub_path
-                if (volume_modes or {}).get(vol_name) == "ro":
-                    mount_def["readOnly"] = True
                 volume_mounts.append(mount_def)
 
         return pod_volumes, volume_mounts
@@ -2804,7 +2836,7 @@ class KubeConfigManager(ConfigManager):
 
     def _build_pod_spec(self, *, full_name, hostname, username, uid, mode, runtime,
                         template_spec, pvc_name, available_volumes, user_details,
-                        preemptible, display_port=None, volume_modes=None):
+                        preemptible, display_port=None):
         """Build the Pod manifest for a session from already-resolved inputs.
 
         Pure function of its arguments (no Kubernetes API calls) so it is
@@ -2838,7 +2870,6 @@ class KubeConfigManager(ConfigManager):
             personal_mount_path=personal_mount_path,
             requested_volumes=requested_volumes,
             available_volumes=available_volumes,
-            volume_modes=volume_modes,
         )
 
         container = {
@@ -2902,7 +2933,7 @@ class KubeConfigManager(ConfigManager):
 
         if runtime == "kata":
             pod_body["spec"]["runtimeClassName"] = getattr(self, "kata_runtime_class", "kata")
-        elif resources.get('gpu'):
+        elif requested_gpu_count(resources):
             # Kata handles its own device passthrough story, so this only
             # applies to the plain-container path — see gpu_runtime_class.
             gpu_runtime_class = getattr(self, "gpu_runtime_class", "nvidia")
@@ -2935,7 +2966,11 @@ class KubeConfigManager(ConfigManager):
             if 'memory' in resources:
                 requests['memory'] = resources['memory']
                 limits['memory'] = resources['memory']
-            if 'gpu' in resources:
+            # A zero count is no request at all, not `nvidia.com/gpu: 0`
+            # (which the scheduler would honour by giving the pod none while
+            # still binding it to the device plugin's admission path).
+            gpus = requested_gpu_count(resources)
+            if gpus:
                 limits['nvidia.com/gpu'] = resources['gpu']
             if requests:
                 resource_reqs['requests'] = requests
@@ -3007,7 +3042,13 @@ class KubeConfigManager(ConfigManager):
                 "serial": HOME_DISK_SERIAL,
                 "disk": {"bus": "virtio"},
             })
-        if 'gpu' in resources:
+        if requested_gpu_count(resources):
+            # Presence is not enough: a zero count must attach nothing. A
+            # `gpu: 0` here used to produce a real devices.gpus entry, so a
+            # template someone had turned the GPU off in still took a card —
+            # and on a mixed cluster _vm_gpu_device_name would refuse to
+            # resolve one at all, failing the session outright.
+            #
             # deviceName comes from the live GPU catalog: the template's
             # gpuType (nodeSelector) picks the entry, whose vmResource is the
             # KubeVirt-permitted device-plugin name for that card. Per-type,
@@ -3429,12 +3470,29 @@ class KubeConfigManager(ConfigManager):
             # silently forever, and the operator overwrites policyFailed on
             # every successful call, so setting it in the result would be
             # discarded.
+            requested_home = (cr.get('spec') or {}).get('homeVolume')
             home_volume = self.resolve_session_home_volume(
                 username, full_name,
-                requested=(cr.get('spec') or {}).get('homeVolume'),
+                requested=requested_home,
                 default_size=template_spec.get('homeDiskSize'),
                 zone=template_spec.get('zone') or DEFAULT_ZONE,
                 logger=logger)
+
+            # Write the resolved home back onto the CR. An instance that never
+            # chose one gets a volume named after itself, and until this the
+            # only record of that was the HomeVolume CR sitting in the user's
+            # namespace: spec.homeVolume stayed empty, so the edit form's
+            # picker showed "New home for this instance" for an instance that
+            # already had one, and the volumes page could not say which
+            # instance held it. The disk was right; the CR just did not say so.
+            #
+            # Recording it is also what makes it STAY right. The resolution is
+            # "the volume named after this instance", which is stable, but it
+            # is derived — and a derived home is one that a rename or a
+            # default change could quietly move to a different disk.
+            if not requested_home and home_volume.get("name"):
+                self._record_session_home_volume(
+                    user_ns, full_name, home_volume["name"], logger=logger)
 
             # The access matrix decides whether this home may be mounted in
             # THIS zone. Absent is a refusal with nothing below it — the whole
@@ -3444,14 +3502,11 @@ class KubeConfigManager(ConfigManager):
             # fact.
             if wants_start:
                 zone = template_spec.get('zone') or DEFAULT_ZONE
-                access = self.volume_access(
-                    username, zone, home_volume.get("name"))
+                home_name = home_volume.get("name")
+                access = self.volume_access(username, zone, home_name)
                 if access is None:
                     raise PolicyError(
-                        f"Home volume '{home_volume.get('name')}' is not "
-                        f"granted in zone '{zone}'. An administrator grants "
-                        f"this in the user's access matrix; creating a home "
-                        f"volume grants it only in the zone it was made for.")
+                        self.home_volume_refusal(username, zone, home_name))
 
             # One live attach. Checked only when this reconcile would START
             # the guest: a created-but-stopped instance holds nothing, and
@@ -3479,7 +3534,8 @@ class KubeConfigManager(ConfigManager):
                 template_spec, display_port,
                 template_spec.get('instancetype'), preemptible,
                 home_pvc=home_pvc,
-                shared_datasets=self.session_shared_datasets(username),
+                shared_datasets=self.session_shared_datasets(
+                    username, template_spec.get('zone') or DEFAULT_ZONE),
                 start=wants_start,
                 viewer=result.get("viewer"),
                 user_details=user_details,
@@ -3564,10 +3620,6 @@ class KubeConfigManager(ConfigManager):
             user_details=user_details if user_details is not None else self.get_user(username),
             preemptible=preemptible,
             display_port=display_port if mode == 'desktop' else None,
-            # Read-only where a Group granted this member only `ro`; resolved
-            # here (operator-side, at build time) rather than trusted from the
-            # template or the guest.
-            volume_modes=self.get_user_volume_modes(username),
         )
         logger.debug(f"Creating Pod:\n{yaml.safe_dump(pod_body)}")
         core_api = client.CoreV1Api()
@@ -4025,7 +4077,7 @@ class KubeConfigManager(ConfigManager):
             logger.error(f"Failed to delete dataset {name!r}: {e}")
             return False
         self._load_datasets()
-        # After the reload, so s3_proxy_users no longer resolves anyone to it.
+        # After the reload, so s3_proxy_peers no longer resolves anyone to it.
         self._refresh_s3_proxy_policies(name)
         return True
 
@@ -4152,34 +4204,42 @@ class KubeConfigManager(ConfigManager):
         return deployment, service
 
     def _build_s3_proxy_network_policy(self, volume: str, mode: str,
-                                       permitted_users) -> Dict[str, Any]:
+                                       permitted_peers) -> Dict[str, Any]:
         """Fencing (pure): only the session pods of users granted this volume
-        at this mode may reach this proxy, and only on its port.
+        at this mode, **in the zone the grant was made in**, may reach this
+        proxy, and only on its port.
 
         This is the half of the boundary that Whistler can actually enforce.
         The generated key is the other half, and the two compose as AND —
         which is the whole reason the endpoint is cluster-internal: a leaked
         key is inert without the reach, and reach is what zones control.
 
-        An EMPTY permitted-users list yields a policy with no `from`, which
-        NetworkPolicy reads as "deny all ingress". Fail closed: a volume
-        nobody is granted is a volume nobody can reach.
+        ``permitted_peers`` is ``(username, zone)`` pairs (s3_proxy_peers).
+        Each becomes one `from` peer combining a namespaceSelector on the
+        user's namespace with a podSelector on the session's zone label —
+        which NetworkPolicy reads as AND *within* a peer and OR *between*
+        them, exactly the shape the access matrix has. Selecting the namespace
+        alone would hand a user their most permissive zone's access in every
+        zone, which is the one thing the table exists to prevent.
+
+        An EMPTY peer list yields a policy with no `from`, which NetworkPolicy
+        reads as "deny all ingress". Fail closed: a volume nobody is granted
+        is a volume nobody can reach.
         """
         name = self._s3_proxy_name(volume, mode)
         labels = {"app": "whistler-s3-proxy", "volume": volume, "mode": mode}
         ingress: List[Dict[str, Any]] = []
-        users = sorted(permitted_users or [])
-        if users:
+        peers = sorted(set(tuple(p) for p in (permitted_peers or ())))
+        if peers:
             ingress.append({
                 "from": [{
                     # Session pods live in per-user namespaces; select those
-                    # by the user label the namespace carries.
-                    "namespaceSelector": {"matchExpressions": [{
-                        "key": USER_NS_LABEL,
-                        "operator": "In",
-                        "values": users,
-                    }]},
-                }],
+                    # by the user label the namespace carries, and the session
+                    # itself by the zone label ensure_session stamps on it.
+                    "namespaceSelector": {
+                        "matchLabels": {USER_NS_LABEL: username}},
+                    "podSelector": {"matchLabels": {ZONE_LABEL: zone}},
+                } for username, zone in peers],
                 "ports": [{"port": 8080, "protocol": "TCP"}],
             })
         return {
@@ -4233,35 +4293,48 @@ class KubeConfigManager(ConfigManager):
             logger.error(f"Failed to create S3 auth secret {name}: {e}")
             return None
 
-    def s3_proxy_users(self, volume: str, mode: str) -> List[str]:
-        """Users whose grant on ``volume`` resolves to exactly ``mode``.
+    def s3_proxy_peers(self, volume: str, mode: str) -> List[tuple]:
+        """``(username, zone)`` pairs whose access-matrix cell for ``volume``
+        resolves to exactly ``mode``. Sorted, so a policy body is stable.
 
         Drives the proxy's fencing policy, so it has to answer the same
-        question the mount does: get_user_volume_modes carries the group's
-        per-member rw/ro, a volume named nowhere in those grants is
-        read-write (the pre-groups default), and the dataset's own
-        ``readOnly`` is a ceiling over both — so a read-only dataset resolves
-        every user to ro and leaves its rw proxy admitting nobody."""
+        question the mount does — which is now a per-zone question. A user may
+        hold a dataset read-write in one zone and read-only (or not at all) in
+        another, and a session's zone is a label on its pod, so the policy can
+        say exactly that. The dataset's own ``readOnly`` is a ceiling over
+        every cell: a read-only dataset resolves everyone to ro and leaves its
+        rw proxy admitting nobody.
+        """
         definition = self.get_dataset_definitions().get(volume) or {}
         out = []
         for user in self.list_all_users() or []:
             username = user.get("name") if isinstance(user, dict) else user
             if not username:
                 continue
-            # Every allow is explicit: a user granted nothing gets nothing,
-            # so an unconfigured account no longer lands in every rw proxy.
-            if volume not in self.get_user_allowed_volumes(username):
-                continue
-            granted = (self.get_user_volume_modes(username) or {}).get(
-                volume, "rw")
-            if self.dataset_mode(definition, granted) == mode:
-                out.append(username)
-        return out
+            # Every allow is explicit: an absent cell is a refusal, so an
+            # unconfigured account lands in no proxy at all.
+            for zone, cells in (self.get_user_volume_access(username) or {}).items():
+                granted = (cells or {}).get(volume)
+                if granted is None:
+                    continue
+                served = self.dataset_mode(
+                    definition, "ro" if granted == "read-only" else "rw")
+                if served == mode:
+                    out.append((username, zone))
+        return sorted(out)
 
-    def session_shared_datasets(self, username: str) -> List[Dict[str, Any]]:
-        """Resolve this user's S3 datasets into cloud-init descriptors,
-        ensuring each one's proxy on the way. Returns [] when no datasets
-        are defined, which is the common case.
+    def session_shared_datasets(self, username: str,
+                                zone: str) -> List[Dict[str, Any]]:
+        """Resolve the S3 datasets this user holds **in ``zone``** into
+        cloud-init descriptors, ensuring each one's proxy on the way. Returns
+        [] when no datasets are defined, which is the common case.
+
+        The zone is the session's own (template zone or override, defaulting
+        to DEFAULT_ZONE) and it is not optional: a dataset is granted per
+        (user, zone, volume) cell, so resolving without one would mount a
+        user's most permissive zone's data into every zone they can enter.
+        The proxy's fencing policy is built from the same cells, so a guest
+        that talked its way past this list still cannot reach the endpoint.
 
         A failed proxy is skipped rather than failing the boot: a guest that
         comes up without one dataset is far better than a guest that does not
@@ -4270,8 +4343,7 @@ class KubeConfigManager(ConfigManager):
         definitions = self.get_dataset_definitions()
         if not definitions:
             return []
-        allowed = self.get_user_allowed_volumes(username)
-        modes = self.get_user_volume_modes(username) or {}
+        cells = (self.get_user_volume_access(username) or {}).get(zone) or {}
         core = client.CoreV1Api()
         out = []
         for name in sorted(definitions):
@@ -4284,11 +4356,14 @@ class KubeConfigManager(ConfigManager):
             except Exception as e:
                 logger.error(f"Could not re-fence dataset {name!r}: {e}")
         for name, definition in sorted(definitions.items()):
-            # Every allow is explicit, as everywhere else.
-            if name not in allowed:
+            # An absent cell is a refusal, not a default — there is nothing
+            # below it to fall back to.
+            granted = cells.get(name)
+            if granted is None:
                 continue
             # The dataset's readOnly ceiling wins over the grant.
-            mode = self.dataset_mode(definition, modes.get(name, "rw"))
+            mode = self.dataset_mode(
+                definition, "ro" if granted == "read-only" else "rw")
             try:
                 ready = self.ensure_s3_proxy(name, mode, definition)
             except Exception as e:
@@ -4345,7 +4420,7 @@ class KubeConfigManager(ConfigManager):
             self._ensure_object(
                 name, self.namespace,
                 self._build_s3_proxy_network_policy(
-                    volume, mode, self.s3_proxy_users(volume, mode)),
+                    volume, mode, self.s3_proxy_peers(volume, mode)),
                 create=net.create_namespaced_network_policy,
                 read=net.read_namespaced_network_policy,
                 replace=net.replace_namespaced_network_policy)
@@ -4377,7 +4452,7 @@ class KubeConfigManager(ConfigManager):
             resources=self.s3_proxy_resources,
         )
         policy = self._build_s3_proxy_network_policy(
-            volume, mode, self.s3_proxy_users(volume, mode))
+            volume, mode, self.s3_proxy_peers(volume, mode))
         apps = client.AppsV1Api()
         core = client.CoreV1Api()
         net = client.NetworkingV1Api()
@@ -4609,11 +4684,11 @@ class KubeConfigManager(ConfigManager):
                 KUBEVIRT_VM_PLURAL, full_name)
         except ApiException as e:
             logger.warning(f"Could not read VirtualMachine {full_name}: {e}")
-            return
+            return None
 
         patch = self._build_vm_spec_patch(current.get("spec") or {}, desired_spec)
         if patch is None:
-            return
+            return current
         try:
             self.api.patch_namespaced_custom_object(
                 KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns,
@@ -5595,9 +5670,14 @@ class KubeConfigManager(ConfigManager):
         }
 
     def get_user_groups(self, username: str) -> List[Dict[str, Any]]:
-        """The groups this user belongs to, by name. Membership is either
-        plain ``members`` or a per-member entry in a volume's ``access`` map —
-        both are ways of being granted something by the project."""
+        """The groups this user belongs to, by name.
+
+        Membership is ``members``, and nothing else. It used to also count a
+        per-member entry in a volume grant's ``access`` map — a second way of
+        being in a group, which existed only because that grant carried
+        per-person exceptions. The access matrix has no such thing: a group
+        states one row per (zone, volume) and every member gets it, so the one
+        way to hand a single person something is to grant it on their User."""
         self._load_groups()
         member_of = []
         for name in sorted(self.groups):
@@ -5606,8 +5686,6 @@ class KubeConfigManager(ConfigManager):
             # directly — as the unit tests do — hasn't been through the loader.
             spec = {**self.groups[name], "name": name}
             if username in (spec.get("members") or []):
-                member_of.append(spec)
-            elif group_volume_grants(spec, username):
                 member_of.append(spec)
         return member_of
 
@@ -5675,36 +5753,6 @@ class KubeConfigManager(ConfigManager):
         if not changed:
             return True
         return self._save_user_spec(username, {"volumeAccess": own or None})
-
-    def get_user_allowed_volumes(self, username: str) -> List[str]:
-        self._load_users()
-        own = self.users.get(username, {}).get("allowedVolumes", [])
-        return merge_allow_lists(own, *(
-            list(group_volume_grants(g, username))
-            for g in self.get_user_groups(username)))
-
-    def get_user_volume_modes(self, username: str) -> Dict[str, str]:
-        """``{volume: "rw"|"ro"}`` for every volume a *group* grants this user.
-
-        Only group-granted volumes appear: a volume the user reaches through
-        their own allowedVolumes is read-write, which is what it has always
-        been. Across groups the most
-        permissive grant wins — a user granted ``rw`` in one project does not
-        lose it by also being a read-only guest in another."""
-        modes: Dict[str, str] = {}
-        for group in self.get_user_groups(username):
-            for name, mode in group_volume_grants(group, username).items():
-                if modes.get(name) != "rw":
-                    modes[name] = mode
-        # A volume the user holds outright is theirs read-write, whatever a
-        # group says: the group grant adds access, it cannot take it away.
-        self._load_users()
-        for name in self.users.get(username, {}).get("allowedVolumes", []) or []:
-            modes[name] = "rw"
-        return modes
-
-    def set_user_allowed_volumes(self, username: str, volume_names: List[str]) -> bool:
-        return self._save_user_spec(username, {"allowedVolumes": volume_names})
 
     def get_user_allowed_gpu_types(self, username: str) -> List[str]:
         self._load_users()

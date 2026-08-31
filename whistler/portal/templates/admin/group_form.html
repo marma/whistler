@@ -37,55 +37,23 @@
     </div>
 
     <div class="ui divider"></div>
-    <h4 class="ui header">Volumes &amp; Datasets</h4>
-    <p class="ui grey text">
-      What members may mount, and how. What <strong>read-only</strong> is worth
-      depends on which kind it is: for a <em>dataset</em> it is enforced by the
-      proxy, so it holds even in a VM where the user is root. For a PVC volume it
-      is a real read-only mount in a container session, but on a VM it is still
-      only a mount flag that root can drop (design/security.md, design/storage.md).
-    </p>
-
-    {% for vol in volumes %}
-    {% set grant = volume_grants.get(vol.name) %}
-    <div class="two fields">
-      <div class="field">
-        <label>
-          {{ vol.name }}
-          {% if vol.isDataset %}
-            <span class="ui blue mini label"><i class="cloud icon"></i> dataset</span>
-            {% if vol.readOnly %}<span class="ui green mini label">read-only</span>{% endif %}
-          {% endif %}
-        </label>
-        <select name="vol_mode_{{ vol.name }}" class="ui dropdown">
-          <option value="none" {% if not grant or grant.get("mode", "rw") == "none" %}selected{% endif %}>not granted</option>
-          <option value="rw" {% if grant and grant.get("mode", "rw") == "rw" %}selected{% endif %}>read-write</option>
-          <option value="ro" {% if grant and grant.get("mode") == "ro" %}selected{% endif %}>read-only</option>
-        </select>
-        {% if vol.isDataset and vol.readOnly %}
-        <div class="ui pointing label">This dataset is read-only for everyone, so a read-write grant here still resolves to read-only.</div>
-        {% endif %}
-      </div>
-      <div class="field">
-        <label>Per-member exceptions <span class="ui grey tiny label">optional</span></label>
-        <input name="vol_access_{{ vol.name }}" type="text" placeholder="carol:ro, dan:rw"
-               value="{{ grant.accessText if grant else '' }}">
-      </div>
-    </div>
-    {% else %}
-    <p class="ui grey text">Nothing to grant yet. Create a <a href="/admin/volumes/new?user={{ current_user }}">volume</a> or a <a href="/admin/datasets/new?user={{ current_user }}">dataset</a>.</p>
-    {% endfor %}
-
-    <div class="ui divider"></div>
     <h4 class="ui header">Access</h4>
     <p class="ui grey text">
-      Which datasets this group's members may mount, and in which zone. A
-      member's effective access is this unioned with their own, most
-      permissive per cell — joining a project confers access, it never takes
-      any away.
+      Which datasets this group's members may mount, and in which zone — the
+      one table that decides it, now that the separate allow-list with its
+      per-member exceptions is gone. A member's effective access is this
+      unioned with their own, most permissive per cell: joining a project
+      confers access, it never takes any away. To hand <em>one</em> person
+      something the rest of the project does not get, grant it on their User
+      rather than here.
       <strong>Home volumes are not here on purpose</strong>: a home's name only
       resolves in its owner's own namespace, so a group could never grant one
       to anybody. Groups grant shared data.
+    </p>
+    <p class="ui grey text">
+      <strong>Read-only</strong> on a dataset is enforced by the proxy Whistler
+      runs in front of it, so it holds even in a VM where the member is root
+      (design/security.md, design/storage.md).
     </p>
     {% include "admin/_access_styles.html" %}
     {% with sections = access_sections, show_group_mark = False %}
@@ -168,7 +136,7 @@
 
     <div class="ui divider"></div>
     <h4 class="ui header">Session overrides</h4>
-    <p class="ui grey text">Granted to members on top of their own. gpuType/volumes/zone stay limited to the allow-lists above.</p>
+    <p class="ui grey text">Granted to members on top of their own. gpuType and zone stay limited to the allow-lists above.</p>
     {% for g in override_groups %}
     <div class="field">
       <div class="ui checkbox">

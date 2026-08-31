@@ -338,6 +338,30 @@ def test_gpu_devices_present_only_when_requested():
     assert "gpus" not in without_gpu["spec"]["template"]["spec"]["domain"]["devices"]
 
 
+@pytest.mark.parametrize("zero", [0, "0", "", None])
+def test_a_zero_gpu_count_attaches_nothing(zero):
+    """Presence used to be the test (`'gpu' in resources`), so a template
+    someone had turned the GPU off in still took a card — and on a mixed
+    cluster _vm_gpu_device_name could not resolve one at all, failing the
+    session outright. "No GPU" writes the absence rather than a zero, but a CR
+    already carrying one has to mean the same thing."""
+    vm = _build(template_spec={"image": "x", "resources": {"gpu": zero}})
+    assert "gpus" not in vm["spec"]["template"]["spec"]["domain"]["devices"]
+
+
+def test_a_zero_count_does_not_need_a_resolvable_gpu_type():
+    # The mixed-cluster case: two VM-attachable types and no pin is a hard
+    # PolicyError for a real request, and must simply not arise for none.
+    mixed = [{"name": "a", "vmResource": "nvidia.com/A"},
+             {"name": "b", "vmResource": "nvidia.com/B"}]
+    with pytest.raises(PolicyError):
+        _build(_catalog=mixed,
+               template_spec={"image": "x", "resources": {"gpu": 1}})
+    vm = _build(_catalog=mixed,
+                template_spec={"image": "x", "resources": {"gpu": 0}})
+    assert "gpus" not in vm["spec"]["template"]["spec"]["domain"]["devices"]
+
+
 def test_gpu_type_pin_selects_its_own_resource_on_mixed_clusters():
     from whistler.config import GPU_NODE_LABEL
     catalog = [

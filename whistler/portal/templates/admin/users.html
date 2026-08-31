@@ -20,7 +20,7 @@
       <th>Username</th>
       <th>SSH Keys</th>
       <th>Security Context</th>
-      <th>Allowed Volumes</th>
+      <th>Access</th>
       <th>Actions</th>
     </tr>
   </thead>
@@ -49,8 +49,17 @@
         {% else %}—{% endif %}
       </td>
       <td>
-        {% for v in (u.allowedVolumes or []) %}
-          <span class="ui teal mini label">{{ v }}</span>
+        {# The volumes and datasets this user's OWN access matrix names, once
+           each rather than once per zone — the details page has the grid. A
+           group may add more, which is what Computed access is for. #}
+        {% set granted = [] %}
+        {% for zone, cells in (u.volumeAccess or {}) | dictsort %}
+          {% for vol in (cells or {}) | sort %}
+            {% if vol not in granted %}{% set _ = granted.append(vol) %}{% endif %}
+          {% endfor %}
+        {% endfor %}
+        {% for vol in granted %}
+          <span class="ui teal mini label">{{ vol }}</span>
         {% else %}
           <span class="ui grey mini label">none</span>
         {% endfor %}

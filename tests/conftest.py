@@ -11,7 +11,7 @@ import pytest
 from whistler.config import (CHANNEL_CLIPBOARD, CHANNEL_SCREENSHOTS,
                              CHANNEL_TERMINAL, ConfigManager, DEFAULT_ZONE,
                              OVERRIDE_GROUPS, SSH_POSTURE_DIRECT,
-                             _POSTURE_CHANNELS, group_volume_grants,
+                             _POSTURE_CHANNELS,
                              merge_allow_lists, merge_channel_grants,
                              merge_override_grants)
 
@@ -320,7 +320,7 @@ class FakeConfigManager(ConfigManager):
         member_of = []
         for name in sorted(self.groups):
             spec = {**self.groups[name], "name": name}
-            if username in (spec.get("members") or []) or group_volume_grants(spec, username):
+            if username in (spec.get("members") or []):
                 member_of.append(spec)
         return member_of
 
@@ -337,26 +337,6 @@ class FakeConfigManager(ConfigManager):
 
     def delete_group(self, group_name):
         self.groups.pop(group_name, None)
-        return True
-
-    def get_user_allowed_volumes(self, username):
-        own = (self.users.get(username) or {}).get("allowedVolumes", [])
-        return merge_allow_lists(own, *(list(group_volume_grants(g, username))
-                                        for g in self.get_user_groups(username)))
-
-    def get_user_volume_modes(self, username):
-        modes = {}
-        for group in self.get_user_groups(username):
-            for name, mode in group_volume_grants(group, username).items():
-                if modes.get(name) != "rw":
-                    modes[name] = mode
-        for name in (self.users.get(username) or {}).get("allowedVolumes", []) or []:
-            modes[name] = "rw"
-        return modes
-
-    def set_user_allowed_volumes(self, username, volume_names):
-        if username in self.users:
-            self.users[username]["allowedVolumes"] = volume_names
         return True
 
     def get_user_allowed_gpu_types(self, username):

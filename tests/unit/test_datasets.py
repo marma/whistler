@@ -44,11 +44,11 @@ def test_a_read_only_dataset_leaves_its_rw_proxy_admitting_nobody():
     cm = _manager(
         users={"alice": {"name": "alice"}},
         groups={"proj": {"members": ["alice"],
-                         "volumes": [{"name": "refdata", "mode": "rw"}]}},
+                         "volumeAccess": {"open": {"refdata": "allowed"}}}},
         datasets={"refdata": {"bucket": "b", "readOnly": True}},
     )
-    assert cm.s3_proxy_users("refdata", "rw") == []
-    assert cm.s3_proxy_users("refdata", "ro") == ["alice"]
+    assert cm.s3_proxy_peers("refdata", "rw") == []
+    assert cm.s3_proxy_peers("refdata", "ro") == [("alice", "open")]
 
 
 # --- catalog ---------------------------------------------------------------- #
@@ -120,8 +120,8 @@ def test_one_broken_dataset_does_not_block_the_others():
 
     cm.ensure_s3_proxy = _ensure
     cm._refresh_s3_proxy_policies = lambda name: None
-    cm.get_user_allowed_volumes = lambda u: ["broken", "good"]
-    cm.get_user_volume_modes = lambda u: {}
-    assert cm.session_shared_datasets("alice") == []
+    cm.get_user_volume_access = lambda u: {
+        "open": {"broken": "allowed", "good": "allowed"}}
+    assert cm.session_shared_datasets("alice", "open") == []
     # "broken" raised and was skipped; "good" was still reached.
     assert prepared == ["good"]

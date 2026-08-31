@@ -65,8 +65,10 @@
           <tr>
             <td><a href="/admin/groups/{{ g.name }}/edit?user={{ current_user }}">{{ g.name }}</a></td>
             <td>
-              {% for v in g.volumes or [] %}
-                <div class="ui tiny label">{{ v.name }} <span class="detail">{{ v.get("mode", "rw") }}</span></div>
+              {% for zone, cells in (g.volumeAccess or {}) | dictsort %}
+                {% for vol, mode in (cells or {}) | dictsort %}
+                <div class="ui tiny label">{{ vol }} <span class="detail">{{ zone }} · {{ mode }}</span></div>
+                {% endfor %}
               {% endfor %}
               {% for e in g.entryPoints or [] %}<div class="ui tiny red label">entry: {{ e }}</div>{% endfor %}
               {% for z in g.allowedZones or [] %}<div class="ui tiny blue label">zone: {{ z }}</div>{% endfor %}
@@ -88,13 +90,22 @@
     <div class="ui segment">
       <h4 class="ui header"><i class="th icon"></i> Access</h4>
       <p class="ui grey text">
-        Which volumes this user may mount, and in which zone. This is the
-        user's <strong>own</strong> grant; what they end up with is this
-        unioned with every group they belong to — see
+        Which volumes and datasets this user may mount, and in which zone.
+        This is the one place that decides it — the separate allow-list that
+        used to sit below this table is gone, along with the chance of the two
+        disagreeing. This is the user's <strong>own</strong> grant; what they
+        end up with is this unioned with every group they belong to — see
         <a href="/admin/computed-access?name={{ user_obj.name }}&amp;user={{ current_user }}">Computed access</a>.
         A cell carrying <i class="teal users icon"></i> comes from a group and
         is edited there, not here: saving the union would copy a project's
         grants onto this user permanently.
+      </p>
+      <p class="ui grey text">
+        A missing cell is a refusal, not a default. For a <strong>home
+        volume</strong> that means the session is refused at start; for a
+        <strong>dataset</strong> it means no mount is written and the dataset
+        proxy's NetworkPolicy does not admit this user's pods in that zone, so
+        a guest with a stale key still cannot reach it.
       </p>
       {% include "admin/_access_styles.html" %}
       <form class="ui form" method="post"
@@ -103,40 +114,6 @@
           {% include "admin/_access_grid.html" %}
         {% endwith %}
         <button type="submit" class="ui teal button"><i class="save icon"></i> Save Access</button>
-      </form>
-    </div>
-
-    <div class="ui segment">
-      <h4 class="ui header"><i class="database icon"></i> Volume &amp; Dataset Access</h4>
-      <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/volumes?user={{ current_user }}">
-        {% for vol in volumes %}
-        <div class="field">
-          <div class="ui checkbox">
-            <input type="checkbox" name="volume_names" value="{{ vol.name }}"
-                   id="vol-{{ vol.name }}"
-                   {% if vol.name in own_volumes %}checked{% endif %}>
-            <label for="vol-{{ vol.name }}">
-              {{ vol.name }}
-              {% if vol.isDataset %}
-                <span class="ui blue mini label"><i class="cloud icon"></i> dataset</span>
-                {% if vol.readOnly %}<span class="ui green mini label">read-only</span>{% endif %}
-              {% elif vol.persistentVolumeClaim %}
-                <span class="ui grey mini label">{{ vol.persistentVolumeClaim.claimName }}</span>
-              {% endif %}
-              {% if vol.name not in own_volumes and vol.name in allowed_volumes %}
-                <span class="ui teal mini label">from group ({{ volume_modes.get(vol.name, "rw") }})</span>
-              {% endif %}
-            </label>
-          </div>
-        </div>
-        {% else %}
-        <p class="ui grey text">Nothing to grant yet. Create a <a href="/admin/volumes/new?user={{ current_user }}">volume</a> or a <a href="/admin/datasets/new?user={{ current_user }}">dataset</a>.</p>
-        {% endfor %}
-        {% if volumes %}
-        <div class="ui pointing label">This user may mount exactly the volumes and datasets ticked here, plus any their groups grant. No boxes and no group grant means none.</div>
-        <div class="ui divider"></div>
-        <button type="submit" class="ui teal button"><i class="save icon"></i> Save Volume &amp; Dataset Access</button>
-        {% endif %}
       </form>
     </div>
 
@@ -194,7 +171,7 @@
 
     <div class="ui segment">
       <h4 class="ui header"><i class="sliders horizontal icon"></i> Session Overrides</h4>
-      <p class="ui grey text">Which template values this user may override per-session when creating an instance. gpuType/volumes/zone are still limited to the allow-lists above even when granted here.</p>
+      <p class="ui grey text">Which template values this user may override per-session when creating an instance. gpuType and zone are still limited to the allow-lists above even when granted here.</p>
       <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/overrides?user={{ current_user }}">
         {% for group in override_groups %}
         <div class="field">

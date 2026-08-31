@@ -101,7 +101,7 @@ def test_create_form_shows_the_picked_template_rather_than_a_select():
     html = _render("user/create_instance.html", path="/instances/new",
                    current_user="alice", is_admin=False, tpls=TPLS,
                    selected_template="devbase", selected_tpl=TPLS[0],
-                   volumes=[], allowed_volumes=[], gpu_types=[],
+                   gpu_types=[],
                    allowed_gpu_types=[], overrides=NO_GRANTS, zones=["default"],
                    home_volumes=[], current_home_volume=None)
     assert 'name="template_name" value="devbase"' in html
@@ -114,7 +114,7 @@ def test_create_form_still_has_a_select_for_a_bare_url():
     html = _render("user/create_instance.html", path="/instances/new",
                    current_user="alice", is_admin=False, tpls=TPLS,
                    selected_template=None, selected_tpl=None,
-                   volumes=[], allowed_volumes=[], gpu_types=[],
+                   gpu_types=[],
                    allowed_gpu_types=[], overrides=NO_GRANTS, zones=["default"],
                    home_volumes=[], current_home_volume=None)
     assert "select a template" in html
@@ -162,19 +162,15 @@ def test_dialog_prefills_the_instances_recorded_overrides():
     # empty form would silently propose dropping every override it did not show.
     html = _render("user/_start_dialog.html", current_user="alice", name="box",
                    has_overrides=True, hx=True, overrides=ALL_GRANTS,
-                   volumes=[{"name": "scratch"}], allowed_volumes=["scratch"],
                    gpu_types=["A100"], zones=["default", "open"],
                    cur={"preemptible": False, "homeVolume": "research",
                         "overrides": {"resources": {"cpu": "8", "memory": "16Gi"},
                                       "gpuType": "A100", "gpuCount": 2,
-                                      "zone": "open",
-                                      "volumes": {"scratch": "/mnt/s"}}})
+                                      "zone": "open"}})
     assert 'value="8"' in html and 'value="16Gi"' in html
     assert 'value="A100" selected' in html
     assert 'value="2"' in html
     assert 'value="open" selected' in html
-    assert 'value="/mnt/s"' in html
-    assert "checked" in html
 
 
 def test_dialog_marks_the_submission_as_carrying_overrides():
@@ -182,7 +178,7 @@ def test_dialog_marks_the_submission_as_carrying_overrides():
     # and the connect route must not touch spec.overrides on that path.
     html = _render("user/_start_dialog.html", current_user="alice", name="box",
                    has_overrides=True, hx=True, overrides=ALL_GRANTS,
-                   volumes=[], allowed_volumes=[], gpu_types=[], zones=[],
+                   gpu_types=[], zones=[],
                    cur={"overrides": {}})
     assert 'name="apply_overrides" value="1"' in html
 
@@ -191,7 +187,7 @@ def test_dialog_without_a_grant_is_a_plain_confirm():
     # A grant can be withdrawn between rendering a row and pressing its button.
     html = _render("user/_start_dialog.html", current_user="alice", name="box",
                    has_overrides=False, hx=True, overrides=NO_GRANTS,
-                   volumes=[], allowed_volumes=[], gpu_types=[], zones=[],
+                   gpu_types=[], zones=[],
                    cur={"overrides": {}})
     assert "apply_overrides" not in html
     assert "nothing to choose" in html
@@ -199,8 +195,8 @@ def test_dialog_without_a_grant_is_a_plain_confirm():
 
 def test_dialog_posts_in_place_for_the_dashboard_and_plainly_for_the_detail_page():
     args = dict(current_user="alice", name="box", has_overrides=False,
-                overrides=NO_GRANTS, volumes=[], allowed_volumes=[],
-                gpu_types=[], zones=[], cur={"overrides": {}})
+                overrides=NO_GRANTS, gpu_types=[], zones=[],
+                cur={"overrides": {}})
     hx = _render("user/_start_dialog.html", hx=True, **args)
     plain = _render("user/_start_dialog.html", hx=False, **args)
     assert 'hx-post="/instances/box/connect?user=alice"' in hx
@@ -228,8 +224,7 @@ def _instance(**extra):
 def _connect(cm, form, headers=None):
     return asyncio.run(mgmt.instance_connect(
         request=_FakeRequest(form=form, headers=headers), cm=cm, user="alice",
-        name="box", is_admin=False, **{k: v for k, v in form.items()
-                                       if k != "volume_names"}))
+        name="box", is_admin=False, **form))
 
 
 def test_a_plain_start_leaves_the_overrides_alone(make_config):
@@ -305,17 +300,16 @@ def test_starting_never_touches_preemptible_or_the_home_volume(make_config):
     assert inst["runOverrides"] == {"resources": {"cpu": "2"}}
 
 
-def test_volume_mount_paths_come_from_the_named_form_fields(make_config):
-    # Same misalignment trap as the create form: only the *checked* boxes post a
-    # volume_names entry, so the paths are keyed by name, not zipped.
+def test_the_dialog_offers_no_volume_picker(make_config):
+    """It used to: a checkbox per catalog volume plus a free-text mount path,
+    landing in a `volumes` override. Both are gone (2026-08-29) — what a
+    session reaches is its home volume, set on the edit form rather than per
+    run, and the datasets the access matrix grants it in its zone."""
     cm = make_config(users={"alice": {"name": "alice", "overrides": ALL_GRANTS}},
                      instances={"alice": [_instance(overrides={})]})
-    form = {"apply_overrides": "1", "mount_path__data": "/mnt/data"}
-    asyncio.run(mgmt.instance_connect(
-        request=_FakeRequest(form=form), cm=cm, user="alice", name="box",
-        is_admin=False, apply_overrides="1", volume_names=["data"]))
+    _connect(cm, {"apply_overrides": "1", "override_cpu": "2"})
     assert cm._instances["alice"][0]["runOverrides"] == {
-        "volumes": {"data": "/mnt/data"}}
+        "resources": {"cpu": "2"}}
 
 
 # --------------------------------------------------------------------------- #
@@ -414,7 +408,7 @@ def test_a_dialog_with_somewhere_to_go_submits_into_a_new_tab():
     # is no longer a user gesture, which is exactly what popup blockers catch.
     html = _render("user/_start_dialog.html", current_user="alice", name="box",
                    has_overrides=True, hx=True, then="desktop",
-                   overrides=ALL_GRANTS, volumes=[], allowed_volumes=[],
+                   overrides=ALL_GRANTS,
                    gpu_types=[], zones=[], cur={"overrides": {}})
     assert 'target="_blank"' in html
     assert 'action="/instances/box/connect?user=alice&then=desktop"' in html

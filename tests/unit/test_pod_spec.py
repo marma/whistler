@@ -1,4 +1,6 @@
 """Pod manifest construction (KubeConfigManager._build_pod_spec)."""
+import pytest
+
 from whistler.config import KubeConfigManager
 
 
@@ -82,6 +84,18 @@ def test_resources_map_cpu_memory_and_gpu():
     res = pod["spec"]["containers"][0]["resources"]
     assert res["requests"] == {"cpu": "2", "memory": "4Gi"}
     assert res["limits"] == {"cpu": "2", "memory": "4Gi", "nvidia.com/gpu": 1}
+
+
+@pytest.mark.parametrize("zero", [0, "0", "", None])
+def test_a_zero_gpu_count_requests_no_gpu_resource(zero):
+    # Not `nvidia.com/gpu: 0`, which the scheduler would honour by giving the
+    # pod none while still routing it through the device plugin's admission.
+    pod = _build(template_spec={"resources": {"cpu": "2", "gpu": zero}})
+    res = pod["spec"]["containers"][0]["resources"]
+    assert res["limits"] == {"cpu": "2"}
+    # ...and no GPU runtime class either: that branch keyed on truthiness, so
+    # the STRING "0" used to pull the nvidia runtime in on its own.
+    assert "runtimeClassName" not in pod["spec"]
 
 
 def test_home_volume_uses_pvc_and_personal_mount_path():

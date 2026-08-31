@@ -10,6 +10,7 @@ selects (design/security.md, "Core model: the access matrix"): the claim
 outlives any one Session, and what keeps data from crossing zones is the
 access matrix plus the one-live-attach rule, not the absence of a choice.
 """
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -155,6 +156,34 @@ def test_an_existing_default_is_reused_rather_than_recreated():
     cm.save_home_volume = lambda u, v: pytest.fail("must not recreate")
     assert cm.resolve_session_home_volume("alice", "alice-desk")["name"] == \
         "alice-desk"
+
+
+def test_the_resolved_default_is_recorded_on_the_session():
+    """The CR has to say which home the instance is using, not just have one.
+
+    Until this, `spec.homeVolume` stayed empty for every instance that did not
+    pick a volume — so the edit form's picker showed "New home for this
+    instance" for an instance that already had one, and the volumes page could
+    not name the instance holding a disk. The disk was right all along; the CR
+    simply did not record it."""
+    cm = _manager()
+    patched = []
+    cm.api = MagicMock()
+    cm.api.patch_namespaced_custom_object.side_effect = (
+        lambda g, v, ns, plural, name, body: patched.append((ns, name, body)))
+    cm._record_session_home_volume("whistler-user-alice", "alice-desk",
+                                   "alice-desk")
+    assert patched == [("whistler-user-alice", "alice-desk",
+                        {"spec": {"homeVolume": "alice-desk"}})]
+
+
+def test_recording_the_home_never_blocks_the_boot():
+    # The session is already using the right disk; the only thing a failed
+    # patch loses is the UI knowing about it.
+    cm = _manager()
+    cm.api = MagicMock()
+    cm.api.patch_namespaced_custom_object.side_effect = ApiException(status=500)
+    cm._record_session_home_volume("ns", "alice-desk", "alice-desk")  # no raise
 
 
 def test_a_named_volume_that_does_not_exist_is_refused_not_created():
@@ -331,3 +360,55 @@ def test_a_volume_that_already_has_a_cell_is_left_alone():
         items=[claim])
     with patch("whistler.config.client.CoreV1Api", return_value=core):
         cm.adopt_legacy_home_disks()
+
+
+# --- why a home was refused ------------------------------------------------- #
+#
+# The text IS the remedy path: it surfaces only as status.statusMessage on a
+# Failed session, where there is nothing else to go on.
+
+def _refusing(access):
+    cm = _manager()
+    cm.namespace = "whistler"
+    cm.users = {"alice": {"name": "alice", "volumeAccess": access}}
+    cm.groups = {}
+    return cm
+
+
+def test_a_refused_home_names_the_zones_it_is_actually_granted_in():
+    # A home is granted in the zone it was made for, so the usual cause is
+    # that the instance has since moved. Naming where it moved FROM is the
+    # difference between "add this cell" and "why is my machine broken".
+    msg = _refusing({"green": {"alice-desk": "allowed"},
+                     "red": {"alice-desk": "read-only"},
+                     "default": {"other": "allowed"}}
+                    ).home_volume_refusal("alice", "default", "alice-desk")
+    assert "It is granted in: green, red." in msg
+    assert "'default'" in msg
+
+
+def test_a_home_granted_nowhere_says_so_rather_than_listing_nothing():
+    # "It is granted in: ." would read as a rendering bug and send the reader
+    # looking for a zone that is not there.
+    msg = _refusing({}).home_volume_refusal("alice", "default", "alice-desk")
+    assert "granted in no zone at all" in msg
+
+
+def test_the_refusal_carries_a_command_that_actually_fixes_it():
+    # Pasted straight from a Failed session's message, so it has to be valid
+    # JSON naming the right zone and volume — not prose about a grid.
+    msg = _refusing({}).home_volume_refusal("alice", "restricted", "alice-desk")
+    patch = json.loads(msg.split("-p '")[1].rstrip("'"))
+    assert patch == {"spec": {"volumeAccess": {
+        "restricted": {"alice-desk": "allowed"}}}}
+    assert "kubectl -n whistler patch usr alice" in msg
+
+
+def test_a_group_granted_zone_counts_as_granted():
+    # get_user_volume_access is the merged view, so a cell a project confers
+    # must not be reported as missing.
+    cm = _refusing({})
+    cm.groups = {"lab": {"members": ["alice"],
+                         "volumeAccess": {"green": {"alice-desk": "allowed"}}}}
+    assert "granted in: green" in cm.home_volume_refusal(
+        "alice", "default", "alice-desk")

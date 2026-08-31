@@ -28,7 +28,7 @@
       <th>Name</th>
       <th>Description</th>
       <th>Members</th>
-      <th>Volumes</th>
+      <th>Access</th>
       <th>Zones</th>
       <th>Channels</th>
       <th>Actions</th>
@@ -46,9 +46,18 @@
         {% else %}<span class="ui grey text">none</span>{% endif %}
       </td>
       <td>
-        {% for v in g.volumes or [] %}
-          <div class="ui tiny {{ 'blue' if v.get('mode', 'rw') == 'rw' else 'grey' }} label">
-            {{ v.name }} <span class="detail">{{ v.get("mode", "rw") }}</span>
+        {# One label per cell of the group's access matrix: which dataset, in
+           which zone, and how. The grid on the edit page is the editable
+           version; this is the scan. #}
+        {% set cells = [] %}
+        {% for zone, row in (g.volumeAccess or {}) | dictsort %}
+          {% for vol, mode in (row or {}) | dictsort %}
+            {% set _ = cells.append((zone, vol, mode)) %}
+          {% endfor %}
+        {% endfor %}
+        {% for zone, vol, mode in cells %}
+          <div class="ui tiny {{ 'blue' if mode == 'allowed' else 'grey' }} label">
+            {{ vol }} <span class="detail">{{ zone }} · {{ mode }}</span>
           </div>
         {% else %}<span class="ui grey text">—</span>{% endfor %}
       </td>

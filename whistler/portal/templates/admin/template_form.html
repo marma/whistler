@@ -127,26 +127,68 @@
       </div>
     </div>
 
+    {# Every answer names something. A GPU request is either "none" or a type
+       from the live catalog — there is no "any available type", which read as
+       a choice but was really the absence of one: on a single-GPU cluster it
+       happened to work, and on a mixed one it is a template that cannot say
+       which card it wants. #}
+    {% set tpl_gpu_type = (tpl.nodeSelector or {}).get(GPU_NODE_LABEL) if tpl else None %}
+    {% set tpl_gpu_count = (tpl.resources or {}).get('gpu', '') if tpl else '' %}
+    {% set tpl_no_gpu = not tpl_gpu_type and tpl_gpu_count in ('', None, 0, '0') %}
+    {# The one state the picker cannot represent, and the reason it is worth a
+       branch rather than a silent coercion: a template written before this
+       (or by hand) that asks for N GPUs without naming a type. Selecting
+       "No GPU" for it would throw the GPU away on the next save, and
+       selecting a type would invent an answer nobody gave. So: nothing is
+       selected, the field is required, and the admin has to say which. #}
+    {% set tpl_unpinned = not tpl_gpu_type and not tpl_no_gpu %}
     <div class="two fields">
-      <div class="field">
+      <div class="field {% if tpl_unpinned %}error{% endif %}">
         <label>GPU Type</label>
-        <select name="gpu_type" class="ui dropdown">
-          <option value="">None</option>
+        <select name="gpu_type" class="ui dropdown" id="tpl-gpu-type" required>
+          {% if tpl_unpinned %}
+          <option value="" selected disabled>— this template names no type; pick one —</option>
+          {% endif %}
+          <option value="{{ GPU_NONE }}" {% if tpl_no_gpu %}selected{% endif %}>No GPU</option>
           {% for gt in gpu_types %}
-          <option value="{{ gt }}" {% if tpl and (tpl.nodeSelector or {}).get(GPU_NODE_LABEL) == gt %}selected{% endif %}>{{ gt }}</option>
+          <option value="{{ gt }}" {% if tpl_gpu_type == gt %}selected{% endif %}>{{ gt }}</option>
           {% endfor %}
         </select>
         <div class="ui pointing label">
-          {% if gpu_types %}From whistler.gpuTypes. Requesting a type a user isn't allowed (see their GPU Access) fails provisioning.{% else %}No GPU types defined in whistler.gpuTypes.{% endif %}
+          {% if tpl_unpinned %}
+          This template asks for <strong>{{ tpl_gpu_count }}</strong> GPU(s) without
+          naming a type. That resolves only on a cluster with exactly one kind of
+          card; name the one it wants, or choose No GPU.
+          {% endif %}
+          <strong>No GPU</strong> clears the count below — that is what zero GPUs
+          means, and it is what a new template starts as.
+          {% if gpu_types %}Types come from the live catalog; requesting one a user isn't granted (see their GPU Access) fails provisioning.{% else %}No GPU types are visible on any node right now, so No GPU is the only thing this cluster can offer.{% endif %}
         </div>
       </div>
-      <div class="field">
+      <div class="field" id="tpl-gpu-count-field">
         <label>GPU Count</label>
         <input name="gpu" type="number" min="0" placeholder="e.g. 1"
-               value="{{ (tpl.resources or {}).get('gpu', '') if tpl else '' }}">
-        <div class="ui pointing label">Number of GPUs of the selected type (nvidia.com/gpu).</div>
+               value="{{ tpl_gpu_count }}">
+        <div class="ui pointing label">Number of GPUs of the selected type (nvidia.com/gpu). 0 is the same as No GPU.</div>
       </div>
     </div>
+    <script>
+      // Greyed rather than hidden, and the server normalises either way
+      // (_template_form_data): a count that survives a "No GPU" submission is
+      // dropped there, so this is the explanation and not the enforcement.
+      (function () {
+        var sel = document.getElementById("tpl-gpu-type");
+        var field = document.getElementById("tpl-gpu-count-field");
+        var input = field.querySelector("input");
+        function sync() {
+          var none = sel.value === {{ GPU_NONE | tojson }};
+          field.classList.toggle("disabled", none);
+          input.disabled = none;
+        }
+        sel.addEventListener("change", sync);
+        sync();
+      })();
+    </script>
 
     <div class="field">
       <label>Personal Home Mount Path</label>

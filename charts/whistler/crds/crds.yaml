@@ -217,9 +217,15 @@ spec:
                     values. Each field is honored only if the owning user's
                     User CR `overrides` grants that group; requesting an
                     ungranted field is a hard PolicyError (see
-                    KubeConfigManager._apply_overrides). gpuType and volumes
-                    are additionally checked against allowedGpuTypes /
-                    allowedVolumes, same as a template-baked value.
+                    KubeConfigManager._apply_overrides). gpuType and zone are
+                    additionally checked against allowedGpuTypes /
+                    allowedZones, same as a template-baked value — except for
+                    gpuType "__none__", which removes the request rather than
+                    making one and so is checked against nothing.
+                    There is no `volumes` override: what a session may reach is
+                    its home volume (spec.homeVolume) plus the datasets the
+                    access matrix grants it in its zone, and neither is a
+                    free-text mount a session states for itself.
                   properties:
                     resources:
                       type: object
@@ -230,8 +236,24 @@ spec:
                           type: string
                     gpuType:
                       type: string
+                      description: >-
+                        A GPU type from the live catalog (a
+                        nvidia.com/gpu.product label value), or the literal
+                        "__none__" for NO GPU — which resolves to the removal
+                        of nodeSelector[nvidia.com/gpu.product] AND of
+                        resources.gpu, not to a zero count: both spec builders
+                        key on resources.gpu being present, so a zero would
+                        still attach a card. "__none__" cannot collide with a
+                        real type, since a label value must start with an
+                        alphanumeric. Turning a GPU off needs the `gpuType`
+                        grant but no grant on the type being turned off.
                     gpuCount:
                       type: integer
+                      description: >-
+                        How many GPUs of that type. Ignored when gpuType is
+                        "__none__" — the two can only disagree in one
+                        direction and "none" is the answer that wins. 0 means
+                        the same thing as "__none__".
                     uid:
                       type: integer
                     gid:
@@ -245,10 +267,6 @@ spec:
                           type: integer
                         runAsGroup:
                           type: integer
-                    volumes:
-                      type: object
-                      additionalProperties:
-                        type: string
                     zone:
                       type: string
                       description: >-
@@ -277,8 +295,24 @@ spec:
                           type: string
                     gpuType:
                       type: string
+                      description: >-
+                        A GPU type from the live catalog (a
+                        nvidia.com/gpu.product label value), or the literal
+                        "__none__" for NO GPU — which resolves to the removal
+                        of nodeSelector[nvidia.com/gpu.product] AND of
+                        resources.gpu, not to a zero count: both spec builders
+                        key on resources.gpu being present, so a zero would
+                        still attach a card. "__none__" cannot collide with a
+                        real type, since a label value must start with an
+                        alphanumeric. Turning a GPU off needs the `gpuType`
+                        grant but no grant on the type being turned off.
                     gpuCount:
                       type: integer
+                      description: >-
+                        How many GPUs of that type. Ignored when gpuType is
+                        "__none__" — the two can only disagree in one
+                        direction and "none" is the answer that wins. 0 means
+                        the same thing as "__none__".
                     uid:
                       type: integer
                     gid:
@@ -292,10 +326,6 @@ spec:
                           type: integer
                         runAsGroup:
                           type: integer
-                    volumes:
-                      type: object
-                      additionalProperties:
-                        type: string
                     zone:
                       type: string
                       description: >-
@@ -431,26 +461,18 @@ spec:
                     allowed > read-only > absent; joining a group is a
                     deliberate act that confers access. See
                     design/security.md, "Core model: the access matrix".
-                    ENFORCED TODAY FOR HOME VOLUMES ONLY — dataset and
-                    PVC-volume rows are recorded and shown but still governed
-                    by allowedVolumes and the group volume grants, the same
-                    way `clipboard` is a declared-but-unenforced channel.
+                    ENFORCED. A home volume is checked at session start; a
+                    dataset is checked twice, once when its mount is written
+                    into cloud-init and again in the NetworkPolicy fencing its
+                    S3 proxy, which admits only this subject's pods carrying
+                    this zone's label. This is the ONLY table that decides it:
+                    the parallel allowedVolumes / group `volumes` allow-list
+                    was removed 2026-08-29.
                   additionalProperties:
                     type: object
                     additionalProperties:
                       type: string
                       enum: ["allowed", "read-only"]
-                allowedVolumes:
-                  type: array
-                  items:
-                    type: string
-                  description: >-
-                    Allow-list of the volumes catalog this user's templates may
-                    request, all read-write. Every allow is explicit:
-                    omitted/empty grants NOTHING here, and the effective list
-                    is the union with the volumes granted by every Group this
-                    user belongs to (which may grant read-only access — a name
-                    granted rw anywhere is mounted rw).
                 allowedZones:
                   type: array
                   items:
@@ -558,9 +580,12 @@ spec:
                   items:
                     type: string
                   description: >-
-                    User CR names. A name that matches no User is ignored (it
-                    grants nothing), so a group may be written before its
-                    members exist.
+                    User CR names, and the ONLY thing that makes someone a
+                    member. A name that matches no User is ignored (it grants
+                    nothing), so a group may be written before its members
+                    exist. Being named in a volume grant's per-member `access`
+                    map used to count too; that field is gone (2026-08-29) and
+                    with it the second way of belonging to a group.
                 volumeAccess:
                   type: object
                   description: >-
@@ -575,45 +600,18 @@ spec:
                     allowed > read-only > absent; joining a group is a
                     deliberate act that confers access. See
                     design/security.md, "Core model: the access matrix".
-                    ENFORCED TODAY FOR HOME VOLUMES ONLY — dataset and
-                    PVC-volume rows are recorded and shown but still governed
-                    by allowedVolumes and the group volume grants, the same
-                    way `clipboard` is a declared-but-unenforced channel.
+                    ENFORCED. A home volume is checked at session start; a
+                    dataset is checked twice, once when its mount is written
+                    into cloud-init and again in the NetworkPolicy fencing its
+                    S3 proxy, which admits only this subject's pods carrying
+                    this zone's label. This is the ONLY table that decides it:
+                    the parallel allowedVolumes / group `volumes` allow-list
+                    was removed 2026-08-29.
                   additionalProperties:
                     type: object
                     additionalProperties:
                       type: string
                       enum: ["allowed", "read-only"]
-                volumes:
-                  type: array
-                  description: >-
-                    Volumes from the catalog this group's members may mount,
-                    with the access mode each member gets. This is the field
-                    that carries weight: it is what a per-member NFS export
-                    set will be rendered from once shared volumes land.
-                  items:
-                    type: object
-                    required: ["name"]
-                    properties:
-                      name:
-                        type: string
-                      mode:
-                        type: string
-                        enum: ["rw", "ro", "none"]
-                        default: rw
-                        description: >-
-                          The access every member gets by default. `none`
-                          grants nothing to members at large — only the
-                          people named in `access` reach the volume.
-                      access:
-                        type: object
-                        additionalProperties:
-                          type: string
-                          enum: ["rw", "ro"]
-                        description: >-
-                          Per-member exceptions to `mode`, keyed by username.
-                          A member listed here need not also be in `members`
-                          — but a name in neither gets nothing.
                 allowedZones:
                   type: array
                   items:

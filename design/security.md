@@ -449,6 +449,9 @@ zone sets its ceiling to the desktop stream alone, and no grant can widen it.
 **Decided and implemented 2026-08-25.** Every allow-list in Whistler grants
 exactly what it names. An empty list — `allowedVolumes`, `allowedZones`,
 `allowedGpuTypes`, `entryPoints`, on a `User` or on a `Group` — grants nothing.
+(`allowedVolumes` and the group `volumes` grant were removed entirely on
+2026-08-29, absorbed into the access matrix — see [How it subsumes today's
+grants](#how-it-subsumes-todays-grants). The rule is unchanged for the rest.)
 
 It used to mean the opposite. Empty was read as "the admin has expressed no
 opinion", so an empty list was *no restriction*, and every enforcement point
@@ -532,9 +535,9 @@ An empty cell means the admin has not said yes, so the answer is no.
 This used to be an *inversion*: everywhere else in Whistler an empty allow-list
 meant no restriction — the admin had expressed no opinion, so the user was
 unrestricted — and the matrix was the one field that read the other way. That
-inversion is gone as of **2026-08-25**: `allowedVolumes`, `allowedZones`,
-`allowedGpuTypes` and `entryPoints` all now grant exactly what they name and
-nothing when they name nothing. See [Empty means nothing, everywhere](#empty-means-nothing-everywhere).
+inversion is gone as of **2026-08-25**: `allowedVolumes` (since absorbed into
+this table), `allowedZones`, `allowedGpuTypes` and `entryPoints` all now grant
+exactly what they name and nothing when they name nothing. See [Empty means nothing, everywhere](#empty-means-nothing-everywhere).
 
 What survives is the shape of the field. A cell is `(zone, volume, mode)`, not
 a name, so this is still a table and not an allow-list, and the UI renders
@@ -612,6 +615,12 @@ labelled in `ENFORCED_CHANNELS`: recorded, not enforced. A read-only grant a
 root user can drop is a statement of intent, and presenting it as a control is
 worse than not offering it.
 
+The two PVC rows are **not reachable from the UI** as of 2026-08-29: nothing
+grants a per-user read-only mount on a template's named volumes any more, so
+those mounts are all read-write and the honest row is the one that says so. The
+mechanism stays in `_build_volume_wiring` should named PVC volumes come back as
+a governed kind; the grant that drove it does not.
+
 ### What this replaces, and why taint was dropped
 
 An earlier version of this model gave each volume a **taint** (the set of
@@ -663,20 +672,55 @@ at the point of granting; it should not refuse, because an admin may mean it.
 
 ### How it subsumes today's grants
 
-The matrix replaces `allowedVolumes` and the group volume `mode`/`access`
-grants rather than layering over them. Two mechanisms with opposite defaults
-governing the same question is the confusion this model exists to remove.
+**Done 2026-08-29.** The matrix replaced `allowedVolumes` and the group volume
+`mode`/`access` grants rather than layering over them. Two mechanisms with
+opposite defaults governing the same question is the confusion this model
+exists to remove — and for a while there were literally two panels side by side
+on the User and Group pages, of which only the older one was enforced while the
+newer one carried a "not enforced yet" badge. Both fields are gone from the
+CRDs, `group_volume_grants` is gone from the code, and `ENFORCED_ACCESS_KINDS`
+— the constant that recorded which half of the grid meant anything — is gone
+with them.
 
 A dataset's `readOnly` field stays what it is — a **ceiling** on the volume
 itself, not a cell — and composes as the more restrictive of the two, so a
 read-only dataset cannot be widened by a matrix cell that says `allowed`.
 
-**Migration.** Existing grants are rendered into the matrix on upgrade: for
-each volume a user may mount, an entry at the granted mode in each zone that
-user may enter. That reproduces today's access exactly, which is the point —
-nobody is locked out by an upgrade — and it should be said out loud that the
-result is as permissive as today, so the seeded grid is a starting point to
-tighten, not a policy anyone chose.
+**A dataset cell is now enforced twice**, which is what made the move worth
+making rather than a rename:
+
+- **The mount.** `session_shared_datasets(username, zone)` takes the session's
+  zone and writes a cloud-init mount only for a cell that exists there. Without
+  the zone it resolved a user's most permissive grant into every zone they
+  could enter, which is precisely the leak the table exists to describe.
+- **The reach.** `s3_proxy_peers` returns `(user, zone)` pairs and the proxy's
+  NetworkPolicy renders one `from` peer each, combining a `namespaceSelector`
+  on the user's namespace with a `podSelector` on the session's zone label —
+  AND within a peer, OR between them, which is exactly the shape of the table.
+  Selecting the namespace alone would hand a user their best zone's access
+  everywhere. This half is the one that matters against a root guest holding a
+  previous session's key.
+
+**No migration, deliberately** — the same call as [Empty means nothing,
+everywhere](#empty-means-nothing-everywhere), for the same reason. A backfill
+would write yesterday's implicit grants into the table as though somebody had
+decided them, and the whole value of the grid is that every cell in it was
+chosen. So an existing `User` or `Group` carrying only `allowedVolumes` /
+`volumes` holds **no dataset access** the moment this ships, and an admin sets
+the cells in the portal's Access grid (or
+`kubectl -n whistler patch usr <name> --type merge -p
+'{"spec":{"volumeAccess":{"<zone>":{"<dataset>":"allowed"}}}}'`). Home volumes
+are unaffected: they were already governed by this table.
+
+**Two smaller things went with it.** Being named in a group volume's per-member
+`access` map used to make you a *member* of that group — a second way of
+belonging, which existed only because that grant carried exceptions. A matrix
+row grants every member alike, so `members` is now the only way in, and handing
+one person something the project does not get is a cell on their own User. And
+`_build_volume_wiring` lost its `volume_modes` argument: the `ro` grant that
+made a container's PVC mount read-only belonged to the allow-list, and the
+matrix does not govern a template's own named volumes. Nothing else could set
+it, so it went rather than lingering as a parameter nobody passes.
 
 ## User
 
@@ -1217,7 +1261,7 @@ someone to open their own desktop VM.
 For a single user, grants **join** — the most permissive wins, because every
 grant belongs to the same identity and a user who is `rw` on a volume in one
 project does not lose that by being a read-only guest in another
-([Group](#group), `get_user_volume_modes`).
+([Group](#group), `merge_volume_access`).
 
 On a project instance the rule **inverts**: a volume is published read-only if
 it is read-only for *any* member. Take the meet, not the join.

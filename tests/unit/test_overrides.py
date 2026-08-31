@@ -5,7 +5,8 @@ details used to build its pod or VM, gated by the owning user's granted
 override groups (users.yaml `overrides`)."""
 import pytest
 
-from whistler.config import GPU_NODE_LABEL, KubeConfigManager, PolicyError
+from whistler.config import (GPU_NODE_LABEL, GPU_NONE, KubeConfigManager,
+                             OVERRIDE_GROUPS, PolicyError)
 
 
 def _manager(*, users=None):
@@ -113,20 +114,53 @@ def test_granted_security_context_override_merges():
     assert user["securityContext"] == {"runAsUser": 1001, "fsGroup": 2000}
 
 
-def test_ungranted_volumes_override_raises():
-    cm = _manager(users={"alice": _user("alice")})
-    with pytest.raises(PolicyError):
-        cm._apply_overrides({}, {"name": "alice"},
-                            {"volumes": {"scratch": "/mnt/scratch"}}, "alice")
-
-
-def test_granted_volumes_override_replaces_template_volumes():
+def test_there_is_no_volumes_override_left_to_grant():
+    """A session could name entries from the volumes catalog and choose their
+    mount paths; the grant is gone (2026-08-29) along with the allowedVolumes
+    list that bounded it. A CR still carrying one is ignored, not honoured —
+    the group cannot be granted, so nothing can authorize it."""
+    assert "volumes" not in OVERRIDE_GROUPS
     cm = _manager(users={"alice": _user("alice", volumes=True)})
+    assert cm.get_user_overrides("alice").get("volumes") is None
     spec, _ = cm._apply_overrides(
         {"volumes": {"data": "/mnt/data"}}, {"name": "alice"},
         {"volumes": {"scratch": "/mnt/scratch"}}, "alice",
     )
-    assert spec["volumes"] == {"scratch": "/mnt/scratch"}
+    assert spec["volumes"] == {"data": "/mnt/data"}
+
+
+# --- "No GPU" --------------------------------------------------------------- #
+
+_GPU_TPL = {"image": "x", "resources": {"cpu": "8", "gpu": 1},
+            "nodeSelector": {GPU_NODE_LABEL: "A100", "disktype": "ssd"}}
+
+
+def test_no_gpu_drops_both_halves_of_the_request():
+    """Zero GPUs is the ABSENCE of resources.gpu, not `gpu: 0` — both spec
+    builders would otherwise still attach a card. The node selector has to go
+    with it, or the session is pinned to GPU nodes it has no use for."""
+    cm = _manager(users={"alice": _user("alice", gpuType=True)})
+    spec, _ = cm._apply_overrides(_GPU_TPL, {}, {"gpuType": GPU_NONE}, "alice")
+    assert "gpu" not in spec["resources"]
+    assert spec["resources"]["cpu"] == "8"
+    # Only the GPU key: a template's other node selectors are not ours to drop.
+    assert spec["nodeSelector"] == {"disktype": "ssd"}
+
+
+def test_no_gpu_beats_a_count_submitted_alongside_it():
+    # The form disables the count box and _build_session_overrides declines to
+    # write the pair, but the two can only disagree in one direction and
+    # "none" is the answer that cannot be wrong.
+    cm = _manager(users={"alice": _user("alice", gpuType=True, gpuCount=True)})
+    spec, _ = cm._apply_overrides(
+        _GPU_TPL, {}, {"gpuType": GPU_NONE, "gpuCount": 4}, "alice")
+    assert "gpu" not in spec["resources"]
+
+
+def test_no_gpu_still_needs_the_gpu_type_override_grant():
+    cm = _manager(users={"alice": _user("alice")})
+    with pytest.raises(PolicyError, match="gpuType"):
+        cm._apply_overrides(_GPU_TPL, {}, {"gpuType": GPU_NONE}, "alice")
 
 
 # --- inputs are not mutated ------------------------------------------------ #

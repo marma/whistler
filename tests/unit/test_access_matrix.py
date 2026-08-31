@@ -6,11 +6,16 @@ meant "unrestricted". The allow-lists were brought into line on 2026-08-25, so
 the rule is now uniform — but a cell is (zone, volume, mode) and not a name,
 so the table is still not an allow-list. See design/security.md, "Core model:
 the access matrix".
+
+Since 2026-08-29 it is the ONLY thing that decides what a session may mount.
+The parallel allowedVolumes / group `volumes` allow-list that used to govern
+datasets is gone; see test_datasets.py and test_s3_proxy.py for the two places
+a dataset cell is enforced.
 """
 import pytest
 
-from whistler.config import (ACCESS_MODES, ENFORCED_ACCESS_KINDS,
-                             KubeConfigManager, merge_volume_access)
+from whistler.config import (ACCESS_MODES, KubeConfigManager,
+                             merge_volume_access)
 
 
 def _manager(users=None, groups=None):
@@ -27,7 +32,7 @@ def test_absent_is_no_access_and_there_is_nothing_below_it():
     cm = _manager({"alice": {"name": "alice"}})
     assert cm.volume_access("alice", "open", "anything") is None
     # An empty table grants nothing at all — the same explicit-allow rule
-    # allowedVolumes now follows, arrived at from the other direction.
+    # the allow-lists beside it follow.
     assert cm.get_user_volume_access("alice") == {}
 
 
@@ -119,11 +124,9 @@ def test_deleting_a_volume_drops_it_from_every_zone():
 
 # --- scope ------------------------------------------------------------------ #
 
-def test_only_home_volumes_are_enforced_so_far():
-    # Datasets and PVC volumes appear in the grid but are still governed by
-    # allowedVolumes and the group grants. Recording that in code keeps the UI
-    # honest — the same role ENFORCED_CHANNELS plays for `clipboard`.
-    assert ENFORCED_ACCESS_KINDS == ("home",)
+def test_the_modes_are_the_two_a_cell_can_hold():
+    # Absent is the third state and is deliberately not in the list: it is the
+    # absence of an entry, not a value a cell can be set to.
     assert ACCESS_MODES == ("allowed", "read-only")
 
 
