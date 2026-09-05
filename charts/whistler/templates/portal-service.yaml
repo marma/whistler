@@ -1,4 +1,13 @@
 {{- if .Values.portal.enabled }}
+{{- include "whistler.portal.validate" . }}
+{{- /*
+One Service, two ports: the viewer app on 8080 and the management app on 8081
+(both from the same pod, see portal-deployment.yaml). Node ports are only
+emitted for type NodePort, and only when pinned — empty lets Kubernetes pick a
+free one instead of the chart claiming a fixed number on every cluster it
+lands on.
+*/}}
+{{- $svc := .Values.portal.service }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -7,20 +16,20 @@ metadata:
   labels:
     app: whistler-portal
 spec:
-  type: {{ .Values.portal.service.type }}
+  type: {{ $svc.type }}
   selector:
     app: whistler-portal
   ports:
     - name: http
-      port: {{ .Values.portal.service.port }}
+      port: {{ $svc.port }}
       targetPort: 8080
-      {{- if and (eq .Values.portal.service.type "NodePort") .Values.portal.service.nodePort }}
-      nodePort: {{ .Values.portal.service.nodePort }}
+      {{- if and (eq $svc.type "NodePort") $svc.nodePort }}
+      nodePort: {{ $svc.nodePort }}
       {{- end }}
     - name: management
-      port: {{ .Values.portal.managementService.port }}
+      port: {{ $svc.managementPort }}
       targetPort: 8081
-      {{- if and (eq .Values.portal.service.type "NodePort") .Values.portal.managementService.nodePort }}
-      nodePort: {{ .Values.portal.managementService.nodePort }}
+      {{- if and (eq $svc.type "NodePort") $svc.managementNodePort }}
+      nodePort: {{ $svc.managementNodePort }}
       {{- end }}
 {{- end }}

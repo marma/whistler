@@ -226,10 +226,30 @@ server:
 
 portal:
   enabled: true
-  service:
-    type: NodePort
-    nodePort: 30080
+  # Both portal apps on one origin, through the chart's bundled Traefik pod.
+  # This is the whole configuration: the Ingress brings that pod up itself and
+  # points at it, and the portal Services stay ClusterIP. Leave `host` out if
+  # you reach the cluster by IP and have no name yet.
+  ingress:
+    enabled: true
+    host: whistler.example.com
+  # A shared name/password on that proxy, covering both portal apps and every
+  # way in that reaches it — the Ingress above, and a port-forward or NodePort
+  # on `proxy.service` alike. A lock on the door, not a login: it does not
+  # decide which Whistler user you are, and everyone shares the one password.
+  # Worth having while `auth.allowAny` is on (below), since that combination
+  # means any password signs anyone in.
+  proxy:
+    basicAuth:
+      enabled: true
+      username: whistler
+      password: "change-me"  # or `users: ["alice:$2y$05$..."]` from htpasswd -nB
   auth:
+    # No web SSO yet. allowAny accepts any password at /login and is the only
+    # way in today; allowAdmin would additionally make everyone an admin, so
+    # name your admins here instead.
+    allowAny: true
+    allowAdmin: false
     adminUsers: "alice"
   screenshots:
     intervalSeconds: 300     # 0 disables; the stored box is the whole policy
@@ -362,9 +382,26 @@ Check it came up, then connect as the bootstrap admin:
 kubectl -n whistler get pods
 kubectl -n whistler get zones,groups,templates
 
-ssh alice@<node> -p 30022          # the launcher TUI
-open http://<node>:30080           # the portal
+ssh alice@<node> -p 30022               # the launcher TUI
+open http://whistler.example.com        # the portal, via the Ingress above
 ```
+
+The Ingress hostname has to resolve to your ingress controller — a DNS record,
+or a line in `/etc/hosts` pointing at the address of
+`kubectl -n kube-system get svc traefik`. With no ingress controller (or no
+name), skip the Ingress and port-forward the same origin instead:
+
+```bash
+helm upgrade whistler charts/whistler -n whistler -f values.yaml \
+  --set portal.ingress.enabled=false --set portal.proxy.enabled=true
+kubectl -n whistler port-forward svc/whistler-portal-proxy 8080:80
+```
+
+Either way the browser asks for the `proxy.basicAuth` name and password first
+(`whistler` / `change-me` above), and then the portal's own `/login` asks for a
+Whistler username — any password, since `auth.allowAny` is what accepts it.
+Two prompts, answering two different questions: the first says you may reach
+this origin at all, the second says who you are once you have.
 
 ## 5. Optional: an image registry in the cluster
 

@@ -1,29 +1,17 @@
-{{- if and .Values.portal.enabled .Values.portal.ingress.resource.enabled }}
+{{- if and .Values.portal.enabled .Values.portal.ingress.enabled }}
+{{- include "whistler.portal.validate" . }}
 {{- /*
-A real cluster Ingress in front of the portal.
+A Kubernetes Ingress on the cluster's own ingress controller, handing a
+hostname to the portal.
 
-This is NOT the same thing as portal.ingress.enabled, which ships the bundled
-Traefik *pod* (portal-proxy.yaml) that collapses the viewer (:8080) and
-management (:8081) apps onto one origin using the file provider — no cluster
-ingress controller involved. This object is the other half: it hands a
-hostname on the cluster's own ingress controller to that single origin.
-
-Backend selection:
-  * bundled proxy enabled  -> route to <release>-portal-proxy:80, which already
-    knows the viewer/mgmt path split. One rule, one path, and the split stays
-    in exactly one place.
-  * bundled proxy disabled -> route to the viewer service and let the
-    management app keep its own NodePort. A cluster Ingress cannot reproduce
-    the proxy's path table without duplicating it here.
+The backend is always the bundled proxy service (portal-proxy.yaml), which
+already owns the viewer/management path split — one rule, one path, and the
+split stays in exactly one place. That is also why enabling this turns the
+proxy on: routing straight at the portal Service would reach one app and
+strand the other, and reproducing the path table in Ingress rules would be a
+second copy of it to keep in sync.
 */}}
-{{- $proxy := .Values.portal.ingress }}
-{{- $ing := $proxy.resource }}
-{{- $backendName := printf "%s-portal" .Release.Name }}
-{{- $backendPort := .Values.portal.service.port | int }}
-{{- if $proxy.enabled }}
-{{- $backendName = printf "%s-portal-proxy" .Release.Name }}
-{{- $backendPort = $proxy.service.port | int }}
-{{- end }}
+{{- $ing := .Values.portal.ingress }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -51,7 +39,7 @@ spec:
             pathType: {{ $ing.pathType | default "Prefix" }}
             backend:
               service:
-                name: {{ $backendName }}
+                name: {{ .Release.Name }}-portal-proxy
                 port:
-                  number: {{ $backendPort }}
+                  number: {{ .Values.portal.proxy.service.port | int }}
 {{- end }}

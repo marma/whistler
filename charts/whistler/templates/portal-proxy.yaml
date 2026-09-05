@@ -1,4 +1,4 @@
-{{- if and .Values.portal.enabled .Values.portal.ingress.enabled }}
+{{- if and .Values.portal.enabled (include "whistler.portal.proxyEnabled" .) }}
 {{- /*
 Bundled Traefik reverse proxy fronting the portal pod's two web apps on one
 origin (see portal-deployment.yaml / whistler/portal/__main__.py):
@@ -9,10 +9,15 @@ backend works — it falls to mgmt) and /healthz (probes hit the pod directly).
 Collapsing onto one host lets WHISTLER_DESKTOP_PORTAL_URL stay empty so the
 management UI's "Connect" link resolves same-origin.
 
+Turned on by portal.ingress.enabled (it is the Ingress backend) or directly
+by portal.proxy.enabled for a port-forwarded dev origin.
+
 Uses Traefik's FILE provider (portal-proxy-config.yaml) rather than the
 Kubernetes provider, so it needs no CRDs, no RBAC, and no cluster-installed
 ingress controller — works on a vanilla Kind cluster.
 */}}
+{{- $proxy := .Values.portal.proxy }}
+{{- $auth := $proxy.basicAuth | default dict }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -31,10 +36,13 @@ spec:
         app: whistler-portal-proxy
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/portal-proxy-config.yaml") . | sha256sum }}
+        {{- if $auth.enabled }}
+        checksum/auth: {{ include (print $.Template.BasePath "/portal-proxy-auth.yaml") . | sha256sum }}
+        {{- end }}
     spec:
       containers:
         - name: traefik
-          image: {{ .Values.portal.ingress.image }}
+          image: {{ $proxy.image }}
           # Static config lives at Traefik's default path; dynamic config is
           # loaded (and watched) by the file provider in portal-proxy-config.yaml.
           ports:
@@ -54,12 +62,22 @@ spec:
               mountPath: /config/dynamic.yml
               subPath: dynamic.yml
               readOnly: true
+            {{- if $auth.enabled }}
+            - name: auth
+              mountPath: /auth
+              readOnly: true
+            {{- end }}
           resources:
-            {{- toYaml .Values.portal.ingress.resources | nindent 12 }}
+            {{- toYaml $proxy.resources | nindent 12 }}
       volumes:
         - name: config
           configMap:
             name: {{ .Release.Name }}-portal-proxy
+        {{- if $auth.enabled }}
+        - name: auth
+          secret:
+            secretName: {{ .Release.Name }}-portal-proxy-auth
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -69,14 +87,14 @@ metadata:
   labels:
     app: whistler-portal-proxy
 spec:
-  type: {{ .Values.portal.ingress.service.type }}
+  type: {{ $proxy.service.type }}
   selector:
     app: whistler-portal-proxy
   ports:
     - name: web
-      port: {{ .Values.portal.ingress.service.port }}
+      port: {{ $proxy.service.port }}
       targetPort: 80
-      {{- if and (eq .Values.portal.ingress.service.type "NodePort") .Values.portal.ingress.service.nodePort }}
-      nodePort: {{ .Values.portal.ingress.service.nodePort }}
+      {{- if and (eq $proxy.service.type "NodePort") $proxy.service.nodePort }}
+      nodePort: {{ $proxy.service.nodePort }}
       {{- end }}
 {{- end }}

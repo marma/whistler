@@ -1,0 +1,67 @@
+{{- $auth := .Values.portal.proxy.basicAuth | default dict }}
+{{- if and .Values.portal.enabled $auth.enabled }}
+{{- /*
+HTTP Basic auth credentials for the bundled portal proxy (portal-proxy.yaml).
+
+This is a testing lock, not an authentication system. It exists so a portal
+running with portal.auth.allowAny / allowAdmin — where any password signs
+anyone in, as an admin — can be left reachable on a host without being open to
+whoever finds it. It says nothing about *which* Whistler user you are: the
+portal's own identity (the whistler_user cookie, ?user=) is unchanged behind
+it, so one shared name/password gates the door and everyone through it is
+still whoever the portal thinks they are.
+
+Enforced by the bundled Traefik pod, which is why enabling it without that pod
+is an error rather than a no-op. Being on the proxy is also what makes it cover
+every way in at once: the Ingress routes *through* the proxy, and so does a
+port-forward or NodePort on the proxy Service.
+*/}}
+{{- if not (include "whistler.portal.proxyEnabled" .) }}
+{{- fail "portal.proxy.basicAuth.enabled with no proxy to enforce it. The proxy comes up with portal.ingress.enabled, or on its own with portal.proxy.enabled: true — one of those, or drop basicAuth." }}
+{{- end }}
+{{- $name := printf "%s-portal-proxy-auth" .Release.Name }}
+{{- $lines := list }}
+{{- $fingerprint := "" }}
+{{- if $auth.users }}
+{{- /* Pre-hashed htpasswd lines win: no plaintext in values, and the rendered
+       Secret is a pure function of the input. `htpasswd -nB <user>` makes one. */}}
+{{- $lines = $auth.users }}
+{{- $fingerprint = printf "users:%s" (join "\n" $auth.users) | sha256sum }}
+{{- else }}
+{{- if not $auth.password }}
+{{- fail "portal.proxy.basicAuth.enabled is set but no credential was given — set portal.proxy.basicAuth.password, or portal.proxy.basicAuth.users with pre-hashed htpasswd lines." }}
+{{- end }}
+{{- $fingerprint = printf "plain:%s:%s" $auth.username $auth.password | sha256sum }}
+{{- /* bcrypt salts itself, so rendering the hash fresh every time would churn
+       the Secret — and roll the proxy pod — on every upgrade that changed
+       nothing. Reuse the hash already in the cluster while the credential it
+       was made from is unchanged; the annotation is what says so. (`helm
+       template` has no cluster to look in and so always renders a new hash.) */}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
+{{- $reuse := "" }}
+{{- if $existing }}
+{{- $ann := $existing.metadata.annotations | default dict }}
+{{- if eq (get $ann "whistler/credentials-hash") $fingerprint }}
+{{- $reuse = get ($existing.data | default dict) "users" | b64dec }}
+{{- end }}
+{{- end }}
+{{- if $reuse }}
+{{- $lines = list (trim $reuse) }}
+{{- else }}
+{{- $lines = list (htpasswd (default "whistler" $auth.username) $auth.password) }}
+{{- end }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: whistler-portal-proxy
+  annotations:
+    whistler/credentials-hash: {{ $fingerprint | quote }}
+type: Opaque
+data:
+  # htpasswd format, one user per line. Traefik reads it as `usersFile`.
+  users: {{ join "\n" $lines | b64enc | quote }}
+{{- end }}

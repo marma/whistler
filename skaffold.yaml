@@ -38,18 +38,24 @@ deploy:
           server.service.nodePort: 30022
           portal.auth.allowAny: true
           portal.auth.allowAdmin: true
-          # Front both portal apps through the chart's bundled Traefik pod on one
-          # origin instead of two NodePorts. host left empty -> path-only routing,
-          # so it works regardless of the localhost:30080 the port-forward uses.
-          portal.service.type: ClusterIP
-          portal.ingress.enabled: true
-          # A real cluster Ingress on top of that proxy, so the portal is also
-          # reachable by name through k3s/k3d's own Traefik (default
-          # IngressClass) on its port 80 — no port-forward. Point the name at
-          # the ingress controller's address, e.g. in /etc/hosts:
+          # Those two together mean any password signs anyone in, as an admin.
+          # That is fine behind the port-forward below; it is not fine on the
+          # ingress hostname further down. To put a shared name/password on the
+          # bundled proxy — covering both portal apps and both ways in — add:
+          #   portal.proxy.basicAuth.enabled: true
+          #   portal.proxy.basicAuth.password: <something>
+          # Left off here so the loop stays one click. See values.yaml for what
+          # that lock is and is not — it gates the door, not the identity.
+          #
+          # An Ingress on k3s/k3d's own Traefik, so the portal is reachable by
+          # name on port 80 as well as through the port-forward below. This also
+          # brings up the chart's bundled proxy pod, which is what puts both
+          # portal apps (viewer :8080 + management :8081) on one origin; the
+          # portal's own Services stay ClusterIP. Point the name at the ingress
+          # controller's address, e.g. in /etc/hosts:
           #   kubectl -n kube-system get svc traefik
-          portal.ingress.resource.enabled: true
-          portal.ingress.resource.host: whistler.martinmalmsten.net
+          portal.ingress.enabled: true
+          portal.ingress.host: whistler.martinmalmsten.net
           userVolume.accessMode: ReadWriteOnce
           userVolume.size: 10Mi
           whistler.volumes[0].name: data

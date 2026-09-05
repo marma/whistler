@@ -1,10 +1,9 @@
-{{- if and .Values.portal.enabled .Values.portal.ingress.enabled }}
+{{- if and .Values.portal.enabled (include "whistler.portal.proxyEnabled" .) }}
 {{- /*
 Traefik file-provider config for the bundled portal proxy (see portal-proxy.yaml
 for the Deployment/Service and the routing rationale). Static config + dynamic
 routers/services in one ConfigMap.
 */}}
-{{- $host := .Values.portal.ingress.host }}
 {{- /* The viewer app serves the desktop connect page (/connect), the
        reverse-proxied Selkies viewer (/desktop), the noVNC viewer for VM
        sessions (/vnc + /ws-vnc + its /static assets), the web terminal
@@ -16,11 +15,19 @@ routers/services in one ConfigMap.
        invisibly, because the dashboard hides a thumbnail that fails to load.
        The kiosk cards use the same URL, which is how it surfaced. */}}
 {{- $viewerPaths := "PathPrefix(`/connect`) || PathPrefix(`/desktop`) || PathPrefix(`/launch`) || PathPrefix(`/status`) || PathPrefix(`/term`) || PathPrefix(`/ws-term`) || PathPrefix(`/vnc`) || PathPrefix(`/ws-vnc`) || PathPrefix(`/console`) || PathPrefix(`/ws-console`) || PathPrefix(`/screenshot`) || PathPrefix(`/kiosk`) || PathPrefix(`/static`)" }}
+{{- /* Path routing only, no Host() match. The Ingress in front decides which
+       hostname reaches the proxy; repeating that here would only mean a
+       port-forward to the proxy Service (http://localhost:<port>, the dev
+       arrangement) matched no router and 404'd on every path. */}}
 {{- $viewerRule := $viewerPaths }}
 {{- $mgmtRule := "PathPrefix(`/`)" }}
-{{- if $host }}
-{{- $viewerRule = printf "Host(`%s`) && (%s)" $host $viewerPaths }}
-{{- $mgmtRule = printf "Host(`%s`)" $host }}
+{{- $auth := .Values.portal.proxy.basicAuth | default dict }}
+{{- /* One middleware in front of both routers: the lock is on the origin, not
+       on a subset of its paths. See portal-proxy-auth.yaml for what it is and
+       is not. */}}
+{{- $middlewares := "" }}
+{{- if $auth.enabled }}
+{{- $middlewares = "[portal-auth]" }}
 {{- end }}
 apiVersion: v1
 kind: ConfigMap
@@ -60,11 +67,17 @@ data:
           priority: 100
           entryPoints: [web]
           service: portal-viewer
+          {{- if $middlewares }}
+          middlewares: {{ $middlewares }}
+          {{- end }}
         portal-mgmt:
           rule: "{{ $mgmtRule }}"
           priority: 10
           entryPoints: [web]
           service: portal-mgmt
+          {{- if $middlewares }}
+          middlewares: {{ $middlewares }}
+          {{- end }}
       services:
         portal-viewer:
           loadBalancer:
@@ -73,5 +86,17 @@ data:
         portal-mgmt:
           loadBalancer:
             servers:
-              - url: "http://{{ .Release.Name }}-portal:{{ .Values.portal.managementService.port }}"
+              - url: "http://{{ .Release.Name }}-portal:{{ .Values.portal.service.managementPort }}"
+      {{- if $auth.enabled }}
+      middlewares:
+        portal-auth:
+          basicAuth:
+            # The credential lives in a Secret (portal-proxy-auth.yaml), not
+            # in this ConfigMap. Traefik loads it once at startup — the file
+            # provider does not watch (see above) — so a changed credential
+            # reaches the proxy by rolling the pod, which the checksum/auth
+            # annotation in portal-proxy.yaml does.
+            usersFile: /auth/users
+            realm: {{ $auth.realm | default "Whistler" | quote }}
+      {{- end }}
 {{- end }}

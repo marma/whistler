@@ -42,26 +42,65 @@ server:
 portal:
   enabled: true
   replicaCount: 1
+  # ONE Service with two ports: the viewer app (:8080 — desktop, web terminal,
+  # kiosk) and the management app (:8081 — dashboard, admin). ClusterIP by
+  # default, because a chart that claims fixed node ports out of the box is a
+  # chart that collides with the next thing installed on the cluster. With
+  # `ingress` below — or a port-forward — nothing here needs changing at all.
+  #
+  # nodePort / managementNodePort apply only when type is NodePort, and empty
+  # means "let Kubernetes pick a free one". Pin them only when something
+  # outside the cluster has to know the number in advance.
   service:
-    type: NodePort
+    type: ClusterIP
     port: 8080
-    nodePort: 30080
-  managementService:
-    port: 8081
-    nodePort: 30081
-  # Bundled Traefik reverse proxy: fronts both portal apps (viewer :8080 +
-  # management :8081) on one origin via path routing, so they share a host and
-  # the management UI's desktop "Connect" links resolve same-origin. Ships its
-  # own Traefik pod configured via the file provider — no CRDs, no RBAC, no
-  # cluster ingress controller needed (works on vanilla Kind). Off by default;
-  # the portal NodePorts above still work when this is disabled.
+    managementPort: 8081
+    nodePort: ""
+    managementNodePort: ""
+
+  # A Kubernetes Ingress (networking.k8s.io/v1) on the cluster's own ingress
+  # controller — the normal way in, and the only one that puts both portal
+  # apps on a single origin under a name you choose:
+  #
+  #   ingress:
+  #     enabled: true
+  #     host: portal.example.com
+  #
+  # That is the whole configuration. It brings up the bundled proxy below by
+  # itself and points the Ingress at it, so the management UI's desktop
+  # "Connect" links resolve same-origin without WHISTLER_DESKTOP_PORTAL_URL.
+  # Needs an ingress controller in the cluster (k3s/k3d ship Traefik as the
+  # default class). The port users hit is the controller's own listener — 80,
+  # or 443 with `tls` — and nothing here changes that.
   ingress:
     enabled: false
-    image: "traefik:v3.3"
-    # Restrict routing to this host; empty matches any host (path-only routing).
+    # Empty uses the cluster's default IngressClass.
+    className: ""
+    # Empty matches any host, which is what you want when you reach the
+    # cluster by IP and have no name yet.
     host: ""
+    path: /
+    pathType: Prefix
+    annotations: {}
+    # e.g. [{secretName: whistler-tls, hosts: [portal.example.com]}]
+    tls: []
+
+  # The bundled Traefik pod that collapses the two portal apps onto one origin
+  # by path (viewer paths win; everything else is management). It uses
+  # Traefik's file provider, so it needs no CRDs, no RBAC and no cluster
+  # ingress controller — it works on a bare Kind cluster.
+  #
+  # `enabled` is unset by default, meaning "follow the Ingress": on when
+  # `ingress.enabled` is on, off otherwise. Set it to true to run the proxy
+  # WITHOUT an Ingress — the dev arrangement, where `proxy.service` is
+  # port-forwarded (or a NodePort) and both apps share http://localhost:<port>.
+  # Setting it to false while the Ingress is on is refused rather than
+  # half-honoured: an Ingress needs one backend that knows the path split, and
+  # this is that backend.
+  proxy:
+    enabled:
+    image: "traefik:v3.3"
     service:
-      # ClusterIP + a port-forward (dev) or NodePort/LoadBalancer (real cluster).
       type: ClusterIP
       port: 80
       nodePort: ""
@@ -72,28 +111,32 @@ portal:
       requests:
         cpu: 100m
         memory: 64Mi
-    # A real Kubernetes Ingress object (networking.k8s.io/v1) on the cluster's
-    # own ingress controller — the other half of the story from `enabled`
-    # above, which only ships the bundled Traefik pod. Needs an ingress
-    # controller in the cluster (k3s/k3d ship Traefik as the default class).
+    # HTTP Basic auth on the proxy, so it covers BOTH portal apps and every
+    # way in that reaches the proxy — the Ingress above and a port-forwarded
+    # or NodePort `proxy.service` alike.
     #
-    # Backend: the bundled proxy service when `enabled` is true (it already
-    # owns the viewer/mgmt path split), otherwise the viewer service — a
-    # cluster Ingress cannot reproduce that path table without duplicating it.
+    # This is a lock on the door, not a login. It exists for exactly the
+    # situation portal.auth.allowAny + allowAdmin creates: a portal where any
+    # password signs anyone in as an admin, left reachable while you test. It
+    # does not decide *which* Whistler user you are — the portal's own
+    # identity (the whistler_user cookie, ?user=) is untouched behind it, and
+    # everyone shares the one name/password. Don't mistake it for the real web
+    # SSO that portal.auth is waiting for.
     #
-    # The controller's own listener is the port users hit: 80 (and 443 with
-    # tls below). Nothing here changes that; `service.port` above is only the
-    # bundled proxy's ClusterIP port.
-    resource:
+    #   password  — plaintext here, bcrypt-hashed into a Secret at render time.
+    #               The hash is reused across upgrades while this string is
+    #               unchanged, so a redeploy that changes nothing does not roll
+    #               the proxy pod. Convenient; puts a password in your values.
+    #   users     — pre-hashed htpasswd lines instead, and they win over
+    #               username/password. `htpasswd -nB alice` gives you one.
+    #               Nothing plaintext leaves your terminal.
+    basicAuth:
       enabled: false
-      # Empty uses the cluster's default IngressClass.
-      className: ""
-      host: whistler.martinmalmsten.net
-      path: /
-      pathType: Prefix
-      annotations: {}
-      # e.g. [{secretName: whistler-tls, hosts: [whistler.martinmalmsten.net]}]
-      tls: []
+      username: whistler
+      password: ""
+      users: []
+      realm: "Whistler"
+
   logLevel: INFO
   auth:
     # Minimal/dev only this round. When false the portal returns 401 (real web

@@ -1,0 +1,9 @@
+{{- /*
+Renders nothing. Exists so the portal value checks run on every render, not
+only when the object that happens to reference them is being created — a
+values file that no longer means what it says should fail at `helm template`,
+whether or not the Ingress is switched on. See _portal.tpl.
+*/ -}}
+{{- if .Values.portal.enabled }}
+{{- include "whistler.portal.validate" . }}
+{{- end }}
