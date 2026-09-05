@@ -232,8 +232,9 @@ portal:
   auth:
     adminUsers: "alice"
   screenshots:
-    intervalSeconds: 300     # 0 disables; maxWidth is the whole policy
-    maxWidth: 320
+    intervalSeconds: 300     # 0 disables; the stored box is the whole policy
+    maxWidth: 960            # 960x540 reads window titles and menus;
+    maxHeight: 540           # 320 is the coarse activity overview
 
 whistler:
   # Seeded once, at operator startup. Never overwritten afterwards — manage
@@ -287,10 +288,12 @@ whistler:
     lab-staff:
       description: Internal staff on the imaging project
       members: [alice, bob]
-      volumes:
-        - name: reference-data
-          mode: ro
       allowedZones: [green]
+      # The access matrix: zone -> volume -> allowed | read-only. A cell is
+      # (zone, volume, mode), not a name — an absent cell is no access.
+      volumeAccess:
+        green:
+          reference-data: read-only
 
 templates:
   small:
