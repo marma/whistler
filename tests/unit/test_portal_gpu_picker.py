@@ -45,7 +45,7 @@ def test_the_sentinel_can_never_be_a_real_gpu_type():
 _TPL_BASE = dict(name="t", display_name="T", image="i", description="",
                  cpu="1", memory="2Gi", personal_mount="/userdata", mode="ssh",
                  runtime="vm", privileged=None, fuse=None, display_port=None,
-                 protocol=None)
+                 viewer=None)
 
 
 def _tpl(**gpu):
@@ -221,3 +221,21 @@ def test_editing_a_gpu_template_to_no_gpu_actually_clears_the_cr():
     # ...and the rest of the template is still there.
     assert written["resources"]["cpu"] == "1"
     assert written["image"] == "i"
+
+
+# --- the viewer select ------------------------------------------------------ #
+
+def test_desktop_template_records_the_viewer():
+    data = _template_form_data(**{**_TPL_BASE, "mode": "desktop",
+                                  "viewer": "websockets"})
+    assert data["viewer"] == "websockets"
+
+
+def test_viewer_is_desktop_only_and_enum_bound():
+    # ssh templates have no display, so the (always-submitted) select is dropped.
+    assert "viewer" not in _template_form_data(**{**_TPL_BASE, "viewer": "vnc"})
+    # Anything outside the CRD enum is left off so save_system_template's
+    # merge keeps the existing value instead of failing validation.
+    for bad in (None, "", "rdp"):
+        d = _template_form_data(**{**_TPL_BASE, "mode": "desktop", "viewer": bad})
+        assert "viewer" not in d, bad

@@ -504,6 +504,15 @@ _POSTURE_CHANNELS = {
 #: one question is how they end up disagreeing, so the allow-list is gone.
 ACCESS_MODES = ("allowed", "read-only")
 
+#: Template ``spec.viewer`` — how the portal shows a desktop session: the
+#: Selkies stream reverse-proxied from the guest (``websockets``), or the
+#: KubeVirt VNC subresource (``vnc``, VMs only). Mirrors the CRD enum; an
+#: absent field resolves per runtime at reconcile (vnc for a VM, websockets
+#: for a pod).
+VIEWER_WEBSOCKETS = "websockets"
+VIEWER_VNC = "vnc"
+VIEWERS = (VIEWER_WEBSOCKETS, VIEWER_VNC)
+
 
 def merge_volume_access(*sources) -> Dict[str, Dict[str, str]]:
     """Merge access matrices, most permissive per cell.

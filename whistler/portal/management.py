@@ -44,7 +44,7 @@ from whistler.config import (ACCESS_MODES, CHANNELS, ConfigWriteError,
                              ENFORCED_CHANNELS, GPU_NONE,
                              ENTRY_KIOSK, ENTRY_POINTS, ENTRY_PORTAL,
                              GPU_NODE_LABEL, NEW_USER_ENTRY_POINTS,
-                             NEW_USER_ZONES, OVERRIDE_GROUPS)
+                             NEW_USER_ZONES, OVERRIDE_GROUPS, VIEWERS)
 from whistler.portal.login import (USER_COOKIE, dev_auth, render_login,
                                    render_notice, verify_credentials)
 from whistler.status import GROUP_COLORS, status_group
@@ -1051,7 +1051,7 @@ async def admin_template_create(
     privileged:     Annotated[Optional[str], Form()] = None,
     fuse:           Annotated[Optional[str], Form()] = None,
     display_port:   Annotated[Optional[str], Form()] = None,
-    protocol:       Annotated[Optional[str], Form()] = None,
+    viewer:         Annotated[Optional[str], Form()] = None,
     zone:           Annotated[Optional[str], Form()] = None,
 ):
     data = _template_form_data(
@@ -1059,7 +1059,7 @@ async def admin_template_create(
         description=description, cpu=cpu, memory=memory, gpu=gpu, gpu_type=gpu_type,
         personal_mount=personal_mount,
         mode=mode, runtime=runtime, privileged=privileged, fuse=fuse,
-        display_port=display_port, protocol=protocol, zone=zone,
+        display_port=display_port, viewer=viewer, zone=zone,
     )
     ok = await request.app.state.run(cm.save_system_template, data)
     if not ok:
@@ -1099,7 +1099,7 @@ async def admin_template_update(
     privileged:     Annotated[Optional[str], Form()] = None,
     fuse:           Annotated[Optional[str], Form()] = None,
     display_port:   Annotated[Optional[str], Form()] = None,
-    protocol:       Annotated[Optional[str], Form()] = None,
+    viewer:         Annotated[Optional[str], Form()] = None,
     zone:           Annotated[Optional[str], Form()] = None,
 ):
     data = _template_form_data(
@@ -1107,7 +1107,7 @@ async def admin_template_update(
         description=description, cpu=cpu, memory=memory, gpu=gpu, gpu_type=gpu_type,
         personal_mount=personal_mount,
         mode=mode, runtime=runtime, privileged=privileged, fuse=fuse,
-        display_port=display_port, protocol=protocol, zone=zone,
+        display_port=display_port, viewer=viewer, zone=zone,
     )
     ok = await request.app.state.run(cm.save_system_template, data)
     if not ok:
@@ -1921,7 +1921,7 @@ def _build_session_overrides(*, cpu=None, memory=None,
 
 def _template_form_data(*, name, display_name, image, description, cpu, memory,
                         personal_mount, mode, runtime, privileged, fuse,
-                        display_port, protocol, gpu=None, gpu_type=None,
+                        display_port, viewer, gpu=None, gpu_type=None,
                         zone=None) -> dict:
     """Assemble a save_system_template payload from the admin template form,
     including the access mode / runtime / privileged toggles. Desktop-only
@@ -1966,8 +1966,14 @@ def _template_form_data(*, name, display_name, image, description, cpu, memory,
     if data["mode"] == "desktop":
         if display_port and display_port.strip():
             data["displayPort"] = int(display_port)
-        if protocol:
-            data["protocol"] = protocol
+        # spec.viewer decides how the portal shows the desktop: the Selkies
+        # stream over the reverse proxy, or the KubeVirt VNC subresource. A
+        # template without it gets the runtime default at reconcile (vnc for
+        # a VM), which is how a Selkies VM image ended up on the machine
+        # console. Only the CRD's two values are written; anything else
+        # leaves the existing field alone rather than failing the enum.
+        if viewer in VIEWERS:
+            data["viewer"] = viewer
     return data
 
 

@@ -81,11 +81,18 @@
                value="{{ tpl.displayPort if tpl and tpl.displayPort else '' }}">
       </div>
       <div class="field">
-        <label for="protocol">Protocol</label>
-        <select id="protocol" name="protocol" class="ui dropdown">
-          <option value="rdp" {% if not tpl or tpl.protocol != 'vnc' %}selected{% endif %}>RDP</option>
-          <option value="vnc" {% if tpl and tpl.protocol == 'vnc' %}selected{% endif %}>VNC</option>
+        <label for="viewer">Viewer</label>
+        {# spec.viewer: how the portal shows the desktop. A template that names
+           none gets the runtime default at reconcile (vnc for a VM, websockets
+           for a pod) — which is how a Selkies VM image ended up on the machine
+           console. So the select always names one: for a template without the
+           field it tracks the Runtime dropdown until the admin picks. #}
+        <select id="viewer" name="viewer" class="ui dropdown"
+                data-explicit="{{ 'yes' if tpl and tpl.viewer else 'no' }}">
+          <option value="websockets" {% if tpl and tpl.viewer == 'websockets' %}selected{% endif %}>Selkies desktop stream (websockets)</option>
+          <option value="vnc"        {% if tpl and tpl.viewer == 'vnc' %}selected{% endif %}>Machine console (KubeVirt VNC)</option>
         </select>
+        <div class="ui pointing label">Selkies needs the guest to run a Selkies server; VNC is the VM's real screen and needs nothing in the guest (VMs only).</div>
       </div>
     </div>
 
@@ -220,18 +227,37 @@
 </div>
 
 <script>
-// Show desktop-only fields (display port / protocol) only when mode == desktop.
+// Show desktop-only fields (display port / viewer) only when mode == desktop.
+// The viewer select follows the runtime's default (vnc for a VM, websockets
+// otherwise) until the template has an explicit value — saved, or picked here.
 $(document).ready(function () {
   const desktopFields = document.getElementById('desktop-fields');
+  const viewerSel = document.getElementById('viewer');
+  let viewerExplicit = viewerSel.dataset.explicit === 'yes';
+  let programmatic = false;   // `set selected` fires onChange; that is not a pick
   function sync(value) {
     desktopFields.style.display = (value === 'desktop') ? '' : 'none';
+  }
+  function defaultViewer(runtime) {
+    if (viewerExplicit) return;
+    programmatic = true;
+    $(viewerSel).closest('.ui.dropdown')
+      .dropdown('set selected', runtime === 'vm' ? 'vnc' : 'websockets');
+    programmatic = false;
   }
   $('#mode').closest('.ui.dropdown').dropdown({
     onChange: function (value) { sync(value); }
   });
+  $('#runtime').closest('.ui.dropdown').dropdown({
+    onChange: function (value) { defaultViewer(value); }
+  });
+  $(viewerSel).closest('.ui.dropdown').dropdown({
+    onChange: function () { if (!programmatic) viewerExplicit = true; }
+  });
   $('.ui.dropdown').dropdown();
   $('.ui.checkbox').checkbox();
   sync(document.getElementById('mode').value);
+  defaultViewer(document.getElementById('runtime').value);
 });
 </script>
 
