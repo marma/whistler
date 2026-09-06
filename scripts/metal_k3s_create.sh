@@ -67,7 +67,7 @@ while (( $# )); do
       [[ $# -ge 2 ]] || { echo "ERROR: --allow-gpu needs a value" >&2; exit 2; }
       ALLOW_GPU_ARGS+=("$1" "$2"); shift 2 ;;
     --allow-gpu=*) ALLOW_GPU_ARGS+=("$1"); shift ;;
-    -h|--help) sed -n '3,/^set -euo pipefail/{/^set -euo pipefail/d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
+    -h|--help) sed -n '3,/^set -euo pipefail/{/^set -euo pipefail/d;s/^# \{0,1\}//;p;}' "$0"; exit 0 ;;
     *) echo "ERROR: unknown argument '$1' (see --help)" >&2; exit 2 ;;
   esac
 done

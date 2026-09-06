@@ -57,7 +57,7 @@
 set -euo pipefail
 
 usage() {
-  sed -n '3,/^set -euo pipefail/{/^set -euo pipefail/d;s/^# \{0,1\}//;p}' "$0"
+  sed -n '3,/^set -euo pipefail/{/^set -euo pipefail/d;s/^# \{0,1\}//;p;}' "$0"
 }
 
 ALLOW_GPU_SPECS=()
@@ -159,6 +159,10 @@ json_array() {
 
 NVIDIA_VENDOR_ID=10de
 
+# Not ${var,,}: that is bash 4, and this script also runs from workstations
+# whose bash is 3.2 (macOS).
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
 # pci.ids as pciutils ships it (the `pci.ids` / `hwdata` package).
 find_pci_ids() {
   local f
@@ -259,11 +263,13 @@ resolve_gpu_spec() {
       echo "ERROR: --allow-gpu '${spec}': expected vendor:device=resourceName, e.g. 10de:2684=nvidia.com/AD102_GEFORCE_RTX_4090" >&2
       return 1
     fi
-    printf '%s\t%s%s\n' "${BASH_REMATCH[1],,}" "${BASH_REMATCH[2]:-nvidia.com/}" "${BASH_REMATCH[3]}"
+    printf '%s\t%s%s\n' "$(lower "${BASH_REMATCH[1]}")" "${BASH_REMATCH[2]:-nvidia.com/}" "${BASH_REMATCH[3]}"
 
   elif [[ "$spec" =~ ^(([0-9a-fA-F]{4}):)?([0-9a-fA-F]{4})$ ]]; then
-    local vendor="${BASH_REMATCH[2]:-$NVIDIA_VENDOR_ID}" id="${BASH_REMATCH[3],,}"
-    if [[ "${vendor,,}" != "$NVIDIA_VENDOR_ID" ]]; then
+    local vendor id
+    vendor="$(lower "${BASH_REMATCH[2]:-$NVIDIA_VENDOR_ID}")"
+    id="$(lower "${BASH_REMATCH[3]}")"
+    if [[ "$vendor" != "$NVIDIA_VENDOR_ID" ]]; then
       echo "ERROR: --allow-gpu '${spec}': only NVIDIA (${NVIDIA_VENDOR_ID}:xxxx) devices resolve by id; use vendor:device=resourceName" >&2
       return 1
     fi
@@ -423,7 +429,7 @@ if (( ${#ALLOW_GPU_SPECS[@]} )); then
   for rname in ${pci_names+"${pci_names[@]}"}; do
     advertised="$(kubectl get nodes \
       -o jsonpath="{range .items[*]}{.status.allocatable.${rname//./\\.}}{' '}{end}" 2>/dev/null \
-      | tr ' ' '\n' | grep -vx '0\?' | head -1 || true)"
+      | tr ' ' '\n' | grep -Ev '^0?$' | head -1 || true)"
     if [[ -z "$advertised" ]]; then
       echo "    NOTE: no node advertises ${rname} yet. Fine if the GPU Operator has not"
       echo "    bound the device: it needs sandboxWorkloads.enabled=true and the node"
