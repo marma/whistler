@@ -368,6 +368,16 @@ def test_gpu_devices_present_only_when_requested():
     assert "gpus" not in without_gpu["spec"]["template"]["spec"]["domain"]["devices"]
 
 
+def test_gpu_count_is_one_devices_entry_per_card():
+    # KubeVirt has no count field on devices.gpus: it requests deviceName once
+    # per entry. A single gpu0 for a count of 4 (what this used to emit) is a
+    # session that quietly boots with one card.
+    vm = _build(template_spec={"image": "x", "resources": {"gpu": "4"}})
+    gpus = vm["spec"]["template"]["spec"]["domain"]["devices"]["gpus"]
+    assert [g["name"] for g in gpus] == ["gpu0", "gpu1", "gpu2", "gpu3"]
+    assert {g["deviceName"] for g in gpus} == {"nvidia.com/AD102_GEFORCE_RTX_4090"}
+
+
 @pytest.mark.parametrize("zero", [0, "0", "", None])
 def test_a_zero_gpu_count_attaches_nothing(zero):
     """Presence used to be the test (`'gpu' in resources`), so a template

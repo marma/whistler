@@ -3162,7 +3162,8 @@ class KubeConfigManager(ConfigManager):
                 "serial": HOME_DISK_SERIAL,
                 "disk": {"bus": "virtio"},
             })
-        if requested_gpu_count(resources):
+        gpu_count = requested_gpu_count(resources)
+        if gpu_count:
             # Presence is not enough: a zero count must attach nothing. A
             # `gpu: 0` here used to produce a real devices.gpus entry, so a
             # template someone had turned the GPU off in still took a card —
@@ -3173,9 +3174,18 @@ class KubeConfigManager(ConfigManager):
             # gpuType (nodeSelector) picks the entry, whose vmResource is the
             # KubeVirt-permitted device-plugin name for that card. Per-type,
             # so mixed clusters work — no global resource-name setting.
+            #
+            # One list entry per card: KubeVirt requests `deviceName` once
+            # for every entry in devices.gpus (there is no count field), so
+            # a template asking for 4 GPUs is four entries with the same
+            # deviceName and distinct names. This used to emit a single gpu0
+            # whatever the count said, which silently handed every
+            # multi-GPU session exactly one card (found in production
+            # 2026-09-06).
             gpu_type = (node_selector or {}).get(GPU_NODE_LABEL)
-            devices["gpus"] = [{"name": "gpu0",
-                                "deviceName": self._vm_gpu_device_name(gpu_type)}]
+            device_name = self._vm_gpu_device_name(gpu_type)
+            devices["gpus"] = [{"name": f"gpu{i}", "deviceName": device_name}
+                               for i in range(gpu_count)]
 
         # The guest's authorized_keys: the user's own keys plus the portal's
         # per-user access key, which backs the web terminal (an SSH session

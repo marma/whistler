@@ -46,9 +46,10 @@ only matter if you are building your own VM images.
   emulate, which works and is slow.
 - For GPU passthrough: the host driver, IOMMU and the NVIDIA GPU Operator in
   `sandboxWorkloads` mode, plus the card on the KubeVirt CR's allow-list (see
-  "GPU passthrough" under KubeVirt below). The node side is out of scope here;
-  see [scripts/metal_k3s_create.sh](scripts/metal_k3s_create.sh), which sets
-  up a single-node k3s host end to end.
+  "GPU passthrough" under KubeVirt below) and `vfio_iommu_type1` loaded on the
+  node (see "Preparing the nodes"). The rest of the node side is out of scope
+  here; see [scripts/metal_k3s_create.sh](scripts/metal_k3s_create.sh), which
+  sets up a single-node k3s host end to end.
 
 A note on storage: a home volume is a `disk.img` on a PVC attached to the VM as
 a virtio-blk disk, so an NFS-backed StorageClass is fine for homes. It is *not*
@@ -212,8 +213,8 @@ qemu inside its `virt-launcher` pods.
 
 ### Preparing the nodes
 
-Two things KubeVirt does not check for you, both learned the hard way on a
-production k0s node. Neither produces an error message that names it.
+Three things KubeVirt does not check for you, all learned the hard way on a
+production k0s node. None of them produces an error message that names it.
 
 **Hugepages.** Whistler backs guest RAM with 2 MiB hugepages by default
 (`whistler.hugePages.pageSize` in values.yaml — VFIO pins the whole guest at
@@ -278,6 +279,56 @@ the stale set did not recover on a virt-handler restart alone. Repointing the
 two hostPaths with `customizeComponents` was tried first and left virt-handler
 marking the node `kubevirt.io/schedulable=false` — don't. k3s uses
 `/var/lib/kubelet` and needs none of this.
+
+**VFIO on a GPU node.** Binding the card to vfio-pci is the GPU Operator's job
+(label the node `nvidia.com/gpu.workload.config=vm-passthrough` and its
+vfio-manager does it), and the KubeVirt allow-list is `--allow-gpu`'s. What
+neither does is load the kernel's IOMMU backend for VFIO, `vfio_iommu_type1`.
+vfio-manager runs `modprobe vfio-pci` and stops; on Ubuntu's 6.8 kernel that
+brings in `vfio` but not type1, and without it qemu has a device, a group and
+a container, and no way to map guest memory for it. The VM then dies a few
+seconds after the launcher starts, virt-controller retries it into
+`CrashLoopBackOff`, and the one line that says why is buried in a `SyncFailed`
+event on the VMI (not the VM):
+
+```
+vfio 0000:bd:00.0: failed to setup container for group 160: No available IOMMU models
+```
+
+That message means exactly one thing: no VFIO IOMMU driver is registered. The
+IOMMU itself is fine (the group exists, or vfio-pci could not have bound the
+card). Check and fix on the node:
+
+```bash
+lsmod | grep -E '^vfio'                       # vfio_pci, vfio and vfio_iommu_type1 should all be there
+sudo modprobe vfio_iommu_type1                # the running VM attempt succeeds on its next retry
+printf 'vfio_pci\nvfio_iommu_type1\n' | sudo tee /etc/modules-load.d/vfio.conf   # and survives a reboot
+```
+
+If `modprobe` answers "Module not found in directory /lib/modules/...", the
+kernel package was upgraded under the running kernel and its modules directory
+purged; nothing but a reboot fixes that. Do this on every node that will run
+GPU VMs, before the first one — a node that has never loaded type1 looks
+identical to one that has, right up to the first `-device vfio-pci`.
+
+Two kernel command-line notes from the same night. `amd_iommu=on` is not a
+value the AMD driver knows (`AMD-Vi: Unknown option - 'on'` in dmesg); the
+IOMMU is on by default whenever the firmware exposes it, so the parameter does
+nothing and can go — `intel_iommu=on` is the Intel spelling the habit comes
+from. `amd_iommu=force_isolation` is not a passthrough setting either: it only
+forbids the driver from relaxing host-driven devices into identity domains,
+costs DMA performance on every NIC and NVMe, and has no bearing on VFIO. The
+parameter that does matter on a passthrough host is `iommu=pt` — host-driven
+devices skip translation, VFIO-assigned ones still get a real translated
+domain. It is an optimisation, not a requirement.
+
+The same dmesg is where to confirm isolation while you are there: each
+assigned GPU should sit alone in its IOMMU group
+(`ls /sys/kernel/iommu_groups/<n>/devices/`), since every function in a group
+has to be bound to vfio-pci for any of them to be assignable. Data-centre cards
+have no audio function and the DGX's PCIe switches isolate per slot, so this
+is normally already true; a consumer card shares its group with its HDMI audio
+controller, which vfio-manager binds alongside it.
 
 ## 2. VersityGW (optional — an S3 endpoint for shared datasets)
 
