@@ -70,7 +70,7 @@ def _probe(monkeypatch, objects):
 
 
 def test_probe_running_vmi_is_ready_with_address(monkeypatch):
-    phase, name, address = _probe(monkeypatch, {
+    phase, name, address, _ = _probe(monkeypatch, {
         ("virtualmachineinstances", "alice-desk"): {"status": {
             "phase": "Running",
             "conditions": [{"type": "Ready", "status": "True"}],
@@ -85,7 +85,7 @@ def test_probe_running_vmi_without_ready_condition_is_booting(monkeypatch):
     # (see _build_vm_spec) is what says the guest actually serves the display /
     # sshd, and it surfaces as the Ready condition — reporting Ready before it
     # flips sends the portal's connect page at a port nothing is listening on.
-    phase, _, address = _probe(monkeypatch, {
+    phase, _, address, _ = _probe(monkeypatch, {
         ("virtualmachineinstances", "alice-desk"): {"status": {
             "phase": "Running",
             "conditions": [{"type": "Ready", "status": "False"}],
@@ -96,7 +96,7 @@ def test_probe_running_vmi_without_ready_condition_is_booting(monkeypatch):
 
 
 def test_probe_failed_vmi_is_failed(monkeypatch):
-    phase, _, _ = _probe(monkeypatch, {
+    phase, _, _, _ = _probe(monkeypatch, {
         ("virtualmachineinstances", "alice-desk"): {"status": {"phase": "Failed"}},
     })
     assert phase == "Failed"
@@ -105,7 +105,7 @@ def test_probe_failed_vmi_is_failed(monkeypatch):
 def test_probe_succeeded_vmi_is_stopped(monkeypatch):
     # The domain exited gracefully: the guest shut itself down, or obeyed a
     # halt. Either way nothing is running.
-    phase, _, _ = _probe(monkeypatch, {
+    phase, _, _, _ = _probe(monkeypatch, {
         ("virtualmachineinstances", "alice-desk"): {"status": {"phase": "Succeeded"}},
     })
     assert phase == "Stopped"
@@ -114,7 +114,7 @@ def test_probe_succeeded_vmi_is_stopped(monkeypatch):
 def test_probe_draining_vmi_is_terminating(monkeypatch):
     # A stopped/deleted VM's VMI keeps phase Running while the guest shuts
     # down; the deletionTimestamp is what marks the teardown.
-    phase, _, _ = _probe(monkeypatch, {
+    phase, _, _, _ = _probe(monkeypatch, {
         ("virtualmachineinstances", "alice-desk"): {
             "metadata": {"deletionTimestamp": "2026-07-08T10:00:00Z"},
             "status": {"phase": "Running"},
@@ -124,7 +124,7 @@ def test_probe_draining_vmi_is_terminating(monkeypatch):
 
 
 def test_probe_scheduling_vmi_is_booting(monkeypatch):
-    phase, _, _ = _probe(monkeypatch, {
+    phase, _, _, _ = _probe(monkeypatch, {
         ("virtualmachineinstances", "alice-desk"): {"status": {"phase": "Scheduling"}},
     })
     assert phase == "Booting"
@@ -132,19 +132,19 @@ def test_probe_scheduling_vmi_is_booting(monkeypatch):
 
 def test_probe_no_vmi_no_vm_is_stopped(monkeypatch):
     # Covers both "VM deleted" and "KubeVirt CRDs absent" — never crashes.
-    phase, name, _ = _probe(monkeypatch, {})
+    phase, name, _, _ = _probe(monkeypatch, {})
     assert (phase, name) == ("Stopped", None)
 
 
 def test_probe_halted_vm_is_stopped(monkeypatch):
-    phase, _, _ = _probe(monkeypatch, {
+    phase, _, _, _ = _probe(monkeypatch, {
         ("virtualmachines", "alice-desk"): {"spec": {"runStrategy": "Halted"}},
     })
     assert phase == "Stopped"
 
 
 def test_probe_importing_data_volume_is_importing(monkeypatch):
-    phase, _, _ = _probe(monkeypatch, {
+    phase, _, _, _ = _probe(monkeypatch, {
         ("virtualmachines", "alice-desk"): {
             "spec": {"runStrategy": "RerunOnFailure"}},
         ("datavolumes", "alice-desk-root"): {"status": {"phase": "ImportInProgress"}},
@@ -153,7 +153,7 @@ def test_probe_importing_data_volume_is_importing(monkeypatch):
 
 
 def test_probe_imported_data_volume_is_booting(monkeypatch):
-    phase, _, _ = _probe(monkeypatch, {
+    phase, _, _, _ = _probe(monkeypatch, {
         ("virtualmachines", "alice-desk"): {
             "spec": {"runStrategy": "RerunOnFailure"}},
         ("datavolumes", "alice-desk-root"): {"status": {"phase": "Succeeded"}},
@@ -163,7 +163,7 @@ def test_probe_imported_data_volume_is_booting(monkeypatch):
 
 def test_probe_container_disk_vm_without_vmi_is_booting(monkeypatch):
     # No DataVolume at all (containerDisk boot, or CDI absent) -> Booting.
-    phase, _, _ = _probe(monkeypatch, {
+    phase, _, _, _ = _probe(monkeypatch, {
         ("virtualmachines", "alice-desk"): {
             "spec": {"runStrategy": "RerunOnFailure"}},
     })
@@ -181,7 +181,7 @@ def test_probe_container_disk_vm_without_vmi_is_booting(monkeypatch):
 def test_a_powered_off_guest_is_stopped_not_booting(monkeypatch):
     # Before this, a VM with no VMI that Whistler had not halted fell through
     # to Booting — and stayed there forever, because nothing was coming.
-    phase, name, _ = _probe(monkeypatch, {
+    phase, name, _, _ = _probe(monkeypatch, {
         ("virtualmachines", "alice-desk"): {
             "spec": {"runStrategy": "RerunOnFailure"},
             "status": {"runStrategy": "RerunOnFailure",
@@ -269,3 +269,125 @@ def test_a_start_in_flight_is_not_recorded_as_a_stop(monkeypatch):
 
 def test_a_vanished_vm_is_not_recorded_as_a_stop(monkeypatch):
     assert _record(monkeypatch, {}).meta == {}
+
+
+# --- a VM KubeVirt has given up on ----------------------------------------- #
+# The probe used to compare printableStatus against "Stopped" and nothing else,
+# so a VM in CrashLoopBackOff read as Booting for as long as KubeVirt kept
+# retrying — an hour of "Starting" in the portal, on 2026-09-05, for a VM that
+# had failed eight times. KubeVirt's own word for it now becomes Failed, with
+# the reason riding along for status.statusMessage.
+
+
+def test_a_crash_looping_vm_is_failed_with_the_reason(monkeypatch):
+    phase, name, address, message = _probe(monkeypatch, {
+        ("virtualmachines", "alice-desk"): {
+            "spec": {"runStrategy": "RerunOnFailure"},
+            "status": {"runStrategy": "RerunOnFailure",
+                       "printableStatus": "CrashLoopBackOff",
+                       "startFailure": {
+                           "consecutiveFailCount": 3,
+                           "lastFailedVMIUID": "55b94db5",
+                           "retryAfterTimestamp": "2026-09-05T22:37:08Z"}},
+        },
+    })
+    assert (phase, name, address) == ("Failed", "alice-desk", None)
+    assert "CrashLoopBackOff" in message
+    assert "3 consecutive failed start(s)" in message
+    assert "2026-09-05T22:37:08Z" in message
+    assert "kubectl -n ns describe vm alice-desk" in message
+
+
+def test_an_unschedulable_vm_is_failed_not_booting(monkeypatch):
+    phase, _, _, message = _probe(monkeypatch, {
+        ("virtualmachines", "alice-desk"): {
+            "spec": {"runStrategy": "RerunOnFailure"},
+            "status": {"printableStatus": "ErrorUnschedulable"},
+        },
+    })
+    assert phase == "Failed"
+    assert message.startswith("KubeVirt reports ErrorUnschedulable")
+
+
+def test_a_webhook_rejection_reaches_the_message(monkeypatch):
+    # A VMI KubeVirt's admission webhook refuses (memory not a whole number of
+    # hugepages, say) never exists; the refusal lands on the VM as a Failure
+    # condition, and that text is the only thing that names the template's
+    # mistake.
+    _, _, _, message = _probe(monkeypatch, {
+        ("virtualmachines", "alice-desk"): {
+            "status": {"printableStatus": "CrashLoopBackOff",
+                       "conditions": [
+                           {"type": "Ready", "status": "False",
+                            "message": "Guest VM is not reported as running"},
+                           {"type": "Failure", "status": "True",
+                            "message": "spec.domain.memory.guest '3Gi' is not a "
+                                       "multiple of the page size '1Gi'"}]},
+        },
+    })
+    assert "not a multiple of the page size" in message
+    assert "Guest VM is not reported as running" not in message  # noise
+
+
+def test_an_import_error_is_failed_not_importing(monkeypatch):
+    # Checked before the DataVolume: the DV of a failed import is not Succeeded
+    # either, and Importing would have hidden the error behind a spinner.
+    phase, _, _, _ = _probe(monkeypatch, {
+        ("virtualmachines", "alice-desk"): {
+            "status": {"printableStatus": "DataVolumeError"}},
+        ("datavolumes", "alice-desk-root"): {"status": {"phase": "ImportInProgress"}},
+    })
+    assert phase == "Failed"
+
+
+def test_a_vm_kubevirt_is_still_starting_is_booting_with_no_message(monkeypatch):
+    for printable in ("Starting", "Provisioning", "WaitingForVolumeBinding"):
+        phase, _, _, message = _probe(monkeypatch, {
+            ("virtualmachines", "alice-desk"): {
+                "spec": {"runStrategy": "RerunOnFailure"},
+                "status": {"printableStatus": printable}},
+        })
+        assert (phase, message) == ("Booting", None), printable
+
+
+def test_a_failed_vmi_carries_its_sync_error(monkeypatch):
+    phase, _, _, message = _probe(monkeypatch, {
+        ("virtualmachineinstances", "alice-desk"): {"status": {
+            "phase": "Failed",
+            "conditions": [{"type": "Synchronized", "status": "False",
+                            "message": "failed to prepare disk rootdisk"}],
+        }},
+    })
+    assert phase == "Failed"
+    assert message == "KubeVirt: failed to prepare disk rootdisk"
+
+
+def test_a_failed_vmi_without_a_reason_has_no_message(monkeypatch):
+    _, _, _, message = _probe(monkeypatch, {
+        ("virtualmachineinstances", "alice-desk"): {"status": {"phase": "Failed"}},
+    })
+    assert message is None
+
+
+def _tick(monkeypatch, probe_result, phase_before="Booting"):
+    monkeypatch.setattr(operator, "_probe_vmi",
+                        lambda namespace, name, logger: probe_result)
+    patch = _Patch()
+    operator.session_phase_timer(
+        spec={"user": "alice"}, name="alice-desk", namespace="ns",
+        meta={"annotations": {}}, status={"phase": phase_before, "runtime": "vm"},
+        patch=patch, logger=_LOG)
+    return patch
+
+
+def test_the_timer_writes_the_reason_with_a_failed_phase(monkeypatch):
+    patch = _tick(monkeypatch, ("Failed", "alice-desk", None, "KubeVirt reports X"))
+    assert patch.status["phase"] == "Failed"
+    assert patch.status["statusMessage"] == "KubeVirt reports X"
+
+
+def test_the_timer_clears_the_reason_on_any_other_phase(monkeypatch):
+    # A VM that recovers must not keep last week's reason next to Running.
+    patch = _tick(monkeypatch, ("Booting", "alice-desk", None, None), phase_before="Failed")
+    assert patch.status["phase"] == "Booting"
+    assert patch.status["statusMessage"] is None

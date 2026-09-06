@@ -155,6 +155,75 @@ kubectl wait cdi cdi --for=condition=Available --timeout=10m
 No libvirt is needed on the host or the nodes — KubeVirt bundles libvirt and
 qemu inside its `virt-launcher` pods.
 
+### Preparing the nodes
+
+Two things KubeVirt does not check for you, both learned the hard way on a
+production k0s node. Neither produces an error message that names it.
+
+**Hugepages.** Whistler backs guest RAM with 2 MiB hugepages by default
+(`whistler.hugePages.pageSize` in values.yaml — VFIO pins the whole guest at
+device attach, and at 4 KiB pages a large GPU guest blows virt-handler's 20 s
+sync deadline). Every node that runs VMs has to reserve them; they are never
+allocated on demand. Persistently, on the kernel command line:
+
+```
+hugepagesz=2M hugepages=<count>        # count = GiB of guest RAM × 512
+```
+
+or on a running node:
+
+```bash
+echo <count> | sudo tee /proc/sys/vm/nr_hugepages
+sudo systemctl restart k0sworker       # k3s: systemctl restart k3s
+```
+
+**The restart is not optional.** kubelet reads the hugepage pools once, at
+startup. Until it restarts the node advertises `hugepages-2Mi: 0` and every VM
+pends on `Insufficient hugepages-2Mi` while `/proc/meminfo` shows the pages
+sitting free. Check what the scheduler sees, not what the kernel has:
+
+```bash
+kubectl get node <node> -o jsonpath='{.status.allocatable.hugepages-2Mi}{"\n"}'
+```
+
+The pool comes out of ordinary allocatable memory (a 512 GiB pool on a 1 TiB
+node leaves ~512 GiB for pods), and kubelet re-admits every running pod against
+the smaller number when it restarts, so size the pool and drain accordingly.
+[scripts/metal_k3s_create.sh](scripts/metal_k3s_create.sh) prints what a node
+has in both sizes. To run guests on ordinary pages instead:
+`--set whistler.hugePages.pageSize=""`.
+
+**k0s — or any distribution whose kubelet root is not `/var/lib/kubelet`.**
+virt-handler hostPath-mounts `/var/lib/kubelet` and `/var/lib/kubelet/pods`
+without checking they exist. k0s keeps kubelet under `/var/lib/k0s/kubelet`, so
+kubelet creates an empty `/var/lib/kubelet`, virt-handler mounts it, reports
+itself healthy, and can never finish a VM: every VMI — a stock cirros included —
+goes `Scheduled → Failed` in about three seconds, virt-controller retries it
+into `CrashLoopBackOff`, and **nothing logs an error**, because nothing failed;
+a directory was empty. Whistler's portal now reports such a VM as `Error` with
+KubeVirt's `CrashLoopBackOff` in the session's status message, which is your
+cue to look here.
+
+Upstream fix: [kubevirt#16346](https://github.com/kubevirt/kubevirt/pull/16346)
+(merged 2026-09-03) adds a `--kubelet-root` flag for virt-handler, set through
+`KubeVirt.spec.customizeComponents`. Until you run a release that carries it,
+present the real root at the path virt-handler expects, on every node that runs
+VMs:
+
+```bash
+sudo mkdir -p /var/lib/kubelet
+echo '/var/lib/k0s/kubelet /var/lib/kubelet none bind 0 0' | sudo tee -a /etc/fstab
+sudo mount /var/lib/kubelet
+sudo reboot
+```
+
+The reboot matters: virt-handler's device plugins (`devices.kubevirt.io/kvm`,
+`tun`, `vhost-net`) register with kubelet over sockets under that same root, and
+the stale set did not recover on a virt-handler restart alone. Repointing the
+two hostPaths with `customizeComponents` was tried first and left virt-handler
+marking the node `kubevirt.io/schedulable=false` — don't. k3s uses
+`/var/lib/kubelet` and needs none of this.
+
 ## 2. VersityGW (optional — an S3 endpoint for shared datasets)
 
 Shared data in Whistler is **S3 datasets, not filesystems**
