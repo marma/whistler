@@ -130,9 +130,12 @@ unprivileged pod can do. It keeps PCI class `03xx` only, so the card's audio
 controller — advertised right next to the GPU, and not to be permitted, since
 Whistler's GPU catalog reads this list to tell the two apart — is skipped;
 giving its id by hand earns a warning. `PCI_PROBE_IMAGE` and
-`PCI_PROBE_NODE_SELECTOR` override the probe's image and node set. The one
-thing the script does need locally is `pci.ids` (the `pci.ids` or `hwdata`
-package, or `PCI_IDS=/path`), for the name half of an entry. Entries are written with
+`PCI_PROBE_NODE_SELECTOR` override the probe's image and node set. The name
+half comes from `pci.ids`: the copy pciutils or hwdata installed if there is
+one (Homebrew included, or `PCI_IDS=/path`), otherwise the script fetches the
+file the plugin itself is built from (`PCI_IDS_URL`, pci-ids.ucw.cz) into
+`~/.cache/whistler/` and keeps it for 30 days, so nothing needs installing on
+the workstation. Entries are written with
 `externalResourceProvider: true` (the plugin allocates, KubeVirt only permits)
 and the arguments are the single author of `pciHostDevices`: `none` clears it,
 no argument leaves it alone. Two caveats. The plugin reads the `pci.ids` its

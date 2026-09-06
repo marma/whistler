@@ -36,7 +36,11 @@
 #   KUBEVIRT_FORCE         set to 1 to allow an unsupported version jump
 #   KUBEVIRT_INSTALL_CDI   set to 0 to skip CDI (imageURL boot sources need it)
 #   CDI_VERSION            CDI release tag (default: latest)
-#   PCI_IDS                path to a pci.ids file, if not where pciutils puts it
+#   PCI_IDS                path to a pci.ids file, if not where pciutils/hwdata
+#                          put it (Homebrew prefixes included). Without one the
+#                          script fetches PCI_IDS_URL (default: the file the
+#                          NVIDIA plugin itself is built from) into
+#                          ~/.cache/whistler/pci.ids and keeps it for 30 days.
 #   PCI_PROBE_IMAGE        image for the `--allow-gpu auto` node probe (default
 #                          busybox:1.36; anything with a POSIX sh)
 #   PCI_PROBE_NODE_SELECTOR  which nodes `auto` probes (default: the GPU
@@ -163,18 +167,48 @@ NVIDIA_VENDOR_ID=10de
 # whose bash is 3.2 (macOS).
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
-# pci.ids as pciutils ships it (the `pci.ids` / `hwdata` package).
+# Where the NVIDIA plugin's pci.ids comes from (PCI_IDS_URL in its Makefile).
+# Fetching the same file is how the names derived here stay the names the node
+# will advertise; a distro's copy is the same database, older.
+PCI_IDS_URL="${PCI_IDS_URL:-https://pci-ids.ucw.cz/v2.2/pci.ids}"
+PCI_IDS_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/whistler/pci.ids"
+
+# A readable pci.ids: PCI_IDS, then where pciutils/hwdata put it on Linux and
+# under Homebrew, then the cached download, refreshed when older than 30 days.
 find_pci_ids() {
-  local f
-  for f in "${PCI_IDS:-}" /usr/share/misc/pci.ids /usr/share/hwdata/pci.ids \
-           /usr/share/pci.ids /var/lib/pciutils/pci.ids; do
+  local f prefix
+  local candidates=("${PCI_IDS:-}"
+    /usr/share/misc/pci.ids /usr/share/hwdata/pci.ids /usr/share/pci.ids /var/lib/pciutils/pci.ids
+    /opt/homebrew/share/hwdata/pci.ids /opt/homebrew/share/pci.ids
+    /usr/local/share/hwdata/pci.ids /usr/local/share/pci.ids)
+  if command -v brew >/dev/null 2>&1 && prefix="$(brew --prefix 2>/dev/null)"; then
+    candidates+=("$prefix/share/hwdata/pci.ids" "$prefix/share/pci.ids")
+  fi
+  for f in "${candidates[@]}"; do
     [[ -n "$f" ]] || continue
     [[ -r "$f" ]] && { echo "$f"; return 0; }
     [[ -r "$f.gz" ]] && { echo "$f.gz"; return 0; }
   done
+
+  # -mtime -30: still fresh. Both GNU and BSD find speak this.
+  if [[ -s "$PCI_IDS_CACHE" && -n "$(find "$PCI_IDS_CACHE" -mtime -30 2>/dev/null)" ]]; then
+    echo "$PCI_IDS_CACHE"; return 0
+  fi
+  echo "==> No pci.ids on this machine; fetching ${PCI_IDS_URL}" >&2
+  mkdir -p "$(dirname "$PCI_IDS_CACHE")"
+  if curl -sfL -o "${PCI_IDS_CACHE}.tmp" "$PCI_IDS_URL" && [[ -s "${PCI_IDS_CACHE}.tmp" ]]; then
+    mv "${PCI_IDS_CACHE}.tmp" "$PCI_IDS_CACHE"
+    echo "$PCI_IDS_CACHE"; return 0
+  fi
+  rm -f "${PCI_IDS_CACHE}.tmp"
+  if [[ -s "$PCI_IDS_CACHE" ]]; then
+    echo "    WARNING: fetch failed; using the cached copy from $(date -r "$PCI_IDS_CACHE" 2>/dev/null || echo 'an earlier run')" >&2
+    echo "$PCI_IDS_CACHE"; return 0
+  fi
   cat >&2 <<EOF
-ERROR: no pci.ids found (install pci.ids / hwdata, or point PCI_IDS at one).
-       Or name the device fully: --allow-gpu 10de:2684=nvidia.com/AD102_GEFORCE_RTX_4090
+ERROR: no pci.ids found and ${PCI_IDS_URL} could not be fetched.
+       Point PCI_IDS at a copy (pciutils / hwdata ship one), or name the device fully:
+       --allow-gpu 10de:2684=nvidia.com/AD102_GEFORCE_RTX_4090
 EOF
   return 1
 }
