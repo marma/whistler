@@ -45,9 +45,10 @@ only matter if you are building your own VM images.
 - For VM sessions: nodes with `/dev/kvm`. Without it KubeVirt can be told to
   emulate, which works and is slow.
 - For GPU passthrough: the host driver, IOMMU and the NVIDIA GPU Operator in
-  `sandboxWorkloads` mode. Out of scope here; see
-  [scripts/metal_k3s_create.sh](scripts/metal_k3s_create.sh), which sets up a
-  single-node k3s host end to end.
+  `sandboxWorkloads` mode, plus the card on the KubeVirt CR's allow-list (see
+  "GPU passthrough" under KubeVirt below). The node side is out of scope here;
+  see [scripts/metal_k3s_create.sh](scripts/metal_k3s_create.sh), which sets
+  up a single-node k3s host end to end.
 
 A note on storage: a home volume is a `disk.img` on a PVC attached to the VM as
 a virtio-blk disk, so an NFS-backed StorageClass is fine for homes. It is *not*
@@ -97,7 +98,58 @@ Knobs (all env vars): `KUBEVIRT_VERSION` (default: latest stable),
 `KUBEVIRT_FORCE=1` to allow an unsupported version jump,
 `KUBEVIRT_USE_EMULATION=1` for nodes with no `/dev/kvm` (`=0` turns it back
 off; leave it unset to keep whatever is configured),
-`KUBEVIRT_INSTALL_CDI=0` to skip CDI, `CDI_VERSION`.
+`KUBEVIRT_INSTALL_CDI=0` to skip CDI, `CDI_VERSION`. Plus one argument,
+`--allow-gpu`, for GPU passthrough (next).
+
+**GPU passthrough.** KubeVirt hands a host PCI device to a guest only if the
+`KubeVirt` CR's `permittedHostDevices` names it, and nothing fills that list in
+for you: the GPU Operator's `sandbox-device-plugin` binds the card to vfio-pci
+and advertises it on the node, but both NVIDIA and KubeVirt leave the
+allow-list itself to the admin, on purpose — it is the cluster's decision about
+what may enter a root-capable guest, and there is no wildcard or discovery mode
+for it. Rather than typing the patch, say which cards and let the script write
+it on every run:
+
+```bash
+scripts/install_kubevirt.sh --allow-gpu AD102_GEFORCE_RTX_4090 --allow-gpu GH100_H100_SXM5_80GB
+scripts/install_kubevirt.sh --allow-gpu auto        # every NVIDIA display device on the nodes
+scripts/install_kubevirt.sh --allow-gpu 10de:2684   # by PCI id (lspci -nn -d 10de: prints it)
+scripts/install_kubevirt.sh --allow-gpu none        # clear the list
+```
+
+An entry needs two halves — the PCI id for KubeVirt's `pciVendorSelector` and
+the resource name the plugin will advertise — and the script resolves whichever
+you did not give from `pci.ids`, deriving the name by the plugin's own rule
+(upper-case, whitespace to `_`, everything else outside `[A-Za-z0-9_]`
+dropped: `AD102 [GeForce RTX 4090]` → `AD102_GEFORCE_RTX_4090`). `auto` does
+not look at the machine running the script, which is rarely a node: it starts a
+throwaway `busybox` pod on each node carrying the GPU Operator's NFD label
+`feature.node.kubernetes.io/pci-10de.present=true` (every node, when none has
+it) and reads the PCI bus from the pod's own `/sys/bus/pci/devices`, which any
+unprivileged pod can do. It keeps PCI class `03xx` only, so the card's audio
+controller — advertised right next to the GPU, and not to be permitted, since
+Whistler's GPU catalog reads this list to tell the two apart — is skipped;
+giving its id by hand earns a warning. `PCI_PROBE_IMAGE` and
+`PCI_PROBE_NODE_SELECTOR` override the probe's image and node set. The one
+thing the script does need locally is `pci.ids` (the `pci.ids` or `hwdata`
+package, or `PCI_IDS=/path`), for the name half of an entry. Entries are written with
+`externalResourceProvider: true` (the plugin allocates, KubeVirt only permits)
+and the arguments are the single author of `pciHostDevices`: `none` clears it,
+no argument leaves it alone. Two caveats. The plugin reads the `pci.ids` its
+image was built with and the script reads the host's, so a very new card can be
+named differently; the script prints a note for a permitted resource no node
+advertises, which is normal until the node is labelled
+`nvidia.com/gpu.workload.config=vm-passthrough` and a bug if it stays. And a
+name shared by several device ids (old GeForce and chipset parts, no data-centre
+card) is refused as ambiguous — pick by id, or give both as
+`10de:2684=nvidia.com/AD102_GEFORCE_RTX_4090`.
+
+[scripts/metal_k3s_create.sh](scripts/metal_k3s_create.sh) forwards
+`--allow-gpu` and defaults to `auto` whenever it installs the GPU Operator on a
+host with an NVIDIA display device, turning on the operator's
+`sandboxWorkloads` at the same time. Permitting is not binding: the card stays
+with the host driver until you label the node, which the script prints how to
+do and deliberately never does itself.
 
 **Already running KubeVirt?** Skip the script — it is a convenience, not a
 requirement. What Whistler actually needs from the cluster:

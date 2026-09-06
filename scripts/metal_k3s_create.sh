@@ -45,7 +45,32 @@
 #                     driver.enabled=false and only manages the container
 #                     toolkit, device plugin, and DCGM exporter. Needs helm.
 #   GPU_OPERATOR_NAMESPACE  namespace for the operator  (default: gpu-operator)
+#
+# Arguments (forwarded to install_kubevirt.sh):
+#   --allow-gpu <spec>  permit a GPU for VFIO passthrough in the KubeVirt CR;
+#                     repeatable; <spec> is `auto`, a resource name, a PCI id,
+#                     `id=name` or `none` (see install_kubevirt.sh --help).
+#                     DEFAULT when the GPU Operator is installed and this host
+#                     has an NVIDIA display device: `--allow-gpu auto`, i.e.
+#                     every such device is permitted — permitting is not
+#                     binding. Any --allow-gpu but `none` also turns on the
+#                     operator's sandboxWorkloads so it CAN bind a card to
+#                     vfio-pci; which card is still your call, made by
+#                     labelling the node (printed at the end). This script
+#                     never takes a GPU away from the host by itself.
 set -euo pipefail
+
+ALLOW_GPU_ARGS=()
+while (( $# )); do
+  case "$1" in
+    --allow-gpu)
+      [[ $# -ge 2 ]] || { echo "ERROR: --allow-gpu needs a value" >&2; exit 2; }
+      ALLOW_GPU_ARGS+=("$1" "$2"); shift 2 ;;
+    --allow-gpu=*) ALLOW_GPU_ARGS+=("$1"); shift ;;
+    -h|--help) sed -n '3,/^set -euo pipefail/{/^set -euo pipefail/d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
+    *) echo "ERROR: unknown argument '$1' (see --help)" >&2; exit 2 ;;
+  esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -222,7 +247,35 @@ kubectl get nodes 2>/dev/null || true
 if [[ ! -e /dev/kvm ]]; then
   export KUBEVIRT_USE_EMULATION=1
 fi
-"$SCRIPT_DIR/install_kubevirt.sh"
+
+# Decided here because both KubeVirt (the permit list) and the GPU Operator
+# (sandboxWorkloads) below depend on it.
+install_gpu=0
+if [[ "$GPU_OPERATOR" == "1" ]]; then
+  install_gpu=1
+elif [[ "$GPU_OPERATOR" == "auto" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+  install_gpu=1
+fi
+
+# Default passthrough permit list: every NVIDIA display device on this host,
+# when a GPU Operator is going in and nothing was said. Permitting a device in
+# the KubeVirt CR changes nothing on the node — the vm-passthrough label does.
+has_nvidia_display_device() {
+  local d
+  for d in /sys/bus/pci/devices/*; do
+    [[ "$(cat "$d/vendor" 2>/dev/null)" == 0x10de && "$(cat "$d/class" 2>/dev/null)" == 0x03* ]] && return 0
+  done
+  return 1
+}
+if (( ${#ALLOW_GPU_ARGS[@]} == 0 )) && [[ "$install_gpu" == "1" ]] && has_nvidia_display_device; then
+  ALLOW_GPU_ARGS=(--allow-gpu auto)
+fi
+gpu_passthrough=0
+if (( ${#ALLOW_GPU_ARGS[@]} )) && [[ " ${ALLOW_GPU_ARGS[*]} " != *" none "* ]]; then
+  gpu_passthrough=1
+fi
+
+"$SCRIPT_DIR/install_kubevirt.sh" ${ALLOW_GPU_ARGS+"${ALLOW_GPU_ARGS[@]}"}
 
 # --- NVIDIA GPU Operator --------------------------------------------------------
 # Manages the device plugin, node feature discovery, and DCGM exporter so GPU
@@ -241,13 +294,6 @@ fi
 # by hand, below — k3s's own startup routine auto-detects and re-applies it
 # on every future boot with no signaling needed, so this is a one-time step,
 # not something reapplied per-pod-reschedule the way the toolkit does it.
-install_gpu=0
-if [[ "$GPU_OPERATOR" == "1" ]]; then
-  install_gpu=1
-elif [[ "$GPU_OPERATOR" == "auto" ]] && command -v nvidia-smi >/dev/null 2>&1; then
-  install_gpu=1
-fi
-
 if [[ "$install_gpu" == "1" ]]; then
   command -v helm >/dev/null || { echo "ERROR: GPU_OPERATOR requested but helm not found"; exit 1; }
 
@@ -310,11 +356,19 @@ EOF
   # never go Ready with toolkit.enabled=false (it's checking for a component
   # we deliberately didn't install) — that shouldn't hard-fail the script,
   # so convergence is checked below as a non-fatal warning instead.
+  # sandboxWorkloads is what lets the operator run a node in vm-passthrough
+  # mode (vfio-manager + sandbox-device-plugin). Enabled only when the KubeVirt
+  # permit list says passthrough is wanted; with it on, unlabelled nodes still
+  # default to the container workload, so nothing changes until a node is
+  # labelled.
+  sandbox_flag=()
+  [[ "$gpu_passthrough" == "1" ]] && sandbox_flag=(--set sandboxWorkloads.enabled=true)
   helm upgrade --install gpu-operator nvidia/gpu-operator \
     --namespace "$GPU_OPERATOR_NAMESPACE" --create-namespace \
     --set driver.enabled=false \
     --set toolkit.enabled=false \
-    --set cdi.enabled=false
+    --set cdi.enabled=false \
+    ${sandbox_flag+"${sandbox_flag[@]}"}
 
   echo "==> Waiting for the GPU Operator to become ready (up to 10m)"
   kubectl -n "$GPU_OPERATOR_NAMESPACE" wait --for=condition=Ready pods --all --timeout=10m \
@@ -356,3 +410,15 @@ Cluster '$CLUSTER_NAME' is up on this host, with KubeVirt$( [[ "$METAL_REGISTRY"
   skaffold dev                            # builds/pushes via localhost:${REGISTRY_PORT}
   scripts/metal_k3s_delete.sh             # tear everything down (registry + images too)
 EOF
+
+if [[ "$gpu_passthrough" == "1" && "$install_gpu" == "1" ]]; then
+  cat <<EOF
+GPU passthrough: the KubeVirt CR permits the devices listed above (${ALLOW_GPU_ARGS[*]}).
+To actually hand a card to VMs, label the node — this binds it to vfio-pci and
+TAKES IT AWAY from the host driver, which is why the script does not do it for you:
+
+  kubectl label node <node> nvidia.com/gpu.workload.config=vm-passthrough
+  kubectl get node <node> -o jsonpath='{.status.allocatable}'   # resource appears once bound
+
+EOF
+fi
