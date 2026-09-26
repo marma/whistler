@@ -99,6 +99,12 @@ class LoginRequired(Exception):
     request that could not render one) by ``_login_required``."""
 
 
+class AccountDisabled(Exception):
+    """A known user whose account an admin has suspended (`User.spec.disabled`).
+    Separate from EntryPointDenied only so the page can say the true reason —
+    "kiosk only" would send a suspended person to a kiosk that refuses them too."""
+
+
 class EntryPointDenied(Exception):
     """A known user, refused this whole surface: they hold no `portal` entry
     point (design/security.md, "Closing the fourth axis"). Not a 401 — signing
@@ -135,6 +141,8 @@ def require_user(request: Request):
     if not user:
         raise LoginRequired()
     if not request.app.state.cm.may_enter(user, ENTRY_PORTAL):
+        if request.app.state.cm.is_user_disabled(user):
+            raise AccountDisabled()
         raise EntryPointDenied()
     return user
 
@@ -257,6 +265,11 @@ async def login_submit(
     # produce the same refusal one navigation later.
     if not await request.app.state.run(
             request.app.state.cm.may_enter, name, ENTRY_PORTAL):
+        if await request.app.state.run(
+                request.app.state.cm.is_user_disabled, name):
+            logger.warning(f"Portal login refused for {name}: account disabled")
+            return _login_page(next_to, "This account is disabled.",
+                               status_code=403)
         logger.warning(f"Portal login refused for {name}: no "
                        f"'{ENTRY_PORTAL}' entry point")
         return _entry_denied_page()
@@ -299,6 +312,27 @@ async def _entry_point_denied(request: Request, exc: Exception):
         return _entry_denied_page()
     return JSONResponse({"detail": f"No '{ENTRY_PORTAL}' entry point."},
                         status_code=403)
+
+
+async def _account_disabled(request: Request, exc: Exception):
+    """A suspended account, on any route. The cookies are dropped with the
+    page: there is nothing on this surface the browser may go on holding them
+    for, and the next person at the machine should meet the login form."""
+    if (request.headers.get("Sec-Fetch-Mode") == "navigate"
+            or "text/html" in request.headers.get("Accept", "")):
+        response = HTMLResponse(
+            render_notice(
+                heading="Account disabled",
+                message="This account has been disabled. Ask an "
+                        "administrator to re-enable it.",
+                href=LOGIN_PATH, link_label="Sign in as someone else"),
+            status_code=403, headers={"Cache-Control": "no-store"})
+    else:
+        response = JSONResponse({"detail": "Account disabled."},
+                                status_code=403)
+    response.delete_cookie(USER_COOKIE, path="/")
+    response.delete_cookie(PORTAL_COOKIE, path="/")
+    return response
 
 
 async def _login_required(request: Request, exc: Exception):
@@ -1281,6 +1315,38 @@ async def admin_user_set_entry_points(
     return _tr(f"/admin/users/{username}", admin)
 
 
+async def admin_user_set_disabled(
+    request: Request, cm: CM, admin: Admin, username: str,
+    disabled: Annotated[Optional[str], Form()] = None,
+):
+    """Suspend or restore an account. Nothing else on the CR is touched, which
+    is what makes it temporary: re-enabling puts back exactly the grants,
+    sessions and homes the account had.
+
+    Unlike the entry-point form, disabling *yourself* is refused. Binding your
+    own account to the kiosk is a thing an admin might do to test the binding;
+    suspending your own account has no use but the lockout."""
+    if disabled and username == admin:
+        raise HTTPException(status_code=400,
+                            detail="You cannot disable your own account.")
+    await request.app.state.run(cm.set_user_disabled, username, bool(disabled))
+    logger.info(f"Admin {admin} {'disabled' if disabled else 're-enabled'} "
+                f"user {username}")
+    return _tr(f"/admin/users/{username}", admin)
+
+
+async def admin_user_set_otp(
+    request: Request, cm: CM, admin: Admin, username: str,
+    otp_disabled: Annotated[Optional[str], Form()] = None,
+):
+    """Whether the kiosk asks this user for a TOTP code after the password."""
+    await request.app.state.run(cm.set_user_otp_disabled, username,
+                                bool(otp_disabled))
+    logger.info(f"Admin {admin} turned the kiosk second factor "
+                f"{'off' if otp_disabled else 'on'} for {username}")
+    return _tr(f"/admin/users/{username}", admin)
+
+
 async def admin_user_set_channels(
     request: Request, cm: CM, admin: Admin, username: str,
     restrict:  Annotated[Optional[str], Form()] = None,
@@ -2188,6 +2254,7 @@ def build_management_app(config_manager):
     # routes that do not ask.
     app.add_exception_handler(LoginRequired, _login_required)
     app.add_exception_handler(EntryPointDenied, _entry_point_denied)
+    app.add_exception_handler(AccountDisabled, _account_disabled)
     app.add_api_route(LOGIN_PATH,  login_form,   methods=["GET"], response_class=HTMLResponse)
     app.add_api_route(LOGIN_PATH,  login_submit, methods=["POST"])
     app.add_api_route("/logout",   logout,       methods=["POST"])
@@ -2226,6 +2293,8 @@ def build_management_app(config_manager):
     app.add_api_route("/admin/users/{username}/overrides",        admin_user_set_overrides, methods=["POST"])
     app.add_api_route("/admin/users/{username}/entry-points",     admin_user_set_entry_points, methods=["POST"])
     app.add_api_route("/admin/users/{username}/channels",         admin_user_set_channels, methods=["POST"])
+    app.add_api_route("/admin/users/{username}/disabled",         admin_user_set_disabled, methods=["POST"])
+    app.add_api_route("/admin/users/{username}/otp",              admin_user_set_otp,      methods=["POST"])
     app.add_api_route("/admin/groups",                            admin_groups,           methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/groups/new",                        admin_group_new,        methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/groups",                            admin_group_create,     methods=["POST"])

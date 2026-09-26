@@ -114,8 +114,9 @@ async def _run(request, func, *args):
 #   out of service, so /healthz stays reachable.
 # - Shared: the desktop itself. Both the kiosk's session page and the portal's
 #   connect page end up here, so these carry no entry point of their own —
-#   which is also what keeps a Selkies asset or WebSocket frame off the
-#   per-request User CR read below.
+#   which is also what keeps most of their traffic off the per-request User CR
+#   read below. They are still refused to a *disabled* account (see
+#   _checks_disabled), everywhere but the Selkies asset requests.
 # - Everything else is the portal's: the launch form on /, the web terminal,
 #   the machine console. Written as "everything else" on purpose: a route added
 #   later is checked by default rather than exempt by omission.
@@ -142,14 +143,49 @@ def _required_entry_point(path: str):
     return ENTRY_PORTAL
 
 
+def _checks_disabled(request: web.Request) -> bool:
+    """Whether a request that needs no entry point is still refused to a
+    disabled account.
+
+    The desktop paths need no door, which is exactly why a disabled account
+    has to be asked about there too: otherwise a browser that signed in before
+    the suspension keeps its desktop for as long as it keeps its cookie. It is
+    asked on everything that *opens* something — pages, the status poll,
+    thumbnails and every WebSocket handshake — and not on the plain HTTP under
+    /desktop/, which is the Selkies client's asset volume and reaches nothing
+    without the display WebSocket beside it. The kiosk's login/logout stay
+    open for the reason _KIOSK_OPEN gives."""
+    path = request.path
+    if path == "/healthz" or path.startswith(_OPEN_PREFIXES):
+        return False
+    if path in _KIOSK_OPEN:
+        return False
+    if path.startswith("/desktop"):
+        return request.headers.get("Upgrade", "").lower() == "websocket"
+    return True
+
+
+def _disabled_response(request: web.Request) -> web.Response:
+    if (request.headers.get("Sec-Fetch-Mode") == "navigate"
+            or "text/html" in request.headers.get("Accept", "")):
+        return web.Response(
+            text=render_notice(
+                heading="Account disabled",
+                message="This account has been disabled. Ask an "
+                        "administrator to re-enable it."),
+            status=403, content_type="text/html",
+            headers={"Cache-Control": "no-store"})
+    return web.Response(status=403, text="account disabled")
+
+
 @web.middleware
 async def entry_point_middleware(request: web.Request, handler):
     """Refuse a surface this user is not granted.
 
-    The check costs one User CR read, so it deliberately runs only on requests
-    that *have* an entry point — never on the desktop paths above, which is
-    where the request volume is (every Selkies asset, every WebSocket frame's
-    handshake, every thumbnail).
+    The check costs one User CR read, so the full entry-point question runs
+    only on requests that *have* an entry point. The desktop paths above ask
+    only whether the account is disabled, and skip even that for the Selkies
+    client's plain asset requests, which is where the request volume is.
 
     A refusal is a page, not a redirect: behind the bundled proxy the other
     surface is one origin away, but in a split-port dev run it is not, and a
@@ -164,10 +200,20 @@ async def entry_point_middleware(request: web.Request, handler):
     # refuses the wrong account when it is offered one.
     user = (kiosk.kiosk_identity(request) if needed == ENTRY_KIOSK
             else request.get("user"))
-    if needed is None or not user:
+    if not user:
         return await handler(request)
-    if await _run(request, request.app["cm"].may_enter, user, needed):
+    cm = request.app["cm"]
+    if needed is None:
+        if (_checks_disabled(request)
+                and await _run(request, cm.is_user_disabled, user)):
+            logger.warning(f"Refusing {user} at {request.path}: account disabled")
+            return _disabled_response(request)
         return await handler(request)
+    if await _run(request, cm.may_enter, user, needed):
+        return await handler(request)
+    if await _run(request, cm.is_user_disabled, user):
+        logger.warning(f"Refusing {user} at {request.path}: account disabled")
+        return _disabled_response(request)
     logger.warning(f"Refusing {user} at {request.path}: no '{needed}' entry point")
     if (request.headers.get("Sec-Fetch-Mode") == "navigate"
             or "text/html" in request.headers.get("Accept", "")):

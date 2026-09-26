@@ -565,13 +565,12 @@ def _render_session(session_id: str) -> str:
 # is a mock and not a control.
 _MOCK_ENROLMENTS: dict = {}
 
-# Where a real deployment decides this. Per-user, because "every account has a
-# second factor" and "kiosk accounts do" are different policies and the second
-# one is likelier first: a `mfa: required` on the User CR, or a group grant, or
-# an OIDC provider that has already done it and hands us a claim. True for
-# everyone here so the step is visible.
-def _otp_required(user: str) -> bool:
-    return bool(user)
+# Per-user, from the User CR: every account is asked for a code unless an
+# admin has set ``otpDisabled`` on it (the user page's "Kiosk second factor").
+# Only the user's own CR decides — "this account is exempt" is a statement about
+# one person, not a grant a project hands its members.
+def _otp_required(cm, user: str) -> bool:
+    return bool(user) and cm.is_user_otp_required(user)
 
 
 def _enrolment(user: str) -> dict:
@@ -848,6 +847,12 @@ async def kiosk_login(request: web.Request):
         if not _verify_credentials(user, password):
             logger.warning(f"Kiosk unlock refused for {user}")
             return _html(_render_lock(user, "Wrong password."), status=401)
+        # Disabled while the screen was locked: the password is still right,
+        # but it must not hand the desktop back. Sign out rather than show the
+        # lock again — there is nothing behind it this account may return to.
+        if await _run(request.app["cm"].is_user_disabled, user):
+            logger.warning(f"Kiosk unlock refused for {user}: account disabled")
+            raise _sign_out(web.HTTPSeeOther("/kiosk"))
         logger.info(f"Kiosk unlocked for {user}")
         raise _unlock(web.HTTPSeeOther(return_to))
 
@@ -859,11 +864,15 @@ async def kiosk_login(request: web.Request):
     # would refuse the grid a moment later anyway (it is the boundary); saying
     # so here is the difference between an explanation and a bounce.
     if not await _run(request.app["cm"].may_enter, user, ENTRY_KIOSK):
+        if await _run(request.app["cm"].is_user_disabled, user):
+            logger.warning(f"Kiosk login refused for {user}: account disabled")
+            return _html(_render_login("This account is disabled."),
+                         status=403)
         logger.warning(f"Kiosk login refused for {user}: no "
                        f"'{ENTRY_KIOSK}' entry point")
         return _html(_render_login("This account cannot use the kiosk."),
                      status=403)
-    if _otp_required(user):
+    if await _run(_otp_required, request.app["cm"], user):
         # Not signed in yet: the password only earns the pending cookie, so a
         # browser stopped here has no identity and can reach nothing.
         logger.info(f"Kiosk password accepted for {user}; second factor pending")
@@ -906,6 +915,12 @@ async def kiosk_otp_verify(request: web.Request):
     if enrolling:
         rec["confirmed"] = True
         logger.info(f"Kiosk OTP enrolment confirmed for {user} (mock store)")
+    # The door is asked again on this side of the code: the password step
+    # checked it, but an account disabled (or unbound) in between must not be
+    # signed in by a code it happened to have.
+    if not await _run(request.app["cm"].may_enter, user, ENTRY_KIOSK):
+        logger.warning(f"Kiosk login refused for {user} after the second factor")
+        raise _sign_out(web.HTTPSeeOther("/kiosk"))
     logger.info(f"Kiosk login for {user} (second factor passed)")
     raise _sign_in(web.HTTPSeeOther("/kiosk"), user)
 

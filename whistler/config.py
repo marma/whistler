@@ -1006,8 +1006,25 @@ class ConfigManager(ABC):
         No grant is no entry (2026-08-25). An account nobody has granted a
         door cannot come in through any of them — including one that has just
         been created outside the portal, which is the case worth stating
-        because it used to be the most permissive account in the cluster."""
+        because it used to be the most permissive account in the cluster.
+
+        A disabled account enters nowhere, whatever it is granted — asked here
+        rather than beside each call so that no door can forget it. Doors that
+        want to *say* why ask ``is_user_disabled`` after a refusal."""
+        if self.is_user_disabled(username):
+            return False
         return entry_point in self.get_user_entry_points(username)
+
+    def is_user_disabled(self, username: str) -> bool:
+        """``User.spec.disabled``: a temporary suspension. Only the user's own
+        CR can say it — a group cannot disable its members, and nothing a
+        group grants re-enables one."""
+        return bool((self.get_user(username) or {}).get("disabled"))
+
+    def is_user_otp_required(self, username: str) -> bool:
+        """Whether the kiosk asks this user for a TOTP code. Everyone, unless
+        their own CR sets ``otpDisabled``."""
+        return not (self.get_user(username) or {}).get("otpDisabled")
 
     @abstractmethod
     def get_user_overrides(self, username: str) -> Dict[str, bool]:
@@ -5995,6 +6012,16 @@ class KubeConfigManager(ConfigManager):
         return self._save_user_spec(
             username, {"entryPoints": [e for e in ENTRY_POINTS
                                        if e in set(entry_points or [])]})
+
+    def set_user_disabled(self, username: str, disabled: bool) -> bool:
+        # Enabling removes the key rather than writing false, so a re-enabled
+        # account reads exactly like one that was never disabled.
+        return self._save_user_spec(username,
+                                    {"disabled": True if disabled else None})
+
+    def set_user_otp_disabled(self, username: str, otp_disabled: bool) -> bool:
+        return self._save_user_spec(
+            username, {"otpDisabled": True if otp_disabled else None})
 
     def get_user_overrides(self, username: str) -> Dict[str, bool]:
         self._load_users()

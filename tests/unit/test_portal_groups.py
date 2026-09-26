@@ -254,3 +254,50 @@ def test_user_detail_shows_group_provenance():
     # marker the user page renders and the group page does not.
     assert html.count("from group") == 4
     assert "Granted by a group" in html
+
+
+async def test_disabling_is_reversible_and_refused_on_yourself(make_config):
+    from fastapi import HTTPException
+    cm = make_config(users={"alice": {"name": "alice"}, "admin": {"name": "admin"}})
+    await mgmt.admin_user_set_disabled(_request(cm), cm, "admin", "alice",
+                                       disabled="1")
+    assert cm.users["alice"]["disabled"] is True
+    await mgmt.admin_user_set_disabled(_request(cm), cm, "admin", "alice",
+                                       disabled=None)
+    assert "disabled" not in cm.users["alice"]
+    with pytest.raises(HTTPException):
+        await mgmt.admin_user_set_disabled(_request(cm), cm, "admin", "admin",
+                                           disabled="1")
+    assert "disabled" not in cm.users["admin"]
+
+
+async def test_the_otp_toggle_sets_and_clears_the_exemption(make_config):
+    cm = make_config(users={"alice": {"name": "alice"}})
+    assert cm.is_user_otp_required("alice") is True
+    await mgmt.admin_user_set_otp(_request(cm), cm, "admin", "alice",
+                                  otp_disabled="on")
+    assert cm.is_user_otp_required("alice") is False
+    await mgmt.admin_user_set_otp(_request(cm), cm, "admin", "alice",
+                                  otp_disabled=None)
+    assert "otpDisabled" not in cm.users["alice"]
+
+
+@pytest.mark.parametrize("flags", [{}, {"disabled": True, "otpDisabled": True}])
+def test_user_pages_render_the_account_state(flags):
+    user = {"name": "bob", "publicKeys": [], **flags}
+    detail = _render(
+        "admin/user_detail.html", current_user="alice", is_admin=True,
+        user_obj=user, instances=[], gpu_types=[], allowed_gpu_types=[],
+        user_overrides={}, override_groups=OVERRIDE_GROUPS, zones=["default"],
+        allowed_zones=[], user_groups=[], channels=CHANNELS,
+        enforced_channels=ENFORCED_CHANNELS, own_channels=None,
+        channel_grant=None, entry_points=ENTRY_POINTS, own_entry_points=[],
+        allowed_entry_points=[], access_sections=[], own_zones=[],
+        own_gpu_types=[], own_overrides={})
+    listing = _render("admin/users.html", current_user="alice", is_admin=True,
+                      users=[user])
+    if flags:
+        assert "Re-enable Account" in detail and "disabled" in listing
+        assert "no 2FA" in listing
+    else:
+        assert "Disable Account" in detail and "no 2FA" not in listing

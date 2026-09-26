@@ -435,6 +435,22 @@ spec:
                   description: >-
                     Grants portal admin rights (template/user/session management
                     across all users). Only an existing admin can set this.
+                disabled:
+                  type: boolean
+                  description: >-
+                    Suspends the account without touching anything else on it:
+                    every door (kiosk, portal, gateway) refuses it, whatever
+                    entryPoints it or its groups grant, and so do the viewer
+                    app's desktop pages and display WebSockets. Its sessions,
+                    homes and grants are left as they are, so clearing this
+                    puts the account back exactly as it was. Connections
+                    already open are not cut; stop the sessions for that.
+                otpDisabled:
+                  type: boolean
+                  description: >-
+                    Skips the kiosk's second factor (TOTP) for this user: the
+                    password alone signs in. Omitted/false means the code is
+                    asked, which is the default for every account.
                 uid:
                   type: integer
                   description: >-

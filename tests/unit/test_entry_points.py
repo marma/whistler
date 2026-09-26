@@ -173,14 +173,20 @@ def test_which_paths_need_which_entry_point(path, expected):
 
 
 class _CM:
-    def __init__(self, entry_points=None, sessions=None):
+    def __init__(self, entry_points=None, sessions=None, disabled=()):
         self.entry_points = entry_points or {}
         self.sessions = sessions or {}
+        self.disabled = set(disabled)
+
+    def is_user_disabled(self, username):
+        return username in self.disabled
 
     def get_user_entry_points(self, username):
         return list(self.entry_points.get(username, []))
 
     def may_enter(self, username, entry_point):
+        if self.is_user_disabled(username):
+            return False
         return entry_point in self.get_user_entry_points(username)
 
     def get_user_desktop_sessions(self, username):
@@ -334,4 +340,90 @@ async def test_the_login_form_refuses_a_kiosk_bound_user_after_a_good_password(
     response = await login_submit(request, user="alice", password="x")
     assert response.status_code == 403
     assert "Kiosk only" in response.body.decode()
+    assert not response.headers.getlist("set-cookie")
+
+
+# --------------------------------------------------------------------------- #
+# A disabled account: every door, whatever it is granted                       #
+# --------------------------------------------------------------------------- #
+
+def test_a_disabled_user_enters_nowhere(make_config):
+    cm = make_config(users={"alice": {"name": "alice", "disabled": True,
+                                      "entryPoints": list(ENTRY_POINTS)}},
+                     groups={"staff": {"members": ["alice"],
+                                       "entryPoints": list(ENTRY_POINTS)}})
+    for entry in ENTRY_POINTS:
+        assert cm.may_enter("alice", entry) is False
+    # Nothing else was touched, so re-enabling restores the account exactly.
+    cm.set_user_disabled("alice", False)
+    assert "disabled" not in cm.users["alice"]
+    for entry in ENTRY_POINTS:
+        assert cm.may_enter("alice", entry) is True
+
+
+def test_a_disabled_user_cannot_authenticate_to_the_gateway(make_config):
+    key, line = _keypair()
+    cm = make_config(users={"alice": {"name": "alice", "publicKeys": [line],
+                                      "entryPoints": list(ENTRY_POINTS),
+                                      "disabled": True}})
+    srv = SSHServer(config_manager=cm)
+    assert srv.validate_public_key("alice", key) is False
+    assert srv.username is None
+
+
+@pytest.fixture
+async def viewer_with_disabled(monkeypatch):
+    monkeypatch.setenv("WHISTLER_AUTH_ALLOW_ANY", "true")
+    monkeypatch.setenv("WHISTLER_SCREENSHOT_INTERVAL", "0")
+    cm = _CM(entry_points={"gone": list(ENTRY_POINTS)}, disabled={"gone"})
+    client = TestClient(TestServer(build_app(cm)))
+    await client.start_server()
+    yield client
+    await client.close()
+
+
+@pytest.mark.parametrize("path", ["/", "/kiosk", "/connect/desk",
+                                  "/status/desk", "/screenshot/desk",
+                                  "/vnc/desk"])
+async def test_a_disabled_user_is_refused_the_viewer_app(viewer_with_disabled,
+                                                        path):
+    """The desktop paths need no entry point, and that is exactly why they ask
+    about a suspension: a cookie from before it must not keep the desktop."""
+    resp = await viewer_with_disabled.get(f"{path}?user=gone", headers=_NAV)
+    assert resp.status == 403, path
+    assert "Account disabled" in await resp.text()
+
+
+async def test_a_disabled_user_is_refused_the_display_websocket(
+        viewer_with_disabled):
+    resp = await viewer_with_disabled.get(
+        "/desktop/desk/websockets?user=gone",
+        headers={"Upgrade": "websocket", "Connection": "Upgrade"})
+    assert resp.status == 403
+
+
+async def test_the_kiosk_login_says_the_account_is_disabled(viewer_with_disabled):
+    resp = await viewer_with_disabled.post("/kiosk/login",
+                                           data={"user": "gone", "password": "x"})
+    assert resp.status == 403
+    assert "disabled" in await resp.text()
+    assert not resp.cookies.get("whistler_kiosk")
+
+
+def test_require_user_names_a_suspension_not_the_kiosk(monkeypatch):
+    from whistler.portal.management import AccountDisabled
+    monkeypatch.setenv("WHISTLER_AUTH_ALLOW_ANY", "true")
+    request = _mgmt_request(entry_points={"alice": ["portal"]})
+    request.app.state.cm.disabled.add("alice")
+    with pytest.raises(AccountDisabled):
+        require_user(request)
+
+
+async def test_the_portal_login_refuses_a_disabled_account(monkeypatch):
+    monkeypatch.setenv("WHISTLER_AUTH_ALLOW_ANY", "true")
+    request = _mgmt_request(entry_points={"alice": ["portal"]})
+    request.app.state.cm.disabled.add("alice")
+    response = await login_submit(request, user="alice", password="x")
+    assert response.status_code == 403
+    assert "disabled" in response.body.decode()
     assert not response.headers.getlist("set-cookie")

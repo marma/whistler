@@ -393,6 +393,9 @@ class SSHServer(asyncssh.SSHServer):
         The client sees an ordinary auth failure, which is all SSH can say at
         this stage; the reason is logged here."""
         if not self.config_manager.may_enter(real_user, ENTRY_GATEWAY):
+            if self.config_manager.is_user_disabled(real_user):
+                logger.warning(f"Refusing {real_user}: account is disabled")
+                return False
             logger.warning(
                 f"Refusing {real_user}: no '{ENTRY_GATEWAY}' entry point "
                 f"(entryPoints="

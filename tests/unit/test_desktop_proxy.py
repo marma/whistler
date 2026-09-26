@@ -107,6 +107,9 @@ class FakeCM:
         tests (test_entry_points.py); here every user holds every door."""
         return True
 
+    def is_user_disabled(self, username):
+        return False
+
     def session_channels(self, username, name):
         return self.channels.get(username, set(CHANNELS))
 

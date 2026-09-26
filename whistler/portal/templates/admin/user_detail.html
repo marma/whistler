@@ -6,7 +6,9 @@
   <div class="ten wide column">
     <h2 class="ui header">
       <i class="user icon"></i>
-      <div class="content">{{ user_obj.name }}</div>
+      <div class="content">{{ user_obj.name }}
+        {% if user_obj.disabled %}<span class="ui red label">Disabled</span>{% endif %}
+      </div>
     </h2>
   </div>
   <div class="six wide column" style="text-align:right;padding-top:1.2rem">
@@ -47,6 +49,45 @@
       <div class="ui secondary segment" style="font-family:monospace;font-size:.78rem;word-break:break-all;padding:.6rem">{{ k }}</div>
       {% endfor %}
       {% endif %}
+    </div>
+
+    <div class="ui segment">
+      <h4 class="ui header"><i class="power off icon"></i> Account</h4>
+      <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/disabled?user={{ current_user }}">
+        {% if user_obj.disabled %}
+        <div class="ui error message" style="display:block">
+          <i class="ban icon"></i>
+          This account is <strong>disabled</strong>: the portal, the kiosk,
+          SSH and its desktops all refuse it. Its grants, sessions and homes
+          are untouched.
+        </div>
+        <button type="submit" class="ui green button"><i class="check icon"></i> Re-enable Account</button>
+        {% elif user_obj.name == current_user %}
+        <p class="ui grey text">This is your own account, which cannot be disabled from here.</p>
+        {% else %}
+        <input type="hidden" name="disabled" value="1">
+        <p class="ui grey text">
+          Disabling suspends the account at every door — portal, kiosk, SSH,
+          and the desktop pages — and leaves everything else on it as it is,
+          so re-enabling restores it exactly. Connections already open are
+          not cut; stop the instances below for that.
+        </p>
+        <button type="submit" class="ui orange button"
+                onclick="return confirm('Disable {{ user_obj.name }}?')"><i class="ban icon"></i> Disable Account</button>
+        {% endif %}
+      </form>
+      <div class="ui divider"></div>
+      <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/otp?user={{ current_user }}">
+        <div class="field">
+          <div class="ui checkbox">
+            <input type="checkbox" name="otp_disabled" id="otp-disabled"
+                   {% if user_obj.otpDisabled %}checked{% endif %}>
+            <label for="otp-disabled">Skip the kiosk second factor (TOTP)</label>
+          </div>
+          <div class="ui pointing label">Checked: the kiosk signs this user in on the password alone. Unchecked (the default): a code from an authenticator app is asked after the password.</div>
+        </div>
+        <button type="submit" class="ui teal button"><i class="save icon"></i> Save</button>
+      </form>
     </div>
 
     <div class="ui segment">

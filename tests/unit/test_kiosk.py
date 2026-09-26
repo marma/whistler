@@ -20,6 +20,8 @@ from whistler.status import STATUS_GROUPS
 class FakeCM:
     def __init__(self):
         self.sessions = {}
+        self.disabled = set()
+        self.otp_off = set()
 
     def get_user_desktop_sessions(self, username):
         return self.sessions.get(username, [])
@@ -32,8 +34,15 @@ class FakeCM:
 
     def may_enter(self, username, entry_point):
         """Unrestricted here: what the kiosk surface *is* belongs in this file,
-        who may reach it in test_entry_points.py."""
-        return True
+        who may reach it in test_entry_points.py — except a disabled
+        account, which the kiosk's own handlers also ask about."""
+        return username not in self.disabled
+
+    def is_user_disabled(self, username):
+        return username in self.disabled
+
+    def is_user_otp_required(self, username):
+        return username not in self.otp_off
 
     def trigger_instance_start(self, username, name, run_overrides=None):
         return True
@@ -606,3 +615,48 @@ async def test_a_reload_mid_flow_returns_to_the_code_prompt(portal):
     resp = await portal.get("/kiosk", allow_redirects=False)
     assert resp.status == 303
     assert resp.headers["Location"] == "/kiosk/otp"
+
+
+# --------------------------------------------------------------------------- #
+# Per-user second factor, and a suspension mid-flow                            #
+# --------------------------------------------------------------------------- #
+
+async def test_a_user_with_otp_off_signs_in_on_the_password(portal):
+    portal.cm.otp_off.add("alice")
+    resp = await portal.post("/kiosk/login",
+                             data={"user": "alice", "password": "x"},
+                             allow_redirects=False)
+    assert resp.status == 303
+    assert resp.headers["Location"] == "/kiosk"
+    assert resp.cookies[kiosk.KIOSK_COOKIE].value == "1"
+    assert resp.cookies["whistler_user"].value == "alice"
+
+
+async def test_otp_off_for_one_user_leaves_everyone_else_asked(portal):
+    portal.cm.otp_off.add("bob")
+    resp = await portal.post("/kiosk/login",
+                             data={"user": "alice", "password": "x"},
+                             allow_redirects=False)
+    assert resp.headers["Location"] == "/kiosk/otp"
+
+
+async def test_disabled_between_the_factors_is_not_signed_in(portal):
+    await portal.post("/kiosk/login", data={"user": "alice", "password": "x"})
+    portal.cm.disabled.add("alice")
+    resp = await portal.post("/kiosk/otp", data={"code": "123456"},
+                             allow_redirects=False)
+    assert resp.status == 303
+    assert not resp.cookies[kiosk.KIOSK_COOKIE].value
+    assert not resp.cookies["whistler_user"].value
+
+
+async def test_a_disabled_user_cannot_unlock(portal):
+    await _signed_in(portal)
+    await portal.get("/kiosk/lock", params={"next": "/kiosk"})
+    portal.cm.disabled.add("alice")
+    resp = await portal.post("/kiosk/login", data={"password": "x"},
+                             allow_redirects=False)
+    assert resp.status == 303
+    assert resp.headers["Location"] == "/kiosk"
+    # Signed out, not unlocked: the identity cookie is cleared.
+    assert not resp.cookies["whistler_user"].value

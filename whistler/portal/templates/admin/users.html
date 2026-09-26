@@ -28,6 +28,8 @@
     {% for u in users %}
     <tr>
       <td><strong>{{ u.name }}</strong>
+        {% if u.disabled %}<span class="ui red mini label" title="Refused at every door until re-enabled">disabled</span>{% endif %}
+        {% if u.otpDisabled %}<span class="ui yellow mini label" title="The kiosk does not ask this user for a TOTP code">no 2FA</span>{% endif %}
         {# This user's own entryPoints. Shown here because a binding an admin
            cannot see while scanning the list is one they will forget; a group
            may still widen it, which the details page resolves. #}

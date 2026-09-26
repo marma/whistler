@@ -50,6 +50,9 @@ class _CM:
     def may_enter(self, username, entry_point):
         return entry_point in self.get_user_entry_points(username)
 
+    def is_user_disabled(self, username):
+        return False
+
 
 def _app(cm=None):
     async def run(func, *args):

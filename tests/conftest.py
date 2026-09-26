@@ -365,6 +365,21 @@ class FakeConfigManager(ConfigManager):
             return True
         return False
 
+    def _set_user_flag(self, username, key, value):
+        if username not in self.users:
+            return False
+        if value:
+            self.users[username][key] = True
+        else:
+            self.users[username].pop(key, None)
+        return True
+
+    def set_user_disabled(self, username, disabled):
+        return self._set_user_flag(username, "disabled", disabled)
+
+    def set_user_otp_disabled(self, username, otp_disabled):
+        return self._set_user_flag(username, "otpDisabled", otp_disabled)
+
     def set_user_allowed_zones(self, username, zones):
         if username in self.users:
             self.users[username]["allowedZones"] = zones
