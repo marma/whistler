@@ -204,6 +204,74 @@ class LoadingApp(App):
         self._should_exit = True
         self.exit()
 
+# How often the gateway re-reads its persisted host key (watch_host_key).
+HOST_KEY_POLL_SECONDS = 30
+# Exit status when the host key changed underneath us: non-zero so the exit
+# reads as "restart me" in `kubectl get pod`, distinct from a crash's 1.
+EXIT_HOST_KEY_CHANGED = 3
+_exit_code = 0
+
+
+def _host_key_identity(key_data):
+    """The public half of a private key, or None for garbage. Compared
+    instead of the bytes: OpenSSH private-key encoding carries a random check
+    value, so one key never exports to the same bytes twice."""
+    try:
+        return asyncssh.import_private_key(key_data).public_data
+    except (asyncssh.KeyImportError, ValueError):
+        return None
+
+
+async def watch_host_key(config_manager, secret_name, key_in_use,
+                         on_change, interval=HOST_KEY_POLL_SECONDS):
+    """Call ``on_change`` once when the host key Secret holds a different key
+    than the one this process is serving.
+
+    asyncssh fixes a listener's host keys when it starts, so the only way to
+    serve a new one is a new process. That is what makes a restored key
+    (design/backup.md) take effect without giving anything RBAC on the
+    gateway's Deployment, and it also settles a first-start race between
+    replicas that each generated a key: the Secret keeps the last write, and
+    every replica not serving it restarts onto it.
+
+    A missing or unreadable Secret is not a change. Restarting then would
+    make the next start generate yet another key, which is the churn a
+    persisted key exists to prevent.
+    """
+    current = _host_key_identity(key_in_use)
+    loop = asyncio.get_running_loop()
+    warned_missing = False
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            data = await loop.run_in_executor(
+                None, config_manager.get_server_host_key, secret_name)
+        except Exception as e:
+            logger.warning(f"Could not re-read host key secret {secret_name}: {e}")
+            continue
+        if not data:
+            if not warned_missing:
+                logger.warning(f"Host key secret {secret_name} is gone; "
+                               f"serving the key loaded at startup")
+                warned_missing = True
+            continue
+        warned_missing = False
+        identity = _host_key_identity(data)
+        if identity is None or identity == current:
+            continue
+        logger.warning(f"Host key in secret {secret_name} changed; exiting so "
+                       f"the restarted gateway serves it (open SSH sessions "
+                       f"are dropped)")
+        on_change()
+        return
+
+
+def _restart_for_new_host_key():
+    global _exit_code
+    _exit_code = EXIT_HOST_KEY_CHANGED
+    asyncio.get_running_loop().stop()
+
+
 async def start_server():
     parser = argparse.ArgumentParser(description="Whistler SSH Server")
     parser.add_argument("--kubeconfig", help="Path to kubeconfig file")
@@ -278,6 +346,11 @@ async def start_server():
                 logger.info(f"Persisted new host key to secret {secret_name}")
             else:
                 logger.error(f"Failed to persist host key to secret {secret_name}")
+
+        # Held on the function so the task is not garbage-collected: the
+        # event loop keeps only a weak reference to tasks.
+        start_server.host_key_watch = asyncio.ensure_future(watch_host_key(
+            config_manager, secret_name, key_data, _restart_for_new_host_key))
 
     await asyncssh.create_server(server_factory, '', 8022,
                                  server_host_keys=[host_key_path],
@@ -1277,5 +1350,6 @@ if __name__ == '__main__':
         sys.exit('Error starting server: ' + str(exc))
 
     loop.run_forever()
+    sys.exit(_exit_code)
 
 

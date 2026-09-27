@@ -116,6 +116,37 @@ def test_needs_reissue_inside_the_renewal_window():
     assert hostca.needs_reissue(cert, ["box.w"], valid_before) is True
 
 
+def test_needs_reissue_when_the_ca_changed():
+    """A reinstall mints a new CA and a restore brings an old one back; the
+    session certs in the surviving user namespaces must follow either way
+    rather than wait out their renewal window."""
+    old_ca, new_ca = _ca(), _ca()
+    _key, cert, valid_before = hostca.issue_host_cert(
+        ca_private_key=old_ca, principals=["box.w"], key_id="alice-box")
+    assert hostca.needs_reissue(
+        cert, ["box.w"], valid_before,
+        ca_public=hostca.ca_public_key(old_ca)) is False
+    assert hostca.needs_reissue(
+        cert, ["box.w"], valid_before,
+        ca_public=hostca.ca_public_key(new_ca)) is True
+
+
+def test_reissue_under_a_new_ca_keeps_the_host_key():
+    """Only the certificate changes: a new host key would put the TOFU
+    'REMOTE HOST IDENTIFICATION HAS CHANGED' wall in front of every client
+    that has not adopted the CA."""
+    old_ca, new_ca = _ca(), _ca()
+    key, _cert, _ = hostca.issue_host_cert(
+        ca_private_key=old_ca, principals=["box.w"], key_id="alice-box")
+    key2, cert2, _ = hostca.issue_host_cert(
+        ca_private_key=new_ca, principals=["box.w"], key_id="alice-box",
+        host_private_key=key)
+    assert (asyncssh.import_private_key(key2).export_public_key()
+            == asyncssh.import_private_key(key).export_public_key())
+    assert hostca.signed_by(cert2, hostca.ca_public_key(new_ca))
+    assert not hostca.signed_by(cert2, hostca.ca_public_key(old_ca))
+
+
 def test_needs_reissue_on_garbage_expiry():
     """A Secret whose annotation was lost or mangled must fail toward
     re-issuing rather than serving an unbounded certificate."""

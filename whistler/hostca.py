@@ -149,11 +149,27 @@ def cert_principals(cert_line) -> list:
     return list(asyncssh.import_certificate(cert_line).principals)
 
 
+def signed_by(cert_line, ca_public: str) -> bool:
+    """Whether a certificate was issued by the CA whose public half is
+    ``ca_public``. Raises on garbage, like ``cert_principals``."""
+    signer = asyncssh.import_certificate(cert_line).signing_key
+    return signer.public_data == asyncssh.import_public_key(
+        ca_public).public_data
+
+
 def needs_reissue(cert_line, principals, valid_before, now: float = None,
-                  renew_before: int = RENEW_BEFORE_SECONDS) -> bool:
+                  renew_before: int = RENEW_BEFORE_SECONDS,
+                  ca_public: str = None) -> bool:
     """Whether a stored certificate should be replaced — because it is
-    unreadable, no longer covers the names the session answers to, or is
-    inside its renewal window.
+    unreadable, was signed by a CA other than ``ca_public``, no longer covers
+    the names the session answers to, or is inside its renewal window.
+
+    The CA check is what makes a CA change reach the guests. Session certs
+    live in the user namespaces and outlive the Secret holding the CA, so a
+    reinstall (new CA) or a restore (the old one back) would otherwise leave
+    every session presenting a certificate from a CA the users no longer
+    trust, until its renewal window came round — up to eleven months
+    (design/backup.md, Phase 0).
 
     ``valid_before`` is passed in rather than read back off the certificate:
     asyncssh exposes it only as a private attribute, and depending on that
@@ -163,6 +179,8 @@ def needs_reissue(cert_line, principals, valid_before, now: float = None,
         return True
     try:
         current = set(cert_principals(cert_line))
+        if ca_public and not signed_by(cert_line, ca_public):
+            return True
     except (asyncssh.KeyImportError, ValueError):
         return True
     if current != set(principals):

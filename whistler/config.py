@@ -5370,7 +5370,9 @@ class KubeConfigManager(ConfigManager):
                 logger.error(f"Failed to read host cert secret {secret_name}: {e}")
                 return (None, None)
 
-        if host_key and not hostca.needs_reissue(cert_line, principals, valid_before):
+        if host_key and not hostca.needs_reissue(
+                cert_line, principals, valid_before,
+                ca_public=hostca.ca_public_key(ca_key)):
             return (host_key, cert_line)
 
         try:
