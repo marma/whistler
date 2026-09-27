@@ -117,6 +117,12 @@ def cmd_restore(args) -> int:
     return 0
 
 
+def cmd_serve(args) -> int:
+    from whistler.backup.service import serve
+    serve()
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m whistler.backup",
                                      description=__doc__.split("\n\n")[0])
@@ -145,6 +151,10 @@ def main(argv=None) -> int:
     p.add_argument("-v", "--verbose", action="store_true",
                    help="also list unchanged objects")
     p.set_defaults(fn=cmd_restore)
+
+    p = sub.add_parser("serve", help="run the backup service (the pod that "
+                                     "mounts the backup volume)")
+    p.set_defaults(fn=cmd_serve)
 
     args = parser.parse_args(argv)
     level = os.environ.get("WHISTLER_BACKUP_LOG_LEVEL", "WARNING").upper()

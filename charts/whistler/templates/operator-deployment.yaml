@@ -52,6 +52,20 @@ spec:
             # (python -m whistler.backup) can carry it (design/backup.md).
             - name: WHISTLER_HOST_KEY_SECRET_NAME
               value: "{{ .Release.Name }}-server-host-key"
+            {{- if .Values.backup.enabled }}
+            # The backup volume's claim, which the operator creates and
+            # re-attaches (config.ensure_backup_claim); see values backup.volume.
+            - name: WHISTLER_BACKUP_CLAIM
+              value: "{{ .Release.Name }}-backups"
+            - name: WHISTLER_BACKUP_VOLUME_NAME
+              value: {{ .Values.backup.volume.existingVolumeName | quote }}
+            - name: WHISTLER_BACKUP_STORAGE_CLASS
+              value: {{ .Values.backup.volume.storageClassName | quote }}
+            - name: WHISTLER_BACKUP_SIZE
+              value: {{ .Values.backup.volume.size | quote }}
+            - name: WHISTLER_BACKUP_ACCESS_MODE
+              value: {{ .Values.backup.volume.accessMode | quote }}
+            {{- end }}
             - name: WHISTLER_SSH_DOMAIN_SUFFIX
               value: {{ .Values.whistler.ssh.domainSuffix | quote }}
             - name: WHISTLER_STREAMER_IMAGE

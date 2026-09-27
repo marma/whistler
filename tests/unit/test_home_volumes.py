@@ -633,3 +633,67 @@ def test_the_sweep_records_purges_and_skips():
     assert purged == [("whistler-user-bob", "going")]
     assert claims == [("whistler-user-alice", "whistler-data-alice",
                        "pod-home", "alice")]
+
+
+# --- the backup claim (design/backup.md, Phase 3) ------------------------------ #
+
+def _backup_manager(monkeypatch, pvs, **env):
+    monkeypatch.setenv("WHISTLER_BACKUP_CLAIM", "whistler-backups")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    cm = _manager()
+    cm.namespace = "whistler"
+    cm._list_pvs = lambda: pvs
+    api = MagicMock()
+    api.read_namespaced_persistent_volume_claim.side_effect = ApiException(
+        status=404)
+    return cm, api
+
+
+def test_backups_off_means_no_claim(monkeypatch):
+    monkeypatch.delenv("WHISTLER_BACKUP_CLAIM", raising=False)
+    assert _manager().ensure_backup_claim() is None
+
+
+def test_a_new_install_rebinds_the_old_backup_volume(monkeypatch):
+    old = _released_pv("pv-backups", "whistler-backups")
+    old["metadata"]["labels"] = {"whistler.martinmalmsten.net/user-data":
+                                 "backups"}
+    old["spec"]["claimRef"]["namespace"] = "whistler"
+    cm, api = _backup_manager(monkeypatch, [old])
+    with patch("whistler.config.client.CoreV1Api", return_value=api):
+        assert cm.ensure_backup_claim() == "whistler-backups"
+    body = api.create_namespaced_persistent_volume_claim.call_args[0][1]
+    assert body["spec"]["volumeName"] == "pv-backups"
+
+
+def test_with_no_old_volume_a_claim_is_provisioned(monkeypatch):
+    cm, api = _backup_manager(monkeypatch, [],
+                              WHISTLER_BACKUP_STORAGE_CLASS="fast",
+                              WHISTLER_BACKUP_SIZE="2Gi")
+    with patch("whistler.config.client.CoreV1Api", return_value=api):
+        cm.ensure_backup_claim()
+    body = api.create_namespaced_persistent_volume_claim.call_args[0][1]
+    assert "volumeName" not in body["spec"]
+    assert body["spec"]["storageClassName"] == "fast"
+    assert body["spec"]["resources"]["requests"]["storage"] == "2Gi"
+
+
+def test_a_named_volume_that_is_missing_provisions_nothing(monkeypatch):
+    cm, api = _backup_manager(monkeypatch, [],
+                              WHISTLER_BACKUP_VOLUME_NAME="nfs-backups")
+    with patch("whistler.config.client.CoreV1Api", return_value=api):
+        assert cm.ensure_backup_claim() is None
+    api.create_namespaced_persistent_volume_claim.assert_not_called()
+
+
+def test_an_existing_backup_claim_is_retained(monkeypatch):
+    monkeypatch.setenv("WHISTLER_BACKUP_CLAIM", "whistler-backups")
+    cm = _manager()
+    cm.namespace = "whistler"
+    secured = []
+    cm.secure_claim = lambda ns, c, kind, u: secured.append((ns, c, kind))
+    api = MagicMock()
+    with patch("whistler.config.client.CoreV1Api", return_value=api):
+        assert cm.ensure_backup_claim() == "whistler-backups"
+    assert secured == [("whistler", "whistler-backups", "backups")]

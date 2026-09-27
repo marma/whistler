@@ -1,0 +1,238 @@
+{{- /*
+Backups of Whistler's state (design/backup.md). The install record is always
+rendered; the backup service only when backup.enabled.
+*/ -}}
+---
+# The install id is this object's metadata.uid (whistler/backup/state.py).
+# Helm deletes it on uninstall and creates it on install, while an upgrade
+# keeps it: "a reinstall changes it, an upgrade does not". It carries no data
+# and must not: its only job is to be recreated.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-install
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: whistler-backup
+{{- if .Values.backup.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-backup
+  namespace: {{ .Release.Namespace }}
+---
+# What a backup reads and a restore writes: every Whistler CR, the user and
+# archive namespaces (with their NetworkPolicies, built exactly as the
+# operator builds them), and the claim/PV to report where backups live.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-backup
+rules:
+  - apiGroups: [whistler.martinmalmsten.net]
+    resources: [sessions, templates, users, zones, groups, datasets, homevolumes]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, create]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims, persistentvolumes]
+    verbs: [get]
+  # Callers are checked by TokenReview against an allow-list of
+  # ServiceAccounts (WHISTLER_BACKUP_ALLOWED_SERVICEACCOUNTS).
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-backup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-backup
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-backup
+    namespace: {{ .Release.Namespace }}
+---
+# Secrets and ConfigMaps only in the release namespace: the SSH CA, gateway
+# host key, dataset credentials and backup passphrase; the install record,
+# the restore decision and the schedule settings.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-backup
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets, configmaps]
+    verbs: [get, list, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-backup
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-backup
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-backup
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: whistler-backup
+spec:
+  replicas: 1
+  # One mounter, always: an RWO volume can be mounted by one pod, and two
+  # schedulers would each apply retention.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: whistler-backup
+  template:
+    metadata:
+      labels:
+        app: whistler-backup
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}-backup
+      # No docker-link env vars: the Service is called <release>-backup, so
+      # they would be WHISTLER_BACKUP_*, the very prefix our settings use.
+      enableServiceLinks: false
+      containers:
+        - name: backup
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "whistler.backup", "serve"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: WHISTLER_RELEASE_NAME
+              value: {{ .Release.Name | quote }}
+            - name: WHISTLER_BACKUP_DIR
+              value: /backups
+            - name: WHISTLER_BACKUP_CLAIM
+              value: "{{ .Release.Name }}-backups"
+            - name: WHISTLER_BACKUP_LOG_LEVEL
+              value: {{ .Values.backup.logLevel | quote }}
+            - name: WHISTLER_BACKUP_ALLOWED_SERVICEACCOUNTS
+              value: "system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-portal,system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-operator"
+            - name: WHISTLER_BACKUP_SCHEDULE_MODE
+              value: {{ .Values.backup.schedule.mode | quote }}
+            - name: WHISTLER_BACKUP_SCHEDULE_HOURS
+              value: {{ .Values.backup.schedule.hours | quote }}
+            - name: WHISTLER_BACKUP_SCHEDULE_AT
+              value: {{ .Values.backup.schedule.at | quote }}
+            - name: WHISTLER_BACKUP_RETAIN
+              value: {{ .Values.backup.retain | quote }}
+            # The same names the gateway and operator use, so a backup carries
+            # these Secrets and a restore writes them where they are read.
+            - name: WHISTLER_SSH_CA_SECRET_NAME
+              value: "{{ .Release.Name }}-ssh-ca"
+            - name: WHISTLER_HOST_KEY_SECRET_NAME
+              value: "{{ .Release.Name }}-server-host-key"
+            - name: WHISTLER_SSH_DOMAIN_SUFFIX
+              value: {{ .Values.whistler.ssh.domainSuffix | quote }}
+          ports:
+            - name: http
+              containerPort: 8090
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+{{ toYaml .Values.backup.resources | indent 12 }}
+          volumeMounts:
+            - name: backups
+              mountPath: /backups
+            # A restore that recreates a user namespace builds its
+            # NetworkPolicies exactly as the operator does, which reads these.
+            - name: config
+              mountPath: "/etc/whistler-config/volumes.yaml"
+              subPath: "volumes.yaml"
+              readOnly: true
+            {{- if .Values.whistler.networkPolicy }}
+            - name: config
+              mountPath: "/etc/whistler-config/networkpolicy.yaml"
+              subPath: "networkpolicy.yaml"
+              readOnly: true
+            {{- end }}
+            - name: config
+              mountPath: "/etc/whistler-config/images.yaml"
+              subPath: "images.yaml"
+              readOnly: true
+      volumes:
+        # Created by the operator, not by Helm (see values.yaml, backup.volume):
+        # until it exists this pod is Pending, which is correct.
+        - name: backups
+          persistentVolumeClaim:
+            claimName: "{{ .Release.Name }}-backups"
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: whistler-backup
+spec:
+  type: ClusterIP
+  selector:
+    app: whistler-backup
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http
+---
+# Only the portal and the operator (the uninstall hook runs as it) may
+# connect at all; TokenReview then decides what they may do.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-backup
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: whistler-backup
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [whistler-portal, whistler-operator]
+      ports:
+        - port: 8090
+{{- end }}

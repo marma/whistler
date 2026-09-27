@@ -157,7 +157,8 @@ def _with_role(secret: Dict[str, Any], role: str,
 
 
 def export(cm, *, include_secrets: bool = True, passphrase: str = None,
-           trigger: str = "manual", created: datetime.datetime = None
+           trigger: str = "manual", created: datetime.datetime = None,
+           install_id: str = None
            ) -> Tuple[bytes, Dict[str, Any], List[str]]:
     """A complete backup of ``cm``'s cluster: ``(file, manifest, warnings)``."""
     objects, secrets, warnings = collect(cm, include_secrets)
@@ -168,6 +169,9 @@ def export(cm, *, include_secrets: bool = True, passphrase: str = None,
             "releaseNamespace": cm.namespace,
             "archiveNamespace": ARCHIVE_NAMESPACE,
             "sshDomainSuffix": getattr(cm, "ssh_domain_suffix", None),
+            # Which install made it: retention and the first-login offer key
+            # on it (backup/schedule.py). None from the CLI.
+            "installId": install_id,
         })
     if secrets and not passphrase:
         warnings.append("Secrets are stored unencrypted (no passphrase set): "

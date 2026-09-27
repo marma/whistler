@@ -206,6 +206,48 @@ portal:
       cpu: 250m
       memory: 256Mi
 
+# Backups of Whistler's STATE — users, groups, zones, templates, datasets,
+# home volume records, sessions, and the SSH CA / gateway host key — not of
+# users' data (design/backup.md). One small pod (the backup service) mounts
+# the backup volume and runs the schedule; the portal drives it.
+#
+# The volume must outlive an uninstall, which deletes namespaces and so their
+# claims: the operator creates the claim (Helm cannot know which retained PV
+# an earlier install left) and sets Retain on its PV. On the next install it
+# is found again and re-attached, and the first admin to sign in is offered
+# the latest backup.
+backup:
+  enabled: true
+  volume:
+    # Production: a PV you created (e.g. an NFS export), so backups live on
+    # storage whose lifecycle is not the cluster's and survive losing it. It
+    # must exist and be Available or Released; it is never substituted.
+    existingVolumeName: ""
+    # Otherwise the operator provisions a claim from this class (empty: the
+    # cluster default) — which on in-cluster storage dies with the cluster;
+    # download backups somewhere else for that case.
+    storageClassName: ""
+    size: 1Gi
+    accessMode: ReadWriteOnce
+  # Defaults; the portal's Backups page overrides them once saved.
+  # mode: off | interval (every `hours`) | daily (at `at`, UTC).
+  schedule:
+    mode: daily
+    hours: 24
+    at: "03:00"
+  # Scheduled backups of THIS install to keep. Manual, uninstall, pre-restore
+  # and uploaded backups, and anything from an earlier install, are never
+  # deleted automatically.
+  retain: 14
+  logLevel: INFO
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 50m
+      memory: 128Mi
+
 whistler:
   auth:
     allowAny: false

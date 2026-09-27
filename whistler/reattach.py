@@ -33,6 +33,7 @@ USER_LABEL = "whistler.martinmalmsten.net/user"
 KIND_HOME = "home"          # a HomeVolume's claim (VM home disk image)
 KIND_POD_HOME = "pod-home"  # the per-user claim container sessions mount
 KIND_ARCHIVED = "archived"  # a home taken from its user (archive_patch)
+KIND_BACKUPS = "backups"    # the backup volume (design/backup.md, Phase 3)
 
 # On an archived PV: where it came from and what record holds it, as JSON.
 # The PV is the one object that survives an uninstall, so this is what lets a
@@ -239,3 +240,37 @@ def rebind_manifests(pv: Dict[str, Any], namespace: str, claim: str,
         },
     }
     return pv_patch, pvc
+
+
+def find_backup_volume(pvs: List[Dict[str, Any]], namespace: str, claim: str,
+                       existing: str = None
+                       ) -> Tuple[Optional[Dict[str, Any]], List[str],
+                                  Optional[str]]:
+    """The PV a missing backup claim should be bound to:
+    ``(pv, others, problem)``.
+
+    ``existing`` is a static PV the admin named (``existingVolumeName``). It
+    must be there and free, and is never substituted. Otherwise the backup
+    volume is whichever PV the operator labelled as one, Released and
+    retained — so an install never provisions a second backup volume while
+    the previous install's is still around (design/backup.md, rule 1). With
+    several, the newest is bound and the rest are named in ``others``.
+    ``(None, [], None)`` means provision.
+    """
+    if existing:
+        pv, problem = find_reattachable(pvs, namespace, claim,
+                                        recorded=existing)
+        if problem and not any(_name(p) == existing for p in pvs):
+            problem = (f"the backup volume {existing} (whistler.backup.volume."
+                       f"existingVolumeName) does not exist")
+        return pv, [], problem
+    candidates = [p for p in pvs
+                  if ((p.get("metadata") or {}).get("labels") or {}).get(
+                      USER_DATA_LABEL) == KIND_BACKUPS
+                  and _phase(p) in ("Released", "Available")
+                  and is_retained(p)]
+    if not candidates:
+        return None, [], None
+    candidates.sort(key=lambda p: (p.get("metadata") or {}).get(
+        "creationTimestamp") or "", reverse=True)
+    return candidates[0], [_name(p) for p in candidates[1:]], None

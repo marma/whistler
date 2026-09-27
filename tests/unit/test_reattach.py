@@ -134,3 +134,44 @@ def test_rebind_to_a_classless_pv_says_so_explicitly():
     _patch, pvc = reattach.rebind_manifests(_pv(storage_class=None), NS,
                                             CLAIM, {})
     assert pvc["spec"]["storageClassName"] == ""
+
+
+# --- the backup volume (design/backup.md, Phase 3) ---------------------------- #
+
+def _backup_pv(name, created, phase="Released", policy="Retain"):
+    pv = _pv(name, phase=phase, policy=policy, claim_ns="whistler",
+             claim="whistler-backups",
+             labels={reattach.USER_DATA_LABEL: reattach.KIND_BACKUPS})
+    pv["metadata"]["creationTimestamp"] = created
+    return pv
+
+
+def test_the_previous_installs_backup_volume_is_found_by_its_label():
+    pvs = [_pv("home"),                                     # a home, not ours
+           _backup_pv("old", "2026-01-01T00:00:00Z"),
+           _backup_pv("new", "2026-06-01T00:00:00Z"),
+           _backup_pv("doomed", "2026-09-01T00:00:00Z", policy="Delete")]
+    pv, others, problem = reattach.find_backup_volume(pvs, "whistler",
+                                                      "whistler-backups")
+    assert problem is None
+    assert pv["metadata"]["name"] == "new"
+    assert others == ["old"]
+
+
+def test_no_backup_volume_means_provision():
+    assert reattach.find_backup_volume([_pv("home")], "whistler", "c") == (
+        None, [], None)
+
+
+def test_a_named_backup_volume_is_never_substituted():
+    pv, _, problem = reattach.find_backup_volume(
+        [_backup_pv("other", "2026-01-01T00:00:00Z")], "whistler",
+        "whistler-backups", existing="nfs-backups")
+    assert pv is None and "nfs-backups" in problem and "does not exist" in problem
+
+
+def test_a_named_backup_volume_that_is_free_is_bound():
+    static = _pv("nfs-backups", phase="Available", claim=None)
+    pv, _, problem = reattach.find_backup_volume(
+        [static], "whistler", "whistler-backups", existing="nfs-backups")
+    assert problem is None and pv["metadata"]["name"] == "nfs-backups"

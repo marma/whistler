@@ -88,9 +88,14 @@ def configure(settings: kopf.OperatorSettings, **_):
 # Binding is asynchronous, so a home created a moment ago is caught on a
 # later pass; the reconcile path also secures a claim it finds bound.
 SECURE_USER_DATA_INTERVAL = 300
+# While a claim exists but is not bound yet — a home just created, or the
+# backup claim on a fresh install — its PV carries the class's policy, often
+# Delete. Come back soon rather than leave that window open for five minutes.
+SECURE_USER_DATA_RETRY = 15
 
 
-def _secure_user_data_loop(cm, interval=SECURE_USER_DATA_INTERVAL):
+def _secure_user_data_loop(cm, interval=SECURE_USER_DATA_INTERVAL,
+                           retry=SECURE_USER_DATA_RETRY):
     while True:
         try:
             recorded = cm.secure_user_data()
@@ -99,7 +104,17 @@ def _secure_user_data_loop(cm, interval=SECURE_USER_DATA_INTERVAL):
                             f"home volume(s)")
         except Exception as e:
             logger.error(f"Securing user data failed (retrying): {e}")
-        time.sleep(interval)
+        # A claim created since (secure_soon) or one seen unbound: soon.
+        # Otherwise the slow pass. A claim created mid-wait cuts it short.
+        wake = cm.secure_soon
+        if getattr(cm, "unbound_claims", False) or wake.is_set():
+            wake.clear()
+            time.sleep(retry)
+        else:
+            wake.wait(interval)
+            if wake.is_set():
+                wake.clear()
+                time.sleep(retry)   # give the new claim time to bind
 
 
 # --------------------------------------------------------------------------- #

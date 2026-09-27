@@ -2595,6 +2595,7 @@ class KubeConfigManager(ConfigManager):
         
         try:
             api.create_namespaced_persistent_volume_claim(namespace, pvc_body)
+            self.secure_soon.set()
             if logger: logger.info(f"PVC {pvc_name} created")
             return pvc_name
         except ApiException as e:
@@ -3335,6 +3336,18 @@ class KubeConfigManager(ConfigManager):
     # anything is provisioned. Decisions in whistler/reattach.py.         #
     # ------------------------------------------------------------------ #
 
+    @property
+    def secure_soon(self):
+        """Set whenever a claim is created or re-bound: it has no PV yet, or
+        one with the class's policy (often Delete), so the operator's sweep
+        should run now rather than in five minutes (operator.
+        _secure_user_data_loop waits on it)."""
+        event = self.__dict__.get("_secure_soon")
+        if event is None:
+            import threading
+            event = self.__dict__.setdefault("_secure_soon", threading.Event())
+        return event
+
     @staticmethod
     def _as_dict(obj) -> Dict[str, Any]:
         """A client model as the camelCase dict the API serves."""
@@ -3368,6 +3381,9 @@ class KubeConfigManager(ConfigManager):
             raise
         pv_name = pvc.spec.volume_name if pvc.spec else None
         if not pv_name:
+            # Exists but not bound yet: its PV will appear with whatever
+            # policy the class gives it, so the sweep comes back soon.
+            self.unbound_claims = True
             return None
         pv = self._read_pv(pv_name)
         if pv is None:
@@ -3394,6 +3410,13 @@ class KubeConfigManager(ConfigManager):
             raise PolicyError(f"Cannot attach home: {problem}.")
         if pv is None:
             return False
+        self._bind_claim_to(pv, namespace, claim, labels)
+        log.info(f"Re-attached {namespace}/{claim} to retained "
+                 f"{pv['metadata']['name']}")
+        return True
+
+    def _bind_claim_to(self, pv: Dict[str, Any], namespace: str, claim: str,
+                       labels: Dict[str, str]) -> None:
         pv_patch, pvc_body = reattach.rebind_manifests(
             pv, namespace, claim, labels)
         api = client.CoreV1Api()
@@ -3405,9 +3428,63 @@ class KubeConfigManager(ConfigManager):
         except ApiException as e:
             if e.status != 409:
                 raise
-        log.info(f"Re-attached {namespace}/{claim} to retained "
-                 f"{pv['metadata']['name']}")
-        return True
+        self.secure_soon.set()
+
+    def ensure_backup_claim(self) -> Optional[str]:
+        """The backup volume's claim in the release namespace (design/
+        backup.md, "Where the backup volume goes"). Created here, not by Helm:
+        a rendered claim cannot know which retained PV a previous install
+        left behind. Re-binds that PV if there is one, provisions only if
+        there is none, and once bound sets Retain and labels it as the backup
+        volume so the next install finds it. Returns the claim name, or None
+        when backups are off (WHISTLER_BACKUP_CLAIM unset)."""
+        claim = os.environ.get("WHISTLER_BACKUP_CLAIM")
+        if not claim:
+            return None
+        ns = self.namespace
+        labels = {"app": "whistler-backup"}
+        api = client.CoreV1Api()
+        try:
+            api.read_namespaced_persistent_volume_claim(claim, ns)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        else:
+            self.secure_claim(ns, claim, reattach.KIND_BACKUPS, "")
+            return claim
+
+        existing = os.environ.get("WHISTLER_BACKUP_VOLUME_NAME") or None
+        pv, others, problem = reattach.find_backup_volume(
+            self._list_pvs(), ns, claim, existing=existing)
+        if problem:
+            logger.error(f"Backup volume not attached: {problem}")
+            return None
+        if pv is not None:
+            if others:
+                logger.warning(
+                    f"Several retained backup volumes exist; binding the "
+                    f"newest, {pv['metadata']['name']}. Others: "
+                    f"{', '.join(others)}")
+            self._bind_claim_to(pv, ns, claim, labels)
+            logger.info(f"Re-attached backup claim {ns}/{claim} to "
+                        f"{pv['metadata']['name']}")
+            return claim
+        spec = {"accessModes": [os.environ.get("WHISTLER_BACKUP_ACCESS_MODE",
+                                               "ReadWriteOnce")],
+                "resources": {"requests": {
+                    "storage": os.environ.get("WHISTLER_BACKUP_SIZE", "1Gi")}}}
+        if os.environ.get("WHISTLER_BACKUP_STORAGE_CLASS"):
+            spec["storageClassName"] = os.environ["WHISTLER_BACKUP_STORAGE_CLASS"]
+        try:
+            api.create_namespaced_persistent_volume_claim(ns, {
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": {"name": claim, "labels": labels}, "spec": spec})
+        except ApiException as e:
+            if e.status != 409:
+                raise
+        self.secure_soon.set()
+        logger.info(f"Created backup claim {ns}/{claim}")
+        return claim
 
     def release_claim_volume(self, namespace: str, claim: str,
                              recorded: str = None) -> bool:
@@ -3463,6 +3540,7 @@ class KubeConfigManager(ConfigManager):
         PV read). Returns how many HomeVolumes it newly recorded, for the
         log."""
         done = 0
+        self.unbound_claims = False
         core = client.CoreV1Api()
         try:
             resp = self.api.list_cluster_custom_object(
@@ -3508,6 +3586,10 @@ class KubeConfigManager(ConfigManager):
             except ApiException as e:
                 logger.warning(f"Could not secure home volume "
                                f"{ns}/{item['metadata']['name']}: {e}")
+        try:
+            self.ensure_backup_claim()
+        except ApiException as e:
+            logger.error(f"Could not ensure the backup claim: {e}")
         try:
             recovered = self.recover_archive()
             if recovered:
@@ -3604,6 +3686,7 @@ class KubeConfigManager(ConfigManager):
         }
         try:
             api.create_namespaced_persistent_volume_claim(user_ns, pvc_body)
+            self.secure_soon.set()
             return pvc_name
         except ApiException as e:
             if e.status == 409:

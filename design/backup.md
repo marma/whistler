@@ -468,6 +468,51 @@ zone policies. A wrong passphrase gave a clear error.
 
 ### Phase 3: the backup service and volume
 
+**Done 2026-09-27.** `whistler/backup/service.py` (aiohttp API and the
+scheduler), `schedule.py` (the rules, pure), `store.py` (the directory),
+`state.py` (install id, decision, settings, passphrase), `config.
+ensure_backup_claim`, and the chart's `templates/backup.yaml` plus the
+`backup:` values. Differences from the plan below:
+- **The backup PV is labelled `whistler.martinmalmsten.net/user-data=
+  backups`**, the same label homes use (value `home`/`pod-home`). The
+  uninstall hook then selects everything that must survive with one key.
+- **Several retained backup volumes: the newest by creation time is bound**,
+  not "the one holding the newest backup". The operator cannot read their
+  contents, and rule 1 means a second one only exists if someone made it.
+  The others are logged.
+- **Settings are not yet in the backup.** They live in a ConfigMap, and the
+  backup format carries CRs and Secrets only. After a reinstall the chart's
+  `backup.schedule`/`backup.retain` apply until someone saves them again.
+  Open.
+- **Found live, not by the unit tests:**
+  - Kubernetes injects `WHISTLER_BACKUP_PORT=tcp://…` for a Service named
+    `whistler-backup`, which was the listen-port variable. It is now
+    `WHISTLER_BACKUP_LISTEN_PORT`, and the pod has `enableServiceLinks:
+    false`.
+  - A freshly created claim's PV kept its class's `Delete` policy until the
+    next 5-minute sweep. Creating or re-binding any claim now wakes the sweep
+    (`secure_soon`), and an unbound claim brings it back in 15s.
+- **A pending decision with nothing from another install to offer is
+  recorded as `fresh`** by the service, so this install's own backups are
+  never offered back to it.
+
+Verified by installing the real chart on a throwaway k3d cluster:
+- **The claim.** The operator created it, and the PV was set to Retain and
+  labelled.
+- **The API**, called with the portal's own token: status, back up, list.
+- **Refusals.** The gateway pod was refused by the NetworkPolicy (connection
+  refused, `/healthz` included). A pod wearing the portal's label with another
+  ServiceAccount got 403 from TokenReview; no token got 401. The operator was
+  allowed.
+- **A GitOps-style reinstall** (`helm uninstall` plus deleting the namespace):
+  the PV went Released, the reinstall bound the **same** PV (still one PV in
+  the cluster), the old backup was on offer, and the schedule was paused
+  although due. Restoring through the API brought the user back with its uid,
+  and the SSH CA byte for byte. The gateway restarted onto the restored host
+  key (Phase 0). The decision was recorded with the caller, and the schedule
+  resumed.
+- **A second cycle:** the offer came back, all backups intact, the same PV.
+
 - `python -m whistler.backup serve`: an HTTP API for list, create, download,
   upload, delete, preview, restore, settings and status. TokenReview auth. The
   scheduler loop lives here, with the pause-while-pending and retention

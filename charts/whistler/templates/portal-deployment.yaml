@@ -56,6 +56,12 @@ spec:
             # known_hosts, so it needs the same suffix and CA the gateway uses.
             - name: WHISTLER_SSH_CA_SECRET_NAME
               value: "{{ .Release.Name }}-ssh-ca"
+            {{- if .Values.backup.enabled }}
+            # The backup service (design/backup.md); the portal's Backups page
+            # talks to it with this pod's ServiceAccount token.
+            - name: WHISTLER_BACKUP_URL
+              value: "http://{{ .Release.Name }}-backup.{{ .Release.Namespace }}.svc:8090"
+            {{- end }}
             - name: WHISTLER_SSH_DOMAIN_SUFFIX
               value: {{ .Values.whistler.ssh.domainSuffix | quote }}
             # Periodic desktop screenshots (whistler/portal/screenshots.py):

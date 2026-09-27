@@ -340,6 +340,21 @@ def read(data: bytes, passphrase: str = None) -> Backup:
     return Backup(manifest, objects, secrets, mode)
 
 
+def read_manifest(data: bytes) -> Dict[str, Any]:
+    """Only the manifest, with the same untrusted-input checks as ``read``
+    but without parsing the objects or touching the secrets."""
+    members = _members(data)
+    if MANIFEST not in members:
+        raise BackupError("The backup has no manifest.")
+    try:
+        manifest = json.loads(members[MANIFEST])
+    except ValueError as e:
+        raise BackupError(f"The backup's manifest is unreadable: {e}")
+    if not isinstance(manifest, dict):
+        raise BackupError("The backup's manifest is not an object.")
+    return manifest
+
+
 def filename(manifest: Dict[str, Any]) -> str:
     """``whistler-backup-<UTC timestamp>-<trigger>.tar.gz``"""
     stamp = (manifest.get("createdAt") or "").replace("-", "").replace(
