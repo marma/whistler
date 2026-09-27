@@ -393,3 +393,55 @@ def test_the_admin_page_lists_the_archive_with_its_actions():
     assert f"/admin/archive/homevolumes/{RECORD['record']}/restore" in html
     assert f"/admin/archive/homevolumes/{RECORD['record']}/delete" in html
     assert "alice/desk" in html
+
+
+def test_an_archive_interrupted_after_deleting_the_claim_still_finds_its_disk():
+    """Found live (k3d, 2026-09-27): the first attempt found the disk via the
+    user's claim, deleted the claim, and had to wait for the PV to release;
+    the retry looked for the claim, found none, and gave up — leaving an
+    archived PV the user's volume no longer pointed at. The disk is now
+    recorded before anything is deleted, and an archived PV's own record is
+    the fallback."""
+    cm = _manager()
+    cm.api.get_namespaced_custom_object.return_value = {
+        "metadata": {"name": "old", "annotations": {ARCHIVE_ANNOTATION: "root"}},
+        "spec": {"user": "alice"}}                    # no pvName recorded
+    cm.home_volume_holder = lambda u, v: None
+    cm.secure_home_volume = lambda u, v: None         # the claim is gone
+    record = {**RECORD, "name": "old", "record": "alice-old-1"}
+    cm._list_pvs = lambda: [_pv(name="pv-old", phase="Released",
+                                labels={reattach.USER_DATA_LABEL: "archived"},
+                                annotations={reattach.ARCHIVED_ANNOTATION:
+                                             json.dumps(record)})]
+    cm._read_pv = lambda name: next(p for p in cm._list_pvs()
+                                    if p["metadata"]["name"] == name)
+    bound = []
+    cm._ensure_archive_record = lambda pv, rec: None
+    cm._bind_archive_claim = lambda pv, rec: bound.append(pv) or True
+    cm.revoke_own_volume_access = lambda u, n: True
+    with patch("whistler.config.CoreV1Api", return_value=MagicMock()):
+        assert cm.archive_home_volume(NS, "old") is True
+    assert bound == ["pv-old"]
+    # And it did not give up: no un-marking patch was sent.
+    for call in cm.api.patch_namespaced_custom_object.call_args_list:
+        assert call[0][5] != {"metadata": {"annotations": {
+            ARCHIVE_ANNOTATION: None}}}
+
+
+def test_the_first_attempt_records_the_disk_before_deleting_the_claim():
+    cm = _manager()
+    cm.api.get_namespaced_custom_object.return_value = {
+        "metadata": {"name": "desk", "annotations": {ARCHIVE_ANNOTATION: "root"}},
+        "spec": {"user": "alice"}}
+    cm.home_volume_holder = lambda u, v: None
+    order = []
+    cm.secure_home_volume = lambda u, v: order.append("record") or "pv-desk"
+    cm._read_pv = lambda name: _pv(phase="Bound")
+    cm._ensure_archive_record = lambda pv, rec: None
+    cm._bind_archive_claim = lambda pv, rec: False
+    core = MagicMock()
+    core.delete_namespaced_persistent_volume_claim.side_effect = \
+        lambda *a: order.append("delete-claim")
+    with patch("whistler.config.CoreV1Api", return_value=core):
+        cm.archive_home_volume(NS, "desk")
+    assert order == ["record", "delete-claim"]

@@ -578,6 +578,41 @@ Verified through the real portal on a throwaway k3d cluster:
 
 ### Phase 5: uninstall
 
+**Done 2026-09-27.** `whistler/uninstall.py`, `templates/uninstall-hook.yaml`
+(a `pre-delete` Job running as the operator's ServiceAccount, `backoffLimit:
+0`, kept on failure for its logs), `uninstall:` values, and the README's
+Uninstall section. Differences from the plan below:
+- **The hook waits for the namespaces to be gone**, and fails if they are
+  not gone within `uninstall.timeoutSeconds`. Sessions carry a finalizer only
+  the running operator removes, and Helm deletes the operator as soon as the
+  hook returns. A hook that returned early would strand the namespaces in
+  `Terminating`.
+- **Only homes, archived homes and the backup claim are retained.** Other
+  claims in a user namespace (a persistent VM's root disk, say) are left to
+  their class. Nothing re-attaches them yet, so retaining them would only
+  leak an orphan PV per reinstall. Open: whether persistent root disks are
+  user data to keep.
+- **The hook pod is labelled `whistler-uninstall`** and admitted by the
+  backup service's NetworkPolicy. TokenReview then sees the operator's
+  ServiceAccount.
+- **Found live, fixed in `archive_home_volume`**: an archive interrupted
+  after deleting the user's claim, while waiting for the PV to release,
+  found "no disk" on its retry and gave up. That left an archived PV the
+  user's volume no longer pointed at, and the next start would have got an
+  empty disk. The disk is now recorded on the volume before the claim is
+  deleted, with an archived PV's own record as the fallback.
+
+Verified on a throwaway k3d cluster, the full cycle **twice**. Populate a
+user, a home with a known file, and an archived home. `helm uninstall` (34s)
+ran all five steps and left nothing of Whistler's in the release namespace;
+the three PVs were Released with Retain. Reinstall: the first admin
+navigation went to the offer of the `uninstall` backup. Restoring through the
+portal brought back the user and uid, and the SSH CA byte for byte. The home
+re-attached and read back its file, and the archived home's claim was bound
+to its original PV. Both cycles had the same three PVs throughout. With the
+backup service down, `helm uninstall` failed and deleted nothing, and it
+completed once the service was back.
+
 - The `pre-delete` hook Job and `python -m whistler.uninstall`, with the four
   steps and their failure rules.
 - README: what an uninstall now removes and keeps, how to delete a retained

@@ -115,8 +115,9 @@ class BackupClient:
         return data, name
 
     # writing
-    async def create(self, by: str):
-        return await self._call("POST", "/v1/backups", json={"by": by},
+    async def create(self, by: str, trigger: str = "manual"):
+        return await self._call("POST", "/v1/backups",
+                                json={"by": by, "trigger": trigger},
                                 timeout=SLOW)
 
     async def upload(self, data: bytes):

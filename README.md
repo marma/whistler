@@ -665,40 +665,78 @@ Then add the tags to `whistler.images.vm` and write templates against them; see
 
 # Uninstall
 
-Order matters, for two reasons Helm cannot see: the operator holds a
-finalizer on every Session CR (its delete handler is what tears down the
-pod/VM behind it), and per-user namespaces are created imperatively by the
-operator, not by the chart. Remove the release first and both are stranded —
-Session CRs, and any namespace containing one, hang in `Terminating` on a
-finalizer no controller is left to clear.
+`helm uninstall` (or Flux removing the release) now does the ordering itself,
+in a `pre-delete` hook that runs while the operator is still up
+(`whistler/uninstall.py`, design/backup.md):
+
+1. **Retains every PV behind a home, an archived home and the backups**,
+   whatever the storage class's reclaim policy says.
+2. **Takes a final backup** of Whistler's state (users, groups, zones,
+   templates, datasets, home volume records, instances, the SSH CA and host
+   key) onto the backup volume.
+3. **Deletes the per-user and archive namespaces and waits for them.**
+   Sessions carry a finalizer only the running operator clears, which is why
+   this runs before the release goes.
+4. **Deletes what the operator created in the release namespace** and Helm
+   does not own: the portal-made CRs, the SSH CA, the gateway host key,
+   dataset credentials, the S3 proxies and the backup service's state.
+5. **Releases the backup claim.**
 
 ```bash
-# 1. End every session while the operator is still there to clear its
-#    finalizers and delete the pods/VMs behind them.
-kubectl delete sessions --all --all-namespaces
-
-# 2. The release: deployments, services, RBAC, and the Helm-owned
-#    Zone/Group/Template CRs. `helm uninstall` does not undo
-#    --create-namespace, hence the second line.
 helm uninstall whistler -n whistler
-kubectl delete namespace whistler
+kubectl delete namespace whistler      # helm does not undo --create-namespace
+```
 
-# 3. Per-user namespaces. Every user's home PVC, storage gateway, secrets
-#    and NetworkPolicies live here — THIS DELETES USER DATA.
-kubectl delete namespaces -l whistler.martinmalmsten.net/managed=true
+**Afterwards, only the data remains:** every home disk and the backups, as
+`Released` PVs with `Retain`. `kubectl get pv -l
+whistler.martinmalmsten.net/user-data` lists them.
 
-# 4. The CRDs. Helm never touches these (install-only, see step 4 of the
-#    install); deleting them cascades to any CR of those kinds still left,
-#    portal-created Users among them.
+**Reinstalling picks them up again.** The backup volume is re-attached, and
+the first admin to sign in is offered the latest backup (Admin → Backups).
+Restoring it brings back every user, grant and instance, and the SSH CA, so
+users' `@cert-authority` lines keep working. Each home re-attaches to its old
+disk the next time its instance starts. If the backups' secrets were
+encrypted, the restore asks for the passphrase, which the cluster does not
+keep.
+
+The hook refuses rather than lose something:
+- **It could not retain the disks, or the final backup failed.** The
+  uninstall fails and nothing is deleted; the error says why. Fix it and run
+  `helm uninstall` again. To uninstall without a final backup, set
+  `uninstall.requireFinalBackup=false` first (`helm upgrade --reuse-values
+  --set ...`).
+- **The user namespaces did not finish deleting within
+  `uninstall.timeoutSeconds`** (240). Keep that under Helm's `--timeout`
+  (5m) or Flux's `spec.timeout`, and raise both together if VMs take long to
+  stop.
+
+`helm uninstall --no-hooks` (Flux: `uninstall.disableHooks: true`) skips all
+of this and leaves the namespaces, CRs and Secrets behind. The next install
+still copes: it re-attaches what it finds.
+
+**Deleting the data for real** takes one deliberate step per PV, because
+Whistler has marked them to survive:
+
+```bash
+# Every Whistler disk: homes, archived homes, and the backups themselves.
+kubectl get pv -l whistler.martinmalmsten.net/user-data
+# Hand one back to its provisioner (on a Released PV it is deleted at once):
+kubectl patch pv <name> -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}'
+```
+
+The CRDs stay until you remove them. Helm never touches them. After an
+uninstall they hold nothing, and the backups do not depend on them:
+
+```bash
 kubectl delete -f charts/whistler/crds/crds.yaml
 ```
 
 Nothing else cluster-scoped remains: the PriorityClass and RBAC are
 Helm-owned and go with the release.
 
-If the steps ran out of order and something hangs in `Terminating`, it is
-almost always a Session finalizer with the operator already gone. Clear them
-by hand and deletion resumes:
+If a user namespace hangs in `Terminating` after an uninstall that skipped
+the hook (`--no-hooks`), it is almost always a Session finalizer with the
+operator already gone. Clear them by hand and deletion resumes:
 
 ```bash
 kubectl get sessions -A --no-headers \

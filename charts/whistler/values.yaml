@@ -248,6 +248,23 @@ backup:
       cpu: 50m
       memory: 128Mi
 
+# What `helm uninstall` (or Flux removing the release) does before Helm deletes
+# the chart: a pre-delete hook Job (whistler/uninstall.py). It retains every
+# PV behind a home and the backups, takes a final backup, deletes the user and
+# archive namespaces and waits for them, then removes what the operator made
+# in the release namespace. Afterwards only the disks and the backups remain,
+# and the next install re-attaches both.
+# `helm uninstall --no-hooks` / Flux `uninstall.disableHooks` skip it.
+uninstall:
+  enabled: true
+  # Refuse to uninstall when the final backup fails. Off means: uninstall
+  # anyway and lose whatever changed since the last scheduled backup.
+  requireFinalBackup: true
+  # How long to wait for the user namespaces to go. Sessions have a finalizer
+  # only the running operator removes, so the hook fails rather than return
+  # early. Keep it under Helm's --timeout (default 5m) / Flux's spec.timeout.
+  timeoutSeconds: 240
+
 whistler:
   auth:
     allowAny: false

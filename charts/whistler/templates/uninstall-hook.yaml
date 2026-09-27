@@ -1,0 +1,64 @@
+{{- if .Values.uninstall.enabled }}
+{{- /*
+The pre-delete hook (whistler/uninstall.py, design/backup.md "Uninstall").
+It runs as the operator's ServiceAccount, which still exists at pre-delete
+time and already holds every permission it needs, and while the operator is
+still running — which is what lets the user namespaces' Sessions release
+their finalizers. A failed hook fails the uninstall and is kept for its logs;
+the next attempt replaces it and picks up where it stopped.
+*/ -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-uninstall
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: whistler-uninstall
+  annotations:
+    "helm.sh/hook": pre-delete
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ add .Values.uninstall.timeoutSeconds 120 }}
+  template:
+    metadata:
+      labels:
+        app: whistler-uninstall
+    spec:
+      serviceAccountName: {{ .Release.Name }}-operator
+      restartPolicy: Never
+      enableServiceLinks: false
+      containers:
+        - name: uninstall
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "whistler.uninstall"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: WHISTLER_SSH_CA_SECRET_NAME
+              value: "{{ .Release.Name }}-ssh-ca"
+            - name: WHISTLER_HOST_KEY_SECRET_NAME
+              value: "{{ .Release.Name }}-server-host-key"
+            - name: WHISTLER_UNINSTALL_REQUIRE_FINAL_BACKUP
+              value: {{ .Values.uninstall.requireFinalBackup | quote }}
+            - name: WHISTLER_UNINSTALL_TIMEOUT
+              value: {{ .Values.uninstall.timeoutSeconds | quote }}
+            {{- if .Values.backup.enabled }}
+            - name: WHISTLER_BACKUP_URL
+              value: "http://{{ .Release.Name }}-backup.{{ .Release.Namespace }}.svc:8090"
+            - name: WHISTLER_BACKUP_CLAIM
+              value: "{{ .Release.Name }}-backups"
+            {{- end }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+{{- end }}

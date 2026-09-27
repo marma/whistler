@@ -2899,8 +2899,15 @@ class KubeConfigManager(ConfigManager):
                            f"to a running instance")
             return False
         user_claim = self.home_volume_pvc_name(volume)
-        pv_name = volume.get("pvName") or self.secure_claim(
-            namespace, user_claim, reattach.KIND_HOME, username)
+        # Which disk this is, found so that a RETRY finds it too. The user's
+        # claim is deleted below, so it cannot be the only record: an attempt
+        # that deleted it and then had to wait for the PV to release would
+        # otherwise find "no disk" on its next try and give up, leaving an
+        # archived PV the user's volume no longer points at. So: the recorded
+        # name, else the claim — recorded now, before anything is deleted —
+        # else an archived PV whose record names this volume.
+        pv_name = volume.get("pvName") or self.secure_home_volume(
+            username, volume) or self._archived_pv_for(username, name)
         pv = self._read_pv(pv_name) if pv_name else None
         if pv is None:
             # Nothing to move. Unmark, so the volume reappears as it was
@@ -2951,6 +2958,17 @@ class KubeConfigManager(ConfigManager):
         logger.info(f"Archived home volume {namespace}/{name} as "
                     f"{ARCHIVE_NAMESPACE}/{record['record']} (asked by {by})")
         return True
+
+    def _archived_pv_for(self, username: str, name: str) -> Optional[str]:
+        """An archived PV whose provenance is ``username``/``name``: the
+        record an interrupted archive left on the one object it cannot lose."""
+        for pv in self._list_pvs():
+            record = reattach.archive_record(pv) if reattach.is_archived(pv) \
+                else None
+            if record and record.get("user") == username and \
+                    record.get("name") == name:
+                return pv["metadata"]["name"]
+        return None
 
     @staticmethod
     def _archive_claim_name(record: Dict[str, Any]) -> str:

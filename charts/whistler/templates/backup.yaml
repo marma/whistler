@@ -214,8 +214,8 @@ spec:
       port: 8090
       targetPort: http
 ---
-# Only the portal and the operator (the uninstall hook runs as it) may
-# connect at all; TokenReview then decides what they may do.
+# Only the portal, the operator and the uninstall hook (which runs as the
+# operator's ServiceAccount) may connect at all; TokenReview then decides.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -232,7 +232,7 @@ spec:
             matchExpressions:
               - key: app
                 operator: In
-                values: [whistler-portal, whistler-operator]
+                values: [whistler-portal, whistler-operator, whistler-uninstall]
       ports:
         - port: 8090
 {{- end }}
