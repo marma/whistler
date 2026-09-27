@@ -343,6 +343,28 @@ Tests: `tests/unit/test_hostca.py`, `tests/unit/test_host_key_watch.py`.
 
 ### Phase 1: re-attachable volumes
 
+**Done 2026-09-27**, with three changes from the plan below:
+- **No kopf timer.** kopf puts a finalizer on every object a timer watches,
+  and a finalizer only a running operator can remove would hang the very
+  namespace deletion this is about. A plain thread started from the
+  operator's startup handler sweeps every 300s instead (`secure_user_data`).
+  The reconcile path also secures a claim it finds bound.
+- **Discovery by the stale `claimRef`.** A Released PV still names the claim
+  it belonged to, so no label is needed to find one. That covers the pod home
+  (`whistler-data-<user>`, which has no CR to record on) and a home secured
+  before it was recorded. The labels (`whistler.martinmalmsten.net/user-data`,
+  `…/user`) are for the uninstall hook and for people.
+- **Deleting with data is declarative.** The portal had no `delete` on PVCs,
+  so "also delete the data" had never worked from the portal. Now it
+  annotates the HomeVolume (`whistler/delete-data`), and the operator sets
+  the PV to Delete, deletes the claim, then the CR (`purge_home_volume`).
+  The portal gains no PV rights.
+
+Verified on a throwaway k3d cluster (local-path, a Delete class): Retain
+set, namespace deleted, both PVs Released, both claims bound back to the
+same PVs with the files intact; a recorded PV that was gone was refused
+with no claim created; delete-with-data freed the PV.
+
 - `config.py`: `ensure_retained(pv)` and
   `rebind_released_pv(pv, namespace, claim)`. The latter creates the claim
   with `spec.volumeName` and patches the PV's `claimRef` to the new claim

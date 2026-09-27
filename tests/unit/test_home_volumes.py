@@ -412,3 +412,224 @@ def test_a_group_granted_zone_counts_as_granted():
                          "volumeAccess": {"green": {"alice-desk": "allowed"}}}}
     assert "granted in: green" in cm.home_volume_refusal(
         "alice", "default", "alice-desk")
+
+
+# --- surviving an uninstall (design/backup.md, Phase 1) --------------------- #
+#
+# An uninstall deletes the user namespaces and with them the claims. The PV
+# behind a home is Retain once bound, and a missing claim is bound back to it
+# before anything is provisioned. No empty home next to a real one.
+
+def _released_pv(name="pv-desk", claim="whistler-home-alice-desk"):
+    return {"metadata": {"name": name, "labels": {}},
+            "spec": {"persistentVolumeReclaimPolicy": "Retain",
+                     "accessModes": ["ReadWriteOnce"],
+                     "volumeMode": "Filesystem", "storageClassName": "nfs",
+                     "capacity": {"storage": "20Gi"},
+                     "claimRef": {"namespace": "whistler-user-alice",
+                                  "name": claim, "uid": "gone"}},
+            "status": {"phase": "Released"}}
+
+
+def _bound_claim(pv_name):
+    # Not MagicMock(spec=...): `spec` is mock's own keyword.
+    claim = MagicMock()
+    claim.spec.volume_name = pv_name
+    return claim
+
+
+def _missing_claim(cm, pvs):
+    api = MagicMock()
+    api.read_namespaced_persistent_volume_claim.side_effect = ApiException(
+        status=404)
+    cm._list_pvs = lambda: pvs
+    return api
+
+
+def test_a_missing_claim_is_bound_back_to_its_recorded_disk():
+    cm = _manager()
+    api = _missing_claim(cm, [_released_pv()])
+    with patch("whistler.config.client.CoreV1Api", return_value=api):
+        name = cm.ensure_home_volume_pvc(
+            "alice", {**VOLUME, "pvName": "pv-desk"})
+    assert name == "whistler-home-alice-desk"
+    pv_name, pv_patch = api.patch_persistent_volume.call_args[0]
+    assert pv_name == "pv-desk"
+    assert pv_patch["spec"]["claimRef"]["uid"] is None
+    body = api.create_namespaced_persistent_volume_claim.call_args[0][1]
+    # Bound to the old disk, not provisioned: volumeName is the difference.
+    assert body["spec"]["volumeName"] == "pv-desk"
+
+
+def test_a_recorded_disk_that_is_gone_fails_the_start_instead_of_going_empty():
+    cm = _manager()
+    api = _missing_claim(cm, [])
+    with patch("whistler.config.client.CoreV1Api", return_value=api):
+        with pytest.raises(PolicyError, match="pv-desk"):
+            cm.ensure_home_volume_pvc("alice", {**VOLUME, "pvName": "pv-desk"})
+    api.create_namespaced_persistent_volume_claim.assert_not_called()
+
+
+def test_an_unrecorded_home_finds_its_disk_by_the_stale_claim_ref():
+    cm = _manager()
+    api = _missing_claim(cm, [_released_pv()])
+    with patch("whistler.config.client.CoreV1Api", return_value=api):
+        cm.ensure_home_volume_pvc("alice", VOLUME)
+    body = api.create_namespaced_persistent_volume_claim.call_args[0][1]
+    assert body["spec"]["volumeName"] == "pv-desk"
+
+
+def test_the_pod_home_is_bound_back_too():
+    cm = _manager()
+    api = _missing_claim(cm, [_released_pv("pv-pod", "whistler-data-alice")])
+    with patch("whistler.config.client.CoreV1Api", return_value=api):
+        assert cm._ensure_pvc("alice", "whistler-user-alice") == \
+            "whistler-data-alice"
+    body = api.create_namespaced_persistent_volume_claim.call_args[0][1]
+    assert body["spec"]["volumeName"] == "pv-pod"
+
+
+def test_a_bound_home_is_retained_and_recorded():
+    cm = _manager()
+    cm.api = MagicMock()
+    api = MagicMock()
+    api.read_namespaced_persistent_volume_claim.return_value = _bound_claim("pv-desk")
+    bound = _released_pv()
+    bound["spec"]["persistentVolumeReclaimPolicy"] = "Delete"
+    bound["status"]["phase"] = "Bound"
+    cm._read_pv = lambda name: bound
+    with patch("whistler.config.client.CoreV1Api", return_value=api):
+        assert cm.secure_home_volume("alice", VOLUME) == "pv-desk"
+    pv_patch = api.patch_persistent_volume.call_args[0][1]
+    assert pv_patch["spec"]["persistentVolumeReclaimPolicy"] == "Retain"
+    record = cm.api.patch_namespaced_custom_object.call_args[0]
+    assert record[4] == "alice-desk"
+    assert record[5] == {"spec": {"pvName": "pv-desk"}}
+
+
+def test_a_recorded_home_is_not_touched_again():
+    cm = _manager()
+    cm.secure_claim = lambda *a: pytest.fail("already recorded")
+    assert cm.secure_home_volume(
+        "alice", {**VOLUME, "pvName": "pv-desk"}) == "pv-desk"
+
+
+def test_an_edit_keeps_the_recorded_disk():
+    # The portal's form knows nothing of pvName; a replace that dropped it
+    # would re-open the door to an empty home after the next reinstall.
+    cm = _manager()
+    cm._ensure_user_namespace = lambda u: f"whistler-user-{u}"
+    cm.api = MagicMock()
+    cm.api.get_namespaced_custom_object.return_value = {
+        "metadata": {"resourceVersion": "7"},
+        "spec": {"pvcName": "whistler-home-alice-desk", "pvName": "pv-desk"}}
+    assert cm.save_home_volume("alice", {"name": "alice-desk",
+                                         "description": "renamed"})
+    body = cm.api.replace_namespaced_custom_object.call_args[0][5]
+    assert body["spec"]["pvName"] == "pv-desk"
+    assert body["spec"]["pvcName"] == "whistler-home-alice-desk"
+
+
+def test_deleting_with_data_only_marks_the_volume():
+    # The PV is Retain, so destroying the data takes a cluster-scoped write
+    # the portal (the caller) does not hold. The operator does it.
+    cm = _manager()
+    cm.api = MagicMock()
+    cm.get_home_volume = lambda u, n: dict(VOLUME)
+    cm.home_volume_holder = lambda u, v: None
+    cm.revoke_own_volume_access = lambda u, n: True
+    assert cm.delete_home_volume("alice", "alice-desk", delete_data=True)
+    cm.api.delete_namespaced_custom_object.assert_not_called()
+    body = cm.api.patch_namespaced_custom_object.call_args[0][5]
+    assert body == {"metadata": {"annotations": {"whistler/delete-data": "true"}}}
+
+
+def test_deleting_without_data_deletes_only_the_record():
+    cm = _manager()
+    cm.api = MagicMock()
+    cm.get_home_volume = lambda u, n: dict(VOLUME)
+    cm.home_volume_holder = lambda u, v: None
+    cm.revoke_own_volume_access = lambda u, n: True
+    assert cm.delete_home_volume("alice", "alice-desk")
+    cm.api.delete_namespaced_custom_object.assert_called_once()
+    cm.api.patch_namespaced_custom_object.assert_not_called()
+
+
+def test_a_volume_marked_for_deletion_is_not_offered():
+    cm = _manager()
+    cm.api = MagicMock()
+    cm.api.list_namespaced_custom_object.return_value = {"items": [
+        {"metadata": {"name": "keep"}, "spec": {}},
+        {"metadata": {"name": "going",
+                      "annotations": {"whistler/delete-data": "true"}},
+         "spec": {}}]}
+    assert [v["name"] for v in cm.get_home_volumes("alice")] == ["keep"]
+
+
+def test_purge_releases_the_disk_before_deleting_the_claim_and_record():
+    cm = _manager()
+    cm.api = MagicMock()
+    cm.api.get_namespaced_custom_object.return_value = {
+        "metadata": {"name": "alice-desk"},
+        "spec": {"pvcName": "whistler-home-alice-desk", "pvName": "pv-desk"}}
+    core = MagicMock()
+    core.read_namespaced_persistent_volume_claim.return_value = _bound_claim("pv-desk")
+    order = []
+    core.patch_persistent_volume.side_effect = \
+        lambda name, body: order.append(("release", name, body))
+    core.delete_namespaced_persistent_volume_claim.side_effect = \
+        lambda name, ns: order.append(("claim", name))
+    cm.api.delete_namespaced_custom_object.side_effect = \
+        lambda *a: order.append(("record", a[4]))
+    with patch("whistler.config.client.CoreV1Api", return_value=core):
+        assert cm.purge_home_volume("whistler-user-alice", "alice-desk")
+    assert order == [
+        ("release", "pv-desk",
+         {"spec": {"persistentVolumeReclaimPolicy": "Delete"}}),
+        ("claim", "whistler-home-alice-desk"),
+        ("record", "alice-desk")]
+
+
+def test_a_failed_release_keeps_the_claim_and_the_record():
+    cm = _manager()
+    cm.api = MagicMock()
+    cm.api.get_namespaced_custom_object.return_value = {
+        "metadata": {"name": "alice-desk"}, "spec": {"pvName": "pv-desk"}}
+    core = MagicMock()
+    core.read_namespaced_persistent_volume_claim.return_value = _bound_claim("pv-desk")
+    core.patch_persistent_volume.side_effect = ApiException(status=403)
+    with patch("whistler.config.client.CoreV1Api", return_value=core):
+        assert cm.purge_home_volume("whistler-user-alice", "alice-desk") is False
+    core.delete_namespaced_persistent_volume_claim.assert_not_called()
+    cm.api.delete_namespaced_custom_object.assert_not_called()
+
+
+def test_the_sweep_records_purges_and_skips():
+    cm = _manager()
+    cm.api = MagicMock()
+    cm.api.list_cluster_custom_object.return_value = {"items": [
+        {"metadata": {"name": "new", "namespace": "whistler-user-alice"},
+         "spec": {"user": "alice"}},
+        {"metadata": {"name": "done", "namespace": "whistler-user-alice"},
+         "spec": {"user": "alice", "pvName": "pv-done"}},
+        {"metadata": {"name": "going", "namespace": "whistler-user-bob",
+                      "annotations": {"whistler/delete-data": "true"}},
+         "spec": {"user": "bob"}}]}
+    secured, purged, claims = [], [], []
+    cm.secure_home_volume = lambda u, v: secured.append((u, v["name"])) or "pv"
+    cm.purge_home_volume = lambda ns, n: purged.append((ns, n)) or True
+    cm.secure_claim = lambda ns, c, kind, u: claims.append((ns, c, kind, u))
+    core = MagicMock()
+    pod_home, other = MagicMock(), MagicMock()
+    pod_home.metadata.name = "whistler-data-alice"
+    pod_home.metadata.namespace = "whistler-user-alice"
+    pod_home.metadata.labels = {"app": "whistler", "user": "alice"}
+    other.metadata.name = "whistler-home-alice-new"   # a HomeVolume's: above
+    core.list_persistent_volume_claim_for_all_namespaces.return_value = \
+        MagicMock(items=[pod_home, other])
+    with patch("whistler.config.client.CoreV1Api", return_value=core):
+        assert cm.secure_user_data() == 1
+    assert secured == [("alice", "new")]
+    assert purged == [("whistler-user-bob", "going")]
+    assert claims == [("whistler-user-alice", "whistler-data-alice",
+                       "pod-home", "alice")]

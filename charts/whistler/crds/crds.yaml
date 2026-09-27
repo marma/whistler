@@ -933,6 +933,16 @@ spec:
                     into a named volume, because those claims are named after
                     the session that created them and renaming a bound PVC is
                     not possible.
+                pvName:
+                  type: string
+                  description: >-
+                    The PersistentVolume holding this home's data, written by
+                    the operator once the claim is bound, when it also sets
+                    that PV to Retain. From then on a missing claim is bound
+                    back to this PV and never provisioned empty, so an
+                    uninstall (which deletes the claim with its namespace)
+                    does not lose the home. Remove it only to deliberately
+                    start over with an empty disk.
       additionalPrinterColumns:
         - name: User
           type: string
@@ -943,6 +953,9 @@ spec:
         - name: Claim
           type: string
           jsonPath: .spec.pvcName
+        - name: Volume
+          type: string
+          jsonPath: .spec.pvName
   scope: Namespaced
   names:
     plural: homevolumes

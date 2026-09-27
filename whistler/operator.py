@@ -1,5 +1,6 @@
 import os
 import logging
+import threading
 import time
 
 import kopf
@@ -7,6 +8,7 @@ from kubernetes import client
 
 from whistler.logsetup import quiet_chatty_libraries
 from whistler.config import (
+    DELETE_DATA_ANNOTATION,
     KubeConfigManager,
     PolicyError,
     STOP_ANNOTATION,
@@ -71,6 +73,32 @@ def configure(settings: kopf.OperatorSettings, **_):
         # Never fail startup for this: the operator not running is worse than
         # a home still carrying an ownerReference, which the next start retries.
         logger.error(f"Home-disk adoption failed (will retry next start): {e}")
+    # Retain every home's PV as soon as it is bound, so an uninstall (which
+    # deletes the user namespaces) cannot take the data with it
+    # (design/backup.md, Phase 1). A plain thread rather than a kopf timer on
+    # HomeVolume: kopf timers put a finalizer on every object they watch,
+    # and a finalizer that only a running operator can remove would hang the
+    # very namespace deletion this exists to survive.
+    threading.Thread(target=_secure_user_data_loop, args=(cm,),
+                     name="secure-user-data", daemon=True).start()
+
+
+# First pass right after startup (adoption has just run), then this often.
+# Binding is asynchronous, so a home created a moment ago is caught on a
+# later pass; the reconcile path also secures a claim it finds bound.
+SECURE_USER_DATA_INTERVAL = 300
+
+
+def _secure_user_data_loop(cm, interval=SECURE_USER_DATA_INTERVAL):
+    while True:
+        try:
+            recorded = cm.secure_user_data()
+            if recorded:
+                logger.info(f"Recorded the retained disk of {recorded} "
+                            f"home volume(s)")
+        except Exception as e:
+            logger.error(f"Securing user data failed (retrying): {e}")
+        time.sleep(interval)
 
 
 # --------------------------------------------------------------------------- #
@@ -504,3 +532,24 @@ def delete_session_fn(spec, name, namespace, status, logger, **kwargs):
         # try both so nothing is orphaned.
         _delete_pod()
         _delete_vm()
+
+
+# --------------------------------------------------------------------------- #
+# Deleting a home with its data (config.delete_home_volume marks, this acts). #
+# The PV is Retain, so the data only goes once it is set back to Delete — a    #
+# cluster-scoped write that stays in the operator. Create/update/resume only:  #
+# no on.delete, so kopf puts no finalizer on HomeVolumes.                      #
+# --------------------------------------------------------------------------- #
+
+_PURGE_FILTER = dict(annotations={DELETE_DATA_ANNOTATION: kopf.PRESENT})
+
+
+@kopf.on.create('whistler.martinmalmsten.net', 'v1', 'homevolumes', **_PURGE_FILTER)
+@kopf.on.update('whistler.martinmalmsten.net', 'v1', 'homevolumes', **_PURGE_FILTER)
+@kopf.on.resume('whistler.martinmalmsten.net', 'v1', 'homevolumes', **_PURGE_FILTER)
+def purge_home_volume_fn(name, namespace, **_):
+    if not _get_config_manager().purge_home_volume(namespace, name):
+        raise kopf.TemporaryError(
+            f"Could not delete home volume {namespace}/{name} yet", delay=30)
+    logger.info(f"Deleted home volume {namespace}/{name} and its data")
+

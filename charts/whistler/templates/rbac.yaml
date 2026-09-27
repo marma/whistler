@@ -71,6 +71,13 @@ rules:
   - apiGroups: [batch]
     resources: [jobs]
     verbs: [create, delete, deletecollection, get, list, patch, update, watch]
+  # The PVs behind users' homes (design/backup.md, Phase 1): set Retain once
+  # bound, so an uninstall deleting the user namespaces leaves the data; point
+  # a Released one's claimRef at a recreated claim; set Delete before a home is
+  # deleted with its data. Only the operator writes PVs.
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [get, list, watch, patch]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

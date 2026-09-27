@@ -21,7 +21,7 @@ import yaml
 
 from whistler.cloudinit import (HOME_DISK_SERIAL, S3_PROXY_BUCKET,
                                 build_user_data, resolve_uid, resolve_gid)
-from whistler import hostca
+from whistler import hostca, reattach
 
 logger = logging.getLogger(__name__)
 
@@ -307,6 +307,11 @@ ZONE_PLURAL = "zones"
 GROUP_PLURAL = "groups"
 DATASET_PLURAL = "datasets"
 HOME_VOLUME_PLURAL = "homevolumes"
+# The per-user claim container sessions mount as $HOME (_ensure_pvc).
+POD_HOME_PVC_PREFIX = "whistler-data-"
+# On a HomeVolume: delete it AND its data (delete_home_volume). The operator
+# acts on it, since that needs a cluster-scoped write on the PV.
+DELETE_DATA_ANNOTATION = "whistler/delete-data"
 
 # Node label a template/override's gpuType is matched against, both as the
 # nodeSelector key that schedules onto a GPU of that type and as the node
@@ -2538,16 +2543,29 @@ class KubeConfigManager(ConfigManager):
             pod_spec["dnsConfig"] = {"nameservers": [str(s) for s in servers]}
 
     def _ensure_pvc(self, user, namespace, logger=None):
-        pvc_name = f"whistler-data-{user}"
+        pvc_name = f"{POD_HOME_PVC_PREFIX}{user}"
         api = client.CoreV1Api()
-        
+        labels = {"app": "whistler", "user": user}
+
         try:
             api.read_namespaced_persistent_volume_claim(pvc_name, namespace)
-            return pvc_name
         except ApiException as e:
             if e.status != 404:
                 raise
-        
+        else:
+            try:
+                self.secure_claim(namespace, pvc_name, reattach.KIND_POD_HOME,
+                                  user)
+            except Exception as e:
+                (logger or globals()["logger"]).warning(
+                    f"Could not retain the disk behind {pvc_name}: {e}")
+            return pvc_name
+
+        # No CR records this claim's PV, so only a Released PV whose stale
+        # claimRef names it is given back (reattach.find_reattachable).
+        if self.reattach_claim(namespace, pvc_name, labels, logger=logger):
+            return pvc_name
+
         # Create PVC
         if logger: logger.info(f"Creating PVC {pvc_name} for user {user}")
         
@@ -2556,13 +2574,7 @@ class KubeConfigManager(ConfigManager):
         pvc_body = {
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
-            "metadata": {
-                "name": pvc_name,
-                "labels": {
-                    "app": "whistler",
-                    "user": user
-                }
-            },
+            "metadata": {"name": pvc_name, "labels": labels},
             "spec": {
                 "accessModes": [access_mode],
                 "resources": {
@@ -2617,9 +2629,13 @@ class KubeConfigManager(ConfigManager):
         except AttributeError:
             return []
         type(self)._warned_no_home_volume_crd = False
+        # A volume marked for deletion with its data is already gone as far
+        # as anyone choosing a home is concerned (purge_home_volume).
         out = [{**(item.get("spec") or {}),
                 "name": item["metadata"]["name"]}
-               for item in resp.get("items", [])]
+               for item in resp.get("items", [])
+               if DELETE_DATA_ANNOTATION not in (
+                   item["metadata"].get("annotations") or {})]
         return sorted(out, key=lambda v: v.get("name") or "")
 
     def get_home_volume(self, username: str, name: str) -> Optional[Dict[str, Any]]:
@@ -2650,11 +2666,13 @@ class KubeConfigManager(ConfigManager):
                     self.group, self.version, user_ns, HOME_VOLUME_PLURAL, name)
                 body["metadata"]["resourceVersion"] = \
                     existing["metadata"]["resourceVersion"]
-                # Carry the claim forward: it is the identity of the data, and
-                # losing it would silently hand the user an empty home.
-                if existing.get("spec", {}).get("pvcName") and \
-                        "pvcName" not in spec:
-                    spec["pvcName"] = existing["spec"]["pvcName"]
+                # Carry the claim and its disk forward: they are the identity
+                # of the data, and losing either would silently hand the user
+                # an empty home — pvcName now, pvName after a reinstall
+                # (reattach.find_reattachable).
+                for key in ("pvcName", "pvName"):
+                    if existing.get("spec", {}).get(key) and key not in spec:
+                        spec[key] = existing["spec"][key]
                 self.api.replace_namespaced_custom_object(
                     self.group, self.version, user_ns, HOME_VOLUME_PLURAL,
                     name, body)
@@ -2677,7 +2695,14 @@ class KubeConfigManager(ConfigManager):
         and a dropdown should not be able to destroy it; the claim is left
         behind, still adoptable by recreating a volume with the same
         `pvcName`. Refuses while the volume is attached to a running
-        instance."""
+        instance.
+
+        With ``delete_data`` nothing is deleted here: the CR is marked
+        (DELETE_DATA_ANNOTATION) and the operator does it (purge_home_volume).
+        The disk's PV is Retain (secure_claim), so destroying the data means
+        setting it back to Delete first, a cluster-scoped write the portal —
+        where this is called from — should not hold. Same shape as stopping.
+        """
         user_ns = self._get_user_namespace(username)
         volume = self.get_home_volume(username, name)
         if not volume:
@@ -2688,8 +2713,14 @@ class KubeConfigManager(ConfigManager):
                 f"Refusing to delete home volume {name!r}: in use by {holder}")
             return False
         try:
-            self.api.delete_namespaced_custom_object(
-                self.group, self.version, user_ns, HOME_VOLUME_PLURAL, name)
+            if delete_data:
+                self.api.patch_namespaced_custom_object(
+                    self.group, self.version, user_ns, HOME_VOLUME_PLURAL,
+                    name, {"metadata": {"annotations": {
+                        DELETE_DATA_ANNOTATION: "true"}}})
+            else:
+                self.api.delete_namespaced_custom_object(
+                    self.group, self.version, user_ns, HOME_VOLUME_PLURAL, name)
         except ApiException as e:
             logger.error(f"Failed to delete home volume {name!r}: {e}")
             return False
@@ -2700,16 +2731,38 @@ class KubeConfigManager(ConfigManager):
             self.revoke_own_volume_access(username, name)
         except Exception as e:
             logger.warning(f"Could not clear access rows for {name!r}: {e}")
-        if delete_data:
-            pvc = self.home_volume_pvc_name(volume)
-            try:
-                client.CoreV1Api().delete_namespaced_persistent_volume_claim(
-                    pvc, user_ns)
-                logger.info(f"Deleted home volume claim {pvc}")
-            except ApiException as e:
-                if e.status != 404:
-                    logger.error(f"Failed to delete claim {pvc}: {e}")
-                    return False
+        return True
+
+    def purge_home_volume(self, namespace: str, name: str) -> bool:
+        """The operator's half of deleting a home *with its data*: release
+        the PV to its provisioner, delete the claim, then the CR. In that
+        order, so a failure part-way leaves the CR (and its mark) for the next
+        attempt instead of an orphaned disk nothing points at."""
+        try:
+            item = self.api.get_namespaced_custom_object(
+                self.group, self.version, namespace, HOME_VOLUME_PLURAL, name)
+        except ApiException as e:
+            if e.status == 404:
+                return True
+            raise
+        volume = {**(item.get("spec") or {}), "name": name}
+        pvc = self.home_volume_pvc_name(volume)
+        if not self.release_claim_volume(namespace, pvc, volume.get("pvName")):
+            return False
+        try:
+            client.CoreV1Api().delete_namespaced_persistent_volume_claim(
+                pvc, namespace)
+            logger.info(f"Deleted home volume claim {namespace}/{pvc}")
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to delete claim {pvc}: {e}")
+                return False
+        try:
+            self.api.delete_namespaced_custom_object(
+                self.group, self.version, namespace, HOME_VOLUME_PLURAL, name)
+        except ApiException as e:
+            if e.status != 404:
+                raise
         return True
 
     def home_volume_holder(self, username: str,
@@ -2846,6 +2899,193 @@ class KubeConfigManager(ConfigManager):
                 f"Could not record home volume {volume_name!r} on "
                 f"{full_name}: {e}")
 
+    # ------------------------------------------------------------------ #
+    # User data outlives the install (design/backup.md, Phase 1)          #
+    #                                                                     #
+    # An uninstall deletes the user namespaces, and with them the claims. #
+    # The PVs behind homes are set to Retain as soon as they are bound,   #
+    # and a claim that is missing is bound back to its old PV before      #
+    # anything is provisioned. Decisions in whistler/reattach.py.         #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _as_dict(obj) -> Dict[str, Any]:
+        """A client model as the camelCase dict the API serves."""
+        return client.ApiClient().sanitize_for_serialization(obj)
+
+    def _list_pvs(self) -> List[Dict[str, Any]]:
+        return [self._as_dict(pv) for pv in
+                client.CoreV1Api().list_persistent_volume().items]
+
+    def _read_pv(self, name: str) -> Optional[Dict[str, Any]]:
+        try:
+            return self._as_dict(client.CoreV1Api().read_persistent_volume(name))
+        except ApiException as e:
+            if e.status == 404:
+                return None
+            raise
+
+    def secure_claim(self, namespace: str, claim: str, kind: str,
+                     username: str) -> Optional[str]:
+        """Make the PV behind ``claim`` survive the claim's deletion (Retain,
+        plus labels naming what it holds). Returns the PV's name once the
+        claim is bound, None before; binding is asynchronous (a
+        WaitForFirstConsumer class binds when the first pod schedules), which
+        is why the operator's sweep retries."""
+        api = client.CoreV1Api()
+        try:
+            pvc = api.read_namespaced_persistent_volume_claim(claim, namespace)
+        except ApiException as e:
+            if e.status == 404:
+                return None
+            raise
+        pv_name = pvc.spec.volume_name if pvc.spec else None
+        if not pv_name:
+            return None
+        pv = self._read_pv(pv_name)
+        if pv is None:
+            return None
+        patch = reattach.secure_patch(pv, kind, username)
+        if patch:
+            api.patch_persistent_volume(pv_name, patch)
+            logger.info(f"Retained {pv_name} ({kind} of {username}, "
+                        f"{namespace}/{claim})")
+        return pv_name
+
+    def reattach_claim(self, namespace: str, claim: str,
+                       labels: Dict[str, str], recorded: str = None,
+                       logger=None) -> bool:
+        """Bind a missing ``claim`` back to the PV it had. True if it did;
+        False if there is nothing to give back, so the caller provisions.
+        Raises PolicyError when provisioning would put an empty disk where a
+        real one was (reattach.find_reattachable)."""
+        log = logger or globals()["logger"]
+        pv, problem = reattach.find_reattachable(
+            self._list_pvs(), namespace, claim, recorded=recorded)
+        if problem:
+            raise PolicyError(f"Cannot attach home: {problem}.")
+        if pv is None:
+            return False
+        pv_patch, pvc_body = reattach.rebind_manifests(
+            pv, namespace, claim, labels)
+        api = client.CoreV1Api()
+        # PV first: pre-binding it to the new claim's name reserves it, and
+        # if the claim create then fails the next attempt finds the same PV.
+        api.patch_persistent_volume(pv["metadata"]["name"], pv_patch)
+        try:
+            api.create_namespaced_persistent_volume_claim(namespace, pvc_body)
+        except ApiException as e:
+            if e.status != 409:
+                raise
+        log.info(f"Re-attached {namespace}/{claim} to retained "
+                 f"{pv['metadata']['name']}")
+        return True
+
+    def release_claim_volume(self, namespace: str, claim: str,
+                             recorded: str = None) -> bool:
+        """Undo secure_claim before a home is deleted *with its data*: set
+        the PV back to Delete so the provisioner reclaims it when the claim
+        goes. True when there is nothing in the way (including no PV)."""
+        api = client.CoreV1Api()
+        pv_name = recorded
+        try:
+            pvc = api.read_namespaced_persistent_volume_claim(claim, namespace)
+            pv_name = (pvc.spec.volume_name if pvc.spec else None) or pv_name
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to read claim {claim}: {e}")
+                return False
+        if not pv_name:
+            return True
+        try:
+            api.patch_persistent_volume(pv_name, reattach.release_patch())
+        except ApiException as e:
+            if e.status == 404:
+                return True
+            logger.error(f"Failed to release {pv_name} for deletion: {e}")
+            return False
+        return True
+
+    def secure_home_volume(self, username: str,
+                           volume: Dict[str, Any]) -> Optional[str]:
+        """Retain the PV behind a HomeVolume and record its name on the CR
+        (``spec.pvName``), which from then on forbids provisioning an empty
+        disk in its place. A no-op once recorded."""
+        if volume.get("pvName"):
+            return volume["pvName"]
+        user_ns = self._get_user_namespace(username)
+        pv_name = self.secure_claim(user_ns, self.home_volume_pvc_name(volume),
+                                    reattach.KIND_HOME, username)
+        if not pv_name:
+            return None
+        try:
+            self.api.patch_namespaced_custom_object(
+                self.group, self.version, user_ns, HOME_VOLUME_PLURAL,
+                volume["name"], {"spec": {"pvName": pv_name}})
+        except ApiException as e:
+            logger.warning(f"Could not record {pv_name} on home volume "
+                           f"{volume['name']!r}: "
+                           f"{crd_missing_hint(HOME_VOLUME_PLURAL, e)}")
+        return pv_name
+
+    def secure_user_data(self) -> int:
+        """The operator's sweep: retain every bound home PV in the cluster
+        and record it on its HomeVolume. Idempotent, cheap once done (a
+        recorded HomeVolume costs nothing; a pod home one claim read and one
+        PV read). Returns how many HomeVolumes it newly recorded, for the
+        log."""
+        done = 0
+        core = client.CoreV1Api()
+        try:
+            resp = self.api.list_cluster_custom_object(
+                self.group, self.version, HOME_VOLUME_PLURAL)
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Could not list home volumes to secure: {e}")
+            resp = {"items": []}
+        for item in resp.get("items", []):
+            spec = item.get("spec") or {}
+            ns = item["metadata"]["namespace"]
+            if DELETE_DATA_ANNOTATION in (
+                    item["metadata"].get("annotations") or {}):
+                # The event handler normally got there first; this is the
+                # retry for one it missed or failed.
+                try:
+                    self.purge_home_volume(ns, item["metadata"]["name"])
+                except ApiException as e:
+                    logger.warning(f"Could not purge home volume "
+                                   f"{ns}/{item['metadata']['name']}: {e}")
+                continue
+            if spec.get("pvName"):
+                continue
+            username = spec.get("user") or ns[len("whistler-user-"):]
+            try:
+                if self.secure_home_volume(
+                        username, {**spec, "name": item["metadata"]["name"]}):
+                    done += 1
+            except ApiException as e:
+                logger.warning(f"Could not secure home volume "
+                               f"{ns}/{item['metadata']['name']}: {e}")
+        try:
+            claims = core.list_persistent_volume_claim_for_all_namespaces(
+                label_selector="app=whistler").items
+        except ApiException as e:
+            logger.error(f"Could not list claims to secure: {e}")
+            return done
+        for claim in claims:
+            name = claim.metadata.name
+            if not name.startswith(POD_HOME_PVC_PREFIX):
+                continue
+            username = (claim.metadata.labels or {}).get("user") \
+                or name[len(POD_HOME_PVC_PREFIX):]
+            try:
+                self.secure_claim(claim.metadata.namespace, name,
+                                  reattach.KIND_POD_HOME, username)
+            except ApiException as e:
+                logger.warning(f"Could not secure {claim.metadata.namespace}/"
+                               f"{name}: {e}")
+        return done
+
     def ensure_home_volume_pvc(self, username: str, volume: Dict[str, Any],
                                fallback_size: str = None,
                                logger=None) -> str:
@@ -2864,12 +3104,28 @@ class KubeConfigManager(ConfigManager):
         user_ns = self._get_user_namespace(username)
         pvc_name = self.home_volume_pvc_name(volume)
         api = client.CoreV1Api()
+        labels = {"app": "whistler",
+                  "whistler-home-volume": volume.get("name", "")[:63]}
         try:
             api.read_namespaced_persistent_volume_claim(pvc_name, user_ns)
-            return pvc_name
         except ApiException as e:
             if e.status != 404:
                 raise
+        else:
+            # Usually a no-op: recorded already, or not bound yet (the
+            # operator's sweep catches it then). Never fatal to the start.
+            try:
+                self.secure_home_volume(username, volume)
+            except Exception as e:
+                (logger or globals()["logger"]).warning(
+                    f"Could not retain the disk behind {pvc_name}: {e}")
+            return pvc_name
+
+        # Missing claim: give back the disk it had before provisioning one.
+        # Raises PolicyError when that disk is recorded but gone.
+        if self.reattach_claim(user_ns, pvc_name, labels,
+                               recorded=volume.get("pvName"), logger=logger):
+            return pvc_name
 
         if logger:
             logger.info(f"Creating home volume claim {pvc_name}")
@@ -2890,11 +3146,7 @@ class KubeConfigManager(ConfigManager):
         pvc_body = {
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
-            "metadata": {
-                "name": pvc_name,
-                "labels": {"app": "whistler",
-                           "whistler-home-volume": volume.get("name", "")[:63]},
-            },
+            "metadata": {"name": pvc_name, "labels": labels},
             "spec": spec,
         }
         try:
@@ -3586,6 +3838,8 @@ class KubeConfigManager(ConfigManager):
         if effective_runtime != 'vm':
             try:
                 pvc_name = self._ensure_pvc(username, user_ns, logger)
+            except PolicyError:
+                raise  # a retained disk that cannot be given back: say so
             except Exception:
                 return result
 
@@ -3679,6 +3933,8 @@ class KubeConfigManager(ConfigManager):
                     username, home_volume,
                     fallback_size=template_spec.get('homeDiskSize'),
                     logger=logger)
+            except PolicyError:
+                raise  # a recorded disk that is gone: never an empty one
             except Exception:
                 return result
             ok = self._create_vm(
