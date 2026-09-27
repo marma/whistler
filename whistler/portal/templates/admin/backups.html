@@ -1,0 +1,214 @@
+{% extends "base.html" %}
+{% block title %}Backups — Admin — Whistler{% endblock %}
+{% block content %}
+
+<h2 class="ui header"><i class="archive icon"></i> Backups</h2>
+
+<p class="ui grey text">
+  Backups of Whistler's <strong>state</strong>: users, groups, zones,
+  templates, datasets, home volume records, instances, and the SSH CA and
+  gateway host key. Not of what is on users' disks. They are kept on a volume
+  that survives uninstalling Whistler, and the first admin to sign in after an
+  install is offered the latest one.
+</p>
+
+{% if notice %}<div class="ui positive message">{{ notice }}</div>{% endif %}
+{% if error %}<div class="ui negative message">{{ error }}</div>{% endif %}
+
+{% if not enabled %}
+<div class="ui placeholder segment">
+  <div class="ui icon header">
+    <i class="archive icon"></i>
+    Backups are turned off in this install (<code>backup.enabled: false</code>).
+  </div>
+</div>
+{% elif unavailable %}
+<div class="ui negative message">
+  <div class="header">The backup service is not available</div>
+  <p>{{ unavailable }}</p>
+  {% if hint %}<p>{{ hint }}</p>{% endif %}
+  <p>The rest of the portal is unaffected.</p>
+</div>
+{% else %}
+
+{% set vol = status.volume %}
+{% set inst = status.install %}
+
+{% if status.offer %}
+<div class="ui warning message">
+  <div class="header">A backup from an earlier install is waiting</div>
+  <p>Scheduled backups are paused until you decide, so this install cannot
+    age the earlier backups out.
+    <a href="/admin/backups/offer?user={{ current_user }}">Restore or start fresh</a>.</p>
+</div>
+{% elif status.stale %}
+<div class="ui warning message">{{ status.stale }}</div>
+{% endif %}
+{% if status.lastError %}
+<div class="ui negative message"><strong>Last attempt failed:</strong> {{ status.lastError }}</div>
+{% endif %}
+{% for w in status.warnings %}
+<div class="ui small warning message">{{ w }}</div>
+{% endfor %}
+
+<div class="ui three stackable cards">
+  <div class="card">
+    <div class="content">
+      <div class="header"><i class="hdd icon"></i> Where they are</div>
+      <div class="description">
+        <p><code>{{ vol.persistentVolume or "?" }}</code>
+          {% if vol.storageClassName %}on <strong>{{ vol.storageClassName }}</strong>{% endif %}
+          {% if vol.driver %}({{ vol.driver }}){% endif %}</p>
+        <p>{{ ((vol.usedBytes or 0) / 1073741824) | round(1) }} of
+           {{ ((vol.capacityBytes or 0) / 1073741824) | round(1) }} GiB used on its filesystem.</p>
+        {% if vol.reclaimPolicy and vol.reclaimPolicy != "Retain" %}
+        <div class="ui tiny red label">reclaim policy {{ vol.reclaimPolicy }} — not yet retained</div>
+        {% endif %}
+        {% if in_cluster %}
+        <p class="ui orange text" style="margin-top:0.5em">
+          This looks like storage inside the cluster
+          (<code>{{ vol.driver }}</code>): the backups survive every reinstall,
+          but not losing the cluster. Download them somewhere else for that.</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="content">
+      <div class="header"><i class="clock outline icon"></i> Schedule</div>
+      <div class="description">
+        {% set s = status.settings %}
+        <p>
+          {% if s.mode == "off" %}Off.
+          {% elif s.mode == "interval" %}Every {{ s.hours }} hours.
+          {% else %}Daily at {{ s.at }} UTC.{% endif %}
+          Keeps the newest {{ s.retain }} scheduled backups of this install.
+        </p>
+        <p>
+          {% if status.paused %}<strong>Paused</strong> until the restore offer is answered.
+          {% elif status.nextRun %}Next: {{ status.nextRun }}{% endif %}
+        </p>
+        <p>Last success: {{ status.lastSuccess or "never" }}</p>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="content">
+      <div class="header"><i class="key icon"></i> Secrets</div>
+      <div class="description">
+        {% if status.passphraseSet %}
+        <p><div class="ui tiny green label">encrypted</div>
+          New backups encrypt the SSH CA, host key and dataset credentials with
+          the backup passphrase. It is needed to restore them after a
+          reinstall, and the cluster cannot give it back.</p>
+        {% else %}
+        <p><div class="ui tiny orange label">not encrypted</div>
+          Backups hold the SSH CA's private key in the clear. Anyone with a
+          copy of the volume or a downloaded file holds it too. Set a
+          passphrase below.</p>
+        {% endif %}
+        <p class="ui grey text" style="font-size:0.85em">Install
+          <code>{{ (inst.installId or "unknown")[:8] }}</code>, decision
+          <strong>{{ inst.decision }}</strong>{% if inst.decidedBy %} by {{ inst.decidedBy }}{% endif %}.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h3 class="ui header">All backups</h3>
+
+<form method="post" action="/admin/backups/create?user={{ current_user }}" style="display:inline">
+  <button class="ui primary button"><i class="save icon"></i> Back up now</button>
+</form>
+<form method="post" action="/admin/backups/upload?user={{ current_user }}" enctype="multipart/form-data"
+      class="ui form" style="display:inline-block;margin-left:1rem">
+  <div class="inline fields" style="margin:0">
+    <div class="field"><input type="file" name="backup" accept=".tar.gz,application/gzip" required></div>
+    <div class="field"><button class="ui button"><i class="upload icon"></i> Upload</button></div>
+  </div>
+</form>
+
+{% if backups %}
+<table class="ui celled table">
+  <thead>
+    <tr><th>Taken</th><th>Why</th><th>Install</th><th>Contents</th><th>Size</th><th>Actions</th></tr>
+  </thead>
+  <tbody>
+    {% for b in backups %}
+    <tr {% if b.problem %}class="error"{% endif %}>
+      <td>{{ b.createdAt }}<br><code style="font-size:0.8em">{{ b.file }}</code></td>
+      <td><div class="ui tiny label">{{ b.trigger }}</div></td>
+      <td>
+        {% if b.installId and b.installId == inst.installId %}<span class="ui grey text">this one</span>
+        {% else %}<div class="ui tiny blue label" title="{{ b.installId or 'none' }}">earlier</div>{% endif %}
+      </td>
+      <td>
+        {% if b.problem %}<strong>Unreadable:</strong> {{ b.problem }}
+        {% else %}
+          {% for kind, n in b.counts.items() %}{{ n }} {{ kind }}{{ "" if loop.last else "," }} {% endfor %}
+          {% if b.secrets == "encrypted" %}<i class="lock icon" title="secrets encrypted"></i>
+          {% elif b.secrets == "plain" %}<i class="unlock icon" title="secrets in the clear"></i>{% endif %}
+        {% endif %}
+      </td>
+      <td>{{ (b.size / 1024) | round(1) }} KiB</td>
+      <td class="collapsing">
+        <a class="ui tiny button" href="/admin/backups/file/{{ b.file }}/download?user={{ current_user }}"><i class="download icon"></i> Download</a>
+        {% if not b.problem %}
+        <a class="ui tiny primary button" href="/admin/backups/file/{{ b.file }}/restore?user={{ current_user }}"><i class="undo icon"></i> Restore…</a>
+        {% endif %}
+        <form method="post" action="/admin/backups/file/{{ b.file }}/delete?user={{ current_user }}" style="display:inline"
+              onsubmit="return confirm('Delete {{ b.file }}? This cannot be undone.')">
+          <button class="ui tiny red button"><i class="trash icon"></i></button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="ui grey text"><em>No backups yet.</em></p>
+{% endif %}
+
+<h3 class="ui header">Schedule</h3>
+<form class="ui form" method="post" action="/admin/backups/settings?user={{ current_user }}">
+  {% set s = status.settings %}
+  <div class="four fields">
+    <div class="field">
+      <label>When</label>
+      <select name="mode" class="ui dropdown">
+        <option value="off" {% if s.mode == "off" %}selected{% endif %}>Off</option>
+        <option value="interval" {% if s.mode == "interval" %}selected{% endif %}>Every N hours</option>
+        <option value="daily" {% if s.mode == "daily" %}selected{% endif %}>Daily</option>
+      </select>
+    </div>
+    <div class="field"><label>Hours (every N)</label>
+      <input type="number" name="hours" min="1" max="744" value="{{ s.hours }}"></div>
+    <div class="field"><label>At (daily, UTC)</label>
+      <input type="text" name="at" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" value="{{ s.at }}"></div>
+    <div class="field"><label>Keep</label>
+      <input type="number" name="retain" min="1" max="1000" value="{{ s.retain }}"></div>
+  </div>
+  <p class="ui grey text" style="font-size:0.9em">Retention only removes this
+    install's scheduled backups. Manual, uninstall, pre-restore and uploaded
+    backups, and anything from an earlier install, stay until you delete them.
+    A scheduled backup whose content matches the previous one is not written.</p>
+  <button class="ui button">Save schedule</button>
+</form>
+
+<h3 class="ui header">Passphrase</h3>
+<form class="ui form" method="post" action="/admin/backups/passphrase?user={{ current_user }}" autocomplete="off">
+  <div class="two fields">
+    <div class="field"><label>New passphrase</label><input type="password" name="passphrase" autocomplete="new-password"></div>
+    <div class="field"><label>Again</label><input type="password" name="confirm" autocomplete="new-password"></div>
+  </div>
+  <button class="ui button" name="action" value="set">Set passphrase</button>
+  {% if status.passphraseSet %}
+  <button class="ui basic red button" name="action" value="clear"
+          onclick="return confirm('Clear the passphrase? New backups will store the SSH CA\'s private key unencrypted.')">Clear</button>
+  {% endif %}
+  <p class="ui grey text" style="font-size:0.9em;margin-top:0.5em">Applies to
+    new backups. Existing ones keep the passphrase they were made with.</p>
+</form>
+
+{% endif %}
+{% endblock %}

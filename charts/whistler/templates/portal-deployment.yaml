@@ -61,6 +61,9 @@ spec:
             # talks to it with this pod's ServiceAccount token.
             - name: WHISTLER_BACKUP_URL
               value: "http://{{ .Release.Name }}-backup.{{ .Release.Namespace }}.svc:8090"
+            # Only to say why the service is down: the claim its pod waits for.
+            - name: WHISTLER_BACKUP_CLAIM
+              value: "{{ .Release.Name }}-backups"
             {{- end }}
             - name: WHISTLER_SSH_DOMAIN_SUFFIX
               value: {{ .Values.whistler.ssh.domainSuffix | quote }}

@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Restore an earlier install? — Whistler{% endblock %}
+{% block content %}
+
+{% set newest = offers[0] if offers else None %}
+
+<h2 class="ui header"><i class="history icon"></i>
+  <div class="content">This looks like a new install
+    <div class="sub header">Backups from an earlier install of Whistler are on the backup volume.</div>
+  </div>
+</h2>
+
+{% if newest %}
+<div class="ui segment">
+  <h3 class="ui header">Latest: {{ newest.createdAt }}</h3>
+  <p>
+    <div class="ui label">{{ newest.trigger }}</div>
+    {% if newest.whistlerVersion %}Whistler {{ newest.whistlerVersion }} ·{% endif %}
+    {% for kind, n in newest.counts.items() %}{{ n }} {{ kind }}{{ "" if loop.last else "," }} {% endfor %}
+    {% if newest.secrets == "encrypted" %}· <i class="lock icon"></i> secrets encrypted{% endif %}
+  </p>
+  <p class="ui grey text"><code>{{ newest.file }}</code></p>
+  <a class="ui primary button" href="/admin/backups/file/{{ newest.file }}/restore?user={{ current_user }}">
+    <i class="undo icon"></i> Review and restore</a>
+</div>
+{% endif %}
+
+<p>Scheduled backups are <strong>paused</strong> until you choose, so this
+  install cannot age the earlier backups out. Nothing is restored without a
+  preview.</p>
+
+<form method="post" action="/admin/backups/decline?user={{ current_user }}" style="display:inline"
+      onsubmit="return confirm('Start fresh? The earlier backups stay on the volume, and you can still restore one later from the Backups page.')">
+  <input type="hidden" name="next_to" value="{{ next_to }}">
+  <button class="ui button"><i class="plus icon"></i> Start fresh</button>
+</form>
+<form method="post" action="/admin/backups/offer/dismiss?user={{ current_user }}" style="display:inline">
+  <input type="hidden" name="next_to" value="{{ next_to }}">
+  <input type="hidden" name="install_id" value="{{ status.install.installId }}">
+  <button class="ui basic button">Not now</button>
+</form>
+
+{% if offers | length > 1 %}
+<h3 class="ui header">Other backups from earlier installs</h3>
+<table class="ui very compact celled table">
+  <tbody>
+    {% for b in offers[1:] %}
+    <tr>
+      <td>{{ b.createdAt }}</td><td><div class="ui tiny label">{{ b.trigger }}</div></td>
+      <td>{% for kind, n in b.counts.items() %}{{ n }} {{ kind }}{{ "" if loop.last else "," }} {% endfor %}</td>
+      <td class="collapsing"><a class="ui tiny button" href="/admin/backups/file/{{ b.file }}/restore?user={{ current_user }}">Review…</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% endblock %}

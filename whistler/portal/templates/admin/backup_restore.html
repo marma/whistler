@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}Restore — Backups — Admin — Whistler{% endblock %}
+{% block content %}
+
+<h2 class="ui header"><i class="undo icon"></i>
+  <div class="content">Restore a backup
+    <div class="sub header"><code>{{ name }}</code></div>
+  </div>
+</h2>
+
+<p><a href="/admin/backups?user={{ current_user }}"><i class="arrow left icon"></i>Backups</a></p>
+
+{% if error %}<div class="ui negative message">{{ error }}</div>{% endif %}
+
+{% if result %}
+  <div class="ui {% if result.pruned %}warning{% else %}positive{% endif %} message">
+    <div class="header">Restored {{ result.written }} object(s)</div>
+    {% if result.preRestoreBackup %}
+    <p>The state from just before is saved as <code>{{ result.preRestoreBackup }}</code>:
+      restoring that undoes this.</p>
+    {% endif %}
+  </div>
+  {% if result.pruned %}
+  <div class="ui negative message">
+    <div class="header">The cluster dropped some fields</div>
+    <ul class="list">{% for p in result.pruned %}<li><code>{{ p }}</code></li>{% endfor %}</ul>
+    <p>{{ result.prunedHint }}</p>
+  </div>
+  {% endif %}
+  {% for w in result.warnings %}<div class="ui small warning message">{{ w }}</div>{% endfor %}
+  <p>Restored instances are <strong>stopped</strong>; users start them as usual.
+    Running ones were not touched.</p>
+{% else %}
+
+<div class="ui info message">
+  <p>A restore <strong>creates or replaces by name</strong> and never deletes:
+    anything made since this backup stays. Instances come back stopped, and
+    running ones keep running. The current state is saved first, so a restore
+    can itself be undone.</p>
+</div>
+
+{% if preview %}
+  {% set c = preview.counts %}
+  <div class="ui statistics" style="margin:1rem 0">
+    <div class="green statistic"><div class="value">{{ c.create or 0 }}</div><div class="label">create</div></div>
+    <div class="orange statistic"><div class="value">{{ c.replace or 0 }}</div><div class="label">replace</div></div>
+    <div class="statistic"><div class="value">{{ c.unchanged or 0 }}</div><div class="label">unchanged</div></div>
+    {% if c.skip %}<div class="grey statistic"><div class="value">{{ c.skip }}</div><div class="label">skip</div></div>{% endif %}
+  </div>
+  {% for w in preview.warnings %}<div class="ui small warning message">{{ w }}</div>{% endfor %}
+  {% if preview.secrets == "encrypted" and not preview.secretsReadable %}
+  <div class="ui warning message">This backup's secrets (SSH CA, gateway host
+    key, dataset credentials) are encrypted with a passphrase this install does
+    not hold. Type it below to include them, or restore without them — users
+    will then meet a new SSH CA.</div>
+  {% endif %}
+  <table class="ui very compact celled table">
+    <thead><tr><th>Action</th><th>Kind</th><th>Where</th><th>Name</th></tr></thead>
+    <tbody>
+      {% for e in preview.entries if e.action != "unchanged" %}
+      <tr>
+        <td><div class="ui tiny {{ {'create': 'green', 'replace': 'orange', 'skip': 'grey'}.get(e.action, '') }} label">{{ e.action }}</div></td>
+        <td>{{ e.kind }}</td><td><code>{{ e.namespace }}</code></td>
+        <td>{{ e.name }}{% if e.reason %} <span class="ui grey text">({{ e.reason }})</span>{% endif %}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="4"><em>Nothing to change: the cluster already matches this backup.</em></td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+<form class="ui form" method="post" action="/admin/backups/file/{{ name }}/restore?user={{ current_user }}" autocomplete="off">
+  <div class="two fields">
+    <div class="field">
+      <label>Backup passphrase</label>
+      <input type="password" name="passphrase" autocomplete="off"
+             placeholder="only if this backup's passphrase is not this install's">
+    </div>
+    <div class="field" style="padding-top:1.9em">
+      <div class="ui checkbox">
+        <input type="checkbox" name="include_secrets" id="include_secrets" {% if include_secrets %}checked{% endif %}>
+        <label for="include_secrets">Restore the SSH CA, gateway host key and dataset credentials</label>
+      </div>
+    </div>
+  </div>
+  <button class="ui button" name="action" value="preview"><i class="eye icon"></i> Preview again</button>
+  <button class="ui primary button" name="action" value="restore"
+          onclick="return confirm('Restore {{ name }}? Objects shown as replace will be overwritten.')">
+    <i class="undo icon"></i> Restore</button>
+</form>
+{% endif %}
+
+{% endblock %}

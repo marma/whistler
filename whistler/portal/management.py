@@ -35,8 +35,9 @@ import re
 from typing import Annotated, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
+                               Response)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -48,6 +49,8 @@ from whistler.config import (ACCESS_MODES, CHANNELS, ConfigWriteError,
 from whistler.portal.login import (USER_COOKIE, dev_auth, render_login,
                                    render_notice, verify_credentials)
 from whistler.status import GROUP_COLORS, status_group
+from whistler.portal.backups import (BackupClient, BackupRefused,
+                                     BackupUnavailable, in_cluster_storage)
 
 logger = logging.getLogger("whistler.management")
 
@@ -939,7 +942,9 @@ async def admin_index(request: Request, cm: CM, admin: Admin):
     return templates.TemplateResponse(
         request=request, name="admin/index.html",
         context=_ctx(admin, is_admin=True, all_instances=all_instances,
-                     all_users=all_users, all_templates=all_templates),
+                     all_users=all_users, all_templates=all_templates,
+                     backups_enabled=_backup_client(request).enabled,
+                     backup_health=await _backup_health(request)),
     )
 
 
@@ -2268,6 +2273,324 @@ def _build_zone_data(name, description, allow_cidrs, block_cidrs,
 
 
 # --------------------------------------------------------------------------- #
+# Backups (design/backup.md, Phase 4)                                          #
+# --------------------------------------------------------------------------- #
+#
+# The portal drives the backup service over HTTP (portal/backups.py) and never
+# touches the volume. A service that cannot be reached is a message on these
+# pages, never an error page elsewhere: a broken backup volume must not take
+# the admin UI down.
+
+# "Not now" on the restore offer: a session cookie holding the install id it
+# was dismissed for, so the next install's offer is not hidden by it.
+OFFER_DISMISSED_COOKIE = "whistler_restore_offer_dismissed"
+# How long the portal trusts an answer to "is a restore on offer?". The offer
+# check runs on navigations, and asking the backup service on every one would
+# put its latency in front of every page.
+OFFER_CACHE_SECONDS = 30
+# Paths the offer never redirects away from.
+_OFFER_EXEMPT = ("/admin/backups", "/static", LOGIN_PATH, "/logout")
+
+
+def _backup_client(request: Request) -> BackupClient:
+    return request.app.state.backups
+
+
+def _backup_claim_hint(cm) -> Optional[str]:
+    """Why the service may be down, from the portal's side: the claim the
+    backup pod waits for. Best-effort; None when there is nothing to say."""
+    claim = os.environ.get("WHISTLER_BACKUP_CLAIM")
+    if not claim:
+        return None
+    try:
+        from kubernetes import client as k8s
+        pvc = k8s.CoreV1Api().read_namespaced_persistent_volume_claim(
+            claim, cm.namespace)
+    except Exception as e:
+        return f"Could not read the backup claim {claim}: {e}"
+    phase = pvc.status.phase if pvc.status else None
+    if phase != "Bound":
+        return (f"The backup claim {claim} is {phase or 'unknown'}, so the "
+                f"backup pod cannot start. Check its events: `kubectl -n "
+                f"{cm.namespace} describe pvc {claim}`.")
+    return None
+
+
+def _backups_redirect(admin: str, notice: str = None, error: str = None,
+                      path: str = "/admin/backups") -> RedirectResponse:
+    query = {"user": admin}
+    if notice:
+        query["notice"] = notice
+    if error:
+        query["error"] = error
+    return RedirectResponse(f"{path}?{urlencode(query)}", status_code=303)
+
+
+def _forget_offer(request: Request) -> None:
+    request.app.state.offer_cache = None
+
+
+async def admin_backups(request: Request, cm: CM, admin: Admin):
+    backups = _backup_client(request)
+    status = listing = None
+    unavailable = hint = None
+    if backups.enabled:
+        try:
+            status, listing = await asyncio.gather(backups.status(),
+                                                   backups.list())
+        except BackupUnavailable as e:
+            unavailable = str(e)
+            hint = await request.app.state.run(_backup_claim_hint, cm)
+    return templates.TemplateResponse(
+        request=request, name="admin/backups.html",
+        context=_ctx(admin, is_admin=True, enabled=backups.enabled,
+                     status=status, backups=listing or [],
+                     in_cluster=in_cluster_storage(
+                         ((status or {}).get("volume") or {}).get("driver")),
+                     unavailable=unavailable, hint=hint,
+                     notice=request.query_params.get("notice"),
+                     error=request.query_params.get("error")),
+    )
+
+
+async def admin_backup_create(request: Request, admin: Admin):
+    try:
+        result = await _backup_client(request).create(by=admin)
+    except (BackupUnavailable, BackupRefused) as e:
+        return _backups_redirect(admin, error=str(e))
+    return _backups_redirect(
+        admin, notice=f"Backed up to {result['backup']['file']}.")
+
+
+async def admin_backup_download(request: Request, admin: Admin, name: str):
+    from whistler.backup.schedule import parse_filename
+    if not parse_filename(name):
+        raise HTTPException(status_code=404, detail="No such backup.")
+    try:
+        data, filename = await _backup_client(request).download(name)
+    except (BackupUnavailable, BackupRefused) as e:
+        return _backups_redirect(admin, error=str(e))
+    logger.info(f"{admin} downloaded backup {name}")
+    return Response(content=data, media_type="application/gzip",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="{filename}"',
+                             "Cache-Control": "no-store"})
+
+
+async def admin_backup_upload(request: Request, admin: Admin,
+                              backup: UploadFile = File(...)):
+    from whistler.backup.archive import MAX_ARCHIVE_BYTES
+    data = await backup.read(MAX_ARCHIVE_BYTES + 1)
+    if len(data) > MAX_ARCHIVE_BYTES:
+        return _backups_redirect(admin, error="That file is larger than any "
+                                              "Whistler backup should be.")
+    try:
+        entry = await _backup_client(request).upload(data)
+    except (BackupUnavailable, BackupRefused) as e:
+        return _backups_redirect(admin, error=f"Upload refused: {e}")
+    _forget_offer(request)
+    return _backups_redirect(admin, notice=f"Uploaded as {entry['file']}.")
+
+
+async def admin_backup_delete(request: Request, admin: Admin, name: str):
+    try:
+        await _backup_client(request).delete(name)
+    except (BackupUnavailable, BackupRefused) as e:
+        return _backups_redirect(admin, error=str(e))
+    _forget_offer(request)
+    return _backups_redirect(admin, notice=f"Deleted {name}.")
+
+
+async def admin_backup_settings(request: Request, admin: Admin,
+                                mode: Annotated[str, Form()],
+                                hours: Annotated[str, Form()] = "24",
+                                at: Annotated[str, Form()] = "03:00",
+                                retain: Annotated[str, Form()] = "14"):
+    try:
+        await _backup_client(request).save_settings(
+            {"mode": mode, "hours": hours, "at": at, "retain": retain})
+    except (BackupUnavailable, BackupRefused) as e:
+        return _backups_redirect(admin, error=f"Settings not saved: {e}")
+    return _backups_redirect(admin, notice="Schedule saved.")
+
+
+async def admin_backup_passphrase(request: Request, admin: Admin,
+                                  action: Annotated[str, Form()] = "set",
+                                  passphrase: Annotated[str, Form()] = "",
+                                  confirm: Annotated[str, Form()] = ""):
+    if action == "clear":
+        value = None
+    else:
+        if not passphrase:
+            return _backups_redirect(admin, error="Type a passphrase.")
+        if passphrase != confirm:
+            return _backups_redirect(admin,
+                                     error="The two passphrases differ.")
+        value = passphrase
+    try:
+        await _backup_client(request).set_passphrase(value)
+    except (BackupUnavailable, BackupRefused) as e:
+        return _backups_redirect(admin, error=str(e))
+    logger.info(f"{admin} {'cleared' if value is None else 'set'} the backup "
+                f"passphrase")
+    return _backups_redirect(
+        admin, notice="Passphrase cleared: new backups store secrets "
+                      "unencrypted." if value is None else
+        "Passphrase set: new backups encrypt their secrets. Keep it "
+        "somewhere safe — it is needed to restore them, and the cluster "
+        "cannot give it back.")
+
+
+def _restore_context(admin, name, preview=None, result=None, error=None,
+                     include_secrets=True):
+    return _ctx(admin, is_admin=True, name=name, preview=preview,
+                result=result, error=error, include_secrets=include_secrets)
+
+
+async def admin_backup_restore_form(request: Request, admin: Admin, name: str):
+    """What restoring ``name`` would do. Nothing is written until the admin
+    confirms on this page."""
+    error = preview = None
+    try:
+        preview = await _backup_client(request).preview(name)
+    except (BackupUnavailable, BackupRefused) as e:
+        error = str(e)
+    return templates.TemplateResponse(
+        request=request, name="admin/backup_restore.html",
+        context=_restore_context(admin, name, preview=preview, error=error))
+
+
+async def admin_backup_restore(request: Request, admin: Admin, name: str,
+                               action: Annotated[str, Form()] = "preview",
+                               passphrase: Annotated[str, Form()] = "",
+                               include_secrets: Annotated[Optional[str], Form()] = None):
+    backups = _backup_client(request)
+    secrets = include_secrets == "on"
+    error = preview = result = None
+    try:
+        if action == "restore":
+            result = await backups.restore(name, by=admin,
+                                           passphrase=passphrase or None,
+                                           include_secrets=secrets)
+            _forget_offer(request)
+            logger.info(f"{admin} restored backup {name}: "
+                        f"{result.get('written')} object(s)")
+        else:
+            preview = await backups.preview(name, passphrase or None, secrets)
+    except (BackupUnavailable, BackupRefused) as e:
+        error = str(e)
+    return templates.TemplateResponse(
+        request=request, name="admin/backup_restore.html",
+        context=_restore_context(admin, name, preview=preview, result=result,
+                                 error=error, include_secrets=secrets))
+
+
+async def admin_backup_offer(request: Request, admin: Admin):
+    backups = _backup_client(request)
+    try:
+        status = await backups.status()
+    except BackupUnavailable as e:
+        return _backups_redirect(admin, error=str(e))
+    next_to = _safe_next(request.query_params.get("next") or "/")
+    if not status.get("offer"):
+        return RedirectResponse(_next_url(next_to, admin), status_code=303)
+    return templates.TemplateResponse(
+        request=request, name="admin/backup_offer.html",
+        context=_ctx(admin, is_admin=True, status=status,
+                     offers=status.get("offers") or [], next_to=next_to))
+
+
+async def admin_backup_decline(request: Request, admin: Admin,
+                               next_to: Annotated[str, Form()] = "/"):
+    try:
+        await _backup_client(request).decline(by=admin)
+    except (BackupUnavailable, BackupRefused) as e:
+        return _backups_redirect(admin, error=str(e))
+    _forget_offer(request)
+    logger.info(f"{admin} declined the restore offer for this install")
+    return RedirectResponse(_next_url(_safe_next(next_to), admin),
+                            status_code=303)
+
+
+async def admin_backup_offer_dismiss(request: Request, admin: Admin,
+                                     install_id: Annotated[str, Form()],
+                                     next_to: Annotated[str, Form()] = "/"):
+    response = RedirectResponse(_next_url(_safe_next(next_to), admin),
+                                status_code=303)
+    # Session cookie (no max-age): "not now" lasts until the browser closes.
+    response.set_cookie(OFFER_DISMISSED_COOKIE, install_id, httponly=True,
+                        samesite="lax")
+    return response
+
+
+async def _offer_status(request: Request) -> Optional[dict]:
+    """``{"offer": bool, "installId": str}``, cached briefly; None when the
+    backup service cannot say (then there is no offer: fail open, so a down
+    backup service never stands between an admin and the portal)."""
+    import time
+    cache = getattr(request.app.state, "offer_cache", None)
+    if cache and cache[0] > time.monotonic():
+        return cache[1]
+    try:
+        status = await _backup_client(request).status()
+        answer = {"offer": bool(status.get("offer")),
+                  "installId": (status.get("install") or {}).get("installId")}
+    except (BackupUnavailable, BackupRefused):
+        answer = None
+    request.app.state.offer_cache = (time.monotonic() + OFFER_CACHE_SECONDS,
+                                     answer)
+    return answer
+
+
+def _is_navigation(request: Request) -> bool:
+    return (request.method == "GET"
+            and not request.headers.get("HX-Request")
+            and (request.headers.get("Sec-Fetch-Mode") == "navigate"
+                 or "text/html" in request.headers.get("Accept", "")))
+
+
+async def restore_offer_middleware(request: Request, call_next):
+    """An admin's first navigation after an install lands on the restore
+    offer (design/backup.md, "The first-login offer"). Everything else — a
+    non-admin, a fetch, the backup pages themselves, a dismissed or settled
+    offer, a backup service that cannot be reached — passes straight through."""
+    if (_is_navigation(request)
+            and not request.url.path.startswith(_OFFER_EXEMPT)
+            and _backup_client(request).enabled):
+        user = _get_identity(request)
+        if user and await request.app.state.run(_is_admin, request, user):
+            offer = await _offer_status(request)
+            if offer and offer["offer"] and request.cookies.get(
+                    OFFER_DISMISSED_COOKIE) != offer["installId"]:
+                query = request.url.query
+                next_to = _safe_next(request.url.path +
+                                     (f"?{query}" if query else ""))
+                return RedirectResponse(
+                    "/admin/backups/offer?" + urlencode(
+                        {"user": user, "next": next_to}), status_code=303)
+    return await call_next(request)
+
+
+async def _backup_health(request: Request) -> Optional[dict]:
+    """What the admin overview should warn about, or None."""
+    backups = _backup_client(request)
+    if not backups.enabled:
+        return None
+    try:
+        status = await backups.status()
+    except BackupUnavailable as e:
+        return {"level": "error", "text": f"Backups unavailable: {e}"}
+    if status.get("offer"):
+        return {"level": "warning",
+                "text": "A backup from an earlier install is waiting: restore "
+                        "it or start fresh. Scheduled backups are paused "
+                        "until you decide."}
+    if status.get("stale"):
+        return {"level": "warning", "text": status["stale"]}
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # App factory                                                                  #
 # --------------------------------------------------------------------------- #
 
@@ -2282,6 +2605,9 @@ def build_management_app(config_manager):
         return await loop.run_in_executor(None, func, *args)
 
     app.state.run = _run
+    app.state.backups = BackupClient()
+    app.state.offer_cache = None
+    app.middleware("http")(restore_offer_middleware)
 
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
@@ -2352,6 +2678,19 @@ def build_management_app(config_manager):
     app.add_api_route("/admin/homevolumes",                       admin_home_volumes,     methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/homevolumes/{username}/{name}/delete", admin_home_volume_delete, methods=["POST"])
     app.add_api_route("/admin/homevolumes/{username}/{name}/archive", admin_home_volume_archive, methods=["POST"])
+    # Backups (the offer first: it is a fixed path under the same prefix)
+    app.add_api_route("/admin/backups",                         admin_backups,              methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/admin/backups/offer",                   admin_backup_offer,         methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/admin/backups/offer/dismiss",           admin_backup_offer_dismiss, methods=["POST"])
+    app.add_api_route("/admin/backups/decline",                 admin_backup_decline,       methods=["POST"])
+    app.add_api_route("/admin/backups/create",                  admin_backup_create,        methods=["POST"])
+    app.add_api_route("/admin/backups/upload",                  admin_backup_upload,        methods=["POST"])
+    app.add_api_route("/admin/backups/settings",                admin_backup_settings,      methods=["POST"])
+    app.add_api_route("/admin/backups/passphrase",              admin_backup_passphrase,    methods=["POST"])
+    app.add_api_route("/admin/backups/file/{name}/download",    admin_backup_download,      methods=["GET"])
+    app.add_api_route("/admin/backups/file/{name}/delete",      admin_backup_delete,        methods=["POST"])
+    app.add_api_route("/admin/backups/file/{name}/restore",     admin_backup_restore_form,  methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/admin/backups/file/{name}/restore",     admin_backup_restore,       methods=["POST"], response_class=HTMLResponse)
     app.add_api_route("/admin/archive/homevolumes/{archived}/restore", admin_archived_home_volume_restore, methods=["POST"])
     app.add_api_route("/admin/archive/homevolumes/{archived}/delete", admin_archived_home_volume_delete, methods=["POST"])
     app.add_api_route("/admin/datasets",                          admin_datasets,         methods=["GET"],  response_class=HTMLResponse)

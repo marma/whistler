@@ -7,6 +7,13 @@
   <div class="content">Admin Overview</div>
 </h2>
 
+{% if backup_health %}
+<div class="ui {{ 'negative' if backup_health.level == 'error' else 'warning' }} message">
+  <i class="archive icon"></i> {{ backup_health.text }}
+  <a href="/admin/backups?user={{ current_user }}">Backups</a>
+</div>
+{% endif %}
+
 <div class="ui four statistics" style="margin-bottom:2rem">
   <div class="statistic">
     <div class="value">{{ all_users | length }}</div>
@@ -63,6 +70,17 @@
       <a href="/admin/computed-access?user={{ current_user }}" class="ui primary fluid button">Computed Access</a>
     </div>
   </div>
+  {% if backups_enabled %}
+  <div class="card">
+    <div class="content">
+      <div class="header"><i class="archive icon"></i> Backups</div>
+      <div class="description">Back up and restore Whistler's state; schedule and download</div>
+    </div>
+    <div class="extra content">
+      <a href="/admin/backups?user={{ current_user }}" class="ui primary fluid button">Manage Backups</a>
+    </div>
+  </div>
+  {% endif %}
   <div class="card">
     <div class="content">
       <div class="header"><i class="hdd icon"></i> Home volumes</div>

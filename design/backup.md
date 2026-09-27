@@ -528,6 +528,44 @@ Verified by installing the real chart on a throwaway k3d cluster:
 
 ### Phase 4: the portal
 
+**Done 2026-09-27.** `whistler/portal/backups.py` (the client), the Backups
+routes and `restore_offer_middleware` in `management.py`, and
+`templates/admin/backup{s,_restore,_offer}.html`. How it behaves:
+- **The client sends the pod's ServiceAccount token, re-read every call**,
+  because projected tokens rotate. It reports two kinds of failure.
+  *Unavailable* (unreachable, or refused at 401/403) becomes a message on the
+  backup pages, plus the claim's phase when that is why. *Refused* (a 400)
+  shows the service's reason. A down backup service never becomes an error
+  page anywhere else.
+- **The offer is a middleware.** On a GET navigation (not htmx, not a fetch)
+  by an admin, outside `/admin/backups`, `/static`, `/login` and `/logout`,
+  while the service says `offer`, it redirects to `/admin/backups/offer?next=
+  …`. The answer is cached 30s per portal process and dropped after a
+  restore, decline, upload or delete. It **fails open**: no answer means no
+  offer. "Not now" is a session cookie holding the install id, so it cannot
+  hide the next install's offer.
+- **Restore is one page**: a preview first, then an optional passphrase, the
+  "include secrets" choice, and Preview again / Restore. The result names
+  the pre-restore backup, and any fields the cluster dropped with the fix.
+- **The admin overview** has a Backups card and warns when the service is
+  unavailable, an offer is waiting, or the schedule is stale.
+- **Storage inside the cluster is flagged** by a driver heuristic
+  (`in_cluster_storage`: local, hostpath, longhorn, rook/ceph, openebs, …),
+  worded as a warning, not a guarantee.
+
+Verified through the real portal on a throwaway k3d cluster:
+- **First install:** set a passphrase and took a backup; it showed as
+  encrypted. It downloaded with `attachment` and `no-store`.
+- **After a GitOps-style reinstall:** the admin's navigation to `/dashboard`
+  was sent to the offer. A non-admin was not, and nor was a fetch. "Not now"
+  held in that browser only.
+- **The restore preview** warned that the secrets need a passphrase this
+  install does not hold. A wrong passphrase was refused. The right one
+  restored the user (with uid) and the SSH CA byte for byte, after a
+  pre-restore backup.
+- **Afterwards** the offer was gone. Uploading the downloaded file gave an
+  `…-uploaded` backup, and random bytes were refused with the reason.
+
 - **Admin → Backups:** volume status (PV, storage class, capacity, bound
   state; an in-cluster-storage warning), list (date, trigger, install,
   version, size, encrypted), Back up now, Download, Upload, Delete, Restore
