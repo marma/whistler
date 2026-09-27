@@ -587,11 +587,13 @@ Uninstall section. Differences from the plan below:
   the running operator removes, and Helm deletes the operator as soon as the
   hook returns. A hook that returned early would strand the namespaces in
   `Terminating`.
-- **Only homes, archived homes and the backup claim are retained.** Other
-  claims in a user namespace (a persistent VM's root disk, say) are left to
-  their class. Nothing re-attaches them yet, so retaining them would only
-  leak an orphan PV per reinstall. Open: whether persistent root disks are
-  user data to keep.
+- **Only homes, archived homes and the backup claim are retained.** The
+  only other claim a user namespace holds is the CDI-imported root disk of an
+  `imageURL` template (`<session>-root`). It is left to its class, deleted
+  with the namespace. containerDisk roots, which is every template in use,
+  have no claim and are fresh on every start anyway. The goal is ephemeral
+  roots everywhere, so this is intended rather than a loss. See
+  [rootdisks.md](rootdisks.md), pinned until backups are done.
 - **The hook pod is labelled `whistler-uninstall`** and admitted by the
   backup service's NetworkPolicy. TokenReview then sees the operator's
   ServiceAccount.
