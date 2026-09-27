@@ -943,6 +943,29 @@ spec:
                     uninstall (which deletes the claim with its namespace)
                     does not lose the home. Remove it only to deliberately
                     start over with an empty disk.
+                archived:
+                  type: object
+                  description: >-
+                    Set only on the records in the archive namespace
+                    (whistler-archive): where an archived home came from. An
+                    archived home has no user; this is its provenance, also
+                    kept on the PersistentVolume so a reinstall can rebuild
+                    the archive.
+                  properties:
+                    user:
+                      type: string
+                    name:
+                      type: string
+                    archivedAt:
+                      type: string
+                    archivedBy:
+                      type: string
+                fromArchive:
+                  type: string
+                  description: >-
+                    A request: give this new home the disk of the named
+                    archived home. The operator moves it and then clears the
+                    field; until then the volume cannot be attached.
       additionalPrinterColumns:
         - name: User
           type: string

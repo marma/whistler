@@ -8,6 +8,7 @@ from kubernetes import client
 
 from whistler.logsetup import quiet_chatty_libraries
 from whistler.config import (
+    ARCHIVE_ANNOTATION,
     DELETE_DATA_ANNOTATION,
     KubeConfigManager,
     PolicyError,
@@ -553,3 +554,30 @@ def purge_home_volume_fn(name, namespace, **_):
             f"Could not delete home volume {namespace}/{name} yet", delay=30)
     logger.info(f"Deleted home volume {namespace}/{name} and its data")
 
+
+# Archiving a home and restoring one (config.py, "Archived homes"): the portal
+# marks, the operator moves the PV between claims. Retried with a short delay
+# because a PV takes a moment to go Released once its claim is deleted.
+_ARCHIVE_FILTER = dict(annotations={ARCHIVE_ANNOTATION: kopf.PRESENT})
+
+
+@kopf.on.create('whistler.martinmalmsten.net', 'v1', 'homevolumes', **_ARCHIVE_FILTER)
+@kopf.on.update('whistler.martinmalmsten.net', 'v1', 'homevolumes', **_ARCHIVE_FILTER)
+@kopf.on.resume('whistler.martinmalmsten.net', 'v1', 'homevolumes', **_ARCHIVE_FILTER)
+def archive_home_volume_fn(name, namespace, **_):
+    if not _get_config_manager().archive_home_volume(namespace, name):
+        raise kopf.TemporaryError(
+            f"Archiving home volume {namespace}/{name} is not done yet", delay=5)
+
+
+def _restoring(spec, **_):
+    return bool(spec.get("fromArchive"))
+
+
+@kopf.on.create('whistler.martinmalmsten.net', 'v1', 'homevolumes', when=_restoring)
+@kopf.on.update('whistler.martinmalmsten.net', 'v1', 'homevolumes', when=_restoring)
+@kopf.on.resume('whistler.martinmalmsten.net', 'v1', 'homevolumes', when=_restoring)
+def unarchive_home_volume_fn(name, namespace, **_):
+    if not _get_config_manager().unarchive_home_volume(namespace, name):
+        raise kopf.TemporaryError(
+            f"Restoring home volume {namespace}/{name} is not done yet", delay=5)

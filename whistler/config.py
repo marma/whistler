@@ -312,6 +312,14 @@ POD_HOME_PVC_PREFIX = "whistler-data-"
 # On a HomeVolume: delete it AND its data (delete_home_volume). The operator
 # acts on it, since that needs a cluster-scoped write on the PV.
 DELETE_DATA_ANNOTATION = "whistler/delete-data"
+# On a HomeVolume: archive it (request_archive_home_volume); the value is the
+# admin who asked. Carried out by the operator (archive_home_volume).
+ARCHIVE_ANNOTATION = "whistler/archive"
+# Where archived homes live: one claim + one HomeVolume record each, no user,
+# no sessions. Created by the operator on first use, like user namespaces.
+ARCHIVE_NAMESPACE = os.environ.get("WHISTLER_ARCHIVE_NAMESPACE",
+                                   "whistler-archive")
+ARCHIVE_NS_LABEL = "whistler.martinmalmsten.net/archive"
 
 # Node label a template/override's gpuType is matched against, both as the
 # nodeSelector key that schedules onto a GPU of that type and as the node
@@ -2629,13 +2637,13 @@ class KubeConfigManager(ConfigManager):
         except AttributeError:
             return []
         type(self)._warned_no_home_volume_crd = False
-        # A volume marked for deletion with its data is already gone as far
-        # as anyone choosing a home is concerned (purge_home_volume).
+        # A volume marked for deletion with its data, or for the archive, is
+        # already gone as far as anyone choosing a home is concerned.
         out = [{**(item.get("spec") or {}),
                 "name": item["metadata"]["name"]}
                for item in resp.get("items", [])
-               if DELETE_DATA_ANNOTATION not in (
-                   item["metadata"].get("annotations") or {})]
+               if not ({DELETE_DATA_ANNOTATION, ARCHIVE_ANNOTATION}
+                       & set(item["metadata"].get("annotations") or {}))]
         return sorted(out, key=lambda v: v.get("name") or "")
 
     def get_home_volume(self, username: str, name: str) -> Optional[Dict[str, Any]]:
@@ -2764,6 +2772,425 @@ class KubeConfigManager(ConfigManager):
             if e.status != 404:
                 raise
         return True
+
+    # ------------------------------------------------------------------ #
+    # Archived homes                                                      #
+    #                                                                     #
+    # Taking a home away from its user without destroying it: the claim  #
+    # in the user's namespace is deleted (the PV is Retain, so it goes    #
+    # Released) and the PV is bound to a claim in ARCHIVE_NAMESPACE,      #
+    # beside a HomeVolume record that has no user. A claim cannot change  #
+    # namespace; a retained PV can change claims, which is the whole      #
+    # trick. The PV itself carries the provenance (reattach.              #
+    # ARCHIVED_ANNOTATION), so a reinstall that lost the archive          #
+    # namespace rebuilds it (recover_archive).                            #
+    #                                                                     #
+    # Requests are marks the portal writes on the CR; the moves are the   #
+    # operator's, since they write PVs. Every step is idempotent and the  #
+    # order is chosen so a crash part-way is finished by the next attempt #
+    # rather than leaving a disk nothing points at.                       #
+    # ------------------------------------------------------------------ #
+
+    def _ensure_archive_namespace(self) -> str:
+        core = CoreV1Api()
+        try:
+            core.read_namespace(ARCHIVE_NAMESPACE)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+            logger.info(f"Creating namespace {ARCHIVE_NAMESPACE}")
+            try:
+                core.create_namespace({"metadata": {
+                    "name": ARCHIVE_NAMESPACE,
+                    "labels": {ARCHIVE_NS_LABEL: "true",
+                               "whistler.martinmalmsten.net/managed": "true"}}})
+            except ApiException as ce:
+                if ce.status != 409:
+                    raise
+        return ARCHIVE_NAMESPACE
+
+    def _sessions_using_home(self, username: str, name: str) -> List[str]:
+        """This user's instances that would attach home volume ``name`` at
+        their next start: named explicitly, or an instance with no home
+        chosen whose default home is the volume named after it."""
+        try:
+            resp = self.api.list_namespaced_custom_object(
+                self.group, self.version, self._get_user_namespace(username),
+                SESSION_PLURAL)
+        except ApiException:
+            return []
+        using = []
+        for item in resp.get("items", []):
+            chosen = (item.get("spec") or {}).get("homeVolume")
+            if chosen == name or (not chosen
+                                  and item["metadata"]["name"] == name):
+                using.append(item["metadata"]["name"])
+        return sorted(using)
+
+    def archive_refusal(self, username: str, name: str) -> Optional[str]:
+        """Why ``name`` cannot be archived now, or None."""
+        volume = self.get_home_volume(username, name)
+        if not volume:
+            return f"{username} has no home volume '{name}'."
+        holder = self.home_volume_holder(username, volume)
+        if holder:
+            return (f"Home volume '{name}' is attached to the running instance "
+                    f"'{holder}'. Stop it first.")
+        # Refused rather than handled: an instance whose home vanished would
+        # fail at its next start (a named one) or, worse, be handed a fresh
+        # empty default home (an unnamed one) — the one outcome archiving a
+        # home must never produce.
+        using = self._sessions_using_home(username, name)
+        if using:
+            return (f"Home volume '{name}' is the home of instance(s) "
+                    f"{', '.join(using)}. Delete them, or give them another "
+                    f"home, before archiving it.")
+        pvc = self.home_volume_pvc_name(volume)
+        try:
+            claim = CoreV1Api().read_namespaced_persistent_volume_claim(
+                pvc, self._get_user_namespace(username))
+            bound = bool(claim.spec and claim.spec.volume_name)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+            bound = False
+        if not bound and not volume.get("pvName"):
+            return (f"Home volume '{name}' has never been used, so there is "
+                    f"no disk to archive. Remove it instead.")
+        return None
+
+    def request_archive_home_volume(self, username: str, name: str,
+                                    by: str) -> Tuple[bool, str]:
+        """Mark a home for the archive; the operator moves it. Returns
+        ``(ok, message)``: the refusal when there is one."""
+        refusal = self.archive_refusal(username, name)
+        if refusal:
+            return False, refusal
+        try:
+            self.api.patch_namespaced_custom_object(
+                self.group, self.version, self._get_user_namespace(username),
+                HOME_VOLUME_PLURAL, name,
+                {"metadata": {"annotations": {ARCHIVE_ANNOTATION: by or "admin"}}})
+        except ApiException as e:
+            return False, f"Could not archive '{name}': {e.reason}"
+        logger.info(f"{by} asked to archive home volume {username}/{name}")
+        return True, f"Archiving {username}/{name}."
+
+    def archive_home_volume(self, namespace: str, name: str) -> bool:
+        """Carry out an archive mark. True when done (or nothing left to do),
+        False to be retried."""
+        try:
+            item = self.api.get_namespaced_custom_object(
+                self.group, self.version, namespace, HOME_VOLUME_PLURAL, name)
+        except ApiException as e:
+            if e.status == 404:
+                return True
+            raise
+        meta = item["metadata"]
+        by = (meta.get("annotations") or {}).get(ARCHIVE_ANNOTATION)
+        if not by:
+            return True
+        spec = item.get("spec") or {}
+        username = spec.get("user") or namespace[len("whistler-user-"):]
+        volume = {**spec, "name": name}
+        if self.home_volume_holder(username, volume):
+            logger.warning(f"Not archiving {namespace}/{name} yet: attached "
+                           f"to a running instance")
+            return False
+        user_claim = self.home_volume_pvc_name(volume)
+        pv_name = volume.get("pvName") or self.secure_claim(
+            namespace, user_claim, reattach.KIND_HOME, username)
+        pv = self._read_pv(pv_name) if pv_name else None
+        if pv is None:
+            # Nothing to move. Unmark, so the volume reappears as it was
+            # rather than hanging in a state no list shows.
+            logger.error(f"Cannot archive {namespace}/{name}: no disk behind "
+                         f"it; leaving it where it is")
+            self.api.patch_namespaced_custom_object(
+                self.group, self.version, namespace, HOME_VOLUME_PLURAL, name,
+                {"metadata": {"annotations": {ARCHIVE_ANNOTATION: None}}})
+            return True
+
+        # 1. Mark the PV first, so from here on nothing gives it back to the
+        #    user (find_reattachable refuses archived PVs) and a reinstall
+        #    knows what it is. A retry reuses the record name already on it.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        record = reattach.archive_record(pv) or {
+            "record": f"{username}-{name}-{now:%Y%m%d%H%M%S}",
+            "user": username, "name": name,
+            "description": spec.get("description"),
+            "size": spec.get("size"),
+            "storageClassName": spec.get("storageClassName"),
+            "archivedAt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "archivedBy": by,
+        }
+        core = CoreV1Api()
+        core.patch_persistent_volume(pv_name,
+                                     reattach.archive_patch(pv, record))
+        # 2. The archive's record, then 3. its claim.
+        self._ensure_archive_record(pv_name, record)
+        try:
+            core.delete_namespaced_persistent_volume_claim(user_claim, namespace)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        if not self._bind_archive_claim(pv_name, record):
+            return False
+        # 4. The user's record, and their grants to it.
+        try:
+            self.api.delete_namespaced_custom_object(
+                self.group, self.version, namespace, HOME_VOLUME_PLURAL, name)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        try:
+            self.revoke_own_volume_access(username, name)
+        except Exception as e:
+            logger.warning(f"Could not clear access rows for {name!r}: {e}")
+        logger.info(f"Archived home volume {namespace}/{name} as "
+                    f"{ARCHIVE_NAMESPACE}/{record['record']} (asked by {by})")
+        return True
+
+    @staticmethod
+    def _archive_claim_name(record: Dict[str, Any]) -> str:
+        return f"whistler-home-{record['record']}"
+
+    def _ensure_archive_record(self, pv_name: str,
+                               record: Dict[str, Any]) -> None:
+        self._ensure_archive_namespace()
+        spec = {k: v for k, v in {
+            "pvcName": self._archive_claim_name(record),
+            "pvName": pv_name,
+            "description": record.get("description"),
+            "size": record.get("size"),
+            "storageClassName": record.get("storageClassName"),
+            "archived": {k: record.get(k) for k in
+                         ("user", "name", "archivedAt", "archivedBy")
+                         if record.get(k)},
+        }.items() if v}
+        body = {"apiVersion": f"{self.group}/{self.version}",
+                "kind": "HomeVolume",
+                "metadata": {"name": record["record"],
+                             "namespace": ARCHIVE_NAMESPACE},
+                "spec": spec}
+        try:
+            self.api.create_namespaced_custom_object(
+                self.group, self.version, ARCHIVE_NAMESPACE,
+                HOME_VOLUME_PLURAL, body)
+        except ApiException as e:
+            if e.status != 409:
+                raise
+
+    def _bind_archive_claim(self, pv_name: str,
+                            record: Dict[str, Any]) -> bool:
+        """True once the archive's claim exists (bound or binding)."""
+        claim = self._archive_claim_name(record)
+        try:
+            CoreV1Api().read_namespaced_persistent_volume_claim(
+                claim, ARCHIVE_NAMESPACE)
+            return True
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        pv = self._read_pv(pv_name)
+        if pv is None or (pv.get("status") or {}).get("phase") == "Bound":
+            return False  # still releasing from the user's claim: retry
+        try:
+            return self.reattach_claim(
+                ARCHIVE_NAMESPACE, claim,
+                {"app": "whistler",
+                 "whistler-home-volume": record["record"][:63]},
+                recorded=pv_name, allow_archived=True)
+        except PolicyError as e:
+            logger.error(f"Cannot bind archived {pv_name}: {e}")
+            return False
+
+    def get_archived_home_volumes(self) -> List[Dict[str, Any]]:
+        """Every archived home, newest first."""
+        try:
+            resp = self.api.list_namespaced_custom_object(
+                self.group, self.version, ARCHIVE_NAMESPACE, HOME_VOLUME_PLURAL)
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to list archived home volumes: {e}")
+            return []
+        out = [{**(item.get("spec") or {}), "name": item["metadata"]["name"]}
+               for item in resp.get("items", [])
+               if DELETE_DATA_ANNOTATION not in (
+                   item["metadata"].get("annotations") or {})]
+        return sorted(out, key=lambda v: (v.get("archived") or {}).get(
+            "archivedAt") or "", reverse=True)
+
+    def request_unarchive_home_volume(self, archived: str, username: str,
+                                      name: str) -> Tuple[bool, str]:
+        """Give an archived home to ``username`` as home volume ``name``. A
+        new HomeVolume naming its source (``spec.fromArchive``) is the
+        request; the operator moves the disk (unarchive_home_volume). No
+        access is granted: where it may be mounted is a separate decision,
+        made in the owner's access grid."""
+        name = (name or "").strip()
+        source = next((v for v in self.get_archived_home_volumes()
+                       if v["name"] == archived), None)
+        if not source:
+            return False, f"No archived home volume '{archived}'."
+        if not name or not username:
+            return False, "A user and a volume name are required."
+        if not self.user_exists(username):
+            return False, f"No user '{username}'."
+        user_ns = self._ensure_user_namespace(username)
+        try:
+            self.api.get_namespaced_custom_object(
+                self.group, self.version, user_ns, HOME_VOLUME_PLURAL, name)
+            return False, f"{username} already has a home volume '{name}'."
+        except ApiException as e:
+            if e.status != 404:
+                return False, f"Could not check '{name}': {e.reason}"
+        try:
+            CoreV1Api().read_namespaced_persistent_volume_claim(
+                f"whistler-home-{name}", user_ns)
+            return False, (f"{username} still has a claim "
+                           f"whistler-home-{name}; pick another name.")
+        except ApiException as e:
+            if e.status != 404:
+                return False, f"Could not check '{name}': {e.reason}"
+        ok = self.save_home_volume(username, {
+            "name": name, "fromArchive": archived,
+            "description": source.get("description"),
+            "size": source.get("size"),
+            "storageClassName": source.get("storageClassName")})
+        if not ok:
+            return False, f"Could not create home volume '{name}'."
+        # A CRD from before this field prunes it silently, which would leave
+        # an ordinary volume — the first attach would then provision it EMPTY
+        # while the archived disk sat untouched. Read it back and refuse.
+        created = self.get_home_volume(username, name) or {}
+        if created.get("fromArchive") != archived:
+            try:
+                self.api.delete_namespaced_custom_object(
+                    self.group, self.version, user_ns, HOME_VOLUME_PLURAL, name)
+            except ApiException:
+                pass
+            return False, ("The HomeVolume CRD in this cluster does not know "
+                           "spec.fromArchive. Run `kubectl apply -f "
+                           "charts/whistler/crds/crds.yaml` and try again.")
+        return True, f"Restoring {archived} to {username}/{name}."
+
+    def unarchive_home_volume(self, namespace: str, name: str) -> bool:
+        """Carry out a ``fromArchive`` request. True when done, False to be
+        retried."""
+        try:
+            item = self.api.get_namespaced_custom_object(
+                self.group, self.version, namespace, HOME_VOLUME_PLURAL, name)
+        except ApiException as e:
+            if e.status == 404:
+                return True
+            raise
+        spec = item.get("spec") or {}
+        source = spec.get("fromArchive")
+        if not source:
+            return True
+        username = spec.get("user") or namespace[len("whistler-user-"):]
+        try:
+            archived = self.api.get_namespaced_custom_object(
+                self.group, self.version, ARCHIVE_NAMESPACE,
+                HOME_VOLUME_PLURAL, source)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+            archived = None
+        pv_name = spec.get("pvName") or (
+            (archived or {}).get("spec") or {}).get("pvName")
+        if not pv_name:
+            logger.error(f"Cannot restore {namespace}/{name}: archived "
+                         f"volume {source!r} is gone")
+            return False
+        # 1. Record the disk on the new volume first: from here a retry, or a
+        #    reinstall, knows which PV this home is.
+        if spec.get("pvName") != pv_name:
+            self.api.patch_namespaced_custom_object(
+                self.group, self.version, namespace, HOME_VOLUME_PLURAL, name,
+                {"spec": {"pvName": pv_name}})
+        # 2. Hand the PV to the user, 3. release it from the archive's claim,
+        #    4. bind the user's claim.
+        core = CoreV1Api()
+        core.patch_persistent_volume(pv_name,
+                                     reattach.unarchive_patch(username))
+        archive_claim = (((archived or {}).get("spec") or {}).get("pvcName")
+                         or f"whistler-home-{source}")
+        try:
+            core.delete_namespaced_persistent_volume_claim(
+                archive_claim, ARCHIVE_NAMESPACE)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        user_claim = self.home_volume_pvc_name({**spec, "name": name})
+        try:
+            core.read_namespaced_persistent_volume_claim(user_claim, namespace)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+            pv = self._read_pv(pv_name)
+            if pv is None or (pv.get("status") or {}).get("phase") == "Bound":
+                return False  # still releasing from the archive: retry
+            if not self.reattach_claim(
+                    namespace, user_claim,
+                    {"app": "whistler", "whistler-home-volume": name[:63]},
+                    recorded=pv_name):
+                return False
+        # 5. Retire the archive's record, and the request.
+        if archived:
+            try:
+                self.api.delete_namespaced_custom_object(
+                    self.group, self.version, ARCHIVE_NAMESPACE,
+                    HOME_VOLUME_PLURAL, source)
+            except ApiException as e:
+                if e.status != 404:
+                    raise
+        self.api.patch_namespaced_custom_object(
+            self.group, self.version, namespace, HOME_VOLUME_PLURAL, name,
+            {"spec": {"fromArchive": None}})
+        logger.info(f"Restored archived {source} to {namespace}/{name}")
+        return True
+
+    def request_delete_archived_home_volume(self, archived: str) -> bool:
+        """Destroy an archived home and its data: the same mark and the same
+        operator path (purge_home_volume) as deleting a user's home with its
+        data."""
+        try:
+            self.api.patch_namespaced_custom_object(
+                self.group, self.version, ARCHIVE_NAMESPACE, HOME_VOLUME_PLURAL,
+                archived, {"metadata": {"annotations": {
+                    DELETE_DATA_ANNOTATION: "true"}}})
+        except ApiException as e:
+            logger.error(f"Failed to delete archived {archived!r}: {e}")
+            return False
+        return True
+
+    def recover_archive(self) -> int:
+        """Rebuild the archive from the PVs after it lost its namespace (an
+        uninstall), or finish an archive interrupted after its user's claim
+        went. Every Released PV labelled archived gets its record and claim
+        back. Returns how many it re-bound."""
+        recovered = 0
+        for pv in self._list_pvs():
+            if not reattach.is_archived(pv) or not reattach.is_retained(pv):
+                continue
+            if (pv.get("status") or {}).get("phase") not in (
+                    "Released", "Available"):
+                continue
+            record = reattach.archive_record(pv)
+            pv_name = pv["metadata"]["name"]
+            if not record:
+                logger.warning(f"Archived {pv_name} carries no record; "
+                               f"leaving it for an admin")
+                continue
+            try:
+                self._ensure_archive_record(pv_name, record)
+                if self._bind_archive_claim(pv_name, record):
+                    recovered += 1
+            except ApiException as e:
+                logger.warning(f"Could not recover archived {pv_name}: {e}")
+        return recovered
 
     def home_volume_holder(self, username: str,
                            volume: Dict[str, Any],
@@ -2954,14 +3381,15 @@ class KubeConfigManager(ConfigManager):
 
     def reattach_claim(self, namespace: str, claim: str,
                        labels: Dict[str, str], recorded: str = None,
-                       logger=None) -> bool:
+                       logger=None, allow_archived: bool = False) -> bool:
         """Bind a missing ``claim`` back to the PV it had. True if it did;
         False if there is nothing to give back, so the caller provisions.
         Raises PolicyError when provisioning would put an empty disk where a
         real one was (reattach.find_reattachable)."""
         log = logger or globals()["logger"]
         pv, problem = reattach.find_reattachable(
-            self._list_pvs(), namespace, claim, recorded=recorded)
+            self._list_pvs(), namespace, claim, recorded=recorded,
+            allow_archived=allow_archived)
         if problem:
             raise PolicyError(f"Cannot attach home: {problem}.")
         if pv is None:
@@ -3056,7 +3484,21 @@ class KubeConfigManager(ConfigManager):
                     logger.warning(f"Could not purge home volume "
                                    f"{ns}/{item['metadata']['name']}: {e}")
                 continue
-            if spec.get("pvName"):
+            # The same retries for the archive's marks; the event handlers
+            # normally got there first.
+            annotations = item["metadata"].get("annotations") or {}
+            try:
+                if ARCHIVE_ANNOTATION in annotations:
+                    self.archive_home_volume(ns, item["metadata"]["name"])
+                    continue
+                if spec.get("fromArchive"):
+                    self.unarchive_home_volume(ns, item["metadata"]["name"])
+                    continue
+            except ApiException as e:
+                logger.warning(f"Could not move home volume "
+                               f"{ns}/{item['metadata']['name']}: {e}")
+                continue
+            if spec.get("pvName") or ns == ARCHIVE_NAMESPACE:
                 continue
             username = spec.get("user") or ns[len("whistler-user-"):]
             try:
@@ -3066,6 +3508,12 @@ class KubeConfigManager(ConfigManager):
             except ApiException as e:
                 logger.warning(f"Could not secure home volume "
                                f"{ns}/{item['metadata']['name']}: {e}")
+        try:
+            recovered = self.recover_archive()
+            if recovered:
+                logger.info(f"Re-bound {recovered} archived home(s)")
+        except ApiException as e:
+            logger.error(f"Could not recover the archive: {e}")
         try:
             claims = core.list_persistent_volume_claim_for_all_namespaces(
                 label_selector="app=whistler").items
@@ -3120,6 +3568,11 @@ class KubeConfigManager(ConfigManager):
                 (logger or globals()["logger"]).warning(
                     f"Could not retain the disk behind {pvc_name}: {e}")
             return pvc_name
+
+        if volume.get("fromArchive"):
+            raise PolicyError(
+                f"Home volume '{volume.get('name')}' is still being restored "
+                f"from the archive; start the instance again in a moment.")
 
         # Missing claim: give back the disk it had before provisioning one.
         # Raises PolicyError when that disk is recorded but gone.

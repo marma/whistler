@@ -22,6 +22,7 @@ gone, that is an error with a name, not a silent new disk that looks exactly
 like data loss to the person it happens to.
 """
 
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 # On the PV: what it holds, and whose it is. The kind is what the uninstall
@@ -31,6 +32,12 @@ USER_LABEL = "whistler.martinmalmsten.net/user"
 
 KIND_HOME = "home"          # a HomeVolume's claim (VM home disk image)
 KIND_POD_HOME = "pod-home"  # the per-user claim container sessions mount
+KIND_ARCHIVED = "archived"  # a home taken from its user (archive_patch)
+
+# On an archived PV: where it came from and what record holds it, as JSON.
+# The PV is the one object that survives an uninstall, so this is what lets a
+# reinstall rebuild the archive namespace (KubeConfigManager.recover_archive).
+ARCHIVED_ANNOTATION = "whistler.martinmalmsten.net/archived"
 
 RETAIN = "Retain"
 DELETE = "Delete"
@@ -79,13 +86,54 @@ def release_patch() -> Dict[str, Any]:
     return {"spec": {"persistentVolumeReclaimPolicy": DELETE}}
 
 
+def is_retained(pv: Dict[str, Any]) -> bool:
+    """A Released PV that is not Retain is on its way to being deleted by
+    its provisioner (a home deleted with its data): never bind it back."""
+    return (pv.get("spec") or {}).get("persistentVolumeReclaimPolicy") == RETAIN
+
+
+def is_archived(pv: Dict[str, Any]) -> bool:
+    labels = (pv.get("metadata") or {}).get("labels") or {}
+    return labels.get(USER_DATA_LABEL) == KIND_ARCHIVED
+
+
+def archive_record(pv: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The provenance an archived PV carries, or None."""
+    raw = ((pv.get("metadata") or {}).get("annotations") or {}).get(
+        ARCHIVED_ANNOTATION)
+    try:
+        record = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    return record if isinstance(record, dict) and record.get("record") else None
+
+
+def archive_patch(pv: Dict[str, Any], record: Dict[str, Any]) -> Dict[str, Any]:
+    """Disconnect a PV from its user: kind `archived`, no user label, the
+    provenance in an annotation, and Retain (it is about to lose its claim,
+    so this is the moment the policy matters most)."""
+    return {"metadata": {
+                "labels": {USER_DATA_LABEL: KIND_ARCHIVED, USER_LABEL: None},
+                "annotations": {ARCHIVED_ANNOTATION: json.dumps(
+                    record, sort_keys=True)}},
+            "spec": {"persistentVolumeReclaimPolicy": RETAIN}}
+
+
+def unarchive_patch(username: str) -> Dict[str, Any]:
+    """Give an archived PV to ``username`` as an ordinary home."""
+    return {"metadata": {
+                "labels": {USER_DATA_LABEL: KIND_HOME, USER_LABEL: username},
+                "annotations": {ARCHIVED_ANNOTATION: None}},
+            "spec": {"persistentVolumeReclaimPolicy": RETAIN}}
+
+
 def _was_bound_to(pv: Dict[str, Any], namespace: str, claim: str) -> bool:
     ref = _claim_ref(pv)
     return ref.get("namespace") == namespace and ref.get("name") == claim
 
 
 def find_reattachable(pvs: List[Dict[str, Any]], namespace: str, claim: str,
-                      recorded: str = None
+                      recorded: str = None, allow_archived: bool = False
                       ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """The PV a missing claim should be bound back to.
 
@@ -100,6 +148,11 @@ def find_reattachable(pvs: List[Dict[str, Any]], namespace: str, claim: str,
     ``Released`` PV whose stale ``claimRef`` names exactly this claim is the
     one, which covers a home secured before it was recorded, and the pod
     home, which has no CR to record on.
+
+    An archived PV is never given back to a user's claim: its stale claimRef
+    still names the claim it was archived from, so without this a new volume
+    of the same name would silently pick up the archived disk. Only the
+    archive's own moves pass ``allow_archived``.
     """
     if recorded:
         pv = next((p for p in pvs if _name(p) == recorded), None)
@@ -110,11 +163,17 @@ def find_reattachable(pvs: List[Dict[str, Any]], namespace: str, claim: str,
                 f"empty one in its place; restore the volume, or remove "
                 f"spec.pvName from the HomeVolume to start over with an "
                 f"empty disk")
+        if is_archived(pv) and not allow_archived:
+            return None, (
+                f"PersistentVolume {recorded} has been archived; restore it "
+                f"from the archive before using it")
         return _rebindable(pv, namespace, claim)
 
     candidates = [p for p in pvs
                   if _was_bound_to(p, namespace, claim)
-                  and _phase(p) in ("Released", "Available")]
+                  and _phase(p) in ("Released", "Available")
+                  and is_retained(p)
+                  and (allow_archived or not is_archived(p))]
     if not candidates:
         return None, None
     if len(candidates) > 1:
@@ -130,6 +189,9 @@ def find_reattachable(pvs: List[Dict[str, Any]], namespace: str, claim: str,
 def _rebindable(pv: Dict[str, Any], namespace: str, claim: str
                 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     phase = _phase(pv)
+    if phase in ("Released", "Available") and not is_retained(pv):
+        return None, (f"PersistentVolume {_name(pv)} is being deleted "
+                      f"(reclaim policy is not Retain)")
     if phase == "Released" or (phase == "Available" and (
             not _claim_ref(pv) or _was_bound_to(pv, namespace, claim))):
         return pv, None

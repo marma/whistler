@@ -1583,10 +1583,47 @@ async def admin_home_volumes(request: Request, cm: CM, admin: Admin):
                                 if vol.get("name") in (cells or {})),
             })
     rows.sort(key=lambda r: (r["user"], r.get("name") or ""))
+    archived = await request.app.state.run(cm.get_archived_home_volumes)
     return templates.TemplateResponse(
         request=request, name="admin/home_volumes.html",
-        context=_ctx(admin, is_admin=True, volumes=rows),
+        context=_ctx(admin, is_admin=True, volumes=rows, archived=archived,
+                     usernames=sorted(u.get("name") for u in users
+                                      if u.get("name"))),
     )
+
+
+async def admin_home_volume_archive(request: Request, cm: CM, admin: Admin,
+                                    username: str, name: str):
+    """Take a home from its user without destroying it (config.py,
+    "Archived homes"). The operator moves it; the refusal, when there is
+    one, is the reason — an attached volume, an instance that would lose its
+    home, or no disk to move."""
+    ok, message = await request.app.state.run(
+        cm.request_archive_home_volume, username, name, admin)
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return _tr("/admin/homevolumes", admin)
+
+
+async def admin_archived_home_volume_restore(
+        request: Request, cm: CM, admin: Admin, archived: str,
+        target_user: Annotated[str, Form()],
+        volume_name: Annotated[str, Form()]):
+    ok, message = await request.app.state.run(
+        cm.request_unarchive_home_volume, archived, target_user, volume_name)
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return _tr("/admin/homevolumes", admin)
+
+
+async def admin_archived_home_volume_delete(request: Request, cm: CM,
+                                            admin: Admin, archived: str):
+    ok = await request.app.state.run(
+        cm.request_delete_archived_home_volume, archived)
+    if not ok:
+        raise HTTPException(status_code=400,
+                            detail="Could not delete that archived volume.")
+    return _tr("/admin/homevolumes", admin)
 
 
 async def admin_home_volume_delete(request: Request, cm: CM, admin: Admin,
@@ -2314,6 +2351,9 @@ def build_management_app(config_manager):
     app.add_api_route("/admin/users/{username}/access",           admin_user_set_access,  methods=["POST"])
     app.add_api_route("/admin/homevolumes",                       admin_home_volumes,     methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/homevolumes/{username}/{name}/delete", admin_home_volume_delete, methods=["POST"])
+    app.add_api_route("/admin/homevolumes/{username}/{name}/archive", admin_home_volume_archive, methods=["POST"])
+    app.add_api_route("/admin/archive/homevolumes/{archived}/restore", admin_archived_home_volume_restore, methods=["POST"])
+    app.add_api_route("/admin/archive/homevolumes/{archived}/delete", admin_archived_home_volume_delete, methods=["POST"])
     app.add_api_route("/admin/datasets",                          admin_datasets,         methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/datasets/new",                      admin_dataset_new,      methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/datasets",                          admin_dataset_create,   methods=["POST"])

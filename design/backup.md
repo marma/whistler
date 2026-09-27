@@ -385,6 +385,43 @@ with no claim created; delete-with-data freed the PV.
   removes the PV. *Integration:* delete a user namespace, start the session
   again, the same bytes are on the home.
 
+### Archived homes (added 2026-09-27, between Phases 1 and 2)
+
+An admin can **archive** a home volume: take it away from its user without
+destroying it. A claim cannot change namespace, but a retained PV can change
+claims. So the operator marks the PV (label `user-data=archived`, no user
+label, provenance as JSON in `whistler.martinmalmsten.net/archived`), deletes
+the user's claim, and binds the PV to a claim in **`whistler-archive`**
+(`WHISTLER_ARCHIVE_NAMESPACE`). It sits there beside a HomeVolume record that
+has no user and a `spec.archived` provenance block. The user's record and
+their access cells go.
+- **From the archive**, an admin can restore a home to *any* user under any
+  free name (a new HomeVolume with `spec.fromArchive`; the operator moves the
+  disk and clears the field), or delete it with its data (the same
+  `whistler/delete-data` path as a user's home). A restored home is granted
+  no zone.
+- **Refused** while the volume is attached, or while an instance would attach
+  it at its next start. That includes an instance with no home chosen whose
+  default home is this volume: archiving from under it would give it a fresh
+  empty default home at the next start.
+- **An archived PV is never given back to a user's claim.** Its stale
+  claimRef still names the claim it came from, so without this rule a new
+  volume of the same name would quietly pick it up.
+- **The PV is the record that survives.** The sweep's `recover_archive`
+  rebinds every Released, Retain, archived PV into the archive namespace and
+  recreates its record. That covers an uninstall, and an archive interrupted
+  after the user's claim was deleted.
+
+For the later phases: the uninstall hook (Phase 5) deletes `whistler-archive`
+along with the user namespaces, and the backup (Phase 2) exports its
+HomeVolume records like any other.
+
+Verified on a throwaway k3d cluster: archive → the user's list is empty, the
+same PV is Bound in `whistler-archive` → a new volume of the same name gets
+a new empty PV → deleting `whistler-archive` and running recovery rebuilds it
+→ restoring to another user under another name, that user reads the
+original file.
+
 ### Phase 2: export and restore as a library
 
 - `whistler/backup/archive.py`: build and read the tar.gz (manifest,

@@ -31,6 +31,7 @@
     <tr>
       <td><a href="/admin/users/{{ v.user }}?user={{ current_user }}">{{ v.user }}</a></td>
       <td><strong>{{ v.name }}</strong>
+        {% if v.fromArchive %}<div class="ui tiny orange label" title="The disk of archived volume {{ v.fromArchive }} is being moved here">restoring</div>{% endif %}
         {% if v.description %}<br><span class="ui grey text" style="font-size:0.85em">{{ v.description }}</span>{% endif %}
       </td>
       <td>
@@ -47,6 +48,13 @@
         {% endif %}
       </td>
       <td class="collapsing">
+        <form method="post" action="/admin/homevolumes/{{ v.user }}/{{ v.name }}/archive?user={{ current_user }}"
+              style="display:inline"
+              onsubmit="return confirm('Archive {{ v.user }}/{{ v.name }}?\n\nThe disk and its data are kept, but taken away from {{ v.user }}: it leaves their home volumes and their access grid, and moves to the archive below, where it can be restored to any user or deleted.')">
+          <button class="ui tiny button" {% if v.inUseBy %}disabled{% endif %}>
+            <i class="archive icon"></i> Archive
+          </button>
+        </form>
         <form method="post" action="/admin/homevolumes/{{ v.user }}/{{ v.name }}/delete?user={{ current_user }}"
               style="display:inline"
               onsubmit="return confirm('Remove {{ v.user }}/{{ v.name }}?\n\nThis is somebody else\'s home directory. By default the disk and its data are KEPT and only the name is removed; tick \'delete the data too\' first if you really mean to destroy the files. That cannot be undone.')">
@@ -76,6 +84,70 @@
     No named home volumes yet — every instance is using its own.
   </div>
 </div>
+{% endif %}
+
+<h3 class="ui header"><i class="archive icon"></i> Archived</h3>
+
+<p class="ui grey text">
+  Homes taken away from their users, disk and data intact. An archived volume
+  belongs to nobody and cannot be mounted. <strong>Restore</strong> gives it to
+  a user as a new home volume (grant it a zone on their page afterwards: the
+  access matrix has no defaults); <strong>Delete</strong> destroys the data.
+</p>
+
+{% if archived %}
+<table class="ui celled table">
+  <thead>
+    <tr>
+      <th>From</th>
+      <th>Archived</th>
+      <th>Size</th>
+      <th>Restore to</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for a in archived %}
+    {% set src = a.archived or {} %}
+    <tr>
+      <td><strong>{{ src.user or "?" }}/{{ src.name or a.name }}</strong>
+        {% if a.description %}<br><span class="ui grey text" style="font-size:0.85em">{{ a.description }}</span>{% endif %}
+        <br><code style="font-size:0.8em">{{ a.name }}</code>
+      </td>
+      <td>{{ src.archivedAt or "" }}{% if src.archivedBy %}<br><span class="ui grey text" style="font-size:0.85em">by {{ src.archivedBy }}</span>{% endif %}</td>
+      <td>{{ a.size or "default" }}</td>
+      <td>
+        <form class="ui mini form" method="post" action="/admin/archive/homevolumes/{{ a.name }}/restore?user={{ current_user }}">
+          <div class="inline fields" style="margin:0">
+            <div class="field">
+              <select name="target_user" class="ui mini dropdown">
+                {% for u in usernames %}
+                <option value="{{ u }}" {% if u == src.user %}selected{% endif %}>{{ u }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="field">
+              <input type="text" name="volume_name" value="{{ src.name or '' }}" placeholder="volume name" required>
+            </div>
+            <div class="field">
+              <button class="ui mini primary button"><i class="undo icon"></i> Restore</button>
+            </div>
+          </div>
+        </form>
+      </td>
+      <td class="collapsing">
+        <form method="post" action="/admin/archive/homevolumes/{{ a.name }}/delete?user={{ current_user }}"
+              style="display:inline"
+              onsubmit="return confirm('Delete the archived home {{ src.user }}/{{ src.name }} and ALL of its data?\n\nThis cannot be undone.')">
+          <button class="ui red tiny button"><i class="trash icon"></i> Delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="ui grey text"><em>Nothing archived.</em></p>
 {% endif %}
 
 {% endblock %}
