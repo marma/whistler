@@ -48,6 +48,10 @@ spec:
             # server's or clients fail to verify the name they dialled.
             - name: WHISTLER_SSH_CA_SECRET_NAME
               value: "{{ .Release.Name }}-ssh-ca"
+            # The gateway's host key, named here so a backup taken in this pod
+            # (python -m whistler.backup) can carry it (design/backup.md).
+            - name: WHISTLER_HOST_KEY_SECRET_NAME
+              value: "{{ .Release.Name }}-server-host-key"
             - name: WHISTLER_SSH_DOMAIN_SUFFIX
               value: {{ .Values.whistler.ssh.domainSuffix | quote }}
             - name: WHISTLER_STREAMER_IMAGE

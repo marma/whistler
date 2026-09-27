@@ -131,7 +131,7 @@ manifest.json    format version, Whistler version, created, trigger
                  WHISTLER_SSH_DOMAIN_SUFFIX, whether secrets are encrypted
 state.yaml       the CRs: plain Kubernetes objects, kubectl-applyable
 secrets.yaml     the durable Secrets, or
-secrets.age      the same, encrypted with the backup passphrase
+secrets.enc      the same, encrypted with the backup passphrase
 ```
 
 `state.yaml` holds ordinary objects reduced to `apiVersion`, `kind`,
@@ -424,8 +424,34 @@ original file.
 
 ### Phase 2: export and restore as a library
 
+**Done 2026-09-27.** `whistler/backup/`: `archive.py` (the file, pure),
+`export.py` (what goes in it), `restore.py` (plan, apply, read back), and
+the CLI in `__main__.py`. Differences from the plan below:
+- **The encrypted member is `secrets.enc`**, a JSON envelope (scrypt,
+  AES-256-GCM), not age. `cryptography` is now a declared dependency, where
+  before it came in through asyncssh.
+- **`restore` previews unless given `--apply`.** The backup arrives on
+  stdin, so the CLI cannot ask for confirmation, and the default is the
+  choice that writes nothing. `--pre-restore PATH` saves the current state
+  first. The backup service (Phase 3) will always do that.
+- **A replace keeps what `normalize` drops and nothing else**: kopf's
+  bookkeeping, and a running Session's run marks and `runOverrides`. That is
+  what makes a second restore all *unchanged*, and why a restore does not
+  stop a running session.
+- **A Helm-managed object in the target is skipped**, not replaced. Its
+  values decide it.
+- The operator Deployment now sets `WHISTLER_HOST_KEY_SECRET_NAME`, so a
+  backup taken there carries the gateway host key.
+
+Verified on a throwaway k3d cluster with the real `KubeConfigManager`:
+populate, export encrypted, **delete the namespaces and the CRDs**, re-apply
+the CRDs, restore. The second export had the same `contentHash`, and a
+second restore was all *unchanged*. The Session came back with no run marks,
+the uid survived, the CA Secret decrypted, and the user namespace got its
+zone policies. A wrong passphrase gave a clear error.
+
 - `whistler/backup/archive.py`: build and read the tar.gz (manifest,
-  deterministic `state.yaml`, secrets plain or age-style encrypted), content
+  deterministic `state.yaml`, secrets plain or encrypted), content
   hash for skip-if-unchanged.
 - `whistler/backup/restore.py`: verify → preview → apply → read-back compare,
   in the order above. Pure planning functions (backup + current objects →
