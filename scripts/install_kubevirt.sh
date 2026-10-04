@@ -175,6 +175,9 @@ PCI_IDS_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/whistler/pci.ids"
 
 # A readable pci.ids: PCI_IDS, then where pciutils/hwdata put it on Linux and
 # under Homebrew, then the cached download, refreshed when older than 30 days.
+# A local copy is only as new as the distro that shipped it (Ubuntu 24.04's is
+# from March 2024, older than Blackwell), so a lookup that misses in it retries
+# against fetched_pci_ids — see nvidia_pci_lookup.
 find_pci_ids() {
   local f prefix
   local candidates=("${PCI_IDS:-}"
@@ -189,12 +192,18 @@ find_pci_ids() {
     [[ -r "$f" ]] && { echo "$f"; return 0; }
     [[ -r "$f.gz" ]] && { echo "$f.gz"; return 0; }
   done
+  echo "==> No pci.ids on this machine" >&2
+  fetched_pci_ids
+}
 
+# The cached download of PCI_IDS_URL, fetched when missing or older than 30
+# days; a stale cache is used, with a warning, when the fetch fails.
+fetched_pci_ids() {
   # -mtime -30: still fresh. Both GNU and BSD find speak this.
   if [[ -s "$PCI_IDS_CACHE" && -n "$(find "$PCI_IDS_CACHE" -mtime -30 2>/dev/null)" ]]; then
     echo "$PCI_IDS_CACHE"; return 0
   fi
-  echo "==> No pci.ids on this machine; fetching ${PCI_IDS_URL}" >&2
+  echo "==> Fetching ${PCI_IDS_URL}" >&2
   mkdir -p "$(dirname "$PCI_IDS_CACHE")"
   if curl -sfL -o "${PCI_IDS_CACHE}.tmp" "$PCI_IDS_URL" && [[ -s "${PCI_IDS_CACHE}.tmp" ]]; then
     mv "${PCI_IDS_CACHE}.tmp" "$PCI_IDS_CACHE"
@@ -222,8 +231,11 @@ EOF
 # reads the pci.ids its image was built with and this reads the host's, so a
 # card added to the database recently can differ — the NOTE after the patch
 # (a permitted resource no node advertises) is how that shows up.
+# With "fetched", reads the download rather than the first local copy.
 nvidia_pci_table() {
-  local f; f="$(find_pci_ids)" || return 1
+  local f
+  if [[ "${1:-}" == fetched ]]; then f="$(fetched_pci_ids)" || return 1
+  else f="$(find_pci_ids)" || return 1; fi
   case "$f" in *.gz) zcat "$f" ;; *) cat "$f" ;; esac | awk -v vendor="$NVIDIA_VENDOR_ID" '
     /^#/ { next }
     /^C / { in_vendor = 0; next }
@@ -237,6 +249,21 @@ nvidia_pci_table() {
       gsub(/[^A-Za-z0-9_]/, "", name)
       print id "\t" name "\t" raw
     }'
+}
+
+# Rows of nvidia_pci_table where column <col> equals <value>: the local copy
+# first, then — when it has none, and it was not the download already — the
+# fetched one, so a card newer than the distro's database still resolves.
+nvidia_pci_lookup() {
+  local col="$1" value="$2" table rows
+  table="$(nvidia_pci_table)" || return 1
+  rows="$(awk -F'\t' -v c="$col" -v v="$value" '$c == v' <<<"$table")"
+  if [[ -z "$rows" && "$(find_pci_ids 2>/dev/null)" != "$PCI_IDS_CACHE" ]]; then
+    echo "==> ${value} is not in the local pci.ids; trying the current one" >&2
+    table="$(nvidia_pci_table fetched)" || return 1
+    rows="$(awk -F'\t' -v c="$col" -v v="$value" '$c == v' <<<"$table")"
+  fi
+  printf '%s' "$rows"
 }
 
 # "<class> <vendor> <device>" (0x-prefixed hex) for every PCI function on a
@@ -307,9 +334,9 @@ resolve_gpu_spec() {
       echo "ERROR: --allow-gpu '${spec}': only NVIDIA (${NVIDIA_VENDOR_ID}:xxxx) devices resolve by id; use vendor:device=resourceName" >&2
       return 1
     fi
-    table="$(nvidia_pci_table)" || return 1
     local line name raw
-    line="$(awk -F'\t' -v id="$id" '$1 == id { print; exit }' <<<"$table")"
+    line="$(nvidia_pci_lookup 1 "$id")" || return 1
+    line="${line%%$'\n'*}"
     if [[ -z "$line" ]]; then
       echo "ERROR: --allow-gpu '${spec}': ${NVIDIA_VENDOR_ID}:${id} is not in pci.ids; name it fully: --allow-gpu ${NVIDIA_VENDOR_ID}:${id}=nvidia.com/<NAME>" >&2
       return 1
@@ -322,8 +349,8 @@ resolve_gpu_spec() {
 
   else
     local want="${spec#nvidia.com/}" ids
-    table="$(nvidia_pci_table)" || return 1
-    ids="$(awk -F'\t' -v n="$want" '$2 == n { print $1 }' <<<"$table")"
+    ids="$(nvidia_pci_lookup 2 "$want")" || return 1
+    ids="$(cut -f1 <<<"$ids")"
     if [[ -z "$ids" ]]; then
       cat >&2 <<EOF
 ERROR: --allow-gpu '${spec}': no NVIDIA device in pci.ids normalises to ${want}.
