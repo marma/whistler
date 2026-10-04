@@ -1,6 +1,7 @@
 {% set state = status_label(status, ready|default(true)) %}
 {% set can_connect = state in ("Stopped", "Running") %}
-{% set can_start = state == "Stopped" %}
+{# Error too: a failed start is retried once its cause is fixed, not stopped first. #}
+{% set can_start = state in ("Stopped", "Error") %}
 {% set can_stop = state not in ("Stopped", "Stopping") %}
 
 {#

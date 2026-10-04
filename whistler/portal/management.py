@@ -362,7 +362,8 @@ async def _login_required(request: Request, exc: Exception):
 def _render_status_html(name: str, status: str, user: str, controls: bool,
                         connect_url: str = None, term_url: str = None,
                         ready: bool = True, editable: bool = False,
-                        console_url: str = None, can_override: bool = False) -> str:
+                        console_url: str = None, can_override: bool = False,
+                        status_message: str = None, large: bool = False) -> str:
     """Render the polling status badge. With `controls`, also emit an out-of-band
     swap that re-renders the action buttons (connect/ssh/start/stop/edit) so they
     stay enabled/disabled in step with the status (used on the dashboard; the
@@ -371,12 +372,15 @@ def _render_status_html(name: str, status: str, user: str, controls: bool,
     `can_override` has to travel with them for the same reason the console URL
     does: these buttons are re-rendered on every poll, so a flag left out here
     silently reverts the play button to a plain one-click start the first time
-    the row refreshes."""
+    the row refreshes. `status_message` and `large` likewise: the operator's
+    reason for a failure rides on the badge, and the detail page's bigger
+    badge must not shrink on its first poll."""
     tpl = "user/_status_controls.html" if controls else "user/_status_badge.html"
     return templates.env.get_template(tpl).render(
         name=name, status=status, user=user, controls=controls,
         connect_url=connect_url, term_url=term_url, ready=ready, editable=editable,
         console_url=console_url, can_override=can_override,
+        status_message=status_message, large=large, oob=True,
     )
 
 
@@ -440,6 +444,7 @@ def _merge_sessions(instances: list, desktop_sessions: list, user: str,
         rows.append({
             "name": i["name"], "template": i.get("template"),
             "status": i.get("status"), "ready": i.get("ready", True),
+            "status_message": i.get("statusMessage"),
             "mode": "ssh", "connect_url": None,
             "term_url": _terminal_url(user, i["name"]),
             "console_url": (_console_url(user, i["name"])
@@ -450,6 +455,7 @@ def _merge_sessions(instances: list, desktop_sessions: list, user: str,
         rows.append({
             "name": s["name"], "template": s.get("template"),
             "status": s.get("phase"), "ready": True, "mode": "desktop",
+            "status_message": s.get("statusMessage"),
             "connect_url": _desktop_viewer_url(user, s["name"]),
             "term_url": _terminal_url(user, s["name"]),
             "console_url": (_console_url(user, s["name"])
@@ -715,9 +721,11 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
     # Both ssh instances and desktop/VM sessions are Session CRs with an editable
     # spec.overrides, so both get an Edit action.
     editable = False
+    status_message = None
     if inst:
         status, connect_url = inst["status"], None
         ready = inst.get("ready", True)
+        status_message = inst.get("statusMessage")
         term_url = _terminal_url(user, name)
         # An ssh instance is a container *or* a VM (images/devbase): containers
         # have no emulated display, a VM does. Recomputed here for the same
@@ -732,6 +740,7 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
         if sess:
             status = sess["phase"]
             ready = True
+            status_message = sess.get("statusMessage")
             connect_url = _desktop_viewer_url(user, name)
             term_url = _terminal_url(user, name)
             # Re-rendered out-of-band on every status poll, so it has to be
@@ -745,7 +754,9 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
             ready = True
     return HTMLResponse(
         _render_status_html(name, status, user, controls, connect_url, term_url,
-                            ready, editable, console_url, can_override))
+                            ready, editable, console_url, can_override,
+                            status_message,
+                            large=request.query_params.get("large") == "1"))
 
 
 async def instance_status_badge(request: Request, cm: CM, user: User, name: str,

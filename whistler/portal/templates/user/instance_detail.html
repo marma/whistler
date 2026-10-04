@@ -14,16 +14,18 @@
       </h2>
     </div>
     <div class="four wide column" style="padding-top:1.2rem;text-align:right">
-      <span id="status-{{ inst.name }}"
-            class="ui {{ status_color(inst.status, inst.get('ready', true)) }} large label"
-            hx-get="/instances/{{ inst.name }}/status-badge?user={{ current_user }}"
-            hx-trigger="every 3s"
-            hx-swap="outerHTML">
-        {{ status_label(inst.status, inst.get('ready', true)) }}
-      </span>
+      {% with name=inst.name, status=inst.status, ready=inst.get('ready', true),
+              user=current_user, large=True %}
+      {% include "user/_status_badge.html" %}
+      {% endwith %}
     </div>
   </div>
 </div>
+
+{% with name=inst.name, status=inst.status, ready=inst.get('ready', true),
+        status_message=inst.get('statusMessage'), large=True %}
+{% include "user/_status_reason.html" %}
+{% endwith %}
 
 <div class="ui stackable two column grid">
   <div class="column">

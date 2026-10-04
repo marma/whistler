@@ -39,6 +39,9 @@
     <tr>
       <td>
         <a href="/instances/{{ inst.name }}?user={{ current_user }}"><strong>{{ inst.name }}</strong></a>
+        {% with name=inst.name, status=inst.status, ready=inst.ready, status_message=inst.status_message %}
+        {% include "user/_status_reason.html" %}
+        {% endwith %}
       </td>
       <td>{{ inst.template or "—" }}</td>
       <td class="collapsing right aligned">

@@ -1,0 +1,20 @@
+{# Why a session is in Error, from the operator's status.statusMessage. Always
+   rendered (empty when there is nothing to say) so the badge poll has a target
+   to replace: `oob` is set only in poll responses, where this travels as an
+   out-of-band swap — a reason that only appeared on page load would outlive
+   the failure it describes. `large` is the instance page's full message box. #}
+{% set failed = status_label(status, ready|default(true)) == "Error" and status_message %}
+<div id="reason-{{ name }}"{% if oob %} hx-swap-oob="true"{% endif %}>
+  {% if failed %}
+  {% if large %}
+  <div class="ui negative message">
+    <div class="header">Last start failed</div>
+    <p style="white-space:pre-wrap">{{ status_message }}</p>
+  </div>
+  {% else %}
+  <div class="ui red text" style="font-size:.9em;margin-top:.25em;white-space:normal">
+    <i class="exclamation circle icon"></i>{{ status_message }}
+  </div>
+  {% endif %}
+  {% endif %}
+</div>

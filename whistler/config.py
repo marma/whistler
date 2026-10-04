@@ -1577,7 +1577,10 @@ class KubeConfigManager(ConfigManager):
                     "sshHost": None, 
                     "sshPort": None,
                     "mounts": mounts,
-                    "preemptible": spec.get("preemptible", False)
+                    "preemptible": spec.get("preemptible", False),
+                    # Why the operator failed it, when it did. Without this
+                    # the portal can say "Error" and nothing else.
+                    "statusMessage": status_obj.get("statusMessage"),
                 }
                 instances.append(inst)
         except ApiException as e:
@@ -5850,6 +5853,7 @@ class KubeConfigManager(ConfigManager):
                     "template": spec.get("templateRef"),
                     "namespace": user_ns,
                     "phase": phase,
+                    "statusMessage": status.get("statusMessage"),
                     # The unified runtime (container/kata/vm) replaces the old
                     # backend; keep the "backend" key as an alias for templates.
                     "runtime": status.get("runtime"),

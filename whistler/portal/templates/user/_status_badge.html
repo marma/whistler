@@ -1,5 +1,6 @@
 <span id="status-{{ name }}"
-      class="ui {{ status_color(status, ready|default(true)) }} label"
-      hx-get="/instances/{{ name }}/status-badge?user={{ user }}{% if controls %}&controls=1{% endif %}"
-      hx-trigger="every 5s"
+      class="ui {{ status_color(status, ready|default(true)) }}{% if large %} large{% endif %} label"
+      hx-get="/instances/{{ name }}/status-badge?user={{ user }}{% if controls %}&controls=1{% endif %}{% if large %}&large=1{% endif %}"
+      hx-trigger="every {{ '3s' if large else '5s' }}"
       hx-swap="outerHTML">{{ status_label(status, ready|default(true)) }}</span>
+{% if oob %}{% include "user/_status_reason.html" %}{% endif %}
