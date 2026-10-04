@@ -81,6 +81,10 @@ spec:
             # kiosk start. 0 disables.
             - name: WHISTLER_KIOSK_IDLE_TIMEOUT
               value: {{ .Values.portal.kiosk.idleTimeoutSeconds | quote }}
+            # Web terminal (whistler/portal/terminal.py): closed after this
+            # many seconds without a keystroke. 0 disables.
+            - name: WHISTLER_TERMINAL_IDLE_TIMEOUT
+              value: {{ .Values.portal.terminal.idleTimeoutSeconds | quote }}
             # The screenshot store is per-process; the loop warns if this is >1.
             - name: PORTAL_REPLICAS
               value: {{ .Values.portal.replicaCount | quote }}

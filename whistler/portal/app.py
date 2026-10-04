@@ -781,16 +781,10 @@ async def ws_term(request):
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.warning(f"VM console for {user}/{name} failed to dial: {e}")
                 return web.Response(status=502, text="VM console unreachable")
-            wsr = web.WebSocketResponse()
-            await wsr.prepare(request)
             logger.info(f"Opening serial console for {user}/{name} -> {target['vmiName']}")
-            try:
-                await kubevirt.relay_console(wsr, upstream)
-            except Exception as e:
-                logger.error(f"VM console for {user}/{name} failed: {e}")
-                if not wsr.closed:
-                    await wsr.close(message=str(e).encode())
-            return wsr
+            return await _serve_terminal(
+                request, lambda ws: kubevirt.relay_console(ws, upstream),
+                f"VM console for {user}/{name}")
 
         address, private_key = await asyncio.gather(
             _run(request, cm.get_vmi_address, user, name),
@@ -800,24 +794,29 @@ async def ws_term(request):
             return web.Response(status=409, text="VM has no address yet")
         if not private_key:
             return web.Response(status=502, text="no VM access key for this user")
-        wsr = web.WebSocketResponse()
-        await wsr.prepare(request)
         logger.info(f"Opening SSH terminal for {user}/{name} -> {address}")
-        try:
-            await kubevirt.relay_ssh(wsr, address, user, private_key)
-        except Exception as e:
-            logger.error(f"VM SSH terminal for {user}/{name} failed: {e}")
-            if not wsr.closed:
-                await wsr.close(message=str(e).encode())
-        return wsr
+        return await _serve_terminal(
+            request, lambda ws: kubevirt.relay_ssh(ws, address, user, private_key),
+            f"VM SSH terminal for {user}/{name}")
 
-    wsr = web.WebSocketResponse()
-    await wsr.prepare(request)
     logger.info(f"Opening terminal for {user}/{name} -> {target['podName']}")
+    return await _serve_terminal(
+        request,
+        lambda ws: terminal.relay_terminal(ws, target["podName"], target["namespace"]),
+        f"Terminal for {user}/{name}")
+
+
+async def _serve_terminal(request, relay, what):
+    """Accept the /ws-term upgrade and run ``relay(socket)`` on it, with the
+    heartbeat and idle timeout every terminal shares (see terminal.py)."""
+    wsr = web.WebSocketResponse(heartbeat=terminal.HEARTBEAT_SECONDS)
+    await wsr.prepare(request)
+    sock = terminal.ActivityTrackingSocket(wsr)
     try:
-        await terminal.relay_terminal(wsr, target["podName"], target["namespace"])
+        await terminal.run_with_idle_timeout(
+            sock, relay(sock), terminal.idle_timeout_seconds())
     except Exception as e:
-        logger.error(f"Terminal for {user}/{name} failed: {e}")
+        logger.error(f"{what} failed: {e}")
         if not wsr.closed:
             await wsr.close(message=str(e).encode())
     return wsr

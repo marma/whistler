@@ -21,6 +21,7 @@ import os
 import pty
 import struct
 import termios
+import time
 
 from aiohttp import web
 
@@ -30,6 +31,92 @@ logger = logging.getLogger("whistler.portal")
 # frame immediately after open, so this default is only briefly visible.
 _DEFAULT_COLS, _DEFAULT_ROWS = 80, 24
 _MAX_DIM = 1000  # clamp absurd values before they reach the kernel ioctl
+
+# A shell at a prompt sends nothing, and an ingress or load balancer with an
+# idle timeout (ingress-nginx: 60s) then drops the socket under the user. A
+# WebSocket ping every HEARTBEAT_SECONDS keeps every hop busy; the pong is
+# consumed inside aiohttp and never counts as activity below, so the heartbeat
+# keeps a connection *open* without keeping it *alive* forever. That is the
+# idle timeout's job: nobody typing for this long closes it, whatever the
+# shell is printing. <=0 disables, matching WHISTLER_KIOSK_IDLE_TIMEOUT.
+HEARTBEAT_SECONDS = 30
+_DEFAULT_IDLE_SECONDS = 1800
+
+
+def idle_timeout_seconds() -> int:
+    try:
+        return int(os.environ.get("WHISTLER_TERMINAL_IDLE_TIMEOUT",
+                                  _DEFAULT_IDLE_SECONDS))
+    except ValueError:
+        # Falling back to "disabled" would be the one failure that leaves a
+        # forgotten shell open forever; the default is the safer misreading.
+        return _DEFAULT_IDLE_SECONDS
+
+
+class ActivityTrackingSocket:
+    """A browser WebSocket that records when the user last typed.
+
+    The three relays (kubectl exec, VM SSH, VM serial console) only iterate,
+    ``send_bytes`` and close their socket, so wrapping it here measures
+    activity for all of them without each relay keeping its own clock.
+    Only keystrokes count: not shell output (a `tail -f` or a build left
+    printing is still an unattended terminal) and not resize control frames
+    (dragging a browser window is not using the shell)."""
+
+    def __init__(self, ws: web.WebSocketResponse, clock=time.monotonic):
+        self._ws = ws
+        self._clock = clock
+        self.last_activity = clock()
+
+    def touch(self) -> None:
+        self.last_activity = self._clock()
+
+    def __getattr__(self, name):
+        return getattr(self._ws, name)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        msg = await self._ws.__anext__()
+        if msg.type == web.WSMsgType.BINARY or (
+                msg.type == web.WSMsgType.TEXT and parse_resize(msg.data) is None):
+            self.touch()
+        return msg
+
+
+async def run_with_idle_timeout(sock: ActivityTrackingSocket, relay,
+                                idle_seconds: float) -> bool:
+    """Run ``relay`` (a coroutine bridging ``sock``) until it ends, closing the
+    socket once ``idle_seconds`` pass without activity. Returns True if it was
+    closed for idleness. Closing the socket ends the relay's ``async for``, so
+    each relay's own cleanup (terminate kubectl, close the SSH connection)
+    runs as on any other disconnect."""
+    task = asyncio.ensure_future(relay)
+    if idle_seconds <= 0:
+        await task
+        return False
+    while True:
+        remaining = sock.last_activity + idle_seconds - sock._clock()
+        if remaining <= 0:
+            break
+        done, _ = await asyncio.wait([task], timeout=remaining)
+        if done:
+            task.result()
+            return False
+    minutes = idle_seconds / 60
+    reason = (f"idle for {minutes:g} minutes" if idle_seconds % 60 == 0
+              else f"idle for {idle_seconds:g} seconds")
+    logger.info(f"terminal: closing, {reason}")
+    if not sock.closed:
+        await sock.close(message=reason.encode())
+    try:
+        await asyncio.wait_for(task, timeout=5)
+    except asyncio.TimeoutError:
+        task.cancel()
+    except Exception as e:
+        logger.debug(f"terminal: relay ended after idle close: {e}")
+    return True
 
 
 def build_exec_command(pod_name: str, namespace: str, shell: str = "/bin/bash") -> list[str]:

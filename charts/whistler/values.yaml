@@ -198,6 +198,16 @@ portal:
     # login screen. 0 disables — which on an unattended screen means the last
     # person's desktop stays up until someone else touches it.
     idleTimeoutSeconds: 900
+  # The web terminal (/term). The portal pings every open terminal every 30s so
+  # an ingress or load balancer with an idle timeout of its own (ingress-nginx:
+  # 60s) does not drop a shell sitting at a prompt; this is the portal's own
+  # limit instead. Seconds without a keystroke before the terminal is closed
+  # ("Session closed: idle for 30 minutes") — output does not count, so a
+  # build left printing is closed too. The shell ends with it, a container's
+  # kubectl exec and a VM's SSH login alike; run long jobs under tmux/nohup.
+  # 0 disables.
+  terminal:
+    idleTimeoutSeconds: 1800
   resources:
     limits:
       cpu: 1000m
