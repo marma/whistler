@@ -430,6 +430,13 @@ def reconcile_session_fn(spec, name, namespace, meta, patch, logger, **kwargs):
         # alone instead of probing a nonexistent pod/VMI and reporting Stopped
         # (which masked exactly this: image not in the vm allow-list).
         logger.error(f"Session {name} rejected by policy: {e}")
+        # A stop is never a policy question. ensure_session builds the whole
+        # workload before it gets to the run state, so the refusal arrives
+        # before the halt does. Without this, a running VM whose saved
+        # defaults can no longer be honoured (a GPU type that is gone) shows
+        # Failed and ignores every stop.
+        if not run_intent(meta.get('annotations')):
+            cm.halt_session_workload(user, session_name)
         patch.status['phase'] = 'Failed'
         patch.status['statusMessage'] = str(e)
         patch.status['policyFailed'] = True

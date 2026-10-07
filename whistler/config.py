@@ -7311,6 +7311,31 @@ class KubeConfigManager(ConfigManager):
             logger.error(f"Failed to stop pod {full_name}: {e}")
             return False
 
+    def halt_session_workload(self, username: str, session_name: str) -> None:
+        """Stop a session's workload without building anything.
+
+        ensure_session halts a VM by rebuilding its whole spec first, so any
+        PolicyError on the way (a GPU type no longer on any node, a revoked
+        zone grant) used to abort the stop as well, leaving the guest running
+        under a Failed badge. Whether the instance *could* start has no
+        bearing on whether it may stop, so the operator calls this when a
+        reconcile toward stopped is refused. It touches nothing but the run
+        state: runStrategy=Halted on the VM, or deleting the pod. Each is a
+        404 no-op when that kind of workload does not exist."""
+        user_ns = self._get_user_namespace(username)
+        full_name = f"{username}-{session_name}"
+        try:
+            self.api.patch_namespaced_custom_object(
+                KUBEVIRT_GROUP, KUBEVIRT_VERSION, user_ns,
+                KUBEVIRT_VM_PLURAL, full_name,
+                {"spec": {"runStrategy": VM_RUN_STRATEGY_STOPPED}})
+            logger.info(f"Halted VirtualMachine {full_name} despite a policy "
+                        f"refusal")
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning(f"Could not halt VirtualMachine {full_name}: {e}")
+        self._delete_session_pod(user_ns, full_name)
+
     def stop_instance(self, username: str, instance_name: str) -> bool:
         """Ask for the workload to stop, leaving the Session CR in place.
 

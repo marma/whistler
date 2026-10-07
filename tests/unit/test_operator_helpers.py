@@ -391,3 +391,50 @@ def test_the_timer_clears_the_reason_on_any_other_phase(monkeypatch):
     patch = _tick(monkeypatch, ("Booting", "alice-desk", None, None), phase_before="Failed")
     assert patch.status["phase"] == "Booting"
     assert patch.status["statusMessage"] is None
+
+
+# --- a stop survives a policy refusal --------------------------------------- #
+
+class _PolicyRefusingCM:
+    """ensure_session refuses, as it does for a GPU type that left the node."""
+
+    def __init__(self):
+        self.halted = []
+
+    def ensure_session(self, user, session_name):
+        raise operator.PolicyError("GPU type 'gone' is not present on any node")
+
+    def halt_session_workload(self, user, session_name):
+        self.halted.append((user, session_name))
+
+
+class _Patch:
+    def __init__(self):
+        self.status = {}
+        self.meta = {}
+
+
+def _reconcile_refused(monkeypatch, annotations):
+    cm = _PolicyRefusingCM()
+    monkeypatch.setattr(operator, "_get_config_manager", lambda: cm)
+    patch = _Patch()
+    operator.reconcile_session_fn(
+        spec={"user": "alice"}, name="alice-box", namespace="whistler-user-alice",
+        meta={"annotations": annotations}, patch=patch, logger=_LOG)
+    return cm, patch
+
+
+def test_a_stop_refused_by_policy_still_halts_the_workload(monkeypatch):
+    cm, patch = _reconcile_refused(monkeypatch, {
+        "whistler/last-connect": "100.0", "whistler/last-stop": "200.0"})
+    assert cm.halted == [("alice", "box")]
+    # Still Failed with the reason: it is why the next start will not work.
+    assert patch.status["phase"] == "Failed"
+    assert patch.status["policyFailed"] is True
+
+
+def test_a_start_refused_by_policy_halts_nothing(monkeypatch):
+    cm, patch = _reconcile_refused(monkeypatch, {
+        "whistler/last-connect": "200.0", "whistler/last-stop": "100.0"})
+    assert cm.halted == []
+    assert patch.status["phase"] == "Failed"
