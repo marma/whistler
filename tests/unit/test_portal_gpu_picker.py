@@ -43,7 +43,7 @@ def test_the_sentinel_can_never_be_a_real_gpu_type():
 # --- the template form ------------------------------------------------------ #
 
 _TPL_BASE = dict(name="t", display_name="T", image="i", description="",
-                 cpu="1", memory="2Gi", personal_mount="/userdata", mode="ssh",
+                 cpu="1", memory="2Gi", mode="ssh",
                  runtime="vm", privileged=None, fuse=None, display_port=None,
                  viewer=None)
 

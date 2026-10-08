@@ -1116,7 +1116,6 @@ async def admin_template_create(
     memory:         Annotated[Optional[str], Form()] = None,
     gpu:            Annotated[Optional[str], Form()] = None,
     gpu_type:       Annotated[Optional[str], Form()] = None,
-    personal_mount: Annotated[Optional[str], Form()] = "/userdata",
     mode:           Annotated[str, Form()] = "ssh",
     runtime:        Annotated[str, Form()] = "container",
     privileged:     Annotated[Optional[str], Form()] = None,
@@ -1128,7 +1127,6 @@ async def admin_template_create(
     data = _template_form_data(
         name=slug.strip(), display_name=display_name, image=image,
         description=description, cpu=cpu, memory=memory, gpu=gpu, gpu_type=gpu_type,
-        personal_mount=personal_mount,
         mode=mode, runtime=runtime, privileged=privileged, fuse=fuse,
         display_port=display_port, viewer=viewer, zone=zone,
     )
@@ -1164,7 +1162,6 @@ async def admin_template_update(
     memory:         Annotated[Optional[str], Form()] = None,
     gpu:            Annotated[Optional[str], Form()] = None,
     gpu_type:       Annotated[Optional[str], Form()] = None,
-    personal_mount: Annotated[Optional[str], Form()] = "/userdata",
     mode:           Annotated[str, Form()] = "ssh",
     runtime:        Annotated[str, Form()] = "container",
     privileged:     Annotated[Optional[str], Form()] = None,
@@ -1176,7 +1173,6 @@ async def admin_template_update(
     data = _template_form_data(
         name=name, display_name=display_name, image=image,
         description=description, cpu=cpu, memory=memory, gpu=gpu, gpu_type=gpu_type,
-        personal_mount=personal_mount,
         mode=mode, runtime=runtime, privileged=privileged, fuse=fuse,
         display_port=display_port, viewer=viewer, zone=zone,
     )
@@ -2161,7 +2157,7 @@ def _build_session_overrides(*, cpu=None, memory=None,
 
 
 def _template_form_data(*, name, display_name, image, description, cpu, memory,
-                        personal_mount, mode, runtime, privileged, fuse,
+                        mode, runtime, privileged, fuse,
                         display_port, viewer, gpu=None, gpu_type=None,
                         zone=None) -> dict:
     """Assemble a save_system_template payload from the admin template form,
@@ -2194,7 +2190,6 @@ def _template_form_data(*, name, display_name, image, description, cpu, memory,
         "resources": _nonempty({"cpu": cpu, "memory": memory,
                                 "gpu": "" if no_gpu else gpu}),
         "nodeSelector": _nonempty({GPU_NODE_LABEL: "" if no_gpu else gpu_type}),
-        "personalMountPath": personal_mount or "/userdata",
         "mode": mode if mode in ("ssh", "desktop") else "ssh",
         "runtime": runtime if runtime in ("container", "kata", "vm") else "container",
         "privileged": privileged == "on",

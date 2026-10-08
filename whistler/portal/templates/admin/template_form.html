@@ -198,12 +198,6 @@
     </script>
 
     <div class="field">
-      <label>Personal Home Mount Path</label>
-      <input name="personal_mount" type="text" placeholder="/userdata"
-             value="{{ tpl.personalMountPath if tpl else '/userdata' }}">
-    </div>
-
-    <div class="field">
       <label>Network Zone</label>
       <select name="zone" class="ui dropdown">
         {% for z in zones %}
