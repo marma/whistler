@@ -426,6 +426,11 @@ class FakeConfigManager(ConfigManager):
                                               for g in self.get_user_groups(username)))
         return {g: bool(merged.get(g, False)) for g in OVERRIDE_GROUPS}
 
+    def get_user_dataset_choices(self, username):
+        # Tests that care set `dataset_choices` = {user: [choice, ...]}.
+        return list((getattr(self, "dataset_choices", None) or {}).get(
+            username, []))
+
     def set_user_overrides(self, username, overrides):
         if username in self.users:
             self.users[username]["overrides"] = {

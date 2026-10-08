@@ -82,6 +82,10 @@ def configure(settings: kopf.OperatorSettings, **_):
     # very namespace deletion this exists to survive.
     threading.Thread(target=_secure_user_data_loop, args=(cm,),
                      name="secure-user-data", daemon=True).start()
+    # Push access-matrix changes to the dataset proxies' fencing policies
+    # (the event handlers below wake it; the timeout is the backstop).
+    threading.Thread(target=_refence_datasets_loop, args=(cm,),
+                     name="refence-datasets", daemon=True).start()
 
 
 # First pass right after startup (adoption has just run), then this often.
@@ -115,6 +119,100 @@ def _secure_user_data_loop(cm, interval=SECURE_USER_DATA_INTERVAL,
             if wake.is_set():
                 wake.clear()
                 time.sleep(retry)   # give the new claim time to bind
+
+
+# --------------------------------------------------------------------------- #
+# Dataset fencing follows the access matrix (config.refence_dataset_proxies).  #
+# The matrix is on User and Group CRs, which nothing used to watch, so a       #
+# revoked cell waited for some session to be built before any proxy heard of   #
+# it. Event handlers, not on.create/update/delete: they are stateless, so kopf #
+# writes no annotation and no finalizer on a User or a Group. They only wake   #
+# a single worker, which coalesces a burst (a group edit, the initial listing  #
+# at startup) into one pass and keeps two passes from racing on one policy.    #
+# --------------------------------------------------------------------------- #
+
+REFENCE_DATASETS_INTERVAL = 300   # backstop for a missed watch event
+REFENCE_DATASETS_SETTLE = 1       # let a burst of events land first
+_refence_wake = threading.Event()
+
+
+@kopf.on.event('whistler.martinmalmsten.net', 'v1', 'users')
+@kopf.on.event('whistler.martinmalmsten.net', 'v1', 'groups')
+@kopf.on.event('whistler.martinmalmsten.net', 'v1', 'datasets')
+def access_changed_fn(**_):
+    _refence_wake.set()
+
+
+def _refence_datasets_loop(cm, wake=_refence_wake,
+                           interval=REFENCE_DATASETS_INTERVAL,
+                           settle=REFENCE_DATASETS_SETTLE, once=False):
+    while True:
+        wake.wait(interval)
+        time.sleep(settle)
+        # Cleared before the pass, so an edit that lands during it wakes the
+        # next one instead of being absorbed by a pass that read before it.
+        wake.clear()
+        try:
+            cm.refence_dataset_proxies()
+        except Exception as e:
+            logger.error(f"Re-fencing dataset proxies failed (retrying): {e}")
+        # A deleted or archived Dataset fires the same events, so this is
+        # also where its managed server goes (the data stays)...
+        try:
+            cm.prune_dataset_servers()
+        except Exception as e:
+            logger.error(f"Pruning dataset servers failed (retrying): {e}")
+        # ...and a resurrected one's comes back (revive_dataset_servers says
+        # why the kopf update handler cannot be trusted with that).
+        try:
+            cm.revive_dataset_servers()
+        except Exception as e:
+            logger.error(f"Reviving dataset servers failed (retrying): {e}")
+        if once:
+            return
+
+
+# --------------------------------------------------------------------------- #
+# Managed datasets: the portal writes the Dataset CR, the operator makes the   #
+# claim and the server (config.ensure_managed_dataset). Built when the CR      #
+# appears rather than on first mount, so a dataset exists to be filled before  #
+# anyone is granted it. No on.delete (no finalizer). Archiving removes the     #
+# server through the prune above and keeps the data; deleting an archived      #
+# dataset for good is a mark (config.destroy_dataset), carried out here.       #
+# --------------------------------------------------------------------------- #
+
+def _marked(meta):
+    return DELETE_DATA_ANNOTATION in (meta.get("annotations") or {})
+
+
+def _served(spec, meta, **_):
+    return (KubeConfigManager.is_managed_dataset(spec)
+            and not KubeConfigManager.is_archived_dataset(spec)
+            and not _marked(meta))
+
+
+def _destroyed(spec, meta, **_):
+    return KubeConfigManager.is_archived_dataset(spec) and _marked(meta)
+
+
+@kopf.on.create('whistler.martinmalmsten.net', 'v1', 'datasets', when=_served)
+@kopf.on.update('whistler.martinmalmsten.net', 'v1', 'datasets', when=_served)
+@kopf.on.resume('whistler.martinmalmsten.net', 'v1', 'datasets', when=_served)
+def managed_dataset_fn(name, spec, **_):
+    if not _get_config_manager().ensure_managed_dataset(name, dict(spec)):
+        raise kopf.TemporaryError(
+            f"Managed dataset {name!r} is not served yet", delay=30)
+
+
+@kopf.on.create('whistler.martinmalmsten.net', 'v1', 'datasets', when=_destroyed)
+@kopf.on.update('whistler.martinmalmsten.net', 'v1', 'datasets', when=_destroyed)
+@kopf.on.resume('whistler.martinmalmsten.net', 'v1', 'datasets', when=_destroyed)
+def destroy_dataset_fn(name, **_):
+    # Short delay: the usual reason to retry is a server pod still
+    # terminating, which purge_dataset waits out before touching the fences.
+    if not _get_config_manager().purge_dataset(name):
+        raise kopf.TemporaryError(
+            f"Dataset {name!r} is not deleted yet", delay=5)
 
 
 # --------------------------------------------------------------------------- #

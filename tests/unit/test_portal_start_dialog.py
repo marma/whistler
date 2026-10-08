@@ -456,3 +456,57 @@ def test_the_run_overrides_are_applied_on_the_way_to_the_desktop(make_config):
     inst = cm._instances["alice"][0]
     assert inst["runOverrides"] == {"gpuCount": 8}
     assert inst["overrides"] == {"gpuCount": 1}
+
+
+# --------------------------------------------------------------------------- #
+# Datasets: chosen per instance, changeable per run                           #
+# --------------------------------------------------------------------------- #
+
+_CHOICES = {"alice": [{"name": "corpus", "description": None,
+                       "zones": {"default": "rw"}},
+                      {"name": "ref", "description": "Reference",
+                       "zones": {"default": "ro", "lab": "rw"}}]}
+
+
+def test_a_dataset_to_choose_is_enough_to_be_asked(make_config):
+    # Not an override grant, but which datasets a run mounts is asked in the
+    # same dialog, so holding one makes start a question.
+    cm = make_config(users={"alice": {"name": "alice"}},
+                     instances={"alice": [_instance()]})
+    cm.dataset_choices = _CHOICES
+    resp = asyncio.run(mgmt.user_index(request=_FakeRequest(), cm=cm,
+                                       user="alice", is_admin=False))
+    assert resp.context["can_override"] is True
+
+
+def test_the_dialog_chooses_this_runs_datasets(make_config):
+    cm = make_config(users={"alice": {"name": "alice"}},
+                     instances={"alice": [_instance(
+                         overrides={"datasets": ["corpus"]})]})
+    cm.dataset_choices = _CHOICES
+    # "elsewhere" is not on offer (archived, ungranted, hand-made): dropped.
+    _connect(cm, {"apply_overrides": "1", "datasets": ["ref", "elsewhere"]})
+    assert cm.run_overrides[-1][2] == {"datasets": ["ref"]}
+    # The defaults are the instance's; the dialog does not move them.
+    assert cm._instances["alice"][0]["overrides"] == {"datasets": ["corpus"]}
+
+
+def test_unchecking_every_dataset_means_none_this_run(make_config):
+    cm = make_config(users={"alice": {"name": "alice"}},
+                     instances={"alice": [_instance(
+                         overrides={"datasets": ["corpus"]})]})
+    cm.dataset_choices = _CHOICES
+    _connect(cm, {"apply_overrides": "1"})
+    assert cm.run_overrides[-1][2] == {}
+
+
+def test_the_fields_offer_the_choices_prefilled_from_the_instance():
+    html = _render("user/_override_fields.html", overrides={},
+                   gpu_types=[], zones=[], datasets=_CHOICES["alice"],
+                   cur={"overrides": {"datasets": ["ref"]}})
+    assert 'value="corpus"' in html
+    ref = html[html.index('value="ref"'):][:120]
+    assert "checked" in ref
+    corpus = html[html.index('value="corpus"'):][:120]
+    assert "checked" not in corpus
+    assert "read-only in default, read-write in lab" in html

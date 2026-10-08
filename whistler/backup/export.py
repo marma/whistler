@@ -86,6 +86,11 @@ def collect(cm, include_secrets: bool = True
             item.setdefault("kind", kind)
             if archive.is_helm_managed(item):
                 continue
+            # A Dataset being deleted for good, as for homes: restoring it
+            # would bring back a record for data that is about to be gone.
+            if DELETE_DATA_ANNOTATION in (
+                    (item.get("metadata") or {}).get("annotations") or {}):
+                continue
             objects.append(archive.normalize(item, release_ns))
 
     for kind, plural in SPREAD_KINDS:

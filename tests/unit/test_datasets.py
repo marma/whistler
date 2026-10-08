@@ -122,6 +122,52 @@ def test_one_broken_dataset_does_not_block_the_others():
     cm._refresh_s3_proxy_policies = lambda name: None
     cm.get_user_volume_access = lambda u: {
         "open": {"broken": "allowed", "good": "allowed"}}
-    assert cm.session_shared_datasets("alice", "open") == []
+    assert cm.session_shared_datasets("alice", "open",
+                                      ["broken", "good"]) == []
     # "broken" raised and was skipped; "good" was still reached.
     assert prepared == ["good"]
+
+
+def test_only_chosen_datasets_that_are_granted_here_are_prepared():
+    # Both conditions, always: the instance chose it AND the matrix grants it
+    # in this zone. Granted-but-unchosen is not mounted (it used to be: every
+    # granted dataset went into every session), and chosen-but-ungranted is
+    # skipped rather than failing the boot.
+    cm = _manager(
+        users={"alice": {"name": "alice"}}, groups={},
+        datasets={"a": {"bucket": "b"}, "b": {"bucket": "b"},
+                  "c": {"bucket": "b"}})
+    prepared = []
+    cm.ensure_s3_proxy = lambda v, m, d: prepared.append(v) or False
+    cm._refresh_s3_proxy_policies = lambda name: None
+    cm.get_user_volume_access = lambda u: {"open": {"a": "allowed",
+                                                    "b": "allowed"}}
+    cm.session_shared_datasets("alice", "open", ["a", "c"])
+    assert prepared == ["a"]
+
+
+def test_requested_datasets_follow_the_run_over_the_defaults():
+    from whistler.config import session_requested_datasets
+    assert session_requested_datasets({}) == []
+    assert session_requested_datasets(
+        {"overrides": {"datasets": ["a"]}}) == ["a"]
+    # The start dialog's answer replaces the defaults for that run, an empty
+    # one included: "this run, no datasets".
+    assert session_requested_datasets(
+        {"overrides": {"datasets": ["a"]},
+         "runOverrides": {"datasets": ["b"]}}) == ["b"]
+    assert session_requested_datasets(
+        {"overrides": {"datasets": ["a"]}, "runOverrides": {}}) == []
+
+
+def test_dataset_choices_span_zones_and_skip_archived():
+    cm = _manager(
+        users={"alice": {"name": "alice", "volumeAccess": {
+            "open": {"ref": "read-only", "gone": "allowed"},
+            "lab": {"ref": "allowed", "missing": "allowed"}}}},
+        groups={},
+        datasets={"ref": {"bucket": "b", "description": "Reference"},
+                  "gone": {"bucket": "b", "archived": True}})
+    assert cm.get_user_dataset_choices("alice") == [
+        {"name": "ref", "description": "Reference",
+         "zones": {"lab": "rw", "open": "ro"}}]

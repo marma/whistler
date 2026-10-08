@@ -106,7 +106,20 @@ def retain_user_data(cm) -> List[str]:
         pv = cm.secure_claim(cm.namespace, claim, reattach.KIND_BACKUPS, "")
         if pv:
             seen.append(pv)
+    for pvc in _dataset_claims(cm, core):
+        pv = cm.secure_claim(cm.namespace, pvc.metadata.name,
+                             reattach.KIND_DATASET, "")
+        if pv:
+            seen.append(pv)
     return seen
+
+
+def _dataset_claims(cm, core):
+    """Managed datasets' claims (config.ensure_managed_dataset), in the
+    release namespace."""
+    from whistler.config import DATASET_SERVER_APP
+    return core.list_namespaced_persistent_volume_claim(
+        cm.namespace, label_selector=f"app={DATASET_SERVER_APP}").items
 
 
 # --- 2. the final backup -------------------------------------------------------- #
@@ -192,6 +205,22 @@ def delete_release_leftovers(cm) -> List[str]:
         gone("NetworkPolicy", p.metadata.name,
              lambda: net.delete_namespaced_network_policy(p.metadata.name, ns))
 
+    # Managed dataset servers: Deployment and Services. Their policies go with
+    # the proxies' above (the per-mode ones carry the proxy label) and here
+    # (the deny-all one), after the Deployment, so no pod outlives its fence.
+    from whistler.config import DATASET_SERVER_APP
+    selector = f"app={DATASET_SERVER_APP}"
+    for d in apps.list_namespaced_deployment(ns, label_selector=selector).items:
+        gone("Deployment", d.metadata.name,
+             lambda: apps.delete_namespaced_deployment(d.metadata.name, ns))
+    for s in core.list_namespaced_service(ns, label_selector=selector).items:
+        gone("Service", s.metadata.name,
+             lambda: core.delete_namespaced_service(s.metadata.name, ns))
+    for p in net.list_namespaced_network_policy(ns,
+                                                label_selector=selector).items:
+        gone("NetworkPolicy", p.metadata.name,
+             lambda: net.delete_namespaced_network_policy(p.metadata.name, ns))
+
     # Secrets: by label where Whistler labels them, by name where it names
     # them (the CA and host key names come from the chart).
     for label in ("app=whistler-dataset", "app=whistler-s3-proxy",
@@ -217,16 +246,19 @@ def delete_release_leftovers(cm) -> List[str]:
 
 def release_backup_claim(cm) -> None:
     """Delete it: its PV (Retain) goes Released once the backup pod, which
-    Helm deletes next, lets go of it, and the next install re-binds it."""
-    claim = os.environ.get("WHISTLER_BACKUP_CLAIM")
-    if not claim:
-        return
-    try:
-        client.CoreV1Api().delete_namespaced_persistent_volume_claim(
-            claim, cm.namespace)
-    except ApiException as e:
-        if e.status != 404:
-            raise
+    Helm deletes next, lets go of it, and the next install re-binds it. The
+    managed datasets' claims go the same way, re-bound by the next install
+    when their Datasets come back (config._ensure_dataset_claim)."""
+    core = client.CoreV1Api()
+    claims = [pvc.metadata.name for pvc in _dataset_claims(cm, core)]
+    if os.environ.get("WHISTLER_BACKUP_CLAIM"):
+        claims.append(os.environ["WHISTLER_BACKUP_CLAIM"])
+    for claim in claims:
+        try:
+            core.delete_namespaced_persistent_volume_claim(claim, cm.namespace)
+        except ApiException as e:
+            if e.status != 404:
+                raise
 
 
 def run(cm, backups, *, require_final_backup=True, timeout=240.0) -> None:
@@ -255,7 +287,8 @@ def run(cm, backups, *, require_final_backup=True, timeout=240.0) -> None:
     logger.info(f"4/5 Deleted {len(deleted)} object(s) from {cm.namespace}: "
                 f"{', '.join(deleted) or 'none'}")
     release_backup_claim(cm)
-    logger.info("5/5 Backup claim released; its PV waits for the next install")
+    logger.info("5/5 Backup and dataset claims released; their PVs wait "
+                "for the next install")
 
 
 def main() -> int:

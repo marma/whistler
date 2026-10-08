@@ -143,6 +143,20 @@ def effective_session_overrides(spec: Optional[Dict[str, Any]]) -> Optional[Dict
     return run if run is not None else spec.get("overrides")
 
 
+def session_requested_datasets(spec: Optional[Dict[str, Any]]) -> List[str]:
+    """The datasets a Session asks to mount: ``datasets`` in its effective
+    overrides — the instance's defaults (chosen at creation or on the edit
+    form), or this run's answer from the start dialog.
+
+    Only what is named is mounted; nothing is not "everything granted". It
+    rides the overrides because that already is the defaults-versus-this-run
+    rule, but it is not a grant-gated override: _apply_overrides ignores the
+    key, and the access matrix decides what of it is mounted
+    (session_shared_datasets)."""
+    names = (effective_session_overrides(spec) or {}).get("datasets") or []
+    return [n for n in names if isinstance(n, str) and n]
+
+
 # Config file locations. Defaults match the in-cluster mount paths used by the
 # Helm chart; override via env so the server/operator can run as host processes
 # (e.g. local k3d integration testing) without writing to /etc.
@@ -306,6 +320,20 @@ USER_PLURAL = "users"
 ZONE_PLURAL = "zones"
 GROUP_PLURAL = "groups"
 DATASET_PLURAL = "datasets"
+# Where a dataset's data lives (Dataset spec.source). `s3` is an admin's
+# bucket fronted by an rclone proxy; `managed` is a claim Whistler creates in
+# the release namespace and serves with VersityGW (design/storage.md,
+# "Datasets are always S3"). Absent means s3, which is what every Dataset
+# written before the field existed is.
+DATASET_SOURCE_S3 = "s3"
+DATASET_SOURCE_MANAGED = "managed"
+DATASET_SOURCES = (DATASET_SOURCE_S3, DATASET_SOURCE_MANAGED)
+# The managed dataset server's pods, its deny-all policy and its claim. Not
+# `whistler-dataset`, which labels the S3 datasets' credential Secrets.
+DATASET_SERVER_APP = "whistler-dataset-server"
+# Container ports of a managed dataset server: one process per mode, because
+# read-only has to be a property of a process, not a permission inside one.
+DATASET_SERVER_PORTS = {"ro": 8080, "rw": 8081}
 HOME_VOLUME_PLURAL = "homevolumes"
 # The per-user claim container sessions mount as $HOME (_ensure_pvc).
 POD_HOME_PVC_PREFIX = "whistler-data-"
@@ -435,8 +463,8 @@ CLUSTER_DNS_POD_LABELS = {"k8s-app": "kube-dns"}
 # arbitrary entries from the legacy volumes.yaml catalog and mount them where
 # it liked, gated by an allowedVolumes list no admin screen writes any more.
 # What a session may reach is now the access matrix — a home volume chosen at
-# creation, plus the datasets granted in the zone it runs in — and neither is
-# a free-text mount path.
+# creation, plus the datasets it chooses that are granted in its zone — and
+# neither is a free-text mount path.
 OVERRIDE_GROUPS = (
     "resources",        # resources.cpu / resources.memory
     "gpuType",          # nodeSelector[GPU_NODE_LABEL] (still gated by allowedGpuTypes)
@@ -671,6 +699,11 @@ def _merge_patch_is_noop(current, patch) -> bool:
         elif cur != value:
             return False
     return True
+
+
+class DatasetSpecError(ValueError):
+    """A Dataset the admin asked for cannot be saved as given
+    (dataset_spec_problem says why, in words meant for the admin)."""
 
 
 class ConfigWriteError(Exception):
@@ -1264,6 +1297,15 @@ class KubeConfigManager(ConfigManager):
             "WHISTLER_S3_PROXY_IMAGE", "rclone/rclone:latest")
         self.s3_proxy_resources = self._env_json(
             "WHISTLER_S3_PROXY_RESOURCES", {})
+        # Managed datasets: VersityGW over a claim of the default class
+        # unless one is named.
+        self.dataset_server_image = os.environ.get(
+            "WHISTLER_DATASET_SERVER_IMAGE",
+            "ghcr.io/versity/versitygw:v1.7.0")
+        self.dataset_server_resources = self._env_json(
+            "WHISTLER_DATASET_SERVER_RESOURCES", {})
+        self.dataset_storage_class = (
+            os.environ.get("WHISTLER_DATASET_STORAGE_CLASS") or None)
 
     @staticmethod
     def _env_json(name, default):
@@ -2458,6 +2500,22 @@ class KubeConfigManager(ConfigManager):
                 }],
                 "ports": [{"port": 8080, "protocol": "TCP"}],
             },
+            # The same for managed datasets' servers, on BOTH process ports.
+            # NetworkPolicy matches the pod's port after the Service has
+            # translated it, so the rw Service's 8080 arrives at 8081 and an
+            # 8080-only rule drops it. Without this rule a guest's mount
+            # hangs rather than failing: packets dropped, never refused
+            # (found on k3s-metal, 2026-10-08 — `ls /shared/<name>` hung).
+            {
+                "to": [{
+                    "namespaceSelector": {"matchLabels": {
+                        "kubernetes.io/metadata.name": self.namespace}},
+                    "podSelector": {"matchLabels": {
+                        "app": DATASET_SERVER_APP}},
+                }],
+                "ports": [{"port": port, "protocol": "TCP"}
+                          for port in sorted(DATASET_SERVER_PORTS.values())],
+            },
         ]
 
     def _build_egress_rules(self, zone: str) -> list:
@@ -3607,6 +3665,7 @@ class KubeConfigManager(ConfigManager):
             except ApiException as e:
                 logger.warning(f"Could not secure home volume "
                                f"{ns}/{item['metadata']['name']}: {e}")
+        self.secure_dataset_claims()
         try:
             self.ensure_backup_claim()
         except ApiException as e:
@@ -4500,7 +4559,8 @@ class KubeConfigManager(ConfigManager):
                 template_spec.get('instancetype'), preemptible,
                 home_pvc=home_pvc,
                 shared_datasets=self.session_shared_datasets(
-                    username, template_spec.get('zone') or DEFAULT_ZONE),
+                    username, template_spec.get('zone') or DEFAULT_ZONE,
+                    session_requested_datasets(cr.get('spec'))),
                 start=wants_start,
                 viewer=result.get("viewer"),
                 user_details=user_details,
@@ -4857,8 +4917,14 @@ class KubeConfigManager(ConfigManager):
                 self.group, self.version, self.namespace, DATASET_PLURAL
             )
             datasets = {
-                item["metadata"]["name"]: {**(item.get("spec") or {}),
-                                           "name": item["metadata"]["name"]}
+                item["metadata"]["name"]: {
+                    **(item.get("spec") or {}),
+                    "name": item["metadata"]["name"],
+                    # For the admin list only: being deleted for good
+                    # (destroy_dataset), so it offers no actions.
+                    **({"deleting": True} if DELETE_DATA_ANNOTATION in (
+                        item["metadata"].get("annotations") or {}) else {}),
+                }
                 for item in resp.get("items", [])
             }
         except (ApiException, AttributeError) as e:
@@ -4894,6 +4960,29 @@ class KubeConfigManager(ConfigManager):
         self._load_datasets()
         return {name: dict(spec or {})
                 for name, spec in (self.datasets or {}).items()}
+
+    def get_user_dataset_choices(self, username: str) -> List[Dict[str, Any]]:
+        """The datasets this user could mount somewhere: every served
+        (not archived) dataset with a cell in their effective matrix, in any
+        zone. What the instance forms and the start dialog offer.
+
+        Any zone rather than the instance's, because the zone can change per
+        run (the `zone` override) and a choice is stored with the instance;
+        the mount itself is decided per zone at start. Each entry says where
+        it is granted and how, so the form can show it."""
+        definitions = self.get_dataset_definitions()
+        held: Dict[str, Dict[str, str]] = {}
+        for zone, cells in (self.get_user_volume_access(username) or {}).items():
+            for name, granted in (cells or {}).items():
+                if name in definitions and \
+                        not self.is_archived_dataset(definitions[name]):
+                    held.setdefault(name, {})[zone] = self.dataset_mode(
+                        definitions[name],
+                        "ro" if granted == "read-only" else "rw")
+        return [{"name": name,
+                 "description": definitions[name].get("description"),
+                 "zones": dict(sorted(held[name].items()))}
+                for name in sorted(held)]
 
     def get_dataset_names(self) -> List[str]:
         """Dataset names, for the grant pickers. Separate from get_volumes()
@@ -4977,8 +5066,15 @@ class KubeConfigManager(ConfigManager):
         except ApiException:
             return False
 
-    def save_dataset(self, dataset_data: Dict[str, Any]) -> bool:
-        """Create or update a Dataset CR from the admin editor.
+    def save_dataset(self, dataset_data: Dict[str, Any],
+                     create: bool = False) -> bool:
+        """Create (``create``) or update a Dataset CR from the admin editor.
+
+        Creating never overwrites: a name that exists is refused, and an
+        **archived** dataset holds its name — re-creating it would otherwise
+        hand a new definition the old dataset's grants and, for a managed
+        one, its data. An archived dataset cannot be edited either; it is
+        resurrected first (restore_dataset).
 
         Unlike save_zone this does NOT push anything to running sessions: a
         dataset is mounted by cloud-init at boot, so an endpoint or bucket
@@ -4998,6 +5094,23 @@ class KubeConfigManager(ConfigManager):
                     self.group, self.version, self.namespace,
                     DATASET_PLURAL, name
                 )
+                if create:
+                    raise DatasetSpecError(
+                        f"An archived dataset named {name!r} exists. "
+                        f"Resurrect it, or delete it for good, first."
+                        if self.is_archived_dataset(existing.get("spec"))
+                        else f"A dataset named {name!r} already exists.")
+                if self.is_archived_dataset(existing.get("spec")):
+                    raise DatasetSpecError(
+                        f"Dataset {name!r} is archived; resurrect it before "
+                        f"editing it.")
+                problem = self.dataset_spec_problem(
+                    spec, existing.get("spec") or {})
+                if problem:
+                    raise DatasetSpecError(problem)
+                # Annotations survive the replace (kopf keeps its state there).
+                if existing["metadata"].get("annotations"):
+                    body_meta["annotations"] = existing["metadata"]["annotations"]
                 self.api.replace_namespaced_custom_object(
                     self.group, self.version, self.namespace,
                     DATASET_PLURAL, name,
@@ -5012,6 +5125,9 @@ class KubeConfigManager(ConfigManager):
             except ApiException as e:
                 if e.status != 404:
                     raise
+                problem = self.dataset_spec_problem(spec)
+                if problem:
+                    raise DatasetSpecError(problem)
                 self.api.create_namespaced_custom_object(
                     self.group, self.version, self.namespace, DATASET_PLURAL,
                     {"apiVersion": f"{self.group}/{self.version}",
@@ -5026,24 +5142,120 @@ class KubeConfigManager(ConfigManager):
         self._refresh_s3_proxy_policies(name)
         return True
 
-    def delete_dataset(self, name: str) -> bool:
-        """Delete a Dataset CR and fence its proxies to nobody.
+    @staticmethod
+    def dataset_source(definition: Dict[str, Any]) -> str:
+        return (definition or {}).get("source") or DATASET_SOURCE_S3
 
-        The proxy Deployments are left running rather than deleted: fencing
-        them is what makes them unreachable, and a delete that raced a session
-        build would just see the proxy recreated. Sessions holding a mount
-        keep it until they stop — the CR is the catalog, not the data path.
+    @classmethod
+    def is_managed_dataset(cls, definition: Dict[str, Any]) -> bool:
+        return cls.dataset_source(definition) == DATASET_SOURCE_MANAGED
+
+    @staticmethod
+    def is_archived_dataset(definition: Dict[str, Any]) -> bool:
+        """Archived: kept as a record (so its name stays taken and it can be
+        resurrected) but served to nobody — no mount, no reach, no server.
+        A managed one keeps its claim and data. See archive_dataset."""
+        return bool((definition or {}).get("archived"))
+
+    @classmethod
+    def dataset_spec_problem(cls, spec: Dict[str, Any],
+                             existing: Dict[str, Any] = None) -> Optional[str]:
+        """Why ``spec`` cannot be saved (over ``existing``, on an edit), or
+        None. Pure.
+
+        **The source never changes.** A dataset's proxies and its server are
+        fenced by NetworkPolicies whose pod selectors depend on the source;
+        switching an existing dataset would leave the old pods selected by no
+        policy at all, which NetworkPolicy reads as open to the cluster. It
+        would also strand a managed dataset's data. Make a new dataset.
+
+        **A managed dataset only grows.** Kubernetes refuses to shrink a
+        claim, and would say so only in the operator's log.
         """
+        source = cls.dataset_source(spec)
+        if source not in DATASET_SOURCES:
+            return (f"Unknown dataset source {source!r}; expected one of "
+                    f"{', '.join(DATASET_SOURCES)}.")
+        if existing is not None and cls.dataset_source(existing) != source:
+            return ("A dataset's source cannot be changed. Create a new "
+                    "dataset instead.")
+        if source == DATASET_SOURCE_S3:
+            if not spec.get("bucket"):
+                return "An S3 dataset needs a bucket."
+            return None
+        size = spec.get("size")
         try:
-            self.api.delete_namespaced_custom_object(
-                self.group, self.version, self.namespace, DATASET_PLURAL, name
-            )
+            wanted = parse_quantity(size) if size else None
+        except ValueError:
+            wanted = None
+        if not wanted or wanted <= 0:
+            return (f"A managed dataset needs a size, as a Kubernetes quantity "
+                    f"such as 10Gi (got {size!r}).")
+        old = (existing or {}).get("size")
+        if old:
+            try:
+                if wanted < parse_quantity(old):
+                    return (f"A managed dataset cannot shrink (from {old} to "
+                            f"{size}); Kubernetes does not shrink a claim.")
+            except ValueError:
+                pass
+        return None
+
+    def _set_dataset_archived(self, name: str, archived: bool) -> bool:
+        try:
+            self.api.patch_namespaced_custom_object(
+                self.group, self.version, self.namespace, DATASET_PLURAL,
+                name, {"spec": {"archived": True if archived else None}})
         except ApiException as e:
-            logger.error(f"Failed to delete dataset {name!r}: {e}")
+            logger.error(f"Failed to {'archive' if archived else 'restore'} "
+                         f"dataset {name!r}: "
+                         f"{crd_missing_hint(DATASET_PLURAL, e)}")
             return False
         self._load_datasets()
-        # After the reload, so s3_proxy_peers no longer resolves anyone to it.
+        # After the reload, so s3_proxy_peers sees the new state.
         self._refresh_s3_proxy_policies(name)
+        return True
+
+    def archive_dataset(self, name: str) -> bool:
+        """What deleting a dataset in the portal does: keep the record, serve
+        it to nobody.
+
+        Its policies are re-fenced to nobody here and now; the operator then
+        removes a managed dataset's server (prune_dataset_servers) and leaves
+        the claim and its Retain PV alone. An S3 dataset's proxies stay up,
+        fenced — the bucket is not Whistler's. Grants stay on Users and
+        Groups, so restore_dataset brings back the dataset as it was. Sessions
+        holding a mount keep it until they stop."""
+        return self._set_dataset_archived(name, True)
+
+    def restore_dataset(self, name: str) -> bool:
+        """Resurrect an archived dataset; the operator serves it again from
+        the same claim, with the same keys."""
+        return self._set_dataset_archived(name, False)
+
+    def destroy_dataset(self, name: str) -> bool:
+        """Delete an ARCHIVED dataset for good: its record, its endpoints,
+        keys and fences, and — for a managed one — its claim and PV, i.e. the
+        data. An S3 dataset's bucket is never touched.
+
+        Refused for a dataset that is not archived, so destroying data always
+        takes two deliberate acts. The work needs writes only the operator
+        has (the PV), so here it is a mark (DELETE_DATA_ANNOTATION) and
+        purge_dataset does it, deleting the record last."""
+        definition = self.get_dataset_definitions().get(name)
+        if definition is None:
+            return False
+        if not self.is_archived_dataset(definition):
+            raise DatasetSpecError(
+                f"Dataset {name!r} is not archived; archive it first.")
+        try:
+            self.api.patch_namespaced_custom_object(
+                self.group, self.version, self.namespace, DATASET_PLURAL,
+                name, {"metadata": {"annotations": {
+                    DELETE_DATA_ANNOTATION: "true"}}})
+        except ApiException as e:
+            logger.error(f"Failed to mark dataset {name!r} for deletion: {e}")
+            return False
         return True
 
     @staticmethod
@@ -5169,7 +5381,8 @@ class KubeConfigManager(ConfigManager):
         return deployment, service
 
     def _build_s3_proxy_network_policy(self, volume: str, mode: str,
-                                       permitted_peers) -> Dict[str, Any]:
+                                       permitted_peers, managed: bool = False
+                                       ) -> Dict[str, Any]:
         """Fencing (pure): only the session pods of users granted this volume
         at this mode, **in the zone the grant was made in**, may reach this
         proxy, and only on its port.
@@ -5190,9 +5403,23 @@ class KubeConfigManager(ConfigManager):
         An EMPTY peer list yields a policy with no `from`, which NetworkPolicy
         reads as "deny all ingress". Fail closed: a volume nobody is granted
         is a volume nobody can reach.
+
+        A ``managed`` dataset is one pod serving both modes on two ports
+        (DATASET_SERVER_PORTS), so its two policies select the same pod and
+        differ by port. NetworkPolicy allows are a union, which is safe here
+        only because every rule names its port: ro peers reach the ro port,
+        rw peers the rw port, and the server's deny-all policy
+        (_build_dataset_server_isolation) covers the moment before either
+        exists. The policy's own labels stay the proxy's, which is what
+        refence_dataset_proxies lists by.
         """
         name = self._s3_proxy_name(volume, mode)
         labels = {"app": "whistler-s3-proxy", "volume": volume, "mode": mode}
+        if managed:
+            selector = {"app": DATASET_SERVER_APP, "volume": volume}
+            port = DATASET_SERVER_PORTS[mode]
+        else:
+            selector, port = labels, 8080
         ingress: List[Dict[str, Any]] = []
         peers = sorted(set(tuple(p) for p in (permitted_peers or ())))
         if peers:
@@ -5205,14 +5432,14 @@ class KubeConfigManager(ConfigManager):
                         "matchLabels": {USER_NS_LABEL: username}},
                     "podSelector": {"matchLabels": {ZONE_LABEL: zone}},
                 } for username, zone in peers],
-                "ports": [{"port": 8080, "protocol": "TCP"}],
+                "ports": [{"port": port, "protocol": "TCP"}],
             })
         return {
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
             "metadata": {"name": name, "labels": labels},
             "spec": {
-                "podSelector": {"matchLabels": labels},
+                "podSelector": {"matchLabels": selector},
                 "policyTypes": ["Ingress"],
                 "ingress": ingress,
             },
@@ -5269,8 +5496,17 @@ class KubeConfigManager(ConfigManager):
         say exactly that. The dataset's own ``readOnly`` is a ceiling over
         every cell: a read-only dataset resolves everyone to ro and leaves its
         rw proxy admitting nobody.
+
+        A dataset that is no longer defined, or is archived, admits nobody,
+        whatever the matrix still says: its cells stay on every User and
+        Group that named it (so a resurrected dataset comes back with its
+        grants), and those must not keep its endpoint reachable meanwhile.
         """
-        definition = self.get_dataset_definitions().get(volume) or {}
+        definitions = self.get_dataset_definitions()
+        if volume not in definitions or \
+                self.is_archived_dataset(definitions[volume]):
+            return []
+        definition = definitions[volume] or {}
         out = []
         for user in self.list_all_users() or []:
             username = user.get("name") if isinstance(user, dict) else user
@@ -5288,11 +5524,16 @@ class KubeConfigManager(ConfigManager):
                     out.append((username, zone))
         return sorted(out)
 
-    def session_shared_datasets(self, username: str,
-                                zone: str) -> List[Dict[str, Any]]:
-        """Resolve the S3 datasets this user holds **in ``zone``** into
-        cloud-init descriptors, ensuring each one's proxy on the way. Returns
-        [] when no datasets are defined, which is the common case.
+    def session_shared_datasets(self, username: str, zone: str,
+                                wanted=()) -> List[Dict[str, Any]]:
+        """Resolve the datasets the session asked for (``wanted``,
+        session_requested_datasets) that this user holds **in ``zone``** into
+        cloud-init descriptors, ensuring each one's server on the way.
+
+        Both conditions, always: a dataset is mounted only if the instance
+        chose it AND the matrix grants it in this zone. A chosen dataset with
+        no cell here is skipped (and logged) rather than failing the boot —
+        the same instance may run in another zone where it is granted.
 
         The zone is the session's own (template zone or override, defaulting
         to DEFAULT_ZONE) and it is not optional: a dataset is granted per
@@ -5308,7 +5549,11 @@ class KubeConfigManager(ConfigManager):
         definitions = self.get_dataset_definitions()
         if not definitions:
             return []
+        wanted = set(wanted or ())
         cells = (self.get_user_volume_access(username) or {}).get(zone) or {}
+        for name in sorted(wanted - set(cells)):
+            logger.warning(f"{username}: dataset {name!r} was chosen but is "
+                           f"not granted in zone {zone!r}; not mounting it")
         core = client.CoreV1Api()
         out = []
         for name in sorted(definitions):
@@ -5321,6 +5566,8 @@ class KubeConfigManager(ConfigManager):
             except Exception as e:
                 logger.error(f"Could not re-fence dataset {name!r}: {e}")
         for name, definition in sorted(definitions.items()):
+            if name not in wanted or self.is_archived_dataset(definition):
+                continue
             # An absent cell is a refusal, not a default — there is nothing
             # below it to fall back to.
             granted = cells.get(name)
@@ -5372,30 +5619,605 @@ class KubeConfigManager(ConfigManager):
 
         Only touches proxies that already exist: fencing the other mode must
         never be the thing that conjures it into being.
+
+        The policy keeps the shape it was created with (managed server or
+        rclone proxy), read off its own pod selector rather than the catalog:
+        a deleted dataset has no definition to ask, and re-fencing it in the
+        wrong shape would leave its pods selected by nothing.
         """
         net = client.NetworkingV1Api()
         for mode in ("ro", "rw"):
             name = self._s3_proxy_name(volume, mode)
             try:
-                net.read_namespaced_network_policy(name, self.namespace)
+                existing = net.read_namespaced_network_policy(
+                    name, self.namespace)
             except ApiException as e:
                 if e.status != 404:
                     logger.error(f"Could not read policy for {name}: {e}")
                 continue
+            selector = getattr(getattr(getattr(existing, "spec", None),
+                                       "pod_selector", None),
+                               "match_labels", None) or {}
+            managed = selector.get("app") == DATASET_SERVER_APP
             self._ensure_object(
                 name, self.namespace,
                 self._build_s3_proxy_network_policy(
-                    volume, mode, self.s3_proxy_peers(volume, mode)),
+                    volume, mode, self.s3_proxy_peers(volume, mode),
+                    managed=managed),
                 create=net.create_namespaced_network_policy,
                 read=net.read_namespaced_network_policy,
                 replace=net.replace_namespaced_network_policy)
+
+    def refence_dataset_proxies(self) -> int:
+        """Re-fence every proxy that exists, from the access matrix as it is
+        now. Returns how many datasets were re-fenced.
+
+        This is what makes revoking a grant take effect when it is made. The
+        matrix lives on User and Group CRs, and saving one used to change no
+        policy at all: a removed cell only reached a proxy when some session,
+        anyone's, was next built — so on a quiet cluster a revoked user kept
+        their reach indefinitely, holding the key from their last session's
+        rclone.conf. The operator calls this on every User, Group and Dataset
+        event and on a slow timer (operator.py).
+
+        Driven by the proxies' own policies rather than the catalog, so a
+        dataset deleted behind the portal's back (kubectl, a Helm value
+        removed) is fenced to nobody too, by s3_proxy_peers' rule for
+        undefined datasets.
+        """
+        try:
+            policies = client.NetworkingV1Api().list_namespaced_network_policy(
+                self.namespace,
+                label_selector="app=whistler-s3-proxy").items
+        except ApiException as e:
+            logger.error(f"Could not list dataset proxy policies: {e}")
+            return 0
+        volumes = sorted({(p.metadata.labels or {}).get("volume")
+                          for p in policies} - {None})
+        for volume in volumes:
+            # One dataset failing must not leave the others un-fenced.
+            try:
+                self._refresh_s3_proxy_policies(volume)
+            except Exception as e:
+                logger.error(f"Could not re-fence dataset {volume!r}: {e}")
+        return len(volumes)
+
+    # -- Managed datasets (design/storage.md, "Datasets are always S3") ------ #
+    #
+    # A claim Whistler creates in the release namespace, served by VersityGW.
+    # One server pod per dataset, never one for all: NetworkPolicy fences pods
+    # and ports, not buckets, so a shared server would turn per-dataset reach
+    # into per-server reach. Inside the pod, one VersityGW process per mode.
+
+    @staticmethod
+    def dataset_server_name(volume: str) -> str:
+        return f"whistler-dataset-{volume}"
+
+    @staticmethod
+    def dataset_claim_name(volume: str) -> str:
+        return f"whistler-dataset-{volume}"
+
+    @staticmethod
+    def dataset_modes(definition: Dict[str, Any]) -> Tuple[str, ...]:
+        """The modes a dataset is served in. A read-only dataset has no rw
+        process at all — a ceiling is better enforced by an absence than by a
+        policy admitting nobody."""
+        return ("ro",) if (definition or {}).get("readOnly") else ("ro", "rw")
+
+    def _build_dataset_server_isolation(self, volume: str) -> Dict[str, Any]:
+        """Deny all ingress to a managed dataset's server pod. Pure.
+
+        The per-mode policies are what admit anyone; this one exists so the
+        pod is never selected by *no* policy — which NetworkPolicy reads as
+        open to the whole cluster. That covers the window before the per-mode
+        policies exist and any later moment one is missing. Created before the
+        Deployment, and never deleted while the pod might run."""
+        labels = {"app": DATASET_SERVER_APP, "volume": volume}
+        return {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": self.dataset_server_name(volume),
+                         "labels": labels},
+            "spec": {"podSelector": {"matchLabels": labels},
+                     "policyTypes": ["Ingress"],
+                     "ingress": []},
+        }
+
+    def _build_dataset_server_manifests(self, *, volume, definition, image,
+                                        claim, auth_secrets,
+                                        resources=None):
+        """Deployment + one Service per mode for a managed dataset. Pure.
+
+        ``auth_secrets`` maps mode -> the Secret holding that mode's
+        generated key pair (_ensure_s3_auth_secret), which is that process's
+        VersityGW root account. Same keys and the same Service names
+        (``whistler-s3-<volume>-<mode>``, port 8080) as an rclone proxy, so a
+        guest cannot tell the two apart and cloud-init needs no branch.
+
+        The ro process is read-only twice over: ``--readonly`` refuses every
+        write in the gateway, and the claim is mounted ``readOnly`` so the
+        kernel refuses it if the gateway ever does not. Verified against
+        VersityGW v1.7.0: writes, deletes and CreateBucket all get 403.
+
+        **Recreate, not RollingUpdate**: the claim is usually RWO, and a new
+        pod scheduled to another node while the old one holds it never starts.
+        """
+        name = self.dataset_server_name(volume)
+        labels = {"app": DATASET_SERVER_APP, "volume": volume}
+        modes = self.dataset_modes(definition)
+        # Nothing here needs root, a writable root filesystem or any
+        # capability: VersityGW only touches the claim (verified with a
+        # read-only root filesystem, multipart uploads included).
+        hardened = {
+            "allowPrivilegeEscalation": False,
+            "readOnlyRootFilesystem": True,
+            "capabilities": {"drop": ["ALL"]},
+        }
+        # VersityGW's posix backend makes each top-level directory a bucket,
+        # and the guest mounts `<dataset>:<S3_PROXY_BUCKET>`. A bucket made by
+        # mkdir rather than CreateBucket has no ACL xattr, which only matters
+        # to CreateBucket itself — the guest's rclone is configured not to
+        # send one (cloudinit, no_check_bucket) — so object reads and writes
+        # in it work (verified).
+        init = {
+            "name": "bucket",
+            "image": image,
+            "command": ["sh", "-c", f"mkdir -p /srv/{S3_PROXY_BUCKET}"],
+            "securityContext": hardened,
+            "volumeMounts": [{"name": "data", "mountPath": "/srv"}],
+        }
+        containers = []
+        for mode in modes:
+            port = DATASET_SERVER_PORTS[mode]
+            args = ["--port", f":{port}", "--quiet"]
+            if mode == "ro":
+                args.insert(0, "--readonly")
+            args += ["posix", "/srv"]
+            containers.append({
+                "name": f"versitygw-{mode}",
+                "image": image,
+                "args": args,
+                "env": [
+                    {"name": "ROOT_ACCESS_KEY_ID", "valueFrom": {
+                        "secretKeyRef": {"name": auth_secrets[mode],
+                                         "key": "accessKeyId"}}},
+                    {"name": "ROOT_SECRET_ACCESS_KEY", "valueFrom": {
+                        "secretKeyRef": {"name": auth_secrets[mode],
+                                         "key": "secretAccessKey"}}},
+                ],
+                "ports": [{"containerPort": port, "name": f"s3-{mode}"}],
+                "securityContext": hardened,
+                "readinessProbe": {"tcpSocket": {"port": port},
+                                   "periodSeconds": 10},
+                "resources": resources or {},
+                "volumeMounts": [{"name": "data", "mountPath": "/srv",
+                                  "readOnly": mode == "ro"}],
+            })
+        deployment = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": name, "labels": labels},
+            "spec": {
+                "replicas": 1,
+                "strategy": {"type": "Recreate"},
+                "selector": {"matchLabels": labels},
+                "template": {
+                    "metadata": {"labels": labels},
+                    "spec": {
+                        "automountServiceAccountToken": False,
+                        "securityContext": {
+                            "runAsNonRoot": True,
+                            "runAsUser": 1000,
+                            "runAsGroup": 1000,
+                            # Makes a fresh claim writable by uid 1000.
+                            "fsGroup": 1000,
+                            "fsGroupChangePolicy": "OnRootMismatch",
+                            "seccompProfile": {"type": "RuntimeDefault"},
+                        },
+                        "initContainers": [init],
+                        "containers": containers,
+                        "volumes": [{"name": "data", "persistentVolumeClaim": {
+                            "claimName": claim}}],
+                    },
+                },
+            },
+        }
+        services = []
+        for mode in modes:
+            services.append({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"name": self._s3_proxy_name(volume, mode),
+                             "labels": {**labels, "mode": mode}},
+                "spec": {
+                    "type": "ClusterIP",
+                    "selector": labels,
+                    "ports": [{"name": "s3", "port": 8080,
+                               "targetPort": DATASET_SERVER_PORTS[mode]}],
+                },
+            })
+        return deployment, services
+
+    def _ensure_dataset_claim(self, volume: str,
+                              definition: Dict[str, Any]) -> Optional[str]:
+        """The managed dataset's claim, created if missing. Returns its
+        name, or None on a failure worth retrying.
+
+        Like a home: an existing claim has its PV secured (Retain, labelled
+        `user-data=dataset`), and a missing one is first bound back to the
+        retained PV its predecessor left (reattach_claim, by the stale
+        claimRef — the claim's name is fixed by the dataset's) before anything
+        is provisioned. That is what brings a dataset's data back after an
+        uninstall, or after deleting and re-creating it under the same name.
+        A larger ``size`` is applied to an existing claim (the class must
+        allow expansion); a smaller one never gets here
+        (dataset_spec_problem)."""
+        ns, claim = self.namespace, self.dataset_claim_name(volume)
+        labels = {"app": DATASET_SERVER_APP, "volume": volume}
+        size = definition.get("size")
+        api = client.CoreV1Api()
+        try:
+            pvc = api.read_namespaced_persistent_volume_claim(claim, ns)
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Could not read dataset claim {claim}: {e}")
+                return None
+            pvc = None
+        if pvc is not None:
+            try:
+                self.secure_claim(ns, claim, reattach.KIND_DATASET, "")
+            except Exception as e:
+                logger.warning(f"Could not retain the disk behind {claim}: {e}")
+            current = ((pvc.spec.resources.requests or {}).get("storage")
+                       if pvc.spec and pvc.spec.resources else None)
+            try:
+                grow = size and current and \
+                    parse_quantity(size) > parse_quantity(current)
+            except ValueError:
+                grow = False
+            if grow:
+                try:
+                    api.patch_namespaced_persistent_volume_claim(
+                        claim, ns, {"spec": {"resources": {
+                            "requests": {"storage": size}}}})
+                    logger.info(f"Growing dataset claim {claim} to {size}")
+                except ApiException as e:
+                    # Not fatal: the dataset keeps serving at its old size.
+                    logger.error(f"Could not grow {claim} to {size} (does "
+                                 f"its storage class allow expansion?): {e}")
+            return claim
+        try:
+            if self.reattach_claim(ns, claim, labels):
+                return claim
+        except PolicyError as e:
+            logger.error(f"Dataset {volume!r}: {e}")
+            return None
+        spec = {"accessModes": ["ReadWriteOnce"],
+                "volumeMode": "Filesystem",
+                "resources": {"requests": {"storage": size}}}
+        if self.dataset_storage_class:
+            spec["storageClassName"] = self.dataset_storage_class
+        try:
+            api.create_namespaced_persistent_volume_claim(ns, {
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": {"name": claim, "labels": labels}, "spec": spec})
+            logger.info(f"Created dataset claim {ns}/{claim} ({size})")
+        except ApiException as e:
+            if e.status != 409:
+                logger.error(f"Could not create dataset claim {claim}: {e}")
+                return None
+        self.secure_soon.set()
+        return claim
+
+    def ensure_managed_dataset(self, volume: str,
+                               definition: Dict[str, Any]) -> bool:
+        """Make a managed dataset's server match its definition: claim,
+        isolation policy, per-mode policies, Deployment, Services. Called by
+        the operator when the Dataset changes and again on every session
+        build that mounts it, so it is idempotent and self-healing. False on
+        a failure worth retrying.
+
+        Policies go first and the Deployment last, so the pod never runs
+        unselected by a policy (_build_dataset_server_isolation)."""
+        if self.is_archived_dataset(definition):
+            return True   # nothing to serve; prune_dataset_servers removes it
+        problem = self.dataset_spec_problem(definition)
+        if problem:
+            logger.error(f"Dataset {volume!r} not served: {problem}")
+            return False
+        modes = self.dataset_modes(definition)
+        auth_secrets = {}
+        for mode in modes:
+            auth_secrets[mode] = self._ensure_s3_auth_secret(volume, mode)
+            if not auth_secrets[mode]:
+                return False
+        apps = client.AppsV1Api()
+        core = client.CoreV1Api()
+        net = client.NetworkingV1Api()
+        ns = self.namespace
+        name = self.dataset_server_name(volume)
+        ok = self._ensure_object(
+            name, ns, self._build_dataset_server_isolation(volume),
+            create=net.create_namespaced_network_policy,
+            read=net.read_namespaced_network_policy,
+            replace=net.replace_namespaced_network_policy)
+        for mode in modes:
+            ok = self._ensure_object(
+                self._s3_proxy_name(volume, mode), ns,
+                self._build_s3_proxy_network_policy(
+                    volume, mode, self.s3_proxy_peers(volume, mode),
+                    managed=True),
+                create=net.create_namespaced_network_policy,
+                read=net.read_namespaced_network_policy,
+                replace=net.replace_namespaced_network_policy) and ok
+        if not ok:
+            return False   # never start the pod without its fencing
+        # A dataset made read-only keeps its rw policy, re-fenced to nobody
+        # (s3_proxy_peers applies the ceiling), and loses its rw Service.
+        self._refresh_s3_proxy_policies(volume)
+        claim = self._ensure_dataset_claim(volume, definition)
+        if not claim:
+            return False
+        deployment, services = self._build_dataset_server_manifests(
+            volume=volume, definition=definition,
+            image=self.dataset_server_image, claim=claim,
+            auth_secrets=auth_secrets,
+            resources=self.dataset_server_resources)
+        ok = self._ensure_object(
+            name, ns, deployment,
+            create=apps.create_namespaced_deployment,
+            read=apps.read_namespaced_deployment,
+            replace=apps.replace_namespaced_deployment)
+        for service in services:
+            ok = self._ensure_object(
+                service["metadata"]["name"], ns, service,
+                create=core.create_namespaced_service,
+                read=core.read_namespaced_service,
+                replace=core.replace_namespaced_service,
+                preserve=self._preserve_cluster_ip) and ok
+        for mode in set(DATASET_SERVER_PORTS) - set(modes):
+            try:
+                core.delete_namespaced_service(
+                    self._s3_proxy_name(volume, mode), ns)
+            except ApiException as e:
+                if e.status != 404:
+                    logger.warning(f"Could not remove the {mode} Service of "
+                                   f"{volume!r}: {e}")
+        return ok
+
+    def _managed_dataset_names(self) -> Optional[Set[str]]:
+        """Names of the managed Datasets that are served (not archived), read
+        straight from the API, or
+        None if that read failed. Not the cached catalog: this decides what
+        to tear down, and _load_datasets keeps a stale catalog on failure by
+        design, which here would be the wrong way round."""
+        try:
+            items = self.api.list_namespaced_custom_object(
+                self.group, self.version, self.namespace,
+                DATASET_PLURAL).get("items", [])
+        except (ApiException, AttributeError) as e:
+            logger.warning(f"Could not list datasets to prune servers: {e}")
+            return None
+        return {item["metadata"]["name"] for item in items
+                if self.is_managed_dataset(item.get("spec") or {})
+                and not self.is_archived_dataset(item.get("spec") or {})}
+
+    def revive_dataset_servers(self) -> List[str]:
+        """Ensure the server of every served (managed, not archived) dataset
+        whose Deployment is missing. Returns the datasets revived.
+
+        The kopf update handler cannot be relied on for this. Resurrecting
+        an archived dataset puts its spec back exactly as kopf last recorded
+        it — no handler ran for the archive, so nothing was recorded — and
+        kopf, seeing no difference, raises no update. Measured on k3d. This
+        runs from the same worker as the prune, on every Dataset event and
+        the backstop, so it also heals a server deleted by hand."""
+        try:
+            items = self.api.list_namespaced_custom_object(
+                self.group, self.version, self.namespace,
+                DATASET_PLURAL).get("items", [])
+        except (ApiException, AttributeError) as e:
+            logger.warning(f"Could not list datasets to revive servers: {e}")
+            return []
+        apps = client.AppsV1Api()
+        revived = []
+        for item in items:
+            spec = item.get("spec") or {}
+            annotations = item["metadata"].get("annotations") or {}
+            if not self.is_managed_dataset(spec) or \
+                    self.is_archived_dataset(spec) or \
+                    DELETE_DATA_ANNOTATION in annotations:
+                continue
+            volume = item["metadata"]["name"]
+            try:
+                apps.read_namespaced_deployment(
+                    self.dataset_server_name(volume), self.namespace)
+                continue
+            except ApiException as e:
+                if e.status != 404:
+                    logger.error(f"Could not read the server of {volume!r}: {e}")
+                    continue
+            if self.ensure_managed_dataset(volume, spec):
+                revived.append(volume)
+                logger.info(f"Started the server of dataset {volume!r}")
+        return revived
+
+    def prune_dataset_servers(self) -> List[str]:
+        """Remove the server (Deployment and Services) of every managed
+        dataset that is archived or no longer defined. Returns the datasets
+        pruned.
+
+        The claim and its data stay — re-creating the dataset brings them
+        back — and so do its policies: deleting a policy while the pod is
+        still terminating would leave it unselected, i.e. open. The policies
+        are already fenced to nobody (s3_proxy_peers on an undefined
+        dataset)."""
+        defined = self._managed_dataset_names()
+        if defined is None:
+            return []
+        apps, core = client.AppsV1Api(), client.CoreV1Api()
+        ns = self.namespace
+        selector = f"app={DATASET_SERVER_APP}"
+        pruned = []
+        try:
+            deployments = apps.list_namespaced_deployment(
+                ns, label_selector=selector).items
+            services = core.list_namespaced_service(
+                ns, label_selector=selector).items
+        except ApiException as e:
+            logger.error(f"Could not list dataset servers: {e}")
+            return []
+        for d in deployments:
+            volume = (d.metadata.labels or {}).get("volume")
+            if not volume or volume in defined:
+                continue
+            try:
+                apps.delete_namespaced_deployment(d.metadata.name, ns)
+                pruned.append(volume)
+                logger.info(f"Removed the server of deleted dataset "
+                            f"{volume!r}; its data is kept")
+            except ApiException as e:
+                if e.status != 404:
+                    logger.error(f"Could not remove {d.metadata.name}: {e}")
+        for s in services:
+            volume = (s.metadata.labels or {}).get("volume")
+            if volume and volume not in defined:
+                try:
+                    core.delete_namespaced_service(s.metadata.name, ns)
+                except ApiException as e:
+                    if e.status != 404:
+                        logger.error(f"Could not remove {s.metadata.name}: {e}")
+        return pruned
+
+    def purge_dataset(self, volume: str) -> bool:
+        """Carry out destroy_dataset. True when the dataset is gone.
+
+        In order, and retried from the top until done: stop every pod that
+        serves it (managed server or S3 proxies) and wait for them to be gone
+        — the fences must outlive the pods, or a terminating pod is selected
+        by no policy, i.e. open; then, for a managed dataset, set the PV back
+        to Delete and delete the claim, which takes the data; then the
+        fences, Services and keys; the record last, because it carries the
+        mark this retries from."""
+        ns = self.namespace
+        apps, core = client.AppsV1Api(), client.CoreV1Api()
+        net = client.NetworkingV1Api()
+        # Read live, never from the cached catalog: this destroys data, so it
+        # acts only on a record that says, right now, both "archived" and
+        # "delete me".
+        try:
+            item = self.api.get_namespaced_custom_object(
+                self.group, self.version, ns, DATASET_PLURAL, volume)
+        except ApiException as e:
+            if e.status == 404:
+                return True
+            logger.error(f"Could not read dataset {volume!r}: {e}")
+            return False
+        definition = item.get("spec") or {}
+        marked = DELETE_DATA_ANNOTATION in (
+            (item.get("metadata") or {}).get("annotations") or {})
+        if not (marked and self.is_archived_dataset(definition)):
+            logger.error(f"Refusing to purge dataset {volume!r}: it is not "
+                         f"both archived and marked for deletion")
+            return False
+        servers = [self.dataset_server_name(volume)] + [
+            self._s3_proxy_name(volume, m) for m in DATASET_SERVER_PORTS]
+        for name in servers:
+            try:
+                apps.delete_namespaced_deployment(name, ns)
+            except ApiException as e:
+                if e.status != 404:
+                    logger.error(f"Could not stop {name}: {e}")
+                    return False
+        try:
+            pods = core.list_namespaced_pod(
+                ns, label_selector=f"volume={volume}").items
+        except ApiException as e:
+            logger.error(f"Could not list pods of {volume!r}: {e}")
+            return False
+        if any((p.metadata.labels or {}).get("app") in (
+                DATASET_SERVER_APP, "whistler-s3-proxy") for p in pods):
+            return False   # still terminating; the retry comes back
+        if self.is_managed_dataset(definition):
+            claim = self.dataset_claim_name(volume)
+            if not self.release_claim_volume(ns, claim):
+                return False
+            try:
+                core.delete_namespaced_persistent_volume_claim(claim, ns)
+            except ApiException as e:
+                if e.status != 404:
+                    logger.error(f"Could not delete dataset claim {claim}: {e}")
+                    return False
+        steps = [(core.delete_namespaced_service,
+                  self._s3_proxy_name(volume, m)) for m in DATASET_SERVER_PORTS]
+        steps += [(net.delete_namespaced_network_policy,
+                   self._s3_proxy_name(volume, m)) for m in DATASET_SERVER_PORTS]
+        steps += [(net.delete_namespaced_network_policy,
+                   self.dataset_server_name(volume))]
+        steps += [(core.delete_namespaced_secret,
+                   f"{self._s3_proxy_name(volume, m)}-auth")
+                  for m in DATASET_SERVER_PORTS]
+        steps += [(core.delete_namespaced_secret,
+                   self.dataset_credentials_secret_name(volume))]
+        for delete, name in steps:
+            try:
+                delete(name, ns)
+            except ApiException as e:
+                if e.status != 404:
+                    logger.error(f"Could not delete {name}: {e}")
+                    return False
+        try:
+            self.api.delete_namespaced_custom_object(
+                self.group, self.version, ns, DATASET_PLURAL, volume)
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Could not delete dataset {volume!r}: {e}")
+                return False
+        logger.info(f"Deleted dataset {volume!r} for good"
+                    + (" and its data" if self.is_managed_dataset(definition)
+                       else ""))
+        return True
+
+    def secure_dataset_claims(self) -> None:
+        """The sweep's share: Retain every managed dataset's PV, and retry a
+        deletion (destroy_dataset) the event handler did not finish."""
+        try:
+            items = self.api.list_namespaced_custom_object(
+                self.group, self.version, self.namespace,
+                DATASET_PLURAL).get("items", [])
+        except (ApiException, AttributeError) as e:
+            if getattr(e, "status", None) != 404:
+                logger.warning(f"Could not list datasets to secure: {e}")
+            return
+        for item in items:
+            volume = item["metadata"]["name"]
+            if DELETE_DATA_ANNOTATION in (
+                    item["metadata"].get("annotations") or {}):
+                try:
+                    self.purge_dataset(volume)
+                except ApiException as e:
+                    logger.warning(f"Could not delete dataset {volume!r}: {e}")
+                continue
+            if not self.is_managed_dataset(item.get("spec") or {}):
+                continue
+            try:
+                self.secure_claim(self.namespace,
+                                  self.dataset_claim_name(volume),
+                                  reattach.KIND_DATASET, "")
+            except ApiException as e:
+                logger.warning(f"Could not secure dataset {volume!r}: {e}")
 
     def ensure_s3_proxy(self, volume: str, mode: str, definition) -> bool:
         """Ensure the (volume, mode) proxy matches its manifests — Deployment,
         Service and fencing NetworkPolicy. Self-healing like
         ensure_storage_gateway: every call reconciles all three, so a grant
         change reaches a running proxy's policy. False on failure; callers
-        treat that as transient and retry."""
+        treat that as transient and retry.
+
+        A managed dataset has no proxy; its server serves both modes and is
+        ensured whole (ensure_managed_dataset)."""
+        if self.is_managed_dataset(definition):
+            return self.ensure_managed_dataset(volume, definition or {})
         if not (definition or {}).get("credentialsSecret"):
             # No credential means no working proxy. Refuse here, where the
             # caller already knows to skip this dataset, rather than building
@@ -6870,10 +7692,12 @@ class KubeConfigManager(ConfigManager):
 
     def save_group(self, group_data: Dict[str, Any]) -> bool:
         """Create or update a Group CR from the admin editor. Unlike
-        save_zone this needs no propagation step: a group grants nothing that
-        is materialized in the cluster — every field is read at policy time,
-        so an edit applies to the next session start (and, for channels, to
-        the next connection attempt).
+        save_zone this needs no propagation step here: most fields are read at
+        policy time, so an edit applies to the next session start (and, for
+        channels, to the next connection attempt). The one grant that IS
+        materialized — dataset cells, in the proxies' fencing policies — is
+        pushed by the operator, which watches Groups and Users
+        (refence_dataset_proxies).
 
         Returns False for a request that is simply malformed (no name), and
         raises ConfigWriteError when the cluster refuses the write — the

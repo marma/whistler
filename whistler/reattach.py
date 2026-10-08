@@ -34,6 +34,7 @@ KIND_HOME = "home"          # a HomeVolume's claim (VM home disk image)
 KIND_POD_HOME = "pod-home"  # the per-user claim container sessions mount
 KIND_ARCHIVED = "archived"  # a home taken from its user (archive_patch)
 KIND_BACKUPS = "backups"    # the backup volume (design/backup.md, Phase 3)
+KIND_DATASET = "dataset"    # a managed dataset's claim (design/storage.md)
 
 # On an archived PV: where it came from and what record holds it, as JSON.
 # The PV is the one object that survives an uninstall, so this is what lets a

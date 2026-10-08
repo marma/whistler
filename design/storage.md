@@ -228,8 +228,8 @@ Two things enforce access, and they compose as AND:
   the proxy alone, so it never enters a guest whose user has root.
 
 Still open: a proxy is a single replica with no availability story; grant
-changes reach a proxy's policy on the next session reconcile rather than being
-pushed; and **datasets are VM-only** — a pod would need `/dev/fuse` to mount
+changes reached a proxy's policy only on the next session reconcile (pushed
+since 2026-10-08, see below); and **datasets are VM-only** — a pod would need `/dev/fuse` to mount
 one, so container sessions currently see no S3 volume at all.
 
 ### Datasets are their own kind, 2026-08-18
@@ -315,6 +315,241 @@ over ~45s — the boundary holds, the diagnosis is poor. And the proxy's VFS
 listing cache (now `--dir-cache-time 1m`) means a dataset changed by another
 writer appears stale for up to that long, which is the read-mostly assumption
 showing through.
+
+### Datasets are always S3; Whistler creates the storage, 2026-10-08
+
+Decided, not yet built (except the revocation fix at the end).
+
+**A dataset is S3 to the guest, whatever is behind it.** One mount path
+(`rclone mount` against an in-cluster endpoint), one contract (no locks, no
+atomic rename, last writer wins), and a block- or file-backed volume served
+this way cannot be mistaken for a shared filesystem — the S3 interface *is*
+the statement that it is not one. Backends live in the server pod, never in
+the guest.
+
+**First backend: a managed PVC served by VersityGW.** The portal creates a
+dataset with a size; the **operator** creates the claim (default storage
+class) and the VersityGW Deployment in the release namespace. The portal marks,
+the operator acts, as with home deletion and archiving, so the portal gains no
+PVC verbs. Remote S3 (today's `rclone serve s3` over an admin's bucket) is
+parked rather than removed.
+
+The question this answers is **how much the portal may define**. Letting it
+reference existing storage is the dangerous direction, and specifically so in
+this cluster: every home's PV is `Retain` (design/backup.md), so Released
+homes of deleted users lie around; the backup claim holds every CR and, with
+no passphrase, the secrets; user home claims sit in user namespaces, and a
+proxy for one would have to run there. A portal that can only *create* a claim
+can point Whistler at none of it. If existing volumes (NFS, CephFS, a
+pre-filled PVC) are wanted later, the rule is that a cluster admin hands them
+over — a labelled claim in a dedicated namespace, created with kubectl — and
+the portal chooses among those and narrows (subPath, read-only), never names a
+PV, a namespace or an NFS server. Raw `server:/path` stays out of the portal:
+under AUTH_SYS the server pod could claim any uid on any export it can route
+to.
+
+What a managed dataset owes, by analogy with homes: `Retain` on its PV, a
+`user-data=dataset` label, re-attach on reinstall, and a place in the
+backup/uninstall story. Deleting is two acts (2026-10-08, see "Archived
+datasets" below): delete archives, and only an archived dataset can be
+deleted for good, behind a typed-name confirmation. VersityGW's POSIX
+backend makes top-level directories buckets, so the volume is laid out
+`/<dataset>/…` — the same trap as `rclone serve s3` above.
+
+**Credentials become per-user, and revocation deletes them.** Today's proxy
+key is one per (dataset, mode), generated once and never rotated, and every
+guest that ever mounted the dataset holds it in a root-readable
+`rclone.conf`. That is tolerable only because reach is the real boundary and
+the endpoint is internal: a revoked user keeps the key and cannot connect.
+Rotation on restart was considered and rejected — it ties revocation to
+whenever something restarts rather than to the admin's act, and rotating a
+shared key breaks every other holder's running mount. Instead: one VersityGW
+account per `(user, dataset, mode)`, created and deleted by the operator from
+the matrix, so removing a cell kills that key everywhere *and* re-fences the
+endpoint, without touching anyone else. That moves part of the ro/rw boundary
+into VersityGW's authorization, so ro and rw stay **separate processes over
+one volume** anyway (two containers in one pod: the ro one mounts the claim
+`readOnly`, and per-port NetworkPolicy rules keep the fencing per mode, which
+also lets an RWO claim serve both). To verify before building: whether
+VersityGW checks credentials per request (S3 signing says it should, and that
+is what makes deletion cut an open mount), and whether it has a server-wide
+read-only mode or the ro side needs another server.
+
+**External access reverses this document's rule, so it is a grant, not a
+flag.** Exposing a dataset outside the cluster means "zones fence the network,
+not the data" stops protecting it for whoever holds an outside credential. It
+is taken on deliberately, with two conditions:
+
+- **Internal keys never work outside.** The external listener is a separate
+  server with its own accounts, behind an Ingress. This is what actually
+  protects a kiosk-bound user's restriction: the leak path is not an external
+  credential (minted in the portal, which a kiosk-only account cannot enter)
+  but the internal key sitting in their guest, where they are root.
+- **`external` is a reserved zone in the access matrix.** A cell
+  `external: {dataset: read-only}` is the only thing that issues an outside
+  credential, per user and revocable like the internal ones. Nobody holds one
+  unless an admin writes that cell, kiosk accounts included, and the grid shows
+  "this person can take this data off the cluster" where the admin edits
+  access, rather than behind a per-dataset switch.
+
+**One server per dataset, not one for all of them.** A shared VersityGW
+serving every dataset as a bucket was considered and rejected, for three
+reasons, the first of which decides it alone:
+
+- **Fencing.** NetworkPolicy selects pods and ports, not buckets. One server
+  turns "alice may reach refdata in zone open" into "alice may reach the
+  dataset server in zone open", and per-dataset access then rests on
+  VersityGW's authorization alone — the reach half of the AND is gone.
+- **Lifecycle.** A pod's volumes are fixed while it runs, so a shared server
+  either restarts for every new dataset (cutting everyone's mounts) or serves
+  one big claim with a directory per dataset, which gives up per-dataset size,
+  `Retain`, archiving and clean deletion.
+- **Blast radius.** A crash, a full disk or an authorization bug takes one
+  dataset, not all.
+
+The cost is a pod per dataset (VersityGW is one Go binary). Inside it, ro and
+rw are two containers, and "read-only" there means **process-wide**: the ro
+container cannot write whoever it believes is asking, which is a property of
+the process (a startup flag, or the claim mounted `readOnly` so the kernel
+refuses), not a per-account permission. That is what keeps a read-only grant
+a boundary if VersityGW's ACLs have a bug.
+
+Keys are **stable across restarts and die only with the grant**: the operator
+keeps each account's key in a Secret and re-creates the account from it
+whenever the server comes back, and the account list lives outside the served
+tree — it is derived from the matrix, so there is nothing in it to back up.
+For the external listener, one server holding exactly one bucket means an
+Ingress can route `https://<host>/<dataset>/…` by path to that dataset's
+external container: path-style S3 puts the bucket first in the path, and the
+signature covers a path the Ingress does not rewrite (unverified).
+
+Built first, in order: managed datasets on the internal endpoint only; then
+per-user keys; then the external listener and the `external` zone, as a
+separate decision.
+
+**Phase 1 built, 2026-10-08: managed datasets, internal only, shared keys.**
+`Dataset.spec.source: managed` + `size`; the portal offers it as the default
+when creating a dataset. The operator builds it when the CR appears
+(`ensure_managed_dataset`, kopf handlers on Datasets) in this order: a
+deny-all policy for the server pod, the per-mode policies, the claim
+(re-attached from its retained PV if one exists, else provisioned), the
+Deployment, the Services. Keys are still today's shared per-(dataset, mode)
+pair, used as each VersityGW process's root account — per-user keys are the
+next step. Deleting a dataset archives it (below); a CR deleted with kubectl
+has its server pruned and keeps claim and policies.
+The PV is `Retain` + `user-data=dataset`; the uninstall hook retains it and
+releases the claim, and a reinstall re-binds it when the Dataset comes back.
+
+**Archived datasets, 2026-10-08.** Deleting a dataset in the portal sets
+`spec.archived` rather than removing the record. An archived dataset is
+served to nobody — `s3_proxy_peers` admits no one, `session_shared_datasets`
+mounts nothing, the managed server is pruned — but keeps its name, its grants
+(the access grid still lists it, labelled, because saving the grid writes
+every row it shows) and, if managed, its claim and data. Two things can
+happen to it:
+
+- **Resurrect** clears the flag. The server comes back on the same claim with
+  the same keys (measured: 7s on k3d, file intact). This needed one fix: kopf
+  raises no update for it, because no handler ran for the archive, so
+  nothing was recorded, and the restored spec equals what kopf last saw. The
+  dataset worker now also revives any served managed dataset whose
+  Deployment is missing (`revive_dataset_servers`), on every Dataset event
+  and the 300s backstop — which also heals a server deleted by hand.
+- **Delete for good**, offered only for an archived dataset, behind a modal
+  that wants the name typed (checked again server-side). The portal marks
+  the record (`whistler/delete-data`); the operator (`purge_dataset`) reads
+  it *live* and acts only if it is both archived and marked: stop the pods
+  and wait until they are gone (fences must outlive pods), PV to Delete,
+  claim, then policies, Services and keys, the record last. An S3 dataset's
+  bucket is never touched.
+
+A name held by an archived dataset cannot be re-used: re-creating it would
+hand a new definition the old one's grants and data. An archived dataset
+cannot be edited either; resurrect it first. Verified end to end through the
+portal's own routes on k3d, including the refusals.
+
+**Instances choose their datasets, 2026-10-08.** Until now every dataset a
+user was granted in the session's zone was mounted, chosen or not. Now an
+instance names the ones it wants — `overrides.datasets`, set on the create
+and edit forms — and the start dialog can change the choice for one run
+(`runOverrides.datasets`), by the same defaults-versus-this-run rule as every
+other override (`session_requested_datasets`). It rides the overrides but is
+not one: no override grant gates it, `_apply_overrides` ignores the key, and
+the start dialog opens for anyone with a dataset to choose. A dataset is
+mounted only if it is chosen **and** granted in the zone the session runs in;
+the forms offer what the user holds in any zone (labelled with where and
+how), because the zone can change per run. Nothing chosen means nothing
+mounted — including for instances that existed before this, which mounted
+everything granted. Verified on k3d that the choice survives the API server
+in both slices (the Session schema is structured, so `datasets` had to be
+added to it or it would have been pruned silently).
+
+Limitation, not new: dataset mounts are written by cloud-init, which re-runs
+on every start only for a fresh root — a containerDisk `image`, which is what
+devbase and the desktops use. A template with a persistent root (`imageURL`,
+a CDI DataVolume) keeps the instance-id across starts, so cloud-init applies
+`write_files` on the first boot only, and a changed choice does not reach it.
+
+Verified on a throwaway k3d cluster (local-path, kube-router's NetworkPolicy
+enforcement) and against VersityGW v1.7.0 in Docker:
+
+- Granted rw in zone `default`: write and list through the rw Service. Not
+  granted ro: the ro port refuses the connection — the matrix, exactly. An
+  ungranted namespace holding *both* valid keys: refused on both ports.
+- Revoking or granting by editing only the User CR takes effect in ~2.6s
+  measured from the client, `kubectl exec` overhead included.
+- `--readonly` refuses PutObject, DeleteObject and CreateBucket with **403**
+  (rclone's read-only proxy answers 500) — on top of the claim being mounted
+  `readOnly` in that container.
+- Delete keeps the PV and the data; re-creating as `readOnly` runs one
+  container, drops the rw Service, fences rw to nobody, and serves the old
+  file. Deleting the claim and re-creating the dataset re-attaches the same
+  PV.
+
+What the server taught us:
+
+- **A bucket VersityGW did not create cannot be "created" again.** A `mkdir`'d
+  bucket directory has no ACL xattr, and CreateBucket on it is a 500
+  (`get bucket acl: no such key`). Object reads and writes inside it work.
+  rclone sends CreateBucket before its first upload, so the guest's
+  `rclone.conf` now says `no_check_bucket = true` — harmless for the rclone
+  proxies, whose bucket always exists too.
+- **An unknown access key is a 404** (`XAdminUserNotFound`), not a 403;
+  rclone reports it as "directory not found". A wrong secret is
+  `SignatureDoesNotMatch`, anonymous is `AccessDenied`. Every request is
+  signature-checked, which is what will let deleting a per-user account cut
+  an open mount — **after VersityGW's IAM cache expires** (`--iam-cache-ttl`,
+  default 120s). Phase 2 should lower or disable it.
+- **Sessions need their own egress carve-out to the server.** The baseline
+  allow let session pods reach `app=whistler-s3-proxy` on 8080 only, so a
+  real guest's mount of a managed dataset **hung** (dropped, not refused) —
+  the k3d probes above sat in namespaces with no zone egress policy and
+  could not have shown it. The baseline now also allows
+  `app=whistler-dataset-server` on 8080 *and* 8081: NetworkPolicy sees the
+  pod port after the Service translates it, and the rw Service's 8080 lands
+  on 8081. Found on k3s-metal, 2026-10-08.
+- It runs fine as uid 1000 on a read-only root filesystem, multipart
+  included; multipart parts land in `.sgwtmp/` inside the bucket, which
+  listings hide. The image's entrypoint passes arguments straight to the
+  binary, and it ships a shell, which the bucket-bootstrap init container
+  uses.
+- With no `--iam-*` flag it runs in single-account mode, and the guest holds
+  that root key. Harmless at phase 1 — root of a process confined to one
+  dataset's claim, behind a policy — but per-user keys (phase 2) mean the
+  root key must never leave the pod.
+
+**Revocation was lazy; fixed 2026-10-08.** The matrix lives on User and Group
+CRs and saving one changed no policy: a removed cell reached a proxy only when
+some session, anyone's, was next built, so on a quiet cluster a revoked user
+kept their reach indefinitely. And a deleted Dataset's proxy (fenced, not
+deleted) still admitted every user whose cells named it, since nothing removes
+those cells. Now `s3_proxy_peers` admits nobody to an undefined dataset, and
+the operator re-fences every existing proxy (`refence_dataset_proxies`,
+driven by the proxies' own policies so a dataset deleted with kubectl is
+covered) on any User, Group or Dataset event — stateless `on.event` handlers
+waking one debounced worker, with a 300s backstop. Still not cut: an
+established connection, if the CNI's conntrack lets it outlive the policy.
+Per-user keys are the answer to that.
 
 ## Still open
 

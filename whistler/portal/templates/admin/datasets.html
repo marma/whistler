@@ -14,11 +14,13 @@
 </div>
 
 <p class="ui grey text">
-  Shared data held in S3 and mounted in VM sessions at <code>/shared/&lt;name&gt;</code>.
-  Sessions never reach the S3 server itself — Whistler runs a proxy per dataset
-  and mode, holds the bucket credential there, and fences it so only granted
-  users can reach it. Grant a dataset in the <a href="/admin/groups?user={{ current_user }}">Groups</a>
-  or user editors, the same way as a volume.
+  Shared data, mounted in VM sessions at <code>/shared/&lt;name&gt;</code> over S3.
+  A dataset is either a <em>Whistler-managed volume</em> — storage Whistler
+  creates and serves — or an <em>external S3 bucket</em>, reached through a
+  proxy that holds the bucket credential. Either way sessions only ever see a
+  Whistler-run endpoint, fenced so only granted users can reach it. Grant a
+  dataset in the access matrix of the <a href="/admin/groups?user={{ current_user }}">Groups</a>
+  or user editors.
 </p>
 
 <div class="ui small warning message">
@@ -37,55 +39,105 @@
     <tr>
       <th>Name</th>
       <th>Description</th>
-      <th>Bucket</th>
-      <th>Endpoint</th>
-      <th>Access</th>
-      <th>Credential</th>
+      <th class="collapsing">Storage</th>
+      <th class="collapsing">Access</th>
       <th>Actions</th>
     </tr>
   </thead>
   <tbody>
     {% for d in datasets %}
-    <tr>
-      <td><strong>{{ d.name }}</strong></td>
+    {% set managed = d.source == "managed" %}
+    <tr {% if d.archived %}class="archived-dataset"{% endif %}>
+      <td style="white-space:nowrap"><strong>{{ d.name }}</strong></td>
       <td>{{ d.description or "—" }}</td>
-      <td>
-        <code>{{ d.bucket or "—" }}</code>
-        {% if d.prefix %}<br><span class="ui grey text">/{{ d.prefix }}</span>{% endif %}
+      <td class="center aligned">
+        {% if managed %}
+          <i class="large blue hdd icon" title="Whistler-managed volume"></i>
+        {% else %}
+          <i class="large cloud icon" title="External S3 bucket"></i>
+        {% endif %}
       </td>
-      <td>
-        {% if d.endpoint %}<code>{{ d.endpoint }}</code>
-        {% else %}<span class="ui grey text">AWS S3</span>{% endif %}
-      </td>
-      <td>
-        {% if d.readOnly %}
+      <td style="white-space:nowrap">
+        {% if d.deleting %}
+          <div class="ui tiny red label"><i class="spinner loading icon"></i> deleting</div>
+        {% elif d.archived %}
+          <div class="ui tiny grey label"><i class="archive icon"></i> archived</div>
+        {% elif d.readOnly %}
           <div class="ui tiny green label"><i class="lock icon"></i> read-only</div>
         {% else %}
           <div class="ui tiny yellow label">writable if granted</div>
         {% endif %}
       </td>
-      <td>
-        {% if d.hasCredentials %}
-          <i class="green check icon"></i>
-          <span class="ui grey text">{{ d.credentialsSecret or "—" }}</span>
-        {% else %}
-          <div class="ui tiny red label">missing</div>
-        {% endif %}
-      </td>
       <td class="collapsing">
+        {% if d.deleting %}
+        {% elif d.archived %}
+        <form method="post" action="/admin/datasets/{{ d.name }}/restore?user={{ current_user }}"
+              style="display:inline">
+          <button class="ui tiny button"><i class="undo icon"></i> Resurrect</button>
+        </form>
+        <button type="button" class="ui red tiny button"
+                onclick="openDestroy('{{ d.name }}', {{ 'true' if managed else 'false' }})">
+          <i class="trash icon"></i> Delete
+        </button>
+        {% else %}
         <a href="/admin/datasets/{{ d.name }}/edit?user={{ current_user }}" class="ui tiny button">
           <i class="edit icon"></i> Edit
         </a>
-        <form method="post" action="/admin/datasets/{{ d.name }}/delete?user={{ current_user }}"
+        <form method="post" action="/admin/datasets/{{ d.name }}/archive?user={{ current_user }}"
               style="display:inline"
-              onsubmit="return confirm('Delete dataset {{ d.name }}? Its proxies are fenced to nobody immediately; sessions holding a mount keep it until they stop. The data in the bucket is not touched.')">
+              onsubmit="return confirm('Delete dataset {{ d.name }}? It is archived: nobody can reach it from now on, and sessions holding a mount keep it only until they stop. {% if managed %}Its data and its grants are kept{% else %}Its grants are kept, and the bucket is not touched{% endif %}; you can resurrect it from the archive, or delete it for good there.')">
           <button class="ui red tiny button"><i class="trash icon"></i> Delete</button>
         </form>
+        {% endif %}
       </td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
+
+<style>
+  .archived-dataset td:not(:last-child) { opacity: .55; }
+</style>
+
+{# One modal for every archived row; openDestroy fills it in. #}
+<div class="ui tiny modal" id="destroy-modal">
+  <div class="header"><i class="red trash icon"></i> Delete <span class="destroy-name"></span> for good</div>
+  <div class="content">
+    <p class="destroy-managed">This deletes the dataset <strong>and all of its data</strong>:
+      its volume is removed from the cluster and cannot be recovered.</p>
+    <p class="destroy-s3">This deletes the dataset's record, endpoints and
+      keys for good. The S3 bucket itself is not touched.</p>
+    <form class="ui form" method="post" id="destroy-form">
+      <div class="field">
+        <label>Type <code class="destroy-name"></code> to confirm</label>
+        <input type="text" name="confirm_name" autocomplete="off" id="destroy-confirm">
+      </div>
+    </form>
+  </div>
+  <div class="actions">
+    <button type="button" class="ui cancel button">Cancel</button>
+    <button type="submit" form="destroy-form" class="ui red button" id="destroy-submit" disabled>
+      <i class="trash icon"></i> Delete for good
+    </button>
+  </div>
+</div>
+
+<script>
+  function openDestroy(name, managed) {
+    const $m = $('#destroy-modal');
+    $m.find('.destroy-name').text(name);
+    $m.find('.destroy-managed').toggle(managed);
+    $m.find('.destroy-s3').toggle(!managed);
+    $('#destroy-form').attr('action',
+      '/admin/datasets/' + encodeURIComponent(name) + '/destroy?user={{ current_user }}');
+    const input = document.getElementById('destroy-confirm');
+    const submit = document.getElementById('destroy-submit');
+    input.value = '';
+    submit.disabled = true;
+    input.oninput = () => { submit.disabled = input.value.trim() !== name; };
+    $m.modal({autofocus: false, onVisible: () => input.focus()}).modal('show');
+  }
+</script>
 {% else %}
 <div class="ui placeholder segment">
   <div class="ui icon header">

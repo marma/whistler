@@ -438,3 +438,43 @@ def test_a_start_refused_by_policy_halts_nothing(monkeypatch):
         "whistler/last-connect": "200.0", "whistler/last-stop": "100.0"})
     assert cm.halted == []
     assert patch.status["phase"] == "Failed"
+
+
+# --- dataset fencing follows the matrix ------------------------------------ #
+
+def test_a_user_group_or_dataset_event_wakes_the_refence_worker():
+    operator._refence_wake.clear()
+    operator.access_changed_fn(type="MODIFIED", body={})
+    assert operator._refence_wake.is_set()
+    operator._refence_wake.clear()
+
+
+def test_refence_worker_runs_a_pass_and_clears_the_wake():
+    import threading
+
+    class _CM:
+        passes = 0
+
+        def refence_dataset_proxies(self):
+            # The wake is already cleared when the pass reads, so an edit
+            # landing during it is not absorbed.
+            assert not wake.is_set()
+            self.passes += 1
+
+    wake = threading.Event()
+    wake.set()
+    cm = _CM()
+    operator._refence_datasets_loop(cm, wake=wake, interval=0, settle=0,
+                                    once=True)
+    assert cm.passes == 1
+
+
+def test_refence_worker_survives_a_failing_pass():
+    import threading
+
+    class _CM:
+        def refence_dataset_proxies(self):
+            raise RuntimeError("api down")
+
+    operator._refence_datasets_loop(_CM(), wake=threading.Event(),
+                                    interval=0, settle=0, once=True)

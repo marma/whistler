@@ -32,7 +32,7 @@ import ipaddress
 import logging
 import os
 import re
-from typing import Annotated, Optional
+from typing import Annotated, List, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -42,6 +42,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from whistler.config import (ACCESS_MODES, CHANNELS, ConfigWriteError,
+                             DATASET_SOURCE_MANAGED, DatasetSpecError,
                              ENFORCED_CHANNELS, GPU_NONE,
                              ENTRY_KIOSK, ENTRY_POINTS, ENTRY_PORTAL,
                              GPU_NODE_LABEL, NEW_USER_ENTRY_POINTS,
@@ -487,26 +488,39 @@ async def _override_form_context(request: Request, cm, user: str) -> dict:
     Every allow is explicit (2026-08-25), which is why there is no "empty means
     any" branch here."""
     (gpu_types, allowed_gpu_types,
-     overrides, zones, allowed_zones) = await asyncio.gather(
+     overrides, zones, allowed_zones, datasets) = await asyncio.gather(
         request.app.state.run(cm.get_gpu_types),
         request.app.state.run(cm.get_user_allowed_gpu_types, user),
         request.app.state.run(cm.get_user_overrides, user),
         request.app.state.run(cm.get_zones),
         request.app.state.run(cm.get_user_allowed_zones, user),
+        request.app.state.run(cm.get_user_dataset_choices, user),
     )
     return {
         "gpu_types": [g for g in gpu_types if g in allowed_gpu_types],
         "allowed_gpu_types": allowed_gpu_types,
         "overrides": overrides,
         "zones": [z for z in zones if z in allowed_zones],
+        # Not a grant-gated override: what the matrix lets them mount.
+        "datasets": datasets,
     }
 
 
-def _may_override(grants: dict) -> bool:
+def _may_override(grants: dict, datasets=()) -> bool:
     """Whether this user can change anything for a run. Decides both the shape
-    of the play button and whether the start dialog has a question to ask; with
-    no grant at all, start stays one click."""
-    return any((grants or {}).values())
+    of the play button and whether the start dialog has a question to ask;
+    with no override grant and no dataset to choose, start stays one click.
+    Datasets count because which ones a run mounts is asked there too."""
+    return any((grants or {}).values()) or bool(datasets)
+
+
+async def _start_asks(request: Request, cm, user: str) -> bool:
+    """_may_override for the pages that only need the yes/no."""
+    grants, datasets = await asyncio.gather(
+        request.app.state.run(cm.get_user_overrides, user),
+        request.app.state.run(cm.get_user_dataset_choices, user),
+    )
+    return _may_override(grants, datasets)
 
 
 # --------------------------------------------------------------------------- #
@@ -517,14 +531,14 @@ async def user_index(request: Request, cm: CM, user: User, is_admin: IsAdmin):
     instances, desktop_sessions, grants = await asyncio.gather(
         request.app.state.run(cm.get_user_instances, user),
         request.app.state.run(cm.get_user_desktop_sessions, user),
-        request.app.state.run(cm.get_user_overrides, user),
+        _start_asks(request, cm, user),
     )
     return templates.TemplateResponse(
         request=request, name="user/index.html",
         context=_ctx(user, is_admin=is_admin,
                      instances=_merge_sessions(instances, desktop_sessions, user,
                                                is_admin=is_admin),
-                     can_override=_may_override(grants)),
+                     can_override=grants),
     )
 
 
@@ -583,6 +597,7 @@ async def instance_create(
     override_run_as_group: Annotated[Optional[str], Form()] = None,
     override_fs_group:     Annotated[Optional[str], Form()] = None,
     override_zone:         Annotated[Optional[str], Form()] = None,
+    datasets:              Annotated[Optional[List[str]], Form()] = None,
 ):
     name = instance_name.strip()
     # The template carries the access mode; create the matching Session. Desktop
@@ -598,6 +613,7 @@ async def instance_create(
         uid=override_uid, gid=override_gid,
         run_as_user=override_run_as_user, run_as_group=override_run_as_group,
         fs_group=override_fs_group, zone=override_zone,
+        datasets=await _chosen_datasets(request, cm, user, datasets),
     )
 
     if mode == "desktop":
@@ -664,6 +680,7 @@ async def instance_update(
     override_run_as_group: Annotated[Optional[str], Form()] = None,
     override_fs_group:     Annotated[Optional[str], Form()] = None,
     override_zone:         Annotated[Optional[str], Form()] = None,
+    datasets:              Annotated[Optional[List[str]], Form()] = None,
 ):
     overrides = _build_session_overrides(
         cpu=override_cpu, memory=override_memory,
@@ -671,6 +688,7 @@ async def instance_update(
         uid=override_uid, gid=override_gid,
         run_as_user=override_run_as_user, run_as_group=override_run_as_group,
         fs_group=override_fs_group, zone=override_zone,
+        datasets=await _chosen_datasets(request, cm, user, datasets),
     )
     ok = await request.app.state.run(
         cm.update_instance, user, name, preemptible == "on", overrides,
@@ -685,7 +703,7 @@ async def instance_detail(request: Request, cm: CM, user: User, is_admin: IsAdmi
     instances, desktop_sessions, grants = await asyncio.gather(
         request.app.state.run(cm.get_user_instances, user),
         request.app.state.run(cm.get_user_desktop_sessions, user),
-        request.app.state.run(cm.get_user_overrides, user),
+        _start_asks(request, cm, user),
     )
     inst = next((i for i in instances if i["name"] == name), None)
     if inst is None:
@@ -702,7 +720,7 @@ async def instance_detail(request: Request, cm: CM, user: User, is_admin: IsAdmi
     return templates.TemplateResponse(
         request=request, name="user/instance_detail.html",
         context=_ctx(user, is_admin=is_admin, inst=inst,
-                     can_override=_may_override(grants)),
+                     can_override=grants),
     )
 
 
@@ -714,9 +732,9 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
     instances, desktop_sessions, grants = await asyncio.gather(
         request.app.state.run(cm.get_user_instances, user),
         request.app.state.run(cm.get_user_desktop_sessions, user),
-        request.app.state.run(cm.get_user_overrides, user),
+        _start_asks(request, cm, user),
     )
-    can_override = _may_override(grants)
+    can_override = grants
     inst = next((i for i in instances if i["name"] == name), None)
     # Both ssh instances and desktop/VM sessions are Session CRs with an editable
     # spec.overrides, so both get an Edit action.
@@ -793,7 +811,8 @@ async def instance_start_dialog(request: Request, cm: CM, user: User,
     return templates.TemplateResponse(
         request=request, name="user/_start_dialog.html",
         context=_ctx(user, is_admin=is_admin, name=name, cur=cur,
-                     has_overrides=_may_override(form_ctx["overrides"]),
+                     has_overrides=_may_override(form_ctx["overrides"],
+                                                 form_ctx["datasets"]),
                      hx=request.query_params.get("hx", "1") != "0",
                      then=_start_destination(request.query_params.get("then")),
                      **form_ctx),
@@ -821,6 +840,7 @@ async def instance_connect(
     override_run_as_group: Annotated[Optional[str], Form()] = None,
     override_fs_group:     Annotated[Optional[str], Form()] = None,
     override_zone:         Annotated[Optional[str], Form()] = None,
+    datasets:              Annotated[Optional[List[str]], Form()] = None,
 ):
     """Start an instance, with the overrides this run is to use.
 
@@ -845,6 +865,7 @@ async def instance_connect(
             uid=override_uid, gid=override_gid,
             run_as_user=override_run_as_user, run_as_group=override_run_as_group,
             fs_group=override_fs_group, zone=override_zone,
+            datasets=await _chosen_datasets(request, cm, user, datasets),
         ) or {}
 
     ok = await request.app.state.run(cm.trigger_instance_start, user, name,
@@ -1684,9 +1705,17 @@ async def _matrix_sections(request: Request, cm, username: str = None):
         "note": "Enforced twice over: the mount is only written for a cell "
                 "that exists, and the dataset proxy's NetworkPolicy admits "
                 "only this user's pods carrying this zone's label.",
-        "rows": [{"key": n, "label": n,
+        # Archived datasets stay in the grid: saving it writes the cells of
+        # every row shown, so hiding one would erase its grants and a
+        # resurrected dataset would come back granted to nobody.
+        "rows": [{"key": n,
+                  "label": f"{n} (archived)" if cm.is_archived_dataset(spec)
+                  else n,
                   "description": (spec or {}).get("description")}
-                 for n, spec in sorted((datasets or {}).items())],
+                 for n, spec in sorted(
+                     (datasets or {}).items(),
+                     # Archived last, as in the dataset list.
+                     key=lambda kv: (cm.is_archived_dataset(kv[1]), kv[0]))],
     })
     return sections
 
@@ -1795,10 +1824,20 @@ async def admin_computed_access(request: Request, cm: CM, admin: Admin,
 # instance mount. See design/storage.md.
 
 def _build_dataset_data(name, description, endpoint, bucket, prefix, region,
-                        provider, credentials_secret, read_only):
+                        provider, credentials_secret, read_only,
+                        source=None, size=None):
+    managed = (source or "").strip() == DATASET_SOURCE_MANAGED
+    if managed:
+        # A managed dataset has no bucket of its own to describe: the form's
+        # S3 fields are hidden for it, and anything left in them is dropped
+        # rather than saved as if it meant something.
+        endpoint = bucket = prefix = region = provider = None
+        credentials_secret = None
     return {
         "name": name.strip(),
         "description": (description or "").strip() or None,
+        "source": DATASET_SOURCE_MANAGED if managed else None,
+        "size": ((size or "").strip() or None) if managed else None,
         "endpoint": (endpoint or "").strip() or None,
         "bucket": (bucket or "").strip() or None,
         "prefix": (prefix or "").strip().strip("/") or None,
@@ -1813,11 +1852,9 @@ def _build_dataset_data(name, description, endpoint, bucket, prefix, region,
 
 async def _dataset_rows(request: Request, cm):
     defs = await request.app.state.run(cm.get_dataset_definitions)
-    rows = []
-    for name, spec in sorted(defs.items()):
-        has_creds = await request.app.state.run(cm.has_dataset_credentials, name)
-        rows.append({"name": name, **(spec or {}), "hasCredentials": has_creds})
-    return rows
+    rows = [{"name": name, **(spec or {})} for name, spec in defs.items()]
+    # Active first, then the archive; alphabetical within each.
+    return sorted(rows, key=lambda r: (bool(r.get("archived")), r["name"]))
 
 
 async def admin_datasets(request: Request, cm: CM, admin: Admin):
@@ -1838,7 +1875,9 @@ async def admin_dataset_new(request: Request, cm: CM, admin: Admin):
 async def admin_dataset_create(
     request: Request, cm: CM, admin: Admin,
     name:               Annotated[str, Form()],
-    bucket:             Annotated[str, Form()],
+    bucket:             Annotated[Optional[str], Form()] = None,
+    source:             Annotated[Optional[str], Form()] = None,
+    size:               Annotated[Optional[str], Form()] = None,
     description:        Annotated[Optional[str], Form()] = None,
     endpoint:           Annotated[Optional[str], Form()] = None,
     prefix:             Annotated[Optional[str], Form()] = None,
@@ -1858,13 +1897,17 @@ async def admin_dataset_create(
     return await _save_dataset(request, cm, admin, name, description, endpoint,
                                bucket, prefix, region, provider,
                                credentials_secret, read_only, access_key_id,
-                               secret_access_key)
+                               secret_access_key, source, size, create=True)
 
 
 async def admin_dataset_edit(request: Request, cm: CM, admin: Admin, name: str):
     defs = await request.app.state.run(cm.get_dataset_definitions)
     if name not in defs:
         raise HTTPException(status_code=404, detail="Dataset not found.")
+    if cm.is_archived_dataset(defs[name]):
+        raise HTTPException(status_code=400,
+                            detail=f"Dataset {name!r} is archived; resurrect "
+                                   f"it before editing it.")
     has_creds = await request.app.state.run(cm.has_dataset_credentials, name)
     return templates.TemplateResponse(
         request=request, name="admin/dataset_form.html",
@@ -1876,7 +1919,9 @@ async def admin_dataset_edit(request: Request, cm: CM, admin: Admin, name: str):
 
 async def admin_dataset_update(
     request: Request, cm: CM, admin: Admin, name: str,
-    bucket:             Annotated[str, Form()],
+    bucket:             Annotated[Optional[str], Form()] = None,
+    source:             Annotated[Optional[str], Form()] = None,
+    size:               Annotated[Optional[str], Form()] = None,
     description:        Annotated[Optional[str], Form()] = None,
     endpoint:           Annotated[Optional[str], Form()] = None,
     prefix:             Annotated[Optional[str], Form()] = None,
@@ -1890,12 +1935,13 @@ async def admin_dataset_update(
     return await _save_dataset(request, cm, admin, name, description, endpoint,
                                bucket, prefix, region, provider,
                                credentials_secret, read_only, access_key_id,
-                               secret_access_key)
+                               secret_access_key, source, size)
 
 
 async def _save_dataset(request, cm, admin, name, description, endpoint,
                         bucket, prefix, region, provider, credentials_secret,
-                        read_only, access_key_id, secret_access_key):
+                        read_only, access_key_id, secret_access_key,
+                        source=None, size=None, create=False):
     """Shared by create and update.
 
     The credential is written FIRST and separately: blank credential fields
@@ -1906,7 +1952,26 @@ async def _save_dataset(request, cm, admin, name, description, endpoint,
     access_key_id = (access_key_id or "").strip()
     secret_access_key = (secret_access_key or "").strip()
     credentials_secret = (credentials_secret or "").strip()
-    if access_key_id and secret_access_key:
+    existing = await request.app.state.run(cm.get_dataset_definitions)
+    if create and name in existing:
+        # Refused before anything is written — including the credential
+        # Secret below, which would otherwise overwrite the existing
+        # dataset's. save_dataset refuses it again against the live record.
+        raise HTTPException(
+            status_code=400,
+            detail=f"An archived dataset named {name!r} exists. Resurrect it, "
+                   f"or delete it for good, first."
+            if cm.is_archived_dataset(existing[name])
+            else f"A dataset named {name!r} already exists.")
+    if not create and cm.is_archived_dataset(existing.get(name)):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Dataset {name!r} is archived; resurrect it before "
+                   f"editing it.")
+    if (source or "").strip() == DATASET_SOURCE_MANAGED:
+        # Whistler owns the storage and its keys; there is no credential.
+        access_key_id = secret_access_key = credentials_secret = ""
+    elif access_key_id and secret_access_key:
         ok = await request.app.state.run(
             cm.save_dataset_credentials, name, access_key_id,
             secret_access_key)
@@ -1922,26 +1987,60 @@ async def _save_dataset(request, cm, admin, name, description, endpoint,
             status_code=400,
             detail="Give both the access key and the secret, or neither "
                    "(neither leaves the stored credential unchanged).")
-    elif not credentials_secret:
+    elif not credentials_secret and (source or "").strip() != \
+            DATASET_SOURCE_MANAGED:
         # Blank everything means "leave the credential alone" — including the
         # LINK to it. Dropping the reference while keeping the Secret leaves a
         # dataset that looks configured and cannot authenticate, which is what
         # an edit that only changed the description used to do.
-        existing = await request.app.state.run(cm.get_dataset_definitions)
         credentials_secret = (existing.get(name) or {}).get("credentialsSecret")
 
     data = _build_dataset_data(name, description, endpoint, bucket, prefix,
-                              region, provider, credentials_secret, read_only)
-    ok = await request.app.state.run(cm.save_dataset, data)
+                              region, provider, credentials_secret, read_only,
+                              source, size)
+    try:
+        ok = await request.app.state.run(cm.save_dataset, data, create)
+    except DatasetSpecError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to save dataset.")
     return _tr("/admin/datasets", admin)
 
 
-async def admin_dataset_delete(request: Request, cm: CM, admin: Admin, name: str):
-    ok = await request.app.state.run(cm.delete_dataset, name)
+async def admin_dataset_archive(request: Request, cm: CM, admin: Admin, name: str):
+    """What "Delete" on an active dataset does: archive it (archive_dataset).
+    Reversible; the data and the grants stay."""
+    ok = await request.app.state.run(cm.archive_dataset, name)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to archive dataset.")
+    return _tr("/admin/datasets", admin)
+
+
+async def admin_dataset_restore(request: Request, cm: CM, admin: Admin, name: str):
+    ok = await request.app.state.run(cm.restore_dataset, name)
+    if not ok:
+        raise HTTPException(status_code=500,
+                            detail="Failed to resurrect dataset.")
+    return _tr("/admin/datasets", admin)
+
+
+async def admin_dataset_destroy(
+    request: Request, cm: CM, admin: Admin, name: str,
+    confirm_name: Annotated[Optional[str], Form()] = None,
+):
+    """Delete an archived dataset for good — data included, for a managed
+    one. The typed name is checked here too, not only by the modal's
+    button: a form posted without it must not destroy anything."""
+    if (confirm_name or "").strip() != name:
+        raise HTTPException(status_code=400,
+                            detail="Type the dataset's name to delete it.")
+    try:
+        ok = await request.app.state.run(cm.destroy_dataset, name)
+    except DatasetSpecError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to delete dataset.")
+    logger.warning(f"{admin} deleted dataset {name!r} for good")
     return _tr("/admin/datasets", admin)
 
 
@@ -1988,11 +2087,26 @@ def _nonempty(d: dict) -> dict:
     return {k: v.strip() for k, v in d.items() if v and v.strip()}
 
 
+async def _chosen_datasets(request: Request, cm, user: str,
+                           submitted) -> List[str]:
+    """The submitted dataset names the user could mount anywhere. A name
+    that is not on offer (archived since the form loaded, a grant removed,
+    a hand-made post) is dropped rather than stored on the instance — it
+    could not mount, and storing it would bring it back silently if the
+    grant returned."""
+    if not submitted:
+        return []
+    choices = await request.app.state.run(cm.get_user_dataset_choices, user)
+    offered = {c["name"] for c in choices}
+    return [d for d in submitted if d in offered]
+
+
 def _build_session_overrides(*, cpu=None, memory=None,
                              gpu_type=None, gpu_count=None,
                              uid=None, gid=None,
                              run_as_user=None, run_as_group=None,
-                             fs_group=None, zone=None) -> Optional[dict]:
+                             fs_group=None, zone=None,
+                             datasets=None) -> Optional[dict]:
     """Assemble a Session spec.overrides payload from the create-instance
     form. A group is only included when the form actually supplied a value
     for it — the form only renders fields for groups the user's User CR
@@ -2034,6 +2148,14 @@ def _build_session_overrides(*, cpu=None, memory=None,
 
     if zone and zone.strip():
         overrides["zone"] = zone.strip()
+
+    # The datasets to mount. Not an override of the template and not gated
+    # by an override grant; the caller has already kept only what the user
+    # could mount (_chosen_datasets), and the matrix decides per zone at
+    # start. Unchecked everything means no datasets.
+    chosen = sorted({d.strip() for d in (datasets or []) if d and d.strip()})
+    if chosen:
+        overrides["datasets"] = chosen
 
     return overrides or None
 
@@ -2709,7 +2831,9 @@ def build_management_app(config_manager):
     app.add_api_route("/admin/datasets",                          admin_dataset_create,   methods=["POST"])
     app.add_api_route("/admin/datasets/{name}/edit",              admin_dataset_edit,     methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/datasets/{name}",                   admin_dataset_update,   methods=["POST"])
-    app.add_api_route("/admin/datasets/{name}/delete",            admin_dataset_delete,   methods=["POST"])
+    app.add_api_route("/admin/datasets/{name}/archive",           admin_dataset_archive,  methods=["POST"])
+    app.add_api_route("/admin/datasets/{name}/restore",           admin_dataset_restore,  methods=["POST"])
+    app.add_api_route("/admin/datasets/{name}/destroy",           admin_dataset_destroy,  methods=["POST"])
     app.add_api_route("/admin/sessions",                          admin_sessions,         methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/sessions/{username}/{name}/stop",   admin_session_stop,     methods=["POST"])
     app.add_api_route("/admin/sessions/{username}/{name}/delete", admin_session_delete,   methods=["POST"])

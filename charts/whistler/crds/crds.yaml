@@ -236,9 +236,10 @@ spec:
                     gpuType "__none__", which removes the request rather than
                     making one and so is checked against nothing.
                     There is no `volumes` override: what a session may reach is
-                    its home volume (spec.homeVolume) plus the datasets the
-                    access matrix grants it in its zone, and neither is a
-                    free-text mount a session states for itself.
+                    its home volume (spec.homeVolume) plus the `datasets` it
+                    chooses here that the access matrix grants it in its zone,
+                    and neither is a free-text mount a session states for
+                    itself.
                   properties:
                     resources:
                       type: object
@@ -286,6 +287,16 @@ spec:
                         Network zone override (requires the "zone" grant;
                         further gated by the user's allowedZones). Takes
                         effect on the next session start/reboot.
+                    datasets:
+                      type: array
+                      items:
+                        type: string
+                      description: >-
+                        The datasets to mount, by name. Not a grant-gated
+                        override: each is mounted only if the access matrix
+                        grants it in the zone the session runs in, and none
+                        is mounted unless named here. Absent or empty means
+                        no datasets. See config.session_requested_datasets.
                 runOverrides:
                   type: object
                   description: >-
@@ -345,6 +356,16 @@ spec:
                         Network zone override (requires the "zone" grant;
                         further gated by the user's allowedZones). Takes
                         effect on the next session start/reboot.
+                    datasets:
+                      type: array
+                      items:
+                        type: string
+                      description: >-
+                        The datasets to mount, by name. Not a grant-gated
+                        override: each is mounted only if the access matrix
+                        grants it in the zone the session runs in, and none
+                        is mounted unless named here. Absent or empty means
+                        no datasets. See config.session_requested_datasets.
             status:
               type: object
               properties:
@@ -830,10 +851,40 @@ spec:
           properties:
             spec:
               type: object
-              required: ["bucket"]
               properties:
                 description:
                   type: string
+                source:
+                  type: string
+                  enum: ["s3", "managed"]
+                  description: >-
+                    Where the data lives. `s3` (the default when absent) is
+                    an admin's bucket fronted by a Whistler-run rclone proxy
+                    and needs `bucket`. `managed` is a claim Whistler creates
+                    in the release namespace and serves with VersityGW, and
+                    needs `size`. Sessions see the same thing either way: an
+                    S3 endpoint mounted at /shared/<name>. Cannot be changed
+                    once set (the portal refuses it), since the two are
+                    fenced by differently-shaped NetworkPolicies. See
+                    design/storage.md, "Datasets are always S3".
+                archived:
+                  type: boolean
+                  description: >-
+                    Set when the dataset is deleted in the portal. An
+                    archived dataset is served to nobody (no mount, its
+                    endpoints fenced to nobody, a managed one's server
+                    removed) but keeps its name, its grants and — if
+                    managed — its claim and data, so it can be resurrected
+                    by clearing this. Deleting it for good is a second,
+                    separate act that removes the data too.
+                size:
+                  type: string
+                  description: >-
+                    Managed datasets only: the claim's size, as a Kubernetes
+                    quantity (e.g. 50Gi). May grow if the storage class
+                    allows expansion; never shrinks. The claim's PV is set to
+                    Retain, and deleting the dataset archives it with the data
+                    kept (see `archived`).
                 endpoint:
                   type: string
                   description: >-
@@ -846,7 +897,9 @@ spec:
                     server moves.
                 bucket:
                   type: string
-                  description: The bucket on that endpoint. Required.
+                  description: >-
+                    The bucket on that endpoint. Required for an `s3`
+                    dataset; unused by a managed one.
                 prefix:
                   type: string
                   description: >-

@@ -26,16 +26,65 @@
              value="{{ dataset.description if dataset else '' }}">
     </div>
 
+    {% set managed = (dataset.source == 'managed') if dataset else true %}
     <div class="ui divider"></div>
     <h4 class="ui header">Where the data is</h4>
+
+    {% if dataset %}
+    {# The source is fixed once saved: the two are fenced differently, and a
+       switch would strand a managed dataset's data. #}
+    <input type="hidden" name="source" value="{{ 'managed' if managed else 's3' }}">
+    <p>
+      {% if managed %}<div class="ui blue label"><i class="hdd icon"></i> Whistler-managed volume</div>
+      {% else %}<div class="ui label"><i class="cloud icon"></i> External S3 bucket</div>{% endif %}
+      <span class="ui grey text">Cannot be changed; create a new dataset instead.</span>
+    </p>
+    {% else %}
+    <div class="grouped fields">
+      <div class="field">
+        <div class="ui radio checkbox">
+          <input type="radio" name="source" value="managed" id="source-managed" checked>
+          <label for="source-managed"><strong>Whistler-managed volume</strong> —
+            Whistler creates the storage and serves it. Fill it from a session
+            granted write access.</label>
+        </div>
+      </div>
+      <div class="field">
+        <div class="ui radio checkbox">
+          <input type="radio" name="source" value="s3" id="source-s3">
+          <label for="source-s3"><strong>External S3 bucket</strong> — data that
+            already lives in an S3 server you name.</label>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    <div id="managed-fields" {% if not managed %}style="display:none"{% endif %}>
+      <div class="field required">
+        <label>Size</label>
+        <input name="size" type="text" placeholder="50Gi"
+               pattern="[0-9]+(\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|k|M|G|T|P)?"
+               value="{{ dataset.size if dataset and dataset.size else '' }}"
+               {% if managed %}required{% endif %}>
+        <div class="ui pointing label">
+          A Kubernetes quantity, such as <code>50Gi</code>. Can grow later if the
+          storage class allows it; never shrinks. The volume is kept when the
+          dataset is deleted (it is archived, and can be resurrected); deleting an
+          archived dataset for good removes the data.
+        </div>
+      </div>
+    </div>
+
+    <div id="s3-fields" {% if managed %}style="display:none"{% endif %}>
     <p class="ui grey text">This is the <em>real</em> S3 server. Only Whistler's proxy
       ever talks to it — sessions are given the proxy's in-cluster address and never
       learn this one.</p>
 
     <div class="field required">
       <label>Bucket</label>
-      <input name="bucket" type="text" required placeholder="reference-data"
-             value="{{ dataset.bucket if dataset else '' }}">
+      <input name="bucket" type="text" placeholder="reference-data"
+             value="{{ dataset.bucket if dataset and dataset.bucket else '' }}"
+             {% if not managed %}required{% endif %}>
     </div>
 
     <div class="field">
@@ -65,6 +114,7 @@
              value="{{ dataset.provider if dataset else '' }}">
       <div class="ui pointing label">rclone's provider name (<code>AWS</code>, <code>Minio</code>, <code>Ceph</code>, …). Defaults to <code>Other</code>, which suits most S3-compatible servers.</div>
     </div>
+    </div>{# #s3-fields #}
 
     <div class="ui divider"></div>
     <h4 class="ui header">Access</h4>
@@ -77,13 +127,14 @@
       </div>
       <div class="ui pointing label">
         A ceiling, not a default: no grant can write to this dataset while it is
-        set, and it is enforced by the proxy — so it holds even in a VM, where
+        set, and it is enforced by the server — so it holds even in a VM, where
         the user is root. Unticking it makes the dataset writable by
-        <em>everyone granted it</em>, and a user with no allow-list at all is
-        granted everything.
+        <em>everyone granted it</em> read-write in the access matrix. Nobody is
+        granted a dataset until a user or group says so.
       </div>
     </div>
 
+    <div id="s3-credential" {% if managed %}style="display:none"{% endif %}>
     <div class="ui divider"></div>
     <h4 class="ui header">Credential</h4>
     <p class="ui grey text">
@@ -118,6 +169,7 @@
         hands entirely. Filling in the fields above manages one for you.
       </div>
     </div>
+    </div>{# #s3-credential #}
 
     <div class="ui divider"></div>
     <button type="submit" class="ui primary button">
@@ -127,12 +179,38 @@
   </form>
 </div>
 
+{% if not dataset %}
+<script>
+  // Show the fields of the chosen source only, and require only those: a
+  // hidden `required` input would block the submit with no visible reason.
+  (function () {
+    const groups = {managed: ["managed-fields"], s3: ["s3-fields", "s3-credential"]};
+    function apply() {
+      const chosen = document.querySelector('input[name="source"]:checked').value;
+      for (const [source, ids] of Object.entries(groups)) {
+        for (const id of ids) {
+          const el = document.getElementById(id);
+          el.style.display = source === chosen ? "" : "none";
+        }
+      }
+      document.querySelector('input[name="size"]').required = chosen === "managed";
+      document.querySelector('input[name="bucket"]').required = chosen === "s3";
+    }
+    document.querySelectorAll('input[name="source"]').forEach(
+      r => r.addEventListener("change", apply));
+    apply();
+  })();
+</script>
+{% endif %}
+
 <div class="ui info message" style="max-width:640px">
   <div class="header">How changes apply</div>
   <p>Access changes take effect at once: saving re-fences this dataset's proxies,
   so revoking write access does not wait for anyone's session to restart. The
   <em>mount itself</em> is set up by cloud-init at boot, so a changed bucket,
   endpoint or prefix reaches a running session only when it next starts.</p>
+  <p>A managed dataset starts out empty. To fill it, grant yourself write
+  access to it in a zone and copy data in from a VM session there.</p>
 </div>
 
 {% endblock %}

@@ -190,10 +190,12 @@ def test_only_type_s3_entries_are_datasets():
 # of this calling a method that does not exist shipped once precisely because
 # the list was only ever passed in by hand.
 
-def _granted(users, groups=None):
+def _granted(users, groups=None, datasets=None):
     cm = _manager()
     cm.users = users
     cm.groups = groups or {}
+    cm.datasets = {"refdata": {"bucket": "b"}, "scratch": {"bucket": "s"}} \
+        if datasets is None else datasets
     return cm
 
 
@@ -280,3 +282,73 @@ def test_downgrading_a_user_re_fences_the_mode_they_lost():
     assert seen["whistler-s3-refdata-ro"][0]["from"][0][
         "namespaceSelector"]["matchLabels"][USER_NS_LABEL] == "alice"
     assert seen["whistler-s3-refdata-rw"] == []
+
+
+def test_a_deleted_dataset_admits_nobody_despite_cells_naming_it():
+    # Deleting a Dataset leaves its cells on every User and Group that named
+    # it. Its proxy is left running (delete_dataset fences rather than
+    # deletes), so if stale cells still resolved to peers, deleting a dataset
+    # would change nothing about who can reach it.
+    cm = _granted({"alice": {"name": "alice", "volumeAccess": {
+        "open": {"refdata": "allowed"}}}}, datasets={})
+    assert cm.s3_proxy_peers("refdata", "rw") == []
+    assert cm.s3_proxy_peers("refdata", "ro") == []
+
+
+def _policy(volume, mode):
+    from types import SimpleNamespace
+    return SimpleNamespace(metadata=SimpleNamespace(
+        labels={"app": "whistler-s3-proxy", "volume": volume, "mode": mode}))
+
+
+def test_refence_covers_every_existing_proxy_including_undefined_ones():
+    # Driven by the policies that exist, not the catalog: a dataset deleted
+    # with kubectl never went through delete_dataset, and its proxy is the
+    # one that most needs fencing to nobody.
+    cm = _granted({})
+    refreshed = []
+    cm._refresh_s3_proxy_policies = refreshed.append
+
+    class _Net:
+        def list_namespaced_network_policy(self, ns, label_selector):
+            assert label_selector == "app=whistler-s3-proxy"
+            from types import SimpleNamespace
+            return SimpleNamespace(items=[
+                _policy("refdata", "ro"), _policy("refdata", "rw"),
+                _policy("gone", "rw")])
+
+    import whistler.config as cfg
+    real = cfg.client.NetworkingV1Api
+    cfg.client.NetworkingV1Api = _Net
+    try:
+        assert cm.refence_dataset_proxies() == 2
+    finally:
+        cfg.client.NetworkingV1Api = real
+    # Once per dataset — _refresh_s3_proxy_policies does both modes itself.
+    assert refreshed == ["gone", "refdata"]
+
+
+def test_refence_keeps_going_past_a_dataset_that_fails():
+    cm = _granted({})
+    refreshed = []
+
+    def refresh(volume):
+        if volume == "bad":
+            raise RuntimeError("boom")
+        refreshed.append(volume)
+    cm._refresh_s3_proxy_policies = refresh
+
+    class _Net:
+        def list_namespaced_network_policy(self, ns, label_selector):
+            from types import SimpleNamespace
+            return SimpleNamespace(items=[_policy("bad", "ro"),
+                                          _policy("refdata", "ro")])
+
+    import whistler.config as cfg
+    real = cfg.client.NetworkingV1Api
+    cfg.client.NetworkingV1Api = _Net
+    try:
+        cm.refence_dataset_proxies()
+    finally:
+        cfg.client.NetworkingV1Api = real
+    assert refreshed == ["refdata"]

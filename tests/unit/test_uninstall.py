@@ -141,7 +141,8 @@ def test_which_claims_are_retained(ns, name, kind):
     assert uninstall._claim_kind(ns, name, "whistler-archive") == kind
 
 
-def test_retain_covers_homes_the_archive_and_the_backup_claim(monkeypatch):
+def test_retain_covers_homes_the_archive_the_backup_and_dataset_claims(
+        monkeypatch):
     monkeypatch.setenv("WHISTLER_BACKUP_CLAIM", "whistler-backups")
     core = MagicMock()
     core.list_namespace.side_effect = lambda label_selector=None: \
@@ -149,7 +150,11 @@ def test_retain_covers_homes_the_archive_and_the_backup_claim(monkeypatch):
                         if "archive" in label_selector
                         else [_ns("whistler-user-alice")])
 
-    def claims(ns):
+    def claims(ns, label_selector=None):
+        if ns == "whistler":
+            # Only the managed datasets' claims are asked for here, by label.
+            assert label_selector == "app=whistler-dataset-server"
+            return SimpleNamespace(items=[_ns("whistler-dataset-corpus")])
         names = {"whistler-user-alice": ["whistler-home-desk",
                                          "alice-box-rootdisk"],
                  "whistler-archive": ["whistler-home-bob-old-1"]}[ns]
@@ -164,8 +169,9 @@ def test_retain_covers_homes_the_archive_and_the_backup_claim(monkeypatch):
     assert secured == [
         ("whistler-archive", "whistler-home-bob-old-1", "archived", ""),
         ("whistler-user-alice", "whistler-home-desk", "home", "alice"),
-        ("whistler", "whistler-backups", "backups", "")]
-    assert len(pvs) == 3
+        ("whistler", "whistler-backups", "backups", ""),
+        ("whistler", "whistler-dataset-corpus", "dataset", "")]
+    assert len(pvs) == 4
 
 
 # --- the release namespace ---------------------------------------------------------------- #

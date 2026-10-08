@@ -672,12 +672,35 @@ whistler:
     #   # portal can manage this Secret for datasets created there.)
     #   credentialsSecret: s3-reference-data
 
-  # The proxy that fronts every dataset above.
+  # The proxy that fronts every `source: s3` dataset above.
   s3Proxy:
     # Needs rclone >= 1.65 for `serve s3`; the distro packages in the guests
     # are older and only ever run `rclone mount`, which is ancient.
     image: rclone/rclone:latest
     resources: {}
+
+  # The server behind every `source: managed` dataset: a claim Whistler
+  # creates in the release namespace, served over S3 by VersityGW, one pod per
+  # dataset (design/storage.md, "Datasets are always S3"). Created in the
+  # portal (Admin -> Datasets) or here:
+  #
+  #   datasets:
+  #     scratch:
+  #       source: managed
+  #       size: 50Gi
+  #
+  # The claim's PV is set to Retain. Deleting a dataset in the portal
+  # archives it with its data; only an archived dataset can be deleted for
+  # good, which removes the data too.
+  datasetServer:
+    # Needs `--readonly` (VersityGW >= 1.0); verified against v1.7.0.
+    image: ghcr.io/versity/versitygw:v1.7.0
+    # Per container; a dataset that is not read-only runs two.
+    resources: {}
+    # "" uses the cluster's default class. The posix backend keeps object
+    # metadata in extended attributes, so the class must support them
+    # (ext4/xfs do; most block-backed classes are fine).
+    storageClass: ""
 
 # Admin-curated catalog of system templates (Template CRs, user: system).
 #

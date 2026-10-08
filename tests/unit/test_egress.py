@@ -46,6 +46,20 @@ S3_PROXY_RULE = {
     "ports": [{"port": 8080, "protocol": "TCP"}],
 }
 
+# Managed datasets' servers: same namespace, but their own label and BOTH
+# process ports — NetworkPolicy sees the pod port after the Service has
+# translated it, and the rw Service's 8080 lands on 8081. Missing, a guest's
+# mount hung instead of failing (k3s-metal, 2026-10-08).
+DATASET_SERVER_RULE = {
+    "to": [{
+        "namespaceSelector": {
+            "matchLabels": {"kubernetes.io/metadata.name": "whistler"}},
+        "podSelector": {"matchLabels": {"app": "whistler-dataset-server"}},
+    }],
+    "ports": [{"port": 8080, "protocol": "TCP"},
+              {"port": 8081, "protocol": "TCP"}],
+}
+
 
 # --- baseline (all pods, zone-independent) --------------------------------- #
 
@@ -54,7 +68,7 @@ def test_baseline_allows_only_storage_reachability():
     # baseline is irrevocable by a zone — it must stay minimal. DNS in
     # particular must NOT be here, or a zone could never narrow it.
     rules = _manager({"default": {}})._build_baseline_egress_rules()
-    assert rules == [GATEWAY_RULE, S3_PROXY_RULE]
+    assert rules == [GATEWAY_RULE, S3_PROXY_RULE, DATASET_SERVER_RULE]
 
 
 def test_reaching_a_proxy_is_not_reaching_a_dataset():

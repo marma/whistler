@@ -299,7 +299,12 @@ exit 0
                 f"access_key_id = {ds['accessKeyId']}\n"
                 f"secret_access_key = {ds['secretAccessKey']}\n"
                 # The proxy serves one bucket, so the remote is its root.
-                "force_path_style = true\n\n"
+                "force_path_style = true\n"
+                # The bucket always exists, so never ask to create it. A
+                # managed dataset's VersityGW answers CreateBucket on a bucket
+                # it did not make itself with a 500, and rclone sends one
+                # before its first upload unless told not to (verified).
+                "no_check_bucket = true\n\n"
             )
         write_files.append({
             "path": RCLONE_CONF_PATH,

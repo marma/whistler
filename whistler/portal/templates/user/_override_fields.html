@@ -14,12 +14,12 @@
                     absent on the create form — its overrides are the defaults
                     every field is prefilled with.
 #}
-{# There is no volume picker here. A session used to be able to name entries
-   from the legacy volumes.yaml catalog and choose their mount paths, gated by
-   an allowedVolumes list; both are gone (2026-08-29). What a session reaches
-   is its home volume — chosen on the create/edit form, not per run — and the
-   datasets granted in the zone it runs in, which is an administrator's cell in
-   the access matrix and never a field on this form. #}
+{# Datasets are chosen here (2026-10-08): which of the datasets the user
+   holds this instance mounts. Not a grant-gated override — `datasets` in the
+   context is what the access matrix lets them mount in some zone, and the
+   mount itself is decided per zone at start. Before this, every dataset
+   granted in the session's zone was mounted, chosen or not. There is still
+   no free-text volume picker (gone 2026-08-29). #}
 {% set ov = (cur or {}).get('overrides') or {} %}
 {% set ov_res = ov.get('resources') or {} %}
 {% set ov_sec = ov.get('securityContext') or {} %}
@@ -140,6 +140,33 @@
       <input name="override_fs_group" type="number" placeholder="fsGroup"
              value="{{ ov_sec.fsGroup if ov_sec.get('fsGroup') is not none else '' }}">
     </div>
+  </div>
+</div>
+{% endif %}
+
+{% if datasets %}
+{% set chosen = ov.get('datasets') or [] %}
+<div class="field">
+  <label>Datasets</label>
+  <div class="grouped fields" style="margin:0">
+    {% for d in datasets %}
+    <div class="field">
+      <div class="ui checkbox">
+        <input type="checkbox" name="datasets" value="{{ d.name }}"
+               id="dataset-{{ d.name }}" {% if d.name in chosen %}checked{% endif %}>
+        <label for="dataset-{{ d.name }}">
+          <strong>{{ d.name }}</strong>{% if d.description %} — {{ d.description }}{% endif %}
+          <span class="ui grey text">
+            ({% for z, mode in d.zones.items() %}{{ 'read-only' if mode == 'ro' else 'read-write' }} in {{ z }}{% if not loop.last %}, {% endif %}{% endfor %})
+          </span>
+        </label>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  <div class="ui pointing label">
+    Mounted at <code>/shared/&lt;name&gt;</code> in VM sessions, and only in a
+    zone where you are granted it.
   </div>
 </div>
 {% endif %}
