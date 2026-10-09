@@ -17,11 +17,13 @@ import json
 import os
 import secrets
 import time
+import urllib.parse
 import yaml
+from xml.etree import ElementTree
 
 from whistler.cloudinit import (HOME_DISK_SERIAL, S3_PROXY_BUCKET,
                                 build_user_data, resolve_uid, resolve_gid)
-from whistler import hostca, reattach
+from whistler import dataset_accounts, hostca, reattach
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +336,10 @@ DATASET_SERVER_APP = "whistler-dataset-server"
 # Container ports of a managed dataset server: one process per mode, because
 # read-only has to be a property of a process, not a permission inside one.
 DATASET_SERVER_PORTS = {"ro": 8080, "rw": 8081}
+# Each process's account API, kept off its S3 port (where guests are). Only
+# the rw one is used — the account store is shared — and only the operator
+# may reach it (_build_dataset_server_operator_access).
+DATASET_SERVER_ADMIN_PORTS = {"ro": 9080, "rw": 9081}
 HOME_VOLUME_PLURAL = "homevolumes"
 # The per-user claim container sessions mount as $HOME (_ensure_pvc).
 POD_HOME_PVC_PREFIX = "whistler-data-"
@@ -5588,15 +5594,33 @@ class KubeConfigManager(ConfigManager):
                 logger.error(
                     f"S3 proxy for {name}/{mode} not ready; skipping mount")
                 continue
-            secret_name = f"{self._s3_proxy_name(name, mode)}-auth"
-            try:
-                sec = core.read_namespaced_secret(secret_name, self.namespace)
-                access = base64.b64decode(sec.data["accessKeyId"]).decode()
-                secret = base64.b64decode(
-                    sec.data["secretAccessKey"]).decode()
-            except (ApiException, KeyError, TypeError) as e:
-                logger.error(f"Could not read {secret_name}: {e}")
-                continue
+            if self.is_managed_dataset(definition):
+                # This user's own account, never a shared key: revoking them
+                # deletes it (sync_dataset_accounts). Synced here so a grant
+                # made a moment ago is live before the guest first mounts; a
+                # server not Ready yet still gets the account from its seed,
+                # and the mount unit retries until it answers.
+                access = dataset_accounts.account_name(username, mode)
+                keys = self.sync_dataset_keys(name) or {}
+                if access not in keys:
+                    logger.error(f"No key for {access} on dataset {name!r}; "
+                                 f"skipping mount")
+                    continue
+                if not self.sync_dataset_accounts(name):
+                    logger.warning(f"Dataset {name!r}: accounts not synced "
+                                   f"yet; the mount retries until they are")
+                secret = keys[access]
+            else:
+                secret_name = f"{self._s3_proxy_name(name, mode)}-auth"
+                try:
+                    sec = core.read_namespaced_secret(secret_name,
+                                                      self.namespace)
+                    access = base64.b64decode(sec.data["accessKeyId"]).decode()
+                    secret = base64.b64decode(
+                        sec.data["secretAccessKey"]).decode()
+                except (ApiException, KeyError, TypeError) as e:
+                    logger.error(f"Could not read {secret_name}: {e}")
+                    continue
             out.append({
                 "name": name,
                 "mode": mode,
@@ -5699,10 +5723,19 @@ class KubeConfigManager(ConfigManager):
 
     @staticmethod
     def dataset_modes(definition: Dict[str, Any]) -> Tuple[str, ...]:
-        """The modes a dataset is served in. A read-only dataset has no rw
-        process at all — a ceiling is better enforced by an absence than by a
-        policy admitting nobody."""
+        """The modes guests are served in. A read-only dataset has no rw
+        Service and its rw port admits no guest; the rw *process* still runs,
+        because it is the only one that can write the bucket policy granting
+        the accounts (dataset_accounts)."""
         return ("ro",) if (definition or {}).get("readOnly") else ("ro", "rw")
+
+    @staticmethod
+    def dataset_root_secret_name(volume: str) -> str:
+        return f"whistler-dataset-{volume}-root"
+
+    @staticmethod
+    def dataset_keys_secret_name(volume: str) -> str:
+        return f"whistler-dataset-{volume}-keys"
 
     def _build_dataset_server_isolation(self, volume: str) -> Dict[str, Any]:
         """Deny all ingress to a managed dataset's server pod. Pure.
@@ -5723,31 +5756,67 @@ class KubeConfigManager(ConfigManager):
                      "ingress": []},
         }
 
-    def _build_dataset_server_manifests(self, *, volume, definition, image,
-                                        claim, auth_secrets,
-                                        resources=None):
-        """Deployment + one Service per mode for a managed dataset. Pure.
+    def _build_dataset_server_operator_access(self, volume: str
+                                              ) -> Dict[str, Any]:
+        """Let the operator — and only the operator — reach the rw process's
+        S3 port (to write the bucket policy and ACL as root) and its admin
+        port (to create and delete accounts). Pure. No guest is ever admitted
+        to an admin port: the account API is not on the S3 ports at all once
+        ``--admin-port`` is set (verified: MethodNotAllowed)."""
+        labels = {"app": DATASET_SERVER_APP, "volume": volume}
+        return {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": f"{self.dataset_server_name(volume)}-operator",
+                         "labels": labels},
+            "spec": {
+                "podSelector": {"matchLabels": labels},
+                "policyTypes": ["Ingress"],
+                "ingress": [{
+                    "from": [{"podSelector": {"matchLabels": {
+                        "app": "whistler-operator"}}}],
+                    "ports": [{"port": DATASET_SERVER_PORTS["rw"],
+                               "protocol": "TCP"},
+                              {"port": DATASET_SERVER_ADMIN_PORTS["rw"],
+                               "protocol": "TCP"}],
+                }],
+            },
+        }
 
-        ``auth_secrets`` maps mode -> the Secret holding that mode's
-        generated key pair (_ensure_s3_auth_secret), which is that process's
-        VersityGW root account. Same keys and the same Service names
-        (``whistler-s3-<volume>-<mode>``, port 8080) as an rclone proxy, so a
-        guest cannot tell the two apart and cloud-init needs no branch.
+    def _build_dataset_server_manifests(self, *, volume, definition, image,
+                                        claim, root_secret, keys_secret,
+                                        resources=None):
+        """Deployment + one Service per guest mode for a managed dataset.
+        Pure.
+
+        **Two processes, one account store.** ro and rw are separate
+        VersityGW processes over the same claim; both read ``users.json``
+        from one shared emptyDir with the IAM cache off, so an account the
+        operator creates or deletes through the rw admin port takes effect
+        in both on the next request (verified). The file is seeded from the
+        keys Secret by the init container, so a restart loses no account;
+        the bucket policy is an xattr on the claim and survives on its own.
+        Guests hold only their own account's key (``ro.alice``); the root key
+        (``root_secret``) never leaves the pod.
 
         The ro process is read-only twice over: ``--readonly`` refuses every
         write in the gateway, and the claim is mounted ``readOnly`` so the
-        kernel refuses it if the gateway ever does not. Verified against
-        VersityGW v1.7.0: writes, deletes and CreateBucket all get 403.
+        kernel refuses it if the gateway ever does not. Each process has an
+        ``--admin-port``, without which the account API is served on its S3
+        port, to guests.
+
+        Same Service names (``whistler-s3-<volume>-<mode>``, port 8080) as
+        an rclone proxy, so a guest cannot tell the two apart and cloud-init
+        needs no branch.
 
         **Recreate, not RollingUpdate**: the claim is usually RWO, and a new
         pod scheduled to another node while the old one holds it never starts.
         """
         name = self.dataset_server_name(volume)
         labels = {"app": DATASET_SERVER_APP, "volume": volume}
-        modes = self.dataset_modes(definition)
         # Nothing here needs root, a writable root filesystem or any
-        # capability: VersityGW only touches the claim (verified with a
-        # read-only root filesystem, multipart uploads included).
+        # capability: VersityGW only touches the claim and the account store
+        # (verified with a read-only root filesystem, multipart included).
         hardened = {
             "allowPrivilegeEscalation": False,
             "readOnlyRootFilesystem": True,
@@ -5755,21 +5824,34 @@ class KubeConfigManager(ConfigManager):
         }
         # VersityGW's posix backend makes each top-level directory a bucket,
         # and the guest mounts `<dataset>:<S3_PROXY_BUCKET>`. A bucket made by
-        # mkdir rather than CreateBucket has no ACL xattr, which only matters
-        # to CreateBucket itself — the guest's rclone is configured not to
-        # send one (cloudinit, no_check_bucket) — so object reads and writes
-        # in it work (verified).
+        # mkdir has no ACL until the operator writes one as root
+        # (sync_dataset_accounts) — without it CreateBucket and a non-root
+        # CopyObject both fail with a 500.
         init = {
-            "name": "bucket",
+            "name": "prepare",
             "image": image,
-            "command": ["sh", "-c", f"mkdir -p /srv/{S3_PROXY_BUCKET}"],
+            "command": ["sh", "-c",
+                        f"mkdir -p /srv/{S3_PROXY_BUCKET} && "
+                        f"cp /seed/users.json /iam/users.json && "
+                        f"chmod 600 /iam/users.json"],
             "securityContext": hardened,
-            "volumeMounts": [{"name": "data", "mountPath": "/srv"}],
+            "volumeMounts": [{"name": "data", "mountPath": "/srv"},
+                             {"name": "iam", "mountPath": "/iam"},
+                             {"name": "seed", "mountPath": "/seed",
+                              "readOnly": True}],
         }
+        root_env = [
+            {"name": "ROOT_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {
+                "name": root_secret, "key": "accessKeyId"}}},
+            {"name": "ROOT_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {
+                "name": root_secret, "key": "secretAccessKey"}}},
+        ]
         containers = []
-        for mode in modes:
+        for mode in DATASET_SERVER_PORTS:
             port = DATASET_SERVER_PORTS[mode]
-            args = ["--port", f":{port}", "--quiet"]
+            args = ["--port", f":{port}",
+                    "--admin-port", f":{DATASET_SERVER_ADMIN_PORTS[mode]}",
+                    "--iam-dir", "/iam", "--iam-cache-disable", "--quiet"]
             if mode == "ro":
                 args.insert(0, "--readonly")
             args += ["posix", "/srv"]
@@ -5777,21 +5859,17 @@ class KubeConfigManager(ConfigManager):
                 "name": f"versitygw-{mode}",
                 "image": image,
                 "args": args,
-                "env": [
-                    {"name": "ROOT_ACCESS_KEY_ID", "valueFrom": {
-                        "secretKeyRef": {"name": auth_secrets[mode],
-                                         "key": "accessKeyId"}}},
-                    {"name": "ROOT_SECRET_ACCESS_KEY", "valueFrom": {
-                        "secretKeyRef": {"name": auth_secrets[mode],
-                                         "key": "secretAccessKey"}}},
-                ],
-                "ports": [{"containerPort": port, "name": f"s3-{mode}"}],
+                "env": root_env,
+                "ports": [{"containerPort": port, "name": f"s3-{mode}"},
+                          {"containerPort": DATASET_SERVER_ADMIN_PORTS[mode],
+                           "name": f"admin-{mode}"}],
                 "securityContext": hardened,
                 "readinessProbe": {"tcpSocket": {"port": port},
                                    "periodSeconds": 10},
                 "resources": resources or {},
                 "volumeMounts": [{"name": "data", "mountPath": "/srv",
-                                  "readOnly": mode == "ro"}],
+                                  "readOnly": mode == "ro"},
+                                 {"name": "iam", "mountPath": "/iam"}],
             })
         deployment = {
             "apiVersion": "apps/v1",
@@ -5816,14 +5894,22 @@ class KubeConfigManager(ConfigManager):
                         },
                         "initContainers": [init],
                         "containers": containers,
-                        "volumes": [{"name": "data", "persistentVolumeClaim": {
-                            "claimName": claim}}],
+                        "volumes": [
+                            {"name": "data", "persistentVolumeClaim": {
+                                "claimName": claim}},
+                            {"name": "iam", "emptyDir": {"medium": "Memory",
+                                                         "sizeLimit": "16Mi"}},
+                            {"name": "seed", "secret": {
+                                "secretName": keys_secret,
+                                "items": [{"key": "users.json",
+                                           "path": "users.json"}]}},
+                        ],
                     },
                 },
             },
         }
         services = []
-        for mode in modes:
+        for mode in self.dataset_modes(definition):
             services.append({
                 "apiVersion": "v1",
                 "kind": "Service",
@@ -5909,13 +5995,242 @@ class KubeConfigManager(ConfigManager):
         self.secure_soon.set()
         return claim
 
+    def _ensure_dataset_root_secret(self, volume: str) -> Optional[str]:
+        """The dataset's VersityGW root key, generated once. Both processes
+        run as it; only the operator ever uses it. Phase 1 handed each mode's
+        root key to every guest — this replaces those, so a key copied out of
+        an old guest's rclone.conf opens nothing."""
+        name = self.dataset_root_secret_name(volume)
+        api = client.CoreV1Api()
+        try:
+            api.read_namespaced_secret(name, self.namespace)
+            return name
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to read {name}: {e}")
+                return None
+        body = {"apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": name, "labels": {
+                    "app": DATASET_SERVER_APP, "volume": volume}},
+                "stringData": {"accessKeyId": "whistler-root",
+                               "secretAccessKey": secrets.token_urlsafe(32)}}
+        try:
+            api.create_namespaced_secret(self.namespace, body)
+        except ApiException as e:
+            if e.status != 409:
+                logger.error(f"Failed to create {name}: {e}")
+                return None
+        return name
+
+    def dataset_account_holders(self, volume: str) -> Dict[str, Set[str]]:
+        """``{mode: usernames}`` who should hold an account on this dataset
+        — exactly the users its fencing admits, by the same rule
+        (s3_proxy_peers: the matrix, the readOnly ceiling, archived means
+        nobody), so the key and the reach can never disagree about who is
+        in."""
+        return {mode: {u for u, _zone in self.s3_proxy_peers(volume, mode)}
+                for mode in dataset_accounts.MODES}
+
+    def sync_dataset_keys(self, volume: str) -> Optional[Dict[str, str]]:
+        """Make the keys Secret hold exactly one key per account the matrix
+        wants, plus the ``users.json`` that seeds the server. Existing keys
+        are kept (a guest holding one keeps working); a new account gets a
+        fresh one; a revoked account's key is dropped. Returns
+        ``{access: secret}``, or None on a failure worth retrying."""
+        name = self.dataset_keys_secret_name(volume)
+        api = client.CoreV1Api()
+        try:
+            current = api.read_namespaced_secret(name, self.namespace)
+            stored = {k: base64.b64decode(v).decode()
+                      for k, v in (current.data or {}).items()}
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to read {name}: {e}")
+                return None
+            current, stored = None, {}
+        wanted = dataset_accounts.desired_accounts(
+            self.dataset_account_holders(volume))
+        keys = {a: stored.get(a) or secrets.token_urlsafe(24)
+                for a in sorted(wanted)}
+        data = {**keys, "users.json": dataset_accounts.render_users_json(keys)}
+        if current is not None and stored == data:
+            return keys
+        body = {"apiVersion": "v1", "kind": "Secret",
+                "metadata": {"name": name, "labels": {
+                    "app": DATASET_SERVER_APP, "volume": volume}},
+                "stringData": data}
+        try:
+            if current is None:
+                api.create_namespaced_secret(self.namespace, body)
+            else:
+                body["metadata"]["resourceVersion"] = \
+                    current.metadata.resource_version
+                api.replace_namespaced_secret(name, self.namespace, body)
+        except ApiException as e:
+            logger.error(f"Failed to write {name}: {e}")
+            return None
+        return keys
+
+    def _dataset_server_ip(self, volume: str) -> Optional[str]:
+        """The Ready server pod's IP, or None. The operator talks to the pod
+        directly: the admin port has no Service on purpose."""
+        try:
+            pods = client.CoreV1Api().list_namespaced_pod(
+                self.namespace,
+                label_selector=f"app={DATASET_SERVER_APP},volume={volume}").items
+        except ApiException as e:
+            logger.error(f"Could not find the server of {volume!r}: {e}")
+            return None
+        for pod in pods:
+            if pod.metadata.deletion_timestamp or not pod.status:
+                continue
+            ready = any(c.type == "Ready" and c.status == "True"
+                        for c in (pod.status.conditions or []))
+            if ready and pod.status.pod_ip:
+                return pod.status.pod_ip
+        return None
+
+    @staticmethod
+    def _vgw_call(method: str, url: str, access: str, secret: str, *,
+                  body: bytes = b"", headers: Dict[str, str] = None,
+                  timeout: float = 5.0) -> Tuple[int, bytes]:
+        """One signed request to a dataset server. ``(status, body)``;
+        connection errors raise OSError."""
+        import urllib.error
+        import urllib.request
+        signed = dataset_accounts.sign_v4(method, url, access, secret,
+                                          body=body, headers=headers)
+        request = urllib.request.Request(url, data=body or None,
+                                         method=method, headers=signed)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def sync_dataset_accounts(self, volume: str) -> bool:
+        """Make the running server's accounts and bucket policy match the
+        matrix. True when they do.
+
+        Revocations first: an account that should not exist is deleted
+        before anything else, which cuts its key on the next request (the IAM
+        cache is off). Then missing accounts are created, the bucket gets an
+        ACL written as root (a mkdir'd bucket has none, and without it a
+        non-root CopyObject fails), and the policy is replaced — or deleted
+        when nobody holds an account, since a policy needs a principal.
+
+        False when the pod is not Ready yet; the keys Secret is still
+        brought up to date, so a server that starts later starts with the
+        right accounts and only the policy waits for the next pass.
+
+        Serialized per dataset: one change can wake the kopf handler and the
+        dataset worker at once, and two passes interleaving list-then-create
+        collide (seen on k3d: a 409 on create-user)."""
+        with self._dataset_sync_lock(volume):
+            return self._sync_dataset_accounts(volume)
+
+    def _dataset_sync_lock(self, volume: str):
+        import threading
+        locks = self.__dict__.setdefault("_dataset_sync_locks", {})
+        guard = self.__dict__.setdefault("_dataset_sync_guard",
+                                         threading.Lock())
+        with guard:
+            return locks.setdefault(volume, threading.Lock())
+
+    def _sync_dataset_accounts(self, volume: str) -> bool:
+        keys = self.sync_dataset_keys(volume)
+        if keys is None:
+            return False
+        ip = self._dataset_server_ip(volume)
+        if not ip:
+            return False
+        root_name = self._ensure_dataset_root_secret(volume)
+        try:
+            root = client.CoreV1Api().read_namespaced_secret(
+                root_name, self.namespace).data
+            access = base64.b64decode(root["accessKeyId"]).decode()
+            secret = base64.b64decode(root["secretAccessKey"]).decode()
+        except (ApiException, KeyError, TypeError) as e:
+            logger.error(f"Could not read the root key of {volume!r}: {e}")
+            return False
+        admin = f"http://{ip}:{DATASET_SERVER_ADMIN_PORTS['rw']}"
+        s3 = f"http://{ip}:{DATASET_SERVER_PORTS['rw']}/{S3_PROXY_BUCKET}"
+
+        def call(method, url, **kw):
+            status, body = self._vgw_call(method, url, access, secret, **kw)
+            if status >= 300:
+                raise OSError(f"{method} {url.split('?')[0]} -> {status}: "
+                              f"{body[:200]!r}")
+            return body
+
+        try:
+            live = dataset_accounts.parse_list_users(
+                call("PATCH", f"{admin}/list-users"))
+            for name in sorted(live):
+                if keys.get(name) != live[name]:
+                    call("PATCH", f"{admin}/delete-user?access="
+                                  f"{urllib.parse.quote(name)}")
+                    if name not in keys:
+                        logger.info(f"Revoked {name} on dataset {volume!r}")
+            for name in sorted(keys):
+                if live.get(name) != keys[name]:
+                    xml = dataset_accounts.account_xml(name, keys[name])
+                    status, body = self._vgw_call(
+                        "PATCH", f"{admin}/create-user", access, secret,
+                        body=xml)
+                    if status == 409:
+                        # Created since we listed (another process, or a
+                        # pass that predates the lock): make it ours.
+                        call("PATCH", f"{admin}/delete-user?access="
+                                      f"{urllib.parse.quote(name)}")
+                        call("PATCH", f"{admin}/create-user", body=xml)
+                    elif status >= 300:
+                        raise OSError(f"PATCH create-user -> {status}: "
+                                      f"{body[:200]!r}")
+                    logger.info(f"Granted {name} on dataset {volume!r}")
+            call("PUT", f"{s3}?acl", headers={"x-amz-acl": "private"})
+            policy = dataset_accounts.build_policy(S3_PROXY_BUCKET, keys)
+            if policy:
+                call("PUT", f"{s3}?policy",
+                     body=json.dumps(policy, sort_keys=True).encode())
+            else:
+                call("DELETE", f"{s3}?policy")
+        except (OSError, ElementTree.ParseError) as e:
+            logger.error(f"Could not sync the accounts of {volume!r}: {e}")
+            return False
+        return True
+
+    def sync_all_dataset_accounts(self) -> int:
+        """The dataset worker's pass: sync every served managed dataset.
+        This is where a revoked grant's key dies, so it runs on every User,
+        Group and Dataset event (operator.py). Returns how many synced."""
+        try:
+            items = self.api.list_namespaced_custom_object(
+                self.group, self.version, self.namespace,
+                DATASET_PLURAL).get("items", [])
+        except (ApiException, AttributeError) as e:
+            logger.warning(f"Could not list datasets to sync accounts: {e}")
+            return 0
+        done = 0
+        for item in items:
+            spec = item.get("spec") or {}
+            if not self.is_managed_dataset(spec) or \
+                    self.is_archived_dataset(spec) or DELETE_DATA_ANNOTATION \
+                    in (item["metadata"].get("annotations") or {}):
+                continue
+            if self.sync_dataset_accounts(item["metadata"]["name"]):
+                done += 1
+        return done
+
     def ensure_managed_dataset(self, volume: str,
                                definition: Dict[str, Any]) -> bool:
-        """Make a managed dataset's server match its definition: claim,
-        isolation policy, per-mode policies, Deployment, Services. Called by
-        the operator when the Dataset changes and again on every session
-        build that mounts it, so it is idempotent and self-healing. False on
-        a failure worth retrying.
+        """Make a managed dataset's server match its definition: root key,
+        keys Secret, policies, claim, Deployment, Services. Called by the
+        operator when the Dataset changes and again on every session build
+        that mounts it, so it is idempotent and self-healing. False on a
+        failure worth retrying. Accounts and the bucket policy are the
+        running server's, so they are synced separately
+        (sync_dataset_accounts) once the pod is Ready.
 
         Policies go first and the Deployment last, so the pod never runs
         unselected by a policy (_build_dataset_server_isolation)."""
@@ -5925,22 +6240,23 @@ class KubeConfigManager(ConfigManager):
         if problem:
             logger.error(f"Dataset {volume!r} not served: {problem}")
             return False
+        root_secret = self._ensure_dataset_root_secret(volume)
+        if not root_secret or self.sync_dataset_keys(volume) is None:
+            return False   # the pod's init container needs the seed
         modes = self.dataset_modes(definition)
-        auth_secrets = {}
-        for mode in modes:
-            auth_secrets[mode] = self._ensure_s3_auth_secret(volume, mode)
-            if not auth_secrets[mode]:
-                return False
         apps = client.AppsV1Api()
         core = client.CoreV1Api()
         net = client.NetworkingV1Api()
         ns = self.namespace
         name = self.dataset_server_name(volume)
-        ok = self._ensure_object(
-            name, ns, self._build_dataset_server_isolation(volume),
-            create=net.create_namespaced_network_policy,
-            read=net.read_namespaced_network_policy,
-            replace=net.replace_namespaced_network_policy)
+        ok = True
+        for policy in (self._build_dataset_server_isolation(volume),
+                       self._build_dataset_server_operator_access(volume)):
+            ok = self._ensure_object(
+                policy["metadata"]["name"], ns, policy,
+                create=net.create_namespaced_network_policy,
+                read=net.read_namespaced_network_policy,
+                replace=net.replace_namespaced_network_policy) and ok
         for mode in modes:
             ok = self._ensure_object(
                 self._s3_proxy_name(volume, mode), ns,
@@ -5961,7 +6277,8 @@ class KubeConfigManager(ConfigManager):
         deployment, services = self._build_dataset_server_manifests(
             volume=volume, definition=definition,
             image=self.dataset_server_image, claim=claim,
-            auth_secrets=auth_secrets,
+            root_secret=root_secret,
+            keys_secret=self.dataset_keys_secret_name(volume),
             resources=self.dataset_server_resources)
         ok = self._ensure_object(
             name, ns, deployment,
@@ -6153,7 +6470,13 @@ class KubeConfigManager(ConfigManager):
         steps += [(net.delete_namespaced_network_policy,
                    self._s3_proxy_name(volume, m)) for m in DATASET_SERVER_PORTS]
         steps += [(net.delete_namespaced_network_policy,
-                   self.dataset_server_name(volume))]
+                   self.dataset_server_name(volume)),
+                  (net.delete_namespaced_network_policy,
+                   f"{self.dataset_server_name(volume)}-operator")]
+        steps += [(core.delete_namespaced_secret,
+                   self.dataset_root_secret_name(volume)),
+                  (core.delete_namespaced_secret,
+                   self.dataset_keys_secret_name(volume))]
         steps += [(core.delete_namespaced_secret,
                    f"{self._s3_proxy_name(volume, m)}-auth")
                   for m in DATASET_SERVER_PORTS]

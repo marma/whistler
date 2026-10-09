@@ -224,7 +224,7 @@ def delete_release_leftovers(cm) -> List[str]:
     # Secrets: by label where Whistler labels them, by name where it names
     # them (the CA and host key names come from the chart).
     for label in ("app=whistler-dataset", "app=whistler-s3-proxy",
-                  "app=whistler-backup"):
+                  f"app={DATASET_SERVER_APP}", "app=whistler-backup"):
         for s in core.list_namespaced_secret(ns, label_selector=label).items:
             if not _helm_managed(s.metadata):
                 gone("Secret", s.metadata.name,

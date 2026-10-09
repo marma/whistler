@@ -77,7 +77,7 @@ def _server(definition=MANAGED):
     return _manager()._build_dataset_server_manifests(
         volume="corpus", definition=definition,
         image="ghcr.io/versity/versitygw:v1.7.0", claim="whistler-dataset-corpus",
-        auth_secrets={"ro": "ro-auth", "rw": "rw-auth"})
+        root_secret="corpus-root", keys_secret="corpus-keys")
 
 
 def _containers(deployment):
@@ -85,32 +85,56 @@ def _containers(deployment):
             deployment["spec"]["template"]["spec"]["containers"]}
 
 
+def _mounts(container):
+    return {m["name"]: m for m in container["volumeMounts"]}
+
+
 def test_ro_process_is_read_only_in_the_gateway_and_the_kernel():
     # Twice over, so a read-only grant holds even if one of the two fails.
     ro = _containers(_server()[0])["versitygw-ro"]
     assert ro["args"][0] == "--readonly"
-    assert ro["volumeMounts"] == [{"name": "data", "mountPath": "/srv",
-                                   "readOnly": True}]
+    assert _mounts(ro)["data"]["readOnly"] is True
     rw = _containers(_server()[0])["versitygw-rw"]
     assert "--readonly" not in rw["args"]
-    assert rw["volumeMounts"][0]["readOnly"] is False
+    assert _mounts(rw)["data"]["readOnly"] is False
 
 
-def test_each_mode_is_its_own_process_with_its_own_key():
-    containers = _containers(_server()[0])
-    ro_env = {e["name"]: e["valueFrom"]["secretKeyRef"]["name"]
-              for e in containers["versitygw-ro"]["env"]}
-    rw_env = {e["name"]: e["valueFrom"]["secretKeyRef"]["name"]
-              for e in containers["versitygw-rw"]["env"]}
-    assert set(ro_env.values()) == {"ro-auth"}
-    assert set(rw_env.values()) == {"rw-auth"}
-    assert containers["versitygw-ro"]["ports"][0]["containerPort"] == 8080
-    assert containers["versitygw-rw"]["ports"][0]["containerPort"] == 8081
+def test_both_processes_share_one_account_store_with_no_cache():
+    # An account created through the rw admin port must exist in the ro
+    # process on the next request, and a deleted one must stop working there
+    # just as fast (verified against VersityGW 1.7.0).
+    for c in _containers(_server()[0]).values():
+        assert "--iam-dir" in c["args"] and "--iam-cache-disable" in c["args"]
+        assert _mounts(c)["iam"]["mountPath"] == "/iam"
+    volumes = {v["name"]: v for v in
+               _server()[0]["spec"]["template"]["spec"]["volumes"]}
+    assert "emptyDir" in volumes["iam"]
+    assert volumes["seed"]["secret"]["secretName"] == "corpus-keys"
 
 
-def test_a_read_only_dataset_runs_no_rw_process_and_no_rw_service():
+def test_the_account_api_is_never_on_a_guest_port():
+    # Without --admin-port VersityGW serves the account API on its S3 port,
+    # where guests are.
+    for mode, c in _containers(_server()[0]).items():
+        args = c["args"]
+        admin = args[args.index("--admin-port") + 1]
+        s3 = args[args.index("--port") + 1]
+        assert admin != s3
+
+
+def test_guests_never_hold_the_root_key():
+    # Both processes run as the dataset's root key, from a Secret no guest
+    # descriptor reads (phase 1 handed a mode's root key to every guest).
+    for c in _containers(_server()[0]).values():
+        assert {e["valueFrom"]["secretKeyRef"]["name"] for e in c["env"]} == {
+            "corpus-root"}
+
+
+def test_a_read_only_dataset_has_no_rw_service_but_keeps_its_writer():
+    # The rw process is the only one that can write the bucket policy, so it
+    # runs; no guest can reach it (no Service, and its port admits nobody).
     deployment, services = _server({**MANAGED, "readOnly": True})
-    assert list(_containers(deployment)) == ["versitygw-ro"]
+    assert set(_containers(deployment)) == {"versitygw-ro", "versitygw-rw"}
     assert [s["metadata"]["name"] for s in services] == ["whistler-s3-corpus-ro"]
 
 
@@ -124,14 +148,24 @@ def test_services_look_exactly_like_an_rclone_proxy_to_the_guest():
         "name": "s3", "port": 8080, "targetPort": 8081}
 
 
-def test_server_bootstraps_the_bucket_the_guest_mounts():
+def test_server_prepares_the_bucket_and_seeds_the_accounts():
     init = _server()[0]["spec"]["template"]["spec"]["initContainers"][0]
-    assert init["command"][-1] == f"mkdir -p /srv/{S3_PROXY_BUCKET}"
+    script = init["command"][-1]
+    assert f"mkdir -p /srv/{S3_PROXY_BUCKET}" in script
+    assert "cp /seed/users.json /iam/users.json" in script
 
 
 def test_server_recreates_rather_than_rolls():
     # An RWO claim: a rolling update's new pod on another node never starts.
     assert _server()[0]["spec"]["strategy"] == {"type": "Recreate"}
+
+
+def test_only_the_operator_reaches_the_writer_and_its_admin_port():
+    policy = _manager()._build_dataset_server_operator_access("corpus")
+    (rule,) = policy["spec"]["ingress"]
+    assert rule["from"] == [{"podSelector": {"matchLabels": {
+        "app": "whistler-operator"}}}]
+    assert {p["port"] for p in rule["ports"]} == {8081, 9081}
 
 
 def test_guest_never_asks_to_create_the_bucket():
@@ -206,7 +240,8 @@ def _ensure_rig(monkeypatch, fail_kinds=()):
         order.append((body["kind"], name))
         return body["kind"] not in fail_kinds
     cm._ensure_object = ensure_object
-    cm._ensure_s3_auth_secret = lambda v, m: f"{v}-{m}-auth"
+    cm._ensure_dataset_root_secret = lambda v: f"{v}-root"
+    cm.sync_dataset_keys = lambda v: order.append(("Keys", v)) or {}
     cm._refresh_s3_proxy_policies = lambda v: None
     cm._ensure_dataset_claim = lambda v, d: order.append(
         ("Claim", v)) or "whistler-dataset-corpus"
@@ -235,7 +270,9 @@ def test_policies_exist_before_the_pod_does(monkeypatch):
     kinds = [k for k, _ in order]
     assert kinds.index("Deployment") > max(
         i for i, k in enumerate(kinds) if k == "NetworkPolicy")
-    assert ("NetworkPolicy", "whistler-dataset-corpus") == order[0]
+    assert ("NetworkPolicy", "whistler-dataset-corpus") in order[:3]
+    # The seed exists before the pod that copies it.
+    assert kinds.index("Keys") < kinds.index("Deployment")
 
 
 def test_no_pod_without_its_fence(monkeypatch):
@@ -250,6 +287,8 @@ def test_a_read_only_dataset_loses_its_rw_service(monkeypatch):
     cm.ensure_managed_dataset("corpus", {**MANAGED, "readOnly": True})
     assert ("delete Service", "whistler-s3-corpus-rw") in order
     assert ("NetworkPolicy", "whistler-s3-corpus-rw") not in order
+    # The writer stays reachable by the operator alone.
+    assert ("NetworkPolicy", "whistler-dataset-corpus-operator") in order
 
 
 def test_an_invalid_definition_builds_nothing(monkeypatch):
@@ -559,3 +598,183 @@ def test_archived_datasets_are_listed_last():
     sections = asyncio.run(_matrix_sections(_portal_request(cm), cm))
     assert [r["key"] for r in sections[-1]["rows"]] == [
         "b-live", "c-live", "0-old", "a-old"]
+
+
+# --- phase 2: per-user keys ------------------------------------------------- #
+
+import base64
+import json as _json
+
+from whistler import dataset_accounts
+
+
+def _b64(s):
+    return base64.b64encode(s.encode()).decode()
+
+
+def _keys_rig(monkeypatch, users, stored=None):
+    """A manager whose keys Secret holds ``stored``; records writes."""
+    cm = _manager(users=users, groups={}, datasets={"corpus": MANAGED})
+    written = []
+    secret = None if stored is None else SimpleNamespace(
+        data={k: _b64(v) for k, v in stored.items()},
+        metadata=SimpleNamespace(resource_version="7"))
+
+    def read(name, ns):
+        if secret is None:
+            raise ApiException(status=404)
+        return secret
+    monkeypatch.setattr(cfg.client, "CoreV1Api", lambda: SimpleNamespace(
+        read_namespaced_secret=read,
+        create_namespaced_secret=lambda ns, body: written.append(
+            ("create", body["stringData"])),
+        replace_namespaced_secret=lambda name, ns, body: written.append(
+            ("replace", body["stringData"]))))
+    return cm, written
+
+
+ALICE_RW = {"alice": {"name": "alice",
+                      "volumeAccess": {"open": {"corpus": "allowed"}}}}
+
+
+def test_keys_follow_the_matrix(monkeypatch):
+    cm, written = _keys_rig(monkeypatch, {**ALICE_RW, "bob": {
+        "name": "bob", "volumeAccess": {"lab": {"corpus": "read-only"}}}})
+    keys = cm.sync_dataset_keys("corpus")
+    assert set(keys) == {"rw.alice", "ro.bob"}
+    (kind, data), = written
+    assert kind == "create"
+    seeded = _json.loads(data["users.json"])["accessAccounts"]
+    assert {a: v["secret"] for a, v in seeded.items()} == keys
+
+
+def test_an_existing_key_survives_and_a_revoked_one_goes(monkeypatch):
+    # A guest holding its key keeps working across syncs; a user no longer
+    # granted loses theirs from the seed too.
+    stored = {"rw.alice": "kept", "ro.mallory": "gone",
+              "users.json": "{}"}
+    cm, written = _keys_rig(monkeypatch, ALICE_RW, stored)
+    assert cm.sync_dataset_keys("corpus") == {"rw.alice": "kept"}
+    (kind, data), = written
+    assert kind == "replace" and "ro.mallory" not in data
+
+
+def test_an_unchanged_key_set_is_not_rewritten(monkeypatch):
+    keys = {"rw.alice": "kept"}
+    stored = {**keys, "users.json": dataset_accounts.render_users_json(keys)}
+    cm, written = _keys_rig(monkeypatch, ALICE_RW, stored)
+    assert cm.sync_dataset_keys("corpus") == keys
+    assert written == []
+
+
+def test_archived_or_read_only_ceiling_shapes_the_accounts(monkeypatch):
+    cm, _ = _keys_rig(monkeypatch, ALICE_RW)
+    cm.datasets = {"corpus": {**MANAGED, "readOnly": True}}
+    assert set(cm.sync_dataset_keys("corpus")) == {"ro.alice"}
+    cm.datasets = {"corpus": {**MANAGED, "archived": True}}
+    assert cm.sync_dataset_keys("corpus") == {}
+
+
+def _accounts_rig(monkeypatch, keys, live):
+    cm = _manager()
+    calls = []
+    cm.sync_dataset_keys = lambda v: keys
+    cm._dataset_server_ip = lambda v: "10.0.0.9"
+    cm._ensure_dataset_root_secret = lambda v: "root"
+    monkeypatch.setattr(cfg.client, "CoreV1Api", lambda: SimpleNamespace(
+        read_namespaced_secret=lambda n, ns: SimpleNamespace(data={
+            "accessKeyId": _b64("whistler-root"),
+            "secretAccessKey": _b64("r00t")})))
+
+    def call(method, url, access, secret, body=b"", headers=None):
+        assert (access, secret) == ("whistler-root", "r00t")
+        path = url.split("10.0.0.9:")[1]
+        calls.append((method, path, body))
+        if path.endswith("/list-users"):
+            accounts = "".join(f"<Accounts><Access>{a}</Access><Secret>{s}"
+                               f"</Secret></Accounts>" for a, s in live.items())
+            return 200, f"<ListUserAccountsResult>{accounts}" \
+                        f"</ListUserAccountsResult>".encode()
+        return 200, b""
+    cm._vgw_call = staticmethod(call)
+    return cm, calls
+
+
+def test_account_sync_revokes_first_then_grants_then_policy(monkeypatch):
+    cm, calls = _accounts_rig(
+        monkeypatch, keys={"rw.alice": "k1", "ro.bob": "k2"},
+        live={"rw.alice": "k1", "ro.mallory": "old"})
+    assert cm.sync_dataset_accounts("corpus")
+    paths = [(m, p.split("?")[0], p) for m, p, _ in calls]
+    assert paths[0][1] == "9081/list-users"
+    assert paths[1][2] == "9081/delete-user?access=ro.mallory"
+    assert paths[2][1] == "9081/create-user"
+    assert b"<Access>ro.bob</Access>" in calls[2][2]
+    assert paths[3][2] == "8081/data?acl"
+    assert paths[4][0] == "PUT" and paths[4][2] == "8081/data?policy"
+    policy = _json.loads(calls[4][2])
+    assert {p for s in policy["Statement"] for p in s["Principal"]["AWS"]} \
+        == {"rw.alice", "ro.bob"}
+    # rw.alice was already right: not recreated.
+    assert not any(b"rw.alice" in body for m, p, body in calls
+                   if p.endswith("create-user"))
+
+
+def test_a_changed_key_is_replaced(monkeypatch):
+    cm, calls = _accounts_rig(monkeypatch, keys={"rw.alice": "new"},
+                              live={"rw.alice": "old"})
+    assert cm.sync_dataset_accounts("corpus")
+    ops = [p.split("?")[0] for _, p, _ in calls]
+    assert ops[:3] == ["9081/list-users", "9081/delete-user",
+                       "9081/create-user"]
+
+
+def test_nobody_granted_deletes_the_policy(monkeypatch):
+    cm, calls = _accounts_rig(monkeypatch, keys={}, live={"ro.x": "s"})
+    assert cm.sync_dataset_accounts("corpus")
+    assert ("DELETE", "8081/data?policy", b"") in calls
+
+
+def test_no_ready_server_is_a_retry_not_a_failure_to_record(monkeypatch):
+    cm, calls = _accounts_rig(monkeypatch, keys={"rw.alice": "k"}, live={})
+    cm._dataset_server_ip = lambda v: None
+    assert not cm.sync_dataset_accounts("corpus")
+    assert calls == []
+
+
+def test_a_server_error_stops_the_sync(monkeypatch):
+    cm, calls = _accounts_rig(monkeypatch, keys={"rw.alice": "k"}, live={})
+    cm._vgw_call = staticmethod(lambda *a, **k: (500, b"boom"))
+    assert not cm.sync_dataset_accounts("corpus")
+
+
+def test_a_guest_gets_its_own_key_not_a_shared_one(monkeypatch):
+    cm = _manager(users=ALICE_RW, groups={}, datasets={"corpus": MANAGED})
+    cm._refresh_s3_proxy_policies = lambda v: None
+    cm.ensure_s3_proxy = lambda *a: True
+    cm.sync_dataset_keys = lambda v: {"rw.alice": "alices-key",
+                                      "rw.bob": "bobs-key"}
+    cm.sync_dataset_accounts = lambda v: True
+    monkeypatch.setattr(cfg.client, "CoreV1Api", lambda: None)
+    (d,) = cm.session_shared_datasets("alice", "open", ["corpus"])
+    assert (d["accessKeyId"], d["secretAccessKey"]) == ("rw.alice",
+                                                       "alices-key")
+
+
+def test_an_account_that_appeared_since_the_listing_is_replaced(monkeypatch):
+    # Two passes woken by one change raced on k3d: create-user -> 409.
+    cm, calls = _accounts_rig(monkeypatch, keys={"rw.alice": "k"}, live={})
+    real = cm._vgw_call
+    seen = []
+
+    def call(method, url, access, secret, body=b"", headers=None):
+        if url.endswith("/create-user") and not seen:
+            seen.append(1)
+            calls.append((method, url.split("10.0.0.9:")[1], body))
+            return 409, b"exists"
+        return real(method, url, access, secret, body=body, headers=headers)
+    cm._vgw_call = staticmethod(call)
+    assert cm.sync_dataset_accounts("corpus")
+    ops = [p.split("?")[0] for _, p, _ in calls]
+    assert ops[1:4] == ["9081/create-user", "9081/delete-user",
+                        "9081/create-user"]

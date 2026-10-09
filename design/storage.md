@@ -424,8 +424,8 @@ external container: path-style S3 puts the bucket first in the path, and the
 signature covers a path the Ingress does not rewrite (unverified).
 
 Built first, in order: managed datasets on the internal endpoint only; then
-per-user keys; then the external listener and the `external` zone, as a
-separate decision.
+per-user keys (done 2026-10-09, below); then the external listener and the
+`external` zone, as a separate decision.
 
 **Phase 1 built, 2026-10-08: managed datasets, internal only, shared keys.**
 `Dataset.spec.source: managed` + `size`; the portal offers it as the default
@@ -467,6 +467,73 @@ A name held by an archived dataset cannot be re-used: re-creating it would
 hand a new definition the old one's grants and data. An archived dataset
 cannot be edited either; resurrect it first. Verified end to end through the
 portal's own routes on k3d, including the refusals.
+
+**Phase 2 built, 2026-10-09: per-user keys.** A managed dataset's server
+now holds one VersityGW account per (user, mode) the matrix grants —
+`ro.alice`, `rw.alice` — and a guest is given only its own
+(`whistler/dataset_accounts.py` for the pure half, `sync_dataset_accounts`
+for the API half). The root key (`whistler-dataset-<name>-root`) never
+leaves the pod; phase 1's per-mode root keys, which every guest held, are
+no longer used, so a key copied out of an old guest opens nothing. Remote-S3
+datasets keep their shared proxy key (rclone takes its keys as flags, so a
+grant change would restart the proxy under everyone), as decided when remote
+S3 was parked.
+
+The design fell out of five measurements against VersityGW v1.7.0, each of
+which closed a simpler option:
+
+- **A `user`-role account is refused a bucket it does not own.** So each
+  account is granted by a bucket policy listing it by name, with only its
+  mode's actions (`READ_ACTIONS` / `WRITE_ACTIONS` — never `s3:*`, which
+  would include the bucket's own policy and ACL).
+- **`admin` role is not an option.** It needs no policy, but it ignores even
+  an explicit Deny, and it can write a policy with Principal `"*"` — which
+  VersityGW reads as *anonymous*: verified, an unsigned GET then succeeds.
+  An rw guest holding one could make the dataset public to anyone with
+  reach, and to the whole world once the external listener exists.
+- **`--noacl` does not help**: user accounts are still refused.
+- **A policy's principals must exist in the writing process's account
+  store, and only the rw process can write one** (the ro process is
+  `--readonly`). So both processes share one store — a `users.json` on a
+  shared emptyDir, IAM cache off — and the policy, an xattr on the shared
+  bucket directory, is enforced by both. An account created through the rw
+  admin port works on the ro port on the next request. Sharing does not let
+  an ro key write: the policy gives it read actions only (verified on the rw
+  port), it cannot reach the rw port anyway, and the ro process is still
+  `--readonly` with the claim mounted read-only.
+- **A non-root CopyObject on a `mkdir`'d bucket is a 500** (`unexpected end
+  of JSON input`: no ACL xattr). Root writing a private ACL fixes it, so the
+  operator does that on every sync — which also repairs phase-1 buckets.
+
+Consequences: the rw *process* always runs, because it is the only writer
+of the policy; a read-only dataset has no rw Service and its rw port admits
+no guest, only the operator (`-operator` NetworkPolicy, which also admits it
+to the admin ports). Each process has an `--admin-port`; without one the
+account API is served on its S3 port, to guests. The operator talks to the
+pod directly with a stdlib SigV4 signer (checked against AWS's own worked
+example), so its account sync needs the operator **in-cluster**.
+
+Accounts survive restarts without the operator: the keys Secret
+(`whistler-dataset-<name>-keys`) holds every account's key plus the rendered
+`users.json`, which the init container copies in at start. Syncs run on
+every User, Group and Dataset event (the dataset worker), on the Dataset's
+own kopf handler, and on each session build that mounts it; they are
+serialized per dataset, after two passes woken by one change collided on
+`create-user` (409) on k3d.
+
+Measured on k3d with the chart installed and the image built from the tree,
+session pods in namespaces Whistler created (so the real egress policies
+applied): rw writes and renames; ro reads and is refused writes; ungranted
+pods cannot connect; the admin port is unreachable from a guest pod.
+**Removing a user's grant killed their key 2.6s later even when used from
+another granted user's pod** — the case the network fence cannot cover. A
+server pod restart kept every account and kept the revoked one dead.
+Flipping `readOnly` swapped `rw.carol` for `ro.carol` and removed the rw
+Service.
+
+Upgrading from phase 1 restarts each managed server (new arguments, new
+root key), and running guests' keys stop working: their `rclone.conf` holds
+the old shared key. A guest gets its own key at its next start.
 
 **Instances choose their datasets, 2026-10-08.** Until now every dataset a
 user was granted in the session's zone was mounted, chosen or not. Now an

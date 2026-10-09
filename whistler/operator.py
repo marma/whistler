@@ -168,6 +168,12 @@ def _refence_datasets_loop(cm, wake=_refence_wake,
             cm.revive_dataset_servers()
         except Exception as e:
             logger.error(f"Reviving dataset servers failed (retrying): {e}")
+        # Per-user keys follow the matrix: a revoked grant's account is
+        # deleted here, which cuts that key on its next request.
+        try:
+            cm.sync_all_dataset_accounts()
+        except Exception as e:
+            logger.error(f"Syncing dataset accounts failed (retrying): {e}")
         if once:
             return
 
@@ -199,9 +205,15 @@ def _destroyed(spec, meta, **_):
 @kopf.on.update('whistler.martinmalmsten.net', 'v1', 'datasets', when=_served)
 @kopf.on.resume('whistler.martinmalmsten.net', 'v1', 'datasets', when=_served)
 def managed_dataset_fn(name, spec, **_):
-    if not _get_config_manager().ensure_managed_dataset(name, dict(spec)):
+    cm = _get_config_manager()
+    if not cm.ensure_managed_dataset(name, dict(spec)):
         raise kopf.TemporaryError(
             f"Managed dataset {name!r} is not served yet", delay=30)
+    # The accounts and the bucket policy need the server Ready, which a new
+    # one is not for a few seconds; retried until it is.
+    if not cm.sync_dataset_accounts(name):
+        raise kopf.TemporaryError(
+            f"Managed dataset {name!r}: accounts not synced yet", delay=10)
 
 
 @kopf.on.create('whistler.martinmalmsten.net', 'v1', 'datasets', when=_destroyed)
