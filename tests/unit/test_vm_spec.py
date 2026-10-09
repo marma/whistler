@@ -457,10 +457,10 @@ def test_websockets_viewer_arms_in_guest_desktop():
     user_data = _cloud_init(
         viewer="websockets",
         template_spec={"image": "x",
-                       "streamerEnv": {"SELKIES_H264_STREAMING_MODE": "true"}})
+                       "streamerEnv": {"SELKIES_VIDEO_STREAMING_MODE": "true"}})
     assert "whistler-desktop@alice.service" in user_data
     assert "SELKIES_PORT=5900" in user_data
-    assert "SELKIES_H264_STREAMING_MODE=true" in user_data
+    assert "SELKIES_VIDEO_STREAMING_MODE=true" in user_data
 
 
 def test_vnc_viewer_gets_plain_guest():

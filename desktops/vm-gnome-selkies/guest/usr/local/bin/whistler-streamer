@@ -1,23 +1,17 @@
 #!/usr/bin/env bash
-# Display plane of a Whistler *VM* desktop: X server + audio daemon + Selkies
-# 2.x streamer, run as a system service (whistler-streamer.service). The
-# in-guest port of desktops/streamer-selkies2/entrypoint.sh — the sidecar model
-# can't reach into a VM (unix sockets don't cross the VM boundary), so the same
-# stack runs inside the guest instead. Byte-for-byte the same as
-# ../../vm-xfce-selkies's whistler-streamer EXCEPT the one GNOME difference
-# called out below (SELKIES_H264_STREAMING_MODE defaults ON). Keep the two, and
-# the reference streamer entrypoint, in sync (see design/creating_desktops.md
-# §4-5).
+# Display plane of a Whistler VM desktop: X server + audio daemon + Selkies
+# 2.0 streamer, run as a system service (whistler-streamer.service). The DE
+# session (whistler-desktop@.service) lives in the same guest and finds the X
+# and Pulse sockets by path; dbus is the VM's own (the unit orders
+# After=dbus.service).
 #
-# Differences from the container entrypoint, all deliberate:
-#   - no `dbus-daemon --system` (the VM's systemd already runs dbus.service;
-#     the unit orders After=dbus.service),
-#   - /tmp/.X11-unix and /tmp/pulse are plain directories, not shared
-#     emptyDirs — the DE session (whistler-desktop@.service) lives in the
-#     same guest and finds them by path,
-#   - config comes from /etc/whistler/streamer.env (EnvironmentFile in the
-#     unit), written per-session by cloud-init from the template's
-#     streamerEnv/displayPort — the VM analog of the sidecar's env injection.
+# Config comes from /etc/whistler/streamer.env (EnvironmentFile in the unit),
+# written per-session by cloud-init from the template's streamerEnv and
+# displayPort. Selkies 2.0 reads every setting from SELKIES_<NAME> itself
+# (`--my-setting` <-> SELKIES_MY_SETTING, CLI winning over env), so a template
+# can set any Selkies setting through streamerEnv without this script naming
+# it — SELKIES_ENCODER=h265enc, SELKIES_MODE=webrtc, ... The settings
+# reference is https://docs.selkies.io/settings.
 #
 # libva note: pixelflux links the system libva and needs vaMapBuffer2
 # (libva >= 2.21). 24.04 ships 2.20, so the bake drops a vendored libva 2.22
@@ -42,9 +36,8 @@ export PULSE_SERVER="unix:/tmp/pulse/native"
 # immediately.
 rm -rf /root/.config/pulse /tmp/pulse-* /tmp/pulse/* /tmp/.X*-lock /tmp/.X11-unix/X*
 mkdir -p /tmp/pulse && chmod 777 /tmp/pulse
-# The sink MUST be named `output`: selkies 2.x tells pcmflux to capture from
-# the device literally named "output.monitor" and pa_simple_new() fails with
-# "No such entity" for anything else.
+# The sink is named `output` because Selkies captures `output.monitor` by
+# default (--audio-device-name).
 pulseaudio --daemonize=false --realtime=false --disallow-exit --exit-idle-time=-1 \
   --load="module-native-protocol-unix auth-anonymous=1 socket=/tmp/pulse/native" \
   --load="module-null-sink sink_name=output sink_properties=device.description=output" \
@@ -61,17 +54,14 @@ mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 # with No GPU (an ordinary choice since the GPU-type picker learned to say so).
 # Two consequences, both scoped to this process tree.
 #
-# 1. On the CUDA image nvidia-smi must look ABSENT, not broken. Selkies calls
-#    GPUtil.getGPUs() on every data-WebSocket connect, and GPUtil ignores
-#    nvidia-smi's exit status: with the driver installed but no card, nvidia-smi
-#    prints "NVIDIA-SMI has failed because it couldn't communicate with the
-#    NVIDIA driver" on STDOUT and exits 9, GPUtil parses that line as a CSV row,
-#    and int() raises ValueError *inside the WebSocket handler*. The socket dies
-#    with a 1006 before a single frame, the client reloads the page, and the
-#    session loops at ~6s forever — while the portal, which only sees a live
-#    /status, still calls it Ready. The silent, non-zero shim in
-#    /usr/local/lib/whistler/no-gpu goes on PATH ahead of it, which makes
-#    GPUtil return [] — the answer it should have had.
+# 1. On the CUDA image nvidia-smi must look ABSENT, not broken: with the
+#    driver installed but no card it prints its failure on STDOUT and exits 9.
+#    Selkies 1.x fed that to GPUtil, whose ValueError killed every data
+#    WebSocket before a frame (the session reload-looped at ~6s while the
+#    portal called it Ready). 2.0 dropped GPUtil and checks the exit status,
+#    so this is now belt and braces: the silent, non-zero shim in
+#    /usr/local/lib/whistler/no-gpu goes on PATH ahead of the real one, so
+#    nothing in the streamer's tree can parse that sentence as data.
 # 2. The CUDA image ships the NVIDIA EGL ICD (glvnd vendor file), and glvnd
 #    probing that ICD with no device segfaults Xvfb inside its GLX init (crash
 #    in InitExtensions via libEGL) — the streamer then "runs" with Selkies
@@ -106,60 +96,43 @@ for i in $(seq 1 30); do xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1 && break
   done & )
 
 # App-aware copy/paste for macOS clients: grabs the XF86Copy/XF86Paste taps
-# the Mac web client sends for plain Cmd-C/Cmd-V (see mac-cmd-chords.patch)
-# and re-injects Ctrl+C/V or Ctrl+Shift+C/V depending on the focused window.
-# Also pre-binds the Mode_switch/ISO_Level3_Shift keysyms Mac's Option-key
-# remap uses (Option+7 for "|" on sv, etc.) — otherwise absent from every
-# layout, forcing a slow dynamic keymap rewrite (and, past a hardcoded 1s
-# timeout in selkies' own xdotool fallback, an occasional stray character) on
-# every such chord. Supervised loop: the agent is stateless, so a crash just
-# restarts it.
+# the Mac web client sends for plain Cmd-C/Cmd-V (see
+# bake/mac-cmd-chords.patch) and re-injects Ctrl+C/V or Ctrl+Shift+C/V
+# depending on the focused window. Also pre-binds the Mode_switch /
+# ISO_Level3_Shift keysyms Mac's Option-key remap uses (Option+7 for "|" on
+# sv, etc.), which no modern layout binds. Supervised loop: the agent is
+# stateless, so a crash just restarts it. `|| true` is load-bearing: this
+# subshell inherits `set -e`, so without it the first non-zero exit (e.g. the
+# agent racing an X server restart) ended the loop and the agent stayed dead.
 ( while true; do
-    /usr/local/bin/whistler-copy-agent
+    /usr/local/bin/whistler-copy-agent || true
     sleep 2
   done & )
 
-# Selkies 2.x: pixelflux capture of $DISPLAY, H.264 encode, web client
-# + WebSocket streaming on one port. Flag spelling matters: 2.x flags are
-# dash-separated and misspellings are IGNORED SILENTLY (parse_known_args);
-# booleans take =true/=false. Basic auth is ON by default in 2.x — off here
-# explicitly; the per-session NetworkPolicy on the launcher pod is the
-# security boundary.
+# Selkies 2.0: pixelflux capture of $DISPLAY, encode, web client + WebSocket
+# streaming on one port. Booleans take =true/=false; an unknown flag is
+# ignored with an "Ignoring unrecognized argument" warning, so check the log
+# after renaming one. Basic auth is ON by default (and refuses to start
+# without a password) — off here explicitly; the per-session NetworkPolicy on
+# the launcher pod is the security boundary.
 #
-# --encoder names the OUTPUT MODE, not the encoder implementation. The enum is
-# only {x264enc, x264enc-striped, jpeg} = full-frame H.264 / striped H.264 /
-# JPEG; there is no "nvenc" value. What actually encodes is chosen by a
-# separate knob, --use-cpu (SELKIES_USE_CPU), which defaults to FALSE and is
-# not set here — so pixelflux tries NVENC (via the CUDA driver API) first, then
-# VA-API (a /dev/dri render node), and drops to its bundled libx264 only if
-# both fail. On a GPU-passthrough session running the -cuda image (baked
-# NVIDIA driver → libnvidia-encode) the stream is therefore encoded on the
-# GPU, while selkies still *reports* encoder "x264enc"; the lean image and
-# GPU-less sessions get software x264 from the identical config. Which backend
-# ran: `journalctl -u whistler-streamer | grep -Ei 'nvenc|vaapi|x264'` —
-# "NVENC Encoder Initialized successfully." / "VAAPI Encoder Initialized
-# successfully." / "... Falling back to x264|CPU". (`jpeg` and
-# `x264enc-striped` force use_cpu=true server-side, so they are always CPU.)
-# Capture (XShm from Xvfb) and GNOME's rendering (llvmpipe — Xvfb's GLX is Mesa
-# swrast, so a passthrough GPU changes nothing there) stay on the CPU
-# regardless: only the encode stage can move to the GPU.
+# Encoder: the default is h264enc, and 2.0 picks the implementation itself —
+# NVENC (the -cuda image's driver brings libnvidia-encode), then VA-API, then
+# software x264 — and steps a browser that cannot decode the codec down a
+# ladder ending in JPEG. Capture (Xvfb) and GNOME's rendering (llvmpipe) stay
+# on the CPU regardless; only the encode moves to the GPU. The session log
+# says which path each display took (the capture/encoder line at INFO). A
+# template can choose another codec with SELKIES_ENCODER in streamerEnv.
 #
-# --h264-streaming-mode defaults to TRUE here (the one difference from the XFCE
-# streamer, which leaves it off). GNOME Shell's mutter is a GL compositor: once
-# it composits a static window it emits no further damage, so pixelflux's
-# default damage-based capture leaves static windows BLACK on the client until
-# something forces a full repaint. Streaming mode continuously encodes the full
-# frame — constant bandwidth and constant encode load even when idle (on the
-# CPU with software x264, on NVENC with the CUDA image), the right trade for a
-# GL compositor. A
-# template CAN still override SELKIES_H264_STREAMING_MODE via streamerEnv, but
-# turning it off brings the black-static-window bug straight back.
+# Video streaming mode ("Turbo": encode every frame) must be ON for GNOME.
+# mutter is a GL compositor: once it composits a static window it emits no
+# further damage, so damage-based capture leaves static windows BLACK until
+# something forces a repaint. 2.0 defaults it on; it is passed explicitly so a
+# changed upstream default cannot bring the bug back. It was called
+# --h264-streaming-mode before 2.0, and templates still carrying
+# SELKIES_H264_STREAMING_MODE in streamerEnv are honoured.
 exec selkies \
   --addr=0.0.0.0 \
   --port="${SELKIES_PORT}" \
-  --mode="${SELKIES_MODE:-websockets}" \
-  --encoder="${SELKIES_ENCODER:-x264enc}" \
-  --h264-streaming-mode="${SELKIES_H264_STREAMING_MODE:-true}" \
-  --enable-https="${SELKIES_ENABLE_HTTPS:-false}" \
-  --enable-basic-auth=false \
-  --web-root=/opt/selkies-web
+  --video-streaming-mode="${SELKIES_VIDEO_STREAMING_MODE:-${SELKIES_H264_STREAMING_MODE:-true}}" \
+  --enable-basic-auth=false

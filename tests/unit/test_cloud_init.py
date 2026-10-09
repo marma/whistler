@@ -395,7 +395,7 @@ def test_half_a_certificate_is_ignored():
         assert "HostCertificate" not in conf
 
 
-# --- desktop mode (viewer=websockets VM images, e.g. vm-xfce-selkies) ----- #
+# --- desktop mode (viewer=websockets VM images, e.g. vm-gnome-selkies) ---- #
 
 STREAMER_ENV = "/etc/whistler/streamer.env"
 
@@ -411,10 +411,10 @@ def test_desktop_enables_per_user_session_unit():
 
 def test_desktop_streamer_env_written_and_streamer_kicked():
     doc = _doc(desktop=True, display_port=9000,
-               streamer_env={"SELKIES_H264_STREAMING_MODE": "true"})
+               streamer_env={"SELKIES_VIDEO_STREAMING_MODE": "true"})
     env = next(f for f in doc["write_files"] if f["path"] == STREAMER_ENV)
     lines = env["content"].splitlines()
-    assert "SELKIES_H264_STREAMING_MODE=true" in lines
+    assert "SELKIES_VIDEO_STREAMING_MODE=true" in lines
     # SELKIES_PORT comes last: displayPort (what the Service/portal dial)
     # must beat any streamerEnv override or the viewer can't connect.
     assert lines[-1] == "SELKIES_PORT=9000"

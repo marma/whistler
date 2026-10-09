@@ -68,8 +68,6 @@ spec:
             {{- end }}
             - name: WHISTLER_SSH_DOMAIN_SUFFIX
               value: {{ .Values.whistler.ssh.domainSuffix | quote }}
-            - name: WHISTLER_STREAMER_IMAGE
-              value: {{ .Values.whistler.streamer.image | quote }}
             - name: WHISTLER_STORAGE_GATEWAY_IMAGE
               value: {{ .Values.whistler.storageGateway.image | quote }}
             # Maps travel as JSON (parsed by KubeConfigManager._env_json).

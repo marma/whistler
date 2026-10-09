@@ -1257,12 +1257,6 @@ class KubeConfigManager(ConfigManager):
         # gateway must agree on the string.
         self.ssh_domain_suffix = os.environ.get(
             "WHISTLER_SSH_DOMAIN_SUFFIX", ".w")
-        # Default image for the streamer sidecar every desktop pod gets;
-        # a template's streamerImage overrides it.
-        self.streamer_image = os.environ.get(
-            "WHISTLER_STREAMER_IMAGE",
-            "ghcr.io/marma/whistler-streamer-selkies2:latest",
-        )
         # Per-user NFS storage gateway (VM homes): image plus values-level
         # placement/limits, passed by the chart as JSON envs (nodeSelector
         # and resources are maps, which a plain env var can't carry).
@@ -4086,7 +4080,7 @@ class KubeConfigManager(ConfigManager):
         if portal_public_key:
             ssh_keys.append(portal_public_key)
         # viewer=websockets means a desktop-VM image with the Selkies stack
-        # baked in (e.g. desktops/vm-xfce-selkies): cloud-init additionally
+        # baked in (e.g. desktops/vm-gnome-selkies): cloud-init additionally
         # starts the per-user DE session unit and writes the streamer env
         # (template streamerEnv + displayPort). The vnc viewer needs no agent,
         # so its guests get the plain (ssh-style) document.

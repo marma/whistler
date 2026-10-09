@@ -1,6 +1,6 @@
-# Display plane of a Whistler VM desktop (Xvfb + PulseAudio + Selkies 2.x).
-# DE-agnostic and identical in shape to ../../vm-xfce-selkies's streamer unit —
-# the GNOME workload is the separate whistler-desktop@<user>.service. Baked
+# Display plane of a Whistler VM desktop (Xvfb + PulseAudio + Selkies 2.0).
+# DE-agnostic — the GNOME workload is the separate
+# whistler-desktop@<user>.service. Baked
 # enabled: it has no per-session inputs beyond the optional
 # /etc/whistler/streamer.env that cloud-init writes before multi-user.target,
 # so it simply starts on every boot.

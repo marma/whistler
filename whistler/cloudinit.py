@@ -131,7 +131,7 @@ def build_user_data(*, username: str, uid: int, ssh_keys: list,
     client that has not adopted the CA still connects as before.
 
     ``desktop=True`` targets a Whistler desktop-VM image (viewer:
-    websockets — e.g. desktops/vm-xfce-selkies): the image ships the
+    websockets — e.g. desktops/vm-gnome-selkies): the image ships the
     Selkies streamer baked in and always-on, but the DE session unit is the
     per-user template ``whistler-desktop@<user>.service`` — only cloud-init
     knows the username, so it enables the unit here. ``streamer_env`` (the

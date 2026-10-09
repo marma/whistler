@@ -166,8 +166,8 @@ reproducible, instead of into image names.
 
 ## How the bake works
 
-Identical in structure to `desktops/vm-xfce-selkies` and
-`desktops/vm-gnome-selkies` — read either of those for the shared mechanics —
+Identical in structure to `desktops/vm-gnome-selkies` — read that for the
+shared mechanics —
 minus the artifact *builder* stage, because there is no Selkies venv to
 ABI-match to the guest. Everything comes from the guest's own apt plus two
 pinned upstream downloads (pixi; NVIDIA's CUDA repo for `cuda-dev`).
@@ -183,7 +183,7 @@ pinned upstream downloads (pixi; NVIDIA's CUDA repo for `cuda-dev`).
 The variant rides in the image **name**, never the tag, and the dev tag is
 literally `:latest`: kubelet and KubeVirt default only that exact tag to
 `imagePullPolicy: Always`, so a `:latest-cuda` would leave nodes booting a stale
-cached qcow2 after every rebuild. See `desktops/vm-xfce-selkies/build.sh` for
+cached qcow2 after every rebuild. See `desktops/vm-gnome-selkies/build.sh` for
 the long version.
 
 ## Using it

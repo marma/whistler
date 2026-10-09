@@ -4,11 +4,10 @@
 # whistler-desktop@<user>` once the user exists — enable (not just start) so
 # persistent-root (CDI) guests bring the desktop back on later boots.
 #
-# The GNOME analog of ../../vm-xfce-selkies's whistler-desktop@.service. Two
-# things differ, both because this runs the real GNOME Shell (46, X11 backend)
-# instead of XFCE: the big Environment= block below (the session env the
-# retired gnome-selkies2 set via `su -c env ...`), and the /run/systemd shadow
-# under [Service] (see the comment there — the load-bearing bit).
+# Runs the real GNOME Shell (46, X11 backend). Two parts worth reading: the
+# big Environment= block below (the session env the retired gnome-selkies2
+# set via `su -c env ...`), and the logind note under [Service] (see the
+# comment there — the load-bearing bit).
 [Unit]
 Description=Whistler GNOME desktop session for %i
 Wants=whistler-streamer.service
@@ -61,7 +60,7 @@ RuntimeDirectory=whistler-desktop-%i
 RuntimeDirectoryMode=0700
 
 # --- logind: we trust the VM's live logind (no /run/systemd shadow) -----------
-# The container images (../../gnome-plain, retired gnome-selkies2) do
+# The retired container desktops (gnome-plain, gnome-selkies2) did
 # `rm -rf /run/systemd` before starting gnome-shell — but that is NOT "removing
 # systemd", it works around a *broken* logind: the systemd package bakes an
 # empty /run/systemd/seats into the image, so gnome-shell's loginManager.js

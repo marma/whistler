@@ -4,8 +4,8 @@
 # runtime: vm). The toolchain is clang/clang++, pixi and Python 3.14, plus the
 # usual build/VCS/editor tools; see README.md for the full list and the why.
 #
-# Sibling of ../../desktops/vm-{xfce,gnome}-selkies/build.sh and deliberately
-# structured the same — read one of those for the shared mechanics. This one is
+# Sibling of ../../desktops/vm-gnome-selkies/build.sh and deliberately
+# structured the same — read it for the shared mechanics. This one is
 # simpler in one big way: there is no artifact *builder* stage, because there is
 # no Selkies venv to ABI-match. Everything comes from the guest's own apt (the
 # base is Ubuntu 26.04, which ships Python 3.14 and clang 21 in the archive —

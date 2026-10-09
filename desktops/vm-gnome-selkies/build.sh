@@ -1,22 +1,17 @@
 #!/usr/bin/env bash
 # Bake the vm-gnome-selkies KubeVirt containerDisk: the real GNOME Shell (46,
 # X11 backend) + the Selkies 2.x streaming stack baked into an Ubuntu 24.04
-# guest. The GNOME sibling of ../vm-xfce-selkies — read that build.sh first;
-# this one differs in exactly two places, both forced by GNOME needing 24.04:
+# guest. GNOME Shell with an X11 backend only exists up to GNOME 46 = Ubuntu
+# 24.04, which is why the guest is 24.04 and why the Selkies stack is built
+# for it (bake/Dockerfile.builder: Python 3.12 venv, patched web client in the
+# wheel, libva 2.22 vendored because 24.04 ships 2.20 and pixelflux needs
+# >= 2.21).
 #
-#   * Artifacts come from bake/Dockerfile.builder (a 24.04 image), NOT from
-#     ../streamer-selkies2 (26.04). GNOME Shell with an X11 backend only exists
-#     up to GNOME 46 = Ubuntu 24.04, so the guest is 24.04 and its Python 3.12 /
-#     libva ABI can't run the 26.04 streamer's 3.13 venv. The builder rebuilds
-#     the venv + web client on 24.04 AND vendors libva 2.22 (24.04 ships 2.20;
-#     pixelflux needs >= 2.21 — see the builder header).
-#   * BASE_IMAGE_URL is the 24.04 cloud image, and the bake apt-installs the
-#     GNOME DE instead of XFCE (bake/user-data.in).
-#
-# Pipeline (host needs only docker, curl and a /dev/kvm node):
-#   1. docker-build bake/Dockerfile.builder and extract /opt/venv,
-#      /opt/selkies-web, the vendored libva tree (/opt/libva) and the wtype
-#      shim — all 24.04-ABI, single-sourced on one SELKIES_COMMIT/LIBVA_VERSION.
+# Pipeline (host needs only docker, curl and a /dev/kvm node — no libguestfs,
+# no ISO tooling, no kvm group membership):
+#   1. docker-build bake/Dockerfile.builder and extract /opt/venv and the
+#      vendored libva tree (/opt/libva) — both 24.04-ABI, single-sourced on one
+#      SELKIES_COMMIT/LIBVA_VERSION.
 #   2. Boot the Ubuntu 24.04 cloud image once under qemu/KVM in a container
 #      (bake/Dockerfile.bake + bake/boot.sh) with a NoCloud seed served over
 #      HTTP: bake/user-data.in installs GNOME + the guest payload (incl. the
@@ -24,19 +19,19 @@
 #   3. Wrap the qcow2 as a containerDisk (Dockerfile.containerdisk).
 #
 # Knobs (env): IMAGE (default localhost:5000/whistler-vm-gnome-selkies),
-# TAG (latest), PUSH=1 to docker-push, DISK_SIZE (14G lean / 24G CUDA — GNOME is
-# heavier than XFCE, and the CUDA figure keeps headroom for an opt-in
-# CUDA_TOOLKIT_PACKAGE build), QEMU_MEM (4096), QEMU_SMP (min(8,nproc)), BASE_IMAGE_URL,
+# TAG (latest), PUSH=1 to docker-push, DISK_SIZE (14G lean / 24G CUDA — the
+# CUDA figure keeps headroom for an opt-in CUDA_TOOLKIT_PACKAGE build), QEMU_MEM (4096), QEMU_SMP (min(8,nproc)), BASE_IMAGE_URL,
 # CACHE_DIR (~/.cache/whistler/vm-images), BAKE_TIMEOUT (2700s),
 # CUDA/NVIDIA_DRIVER_PACKAGE/CUDA_TOOLKIT_PACKAGE (see below).
 #
 # CUDA=1 bakes the NVIDIA open driver in and publishes the result as
-# <IMAGE>-cuda:<TAG>; the default (CUDA=0) is a LEAN, driver-free image. Same
-# split as ../vm-xfce-selkies — only GPU templates pull the -cuda image, and the
-# variant rides in the image NAME (not the tag) so the mutable dev tag can stay
+# <IMAGE>-cuda:<TAG>; the default (CUDA=0) is a LEAN, driver-free image. Two
+# images rather than one: only GPU templates pull the -cuda image, and the variant
+# rides in the image NAME (not the tag) so the mutable dev tag can stay
 # exactly `:latest`, the only tag Kubernetes/KubeVirt default to
-# imagePullPolicy Always; see that script's header for the full why. NOTE the
-# guest here is 24.04, whose open-driver package name differs from 26.04's, so
+# imagePullPolicy Always — a `:latest-cuda` tag would leave nodes booting a
+# stale cached qcow2 after every rebuild. NOTE the
+# guest is 24.04, whose open-driver package name differs from 26.04's, so
 # the default driver is nvidia-driver-550-open (24.04's open-kernel branch —
 # which the archive has since turned into a transitional shim for
 # nvidia-driver-580-open, so that is what actually lands); override
@@ -112,18 +107,11 @@ docker build -f bake/Dockerfile.builder -t whistler-vm-gnome-builder bake/
 BAKE_CTR=$(docker create whistler-vm-gnome-builder)
 mkdir -p "$STAGE_DIR/opt" "$STAGE_DIR/usr/local/bin" "$STAGE_DIR/usr/local/lib"
 docker cp "$BAKE_CTR:/opt/venv" "$STAGE_DIR/opt/venv"
-docker cp "$BAKE_CTR:/opt/selkies-web" "$STAGE_DIR/opt/selkies-web"
-docker cp "$BAKE_CTR:/usr/local/bin/wtype" "$STAGE_DIR/usr/local/bin/wtype"
 # Vendored libva 2.22 → guest /usr/local (ahead of /usr/lib in ld.so order;
 # the bake runs ldconfig after extraction). The builder staged it under
 # /opt/libva/usr/local so this copy lands the lib/ (and pkgconfig/include)
 # tree straight at the guest's /usr/local.
 docker cp "$BAKE_CTR:/opt/libva/usr/local/." "$STAGE_DIR/usr/local/"
-# Copy-agent is a plain script, so unlike the venv it needs no 24.04 rebuild —
-# take the canonical copy from the streamer context (shell copy: only the
-# docker build contexts can't cross directories, build.sh can).
-cp ../streamer-selkies2/whistler-copy-agent "$STAGE_DIR/usr/local/bin/whistler-copy-agent"
-chmod +x "$STAGE_DIR/usr/local/bin/whistler-copy-agent"
 cp -a guest/. "$STAGE_DIR/"
 # --owner/--group 0: the tar is created by an ordinary user but extracted by
 # root in the guest, where tar would otherwise faithfully restore this uid.

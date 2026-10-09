@@ -8,10 +8,8 @@
 whistler:
   images:
     vm:
-      - quay.io/containerdisks/ubuntu:24.04
-      - https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
       # Baked desktop VMs (in-guest Selkies) — build & push with
-      # `make vm-desktop-image PUSH=1` / `make vm-gnome-desktop-image PUSH=1`
+      # `make vm-gnome-desktop-image PUSH=1`
       # (+ CUDA=1 for the -cuda image); not skaffold artifacts because the qcow2
       # bake needs qemu/KVM. Every tag a template references must be listed here
       # or ensure_session fails closed with a PolicyError.
@@ -19,9 +17,7 @@ whistler:
       # KubeVirt defaults to imagePullPolicy Always, so a rebuild is actually
       # re-pulled instead of booting the node's stale cached qcow2. The CUDA
       # variant is a separate image NAME for the same reason (`:latest-cuda`
-      # would not match). See desktops/vm-xfce-selkies/build.sh.
-      - localhost:5000/whistler-vm-xfce-selkies:latest
-      - localhost:5000/whistler-vm-xfce-selkies-cuda:latest
+      # would not match). See desktops/vm-gnome-selkies/build.sh.
       - localhost:5000/whistler-vm-gnome-selkies:latest
       - localhost:5000/whistler-vm-gnome-selkies-cuda:latest
       # Dev-server VMs (no desktop, SSH only) — `make devbase-image
@@ -33,117 +29,35 @@ whistler:
 templates:
   # containerDisk boot: the qcow2 ships inside an OCI image. Fast pull-and-boot,
   # ephemeral root (home persists on the user PVC via the NFS storage gateway).
-  ubuntu-vm:
-    description: "Ubuntu 24.04 VM (containerDisk, noVNC)"
-    mode: desktop
-    runtime: vm
-    image: "quay.io/containerdisks/ubuntu:24.04"
-    viewer: vnc
-    persistence: ephemeral
-    resources:
-      cpu: "2"
-      memory: 2Gi
-
-  # CDI boot: the same cloud image imported from its qcow2 URL into a
-  # per-session root-disk PVC (persistent root; first boot waits on the
-  # import — the session shows phase Importing). Requires CDI, which
-  # install_kubevirt.sh installs by default. Note: this is a *disk image*
-  # import, not an installer-ISO flow — the guest must ship cloud-init.
-  ubuntu-vm-cdi:
-    description: "Ubuntu 24.04 VM (CDI-imported root disk, noVNC)"
-    mode: desktop
-    runtime: vm
-    imageURL: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-    rootDiskSize: 10Gi
-    viewer: vnc
-    persistence: persistent
-    resources:
-      cpu: "2"
-      memory: 2Gi
-
-  # ubuntu-vm + a real desktop: XFCE and the Selkies 2.x stack are baked into
-  # the containerDisk (desktops/vm-xfce-selkies — the sidecar can't reach into
-  # a VM, so the streamer lives in the guest as whistler-streamer.service).
-  # viewer: websockets makes the portal reverse-proxy the guest's Selkies on
-  # displayPort, exactly like a pod desktop: per-session Service -> launcher
-  # pod -> masquerade -> guest. The VNC subresource console stays available
-  # as a rescue path (shows the text console, not the desktop).
-  #
-  # Four VM-desktop templates below, two DEs x {lean, CUDA}. The `-cuda`
-  # variants use the separate -cuda image (built with CUDA=1 — bakes the NVIDIA
-  # open driver) and request the RTX 4090 via nodeSelector + resources.gpu; the
-  # lean ones use the driver-free image and run anywhere. Build all four with:
-  #   make vm-desktop-image        make vm-desktop-image CUDA=1
-  #   make vm-gnome-desktop-image  make vm-gnome-desktop-image CUDA=1
-
-  # XFCE, lean (no GPU) — runs on any node.
-  ubuntu-vm-selkies:
-    description: "Ubuntu 26.04 VM + XFCE (containerDisk, Selkies)"
-    mode: desktop
-    runtime: vm
-    image: "localhost:5000/whistler-vm-xfce-selkies:latest"
-    viewer: websockets
-    persistence: ephemeral
-    displayPort: 8082
-    resources:
-      cpu: "4"
-      memory: 6Gi
-
-  # XFCE, CUDA (RTX 4090 passthrough) — k3s-metal only.
-  ubuntu-vm-selkies-cuda:
-    description: "Ubuntu 26.04 VM + XFCE + RTX 4090 (containerDisk, Selkies)"
-    mode: desktop
-    runtime: vm
-    image: "localhost:5000/whistler-vm-xfce-selkies-cuda:latest"
-    viewer: websockets
-    persistence: ephemeral
-    displayPort: 8082
-    nodeSelector:
-      nvidia.com/gpu.product: NVIDIA-GeForce-RTX-4090
-    resources:
-      cpu: "4"
-      memory: 8Gi
-      gpu: "1"
-
-  # Same VM/Selkies arrangement, but the *real GNOME Shell* (46, X11 backend)
-  # instead of XFCE — baked into desktops/vm-gnome-selkies on a 24.04 guest
-  # (GNOME 46 is the last Shell with an X11 backend; see that image's README).
-  # streamerEnv pins H264 streaming mode ON: mutter is a GL compositor and emits
-  # no damage for static content, so without it static windows render black on
-  # the client. GNOME on llvmpipe is heavier than XFCE, hence the memory floor.
-
   # GNOME, lean (no GPU) — runs on any node.
-  ubuntu-vm-gnome-selkies:
-    description: "Ubuntu 24.04 VM + GNOME Shell (containerDisk, Selkies)"
+  vm-desktop:
+    description: "Ubuntu 24.04 VM + GNOME"
     mode: desktop
     runtime: vm
     image: "localhost:5000/whistler-vm-gnome-selkies:latest"
     viewer: websockets
-    persistence: ephemeral
+    persistence: persistent
     displayPort: 8082
     streamerEnv:
-      SELKIES_H264_STREAMING_MODE: "true"
+      SELKIES_VIDEO_STREAMING_MODE: "true"
     resources:
       cpu: "4"
-      memory: 6Gi
+      memory: 8Gi
 
   # GNOME, CUDA (RTX 4090 passthrough) — k3s-metal only.
-  ubuntu-vm-gnome-selkies-cuda:
-    description: "Ubuntu 24.04 VM + GNOME Shell + RTX 4090 (containerDisk, Selkies)"
+  vm-desktop-cuda:
+    description: "Ubuntu 24.04 VM + GNOME Shell + CUDA"
     mode: desktop
     runtime: vm
     image: "localhost:5000/whistler-vm-gnome-selkies-cuda:latest"
     viewer: websockets
-    persistence: ephemeral
+    persistence: persistent
     displayPort: 8082
     streamerEnv:
-      SELKIES_H264_STREAMING_MODE: "true"
-    nodeSelector:
-      nvidia.com/gpu.product: NVIDIA-GeForce-RTX-4090
+      SELKIES_VIDEO_STREAMING_MODE: "true"
     resources:
       cpu: "4"
       memory: 8Gi
-      gpu: "1"
 
   # --- devbase: development server VMs, no desktop --------------------------
   # mode: ssh + runtime: vm — the guest is a plain SSH host (cloud-init creates
@@ -160,7 +74,7 @@ templates:
   # variants — see images/devbase/README.md for what "CUDA available" means in
   # each. Build: `make devbase-image [VARIANT=cuda|cuda-dev] PUSH=1`.
   devbase:
-    description: "Ubuntu 26.04 dev server (SSH; clang, Python 3.14, pixi)"
+    description: "Ubuntu 26.04 dev vm"
     mode: ssh
     runtime: vm
     image: "localhost:5000/whistler-devbase:latest"
@@ -192,29 +106,6 @@ templates:
     runtime: vm
     image: "localhost:5000/whistler-devbase-cuda-dev:latest"
     persistence: persistent
-    nodeSelector:
-      nvidia.com/gpu.product: NVIDIA-GeForce-RTX-4090
     resources:
       cpu: "8"
       memory: 16Gi
-      gpu: "1"
-
-  # GPU passthrough smoke test (k3s-metal only): requests the RTX 4090 via
-  # KubeVirt's domain.devices.gpus (deviceName resolved per GPU type from the
-  # live catalog: node labels + KubeVirt permittedHostDevices).
-  # nodeSelector pins it to a node labeled with this GPU product, same as the
-  # pod-mode path — moot on the single-node dev cluster but keeps the
-  # template honest about what it actually needs.
-  ubuntu-vm-gpu:
-    description: "Ubuntu 24.04 VM + RTX 4090 passthrough (containerDisk, noVNC)"
-    mode: desktop
-    runtime: vm
-    image: "quay.io/containerdisks/ubuntu:24.04"
-    viewer: vnc
-    persistence: ephemeral
-    nodeSelector:
-      nvidia.com/gpu.product: NVIDIA-GeForce-RTX-4090
-    resources:
-      cpu: "4"
-      memory: 8Gi
-      gpu: "1"

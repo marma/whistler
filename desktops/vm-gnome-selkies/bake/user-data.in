@@ -5,9 +5,8 @@
 # boot that installs the GNOME desktop + streamer stack, then resets cloud-init
 # so the published image treats every session's seed as a fresh first boot.
 #
-# The GNOME sibling of ../../vm-xfce-selkies/bake/user-data.in. The guest is
-# Ubuntu 24.04 (GNOME 46 is the last Shell with an X11 backend — see build.sh /
-# README), so this installs the GNOME Shell session instead of XFCE, drops in
+# The guest is Ubuntu 24.04 (GNOME 46 is the last Shell with an X11 backend —
+# see build.sh / README), so this installs the GNOME Shell session, drops in
 # the vendored libva 2.22 the streamer needs (24.04 ships 2.20; pixelflux needs
 # >= 2.21), and regenerates the gdk-pixbuf loader cache so Adwaita's SVG icons
 # aren't blurry.
@@ -163,10 +162,10 @@ write_files:
         $APT install -y --no-install-recommends "@CUDA_TOOLKIT_PACKAGE@"
       fi
 
-      # Selkies venv + web client + vendored libva 2.22 (all built on 24.04 by
-      # bake/Dockerfile.builder, ABI-matched to this guest) plus the
+      # Selkies venv (web client bundled) + vendored libva 2.22 (both built on
+      # 24.04 by bake/Dockerfile.builder, ABI-matched to this guest) plus the
       # whistler-streamer / whistler-desktop@ units, session scripts and the
-      # wtype shim (guest/). --no-overwrite-dir: never restore the archive's
+      # copy agent (guest/). --no-overwrite-dir: never restore the archive's
       # metadata onto existing system dirs (/etc, /usr, ...) — a group-writable
       # /etc from the build host's umask breaks sshd StrictModes for
       # /etc/ssh/authorized_keys.d.
@@ -175,7 +174,7 @@ write_files:
                  /usr/local/bin/whistler-desktop-session \
                  /usr/local/bin/whistler-session-manager \
                  /usr/local/bin/gnome-session-launch.sh \
-                 /usr/local/bin/wtype \
+                 /usr/local/bin/whistler-copy-agent \
                  /usr/local/bin/vgl
 
       # Make the vendored libva 2.22 authoritative: /usr/local/lib precedes

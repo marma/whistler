@@ -31,12 +31,11 @@ server:
       memory: 1Gi
   logLevel: DEBUG
 
-# Desktop display path: every desktop pod gets a streamer sidecar
-# (whistler.streamer.image) owning Xvfb + PulseAudio + Selkies 2.x (pixelflux);
-# the workload image is display-unaware. The portal reverse-proxies the browser
-# straight to the sidecar's Selkies server over HTTP/WebSockets — H.264 reaches
+# Desktop display path: desktops are VMs (desktops/vm-gnome-selkies) with
+# Selkies 2.x baked into the guest. The portal reverse-proxies the browser to
+# the guest's Selkies server over HTTP/WebSockets — the encoded stream reaches
 # the browser's decoder with no external relay. There is no shared guacd and no
-# coturn/TURN: the Selkies 2.x "websockets" viewer needs neither.
+# coturn/TURN: the Selkies "websockets" transport needs neither.
 
 # Web portal: launch + connect to desktop sessions from a browser.
 portal:
@@ -479,14 +478,6 @@ whistler:
     desktop: []
     vm:
       - quay.io/containerdisks/ubuntu:24.04
-
-  # Streamer sidecar image for the retired container desktop. Unused: container
-  # sessions are web-terminal only and pods no longer get a streamer. Left here
-  # (and the image left buildable) as the reference for the sidecar mechanism —
-  # see design/container_workloads.md, which is also where the case for
-  # reviving it as single-app containers lives.
-  streamer:
-    image: ghcr.io/marma/whistler-streamer-selkies2:latest
 
   # A VM's home: a PVC carrying a disk.img, attached as a second virtio-blk
   # disk and formatted ext4 by the guest on first boot (design/storage.md).

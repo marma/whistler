@@ -631,9 +631,7 @@ make devbase-image                          # -> localhost:5000/whistler-devbase
 make devbase-image VARIANT=cuda PUSH=1      # + the NVIDIA driver (GPU runtime, no nvcc)
 make devbase-image VARIANT=cuda-dev PUSH=1  # + the CUDA SDK (nvcc, ~4.6GB)
 
-# Desktops: XFCE or GNOME Shell with Selkies baked into the guest.
-make vm-desktop-image PUSH=1                # -> localhost:5000/whistler-vm-xfce-selkies:latest
-make vm-desktop-image CUDA=1 PUSH=1         # -> ...-vm-xfce-selkies-cuda:latest
+# Desktop: GNOME Shell with Selkies baked into the guest.
 make vm-gnome-desktop-image PUSH=1          # -> localhost:5000/whistler-vm-gnome-selkies:latest
 make vm-gnome-desktop-image CUDA=1 PUSH=1   # -> ...-vm-gnome-selkies-cuda:latest
 ```

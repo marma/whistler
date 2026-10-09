@@ -2,9 +2,9 @@
 # The GNOME session itself. Runs under `dbus-run-session` (so gnome-shell and
 # the settings daemons below share one session bus) as the unprivileged desktop
 # user, started by whistler-desktop-session. Carried over verbatim from the
-# retired gnome-selkies2 (and shared in spirit with ../../gnome-plain) — the
-# session shape is identical whether the display comes from a sidecar's Xvfb or
-# this VM's in-guest streamer.
+# retired gnome-selkies2 container image — the session shape is the same
+# whether the display comes from a sidecar's Xvfb or this VM's in-guest
+# streamer.
 #
 # We deliberately do NOT use `gnome-session`. On Ubuntu 24.04 its gnome.session
 # RequiredComponents include gsd-power (needs logind + upower), gsd-usb-

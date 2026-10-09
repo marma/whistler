@@ -5,8 +5,7 @@
 #
 # NOTE: this is only the qemu *host* toolbox and is arch-/release-independent
 # of the guest — the baked guest is Ubuntu 24.04 (see build.sh / user-data.in),
-# but the runner staying on 26.04 is fine and keeps it identical to
-# ../../vm-xfce-selkies/bake/Dockerfile.bake.
+# and the runner staying on 26.04 is fine (images/devbase uses the same one).
 FROM ubuntu:26.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
       qemu-system-x86 qemu-utils python3-minimal \

@@ -145,22 +145,21 @@ spec:
                 streamerImage:
                   type: string
                   description: >-
-                    Desktop-only. Override the streamer sidecar image (the native
-                    init sidecar owning Xvfb + PulseAudio + Selkies that every
-                    desktop pod gets); defaults to the operator-configured
-                    WHISTLER_STREAMER_IMAGE (whistler.streamer.image).
+                    Unused. Was the streamer sidecar image for container
+                    desktops, which are retired (desktops are VM-only and carry
+                    Selkies in the guest). Kept so existing Templates validate.
                 streamerEnv:
                   type: object
                   additionalProperties:
                     type: string
                   description: >-
-                    Desktop-only. Extra env vars for the streamer sidecar, for
-                    workload-dependent streaming knobs the sidecar cannot infer —
-                    e.g. SELKIES_H264_STREAMING_MODE: "true" (required for GL
-                    compositors like GNOME Shell) or SELKIES_RESOLUTION. For
-                    runtime=vm + viewer=websockets these reach the guest's
-                    baked-in streamer instead, written by cloud-init to
-                    /etc/whistler/streamer.env.
+                    Desktop-only. Extra env vars for the guest's baked-in
+                    Selkies streamer (runtime=vm + viewer=websockets), written by
+                    cloud-init to /etc/whistler/streamer.env. Selkies reads any
+                    setting as SELKIES_<NAME>, e.g. SELKIES_ENCODER: "h265enc"
+                    or SELKIES_VIDEO_STREAMING_MODE: "true" (required for GL
+                    compositors like GNOME Shell); the image also reads
+                    SELKIES_RESOLUTION for the initial screen size.
                 instancetype:
                   type: string
                   description: VM-only. KubeVirt instancetype name (e.g. "u1.medium").

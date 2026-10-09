@@ -8,11 +8,9 @@ build:
       context: .
       docker:
         dockerfile: Dockerfile
-    # The container-desktop trio (xfce-plain / gnome-plain / streamer-selkies2)
-    # is not built here any more: desktops are VM-only and container sessions
-    # are web-terminal only. The images and their Makefile targets still work
-    # if you want to run the sidecar mechanism by hand — see
-    # design/container_workloads.md.
+    # Desktops are VM-only (desktops/vm-gnome-selkies, baked with qemu/KVM by
+    # `make vm-gnome-desktop-image`, not here); container sessions are
+    # web-terminal only. See design/container_workloads.md.
     - image: whistler-storage-gateway
       context: images/storage-gateway
       docker:

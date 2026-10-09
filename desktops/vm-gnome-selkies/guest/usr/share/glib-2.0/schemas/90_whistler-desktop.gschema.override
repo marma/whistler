@@ -54,7 +54,6 @@ picture-uri='file:///usr/share/backgrounds/warty-final-ubuntu.png'
 #
 # Not set: cursor-theme. Yaru's cursors ride along in the same package, but
 # Adwaita's are what this session has always drawn; switching them is a
-# separate call. Kept in step with the pod sibling
-# desktops/gnome-plain/90_whistler-desktop.gschema.override.
+# separate call.
 [org.gnome.desktop.interface]
 icon-theme='Yaru'

@@ -1,0 +1,178 @@
+# Multi-group X11 keymap injection: type in the group that is in force, never
+# by switching it (apply to Selkies 2.0.0,
+# 3ec56fb1538cf077c27156f5ab75b6595a83c461; re-derive when bumping the pin).
+#
+# The successor of the pre-2.0 keymap-injection.patch. 2.0 rewrote X11
+# injection around XKB (x11_xkb.py: real group/level placement, group locks),
+# which fixed the core-keymap guesswork that patch worked around — but it
+# still types the wrong character whenever the ACTIVE input source is not the
+# one it picks. GNOME with two input sources gives the keymap two XKB groups,
+# and 2.0 places every keysym at the LOWEST group carrying it:
+#
+#   * a keysym the first group carries is injected under whatever group is
+#     locked (_enter_group returns early for group 0). With Swedish active as
+#     the second source of us,se, ':' lands on US Shift+Semicolon and types
+#     the Swedish key there — 'Ö'; '>' -> ':', '|' -> '*', '{' -> 'Å'.
+#   * a keysym only a later group carries is injected by locking that group
+#     for the press and restoring it 0.5s later. GNOME owns the layout and
+#     resets the lock within milliseconds, but the injector trusts its cached
+#     lock for the rest of the linger window, so after the first key every
+#     later one types under the base group: å ä ö -> å ' ; with US active.
+#
+# Measured on vm-gnome-selkies (GNOME 46, X11) with a real client typing
+# ":<>|^@{;/[" (US-layout client) and "åäö" (Swedish-layout client), twice
+# each, in every combination of source order and active source:
+#
+#                          upstream 2.0    this patch
+#   us,se  US active       åäö wrong       OK
+#   us,se  SE active       symbols wrong   OK
+#   se,us  SE active       OK              OK
+#   se,us  US active       both wrong      OK
+#
+# The fix, in _XTestKeyboard._placement: use the keysym's placement in the
+# group in force (the user's lock, or this injector's while a hold lasts)
+# when that group carries it; otherwise report no placement, which sends
+# _resolve to 2.0's own overlay path — the keysym bound to a spare keycode
+# with one group, which types the same under any lock. No group lock is ever
+# taken, so the user's input source never moves and GNOME has nothing to
+# fight. XkbLink gains a per-group index (locate_in_group) for the lookup,
+# filled for all four groups through each key's out-of-range rule (wrap by
+# default, clamp, redirect): a key declaring one group — XF86Copy, media
+# keys — answers the same under any group, and indexing only the groups a key
+# declares sent those to an overlay keycode, past anything that grabs the
+# real one (whistler-copy-agent's XF86Copy/XF86Paste grab broke exactly so).
+# Cost: one XkbGetState round trip per key press on a local X server.
+--- a/src/selkies/x11_xkb.py	2026-10-09 11:49:20.047314313 +0200
++++ b/src/selkies/x11_xkb.py	2026-10-09 12:14:49.539899355 +0200
+@@ -36,6 +36,26 @@
+ XKB_NEW_KEYBOARD_NOTIFY = 0
+ # Levels 0-3 are what Shift and AltGr reach; deeper levels are not injectable.
+ XKB_INJECTABLE_LEVELS = 4
++# XKB has at most four groups. A key declaring fewer still answers in the
++# others: its group-info byte says how an out-of-range group is brought back
++# into range (wrap by default, clamp, or redirect to one group).
++XKB_NUM_GROUPS = 4
++XKB_OUT_OF_RANGE_MASK = 0xC0
++XKB_CLAMP_INTO_RANGE = 0x40
++XKB_REDIRECT_INTO_RANGE = 0x80
++
++
++def _effective_group(group: int, ngroups: int, group_info: int) -> int:
++    """The group a key with `ngroups` groups uses when `group` is active."""
++    if group < ngroups:
++        return group
++    action = group_info & XKB_OUT_OF_RANGE_MASK
++    if action == XKB_CLAMP_INTO_RANGE:
++        return ngroups - 1
++    if action == XKB_REDIRECT_INTO_RANGE:
++        target = (group_info >> 4) & 0x03
++        return target if target < ngroups else 0
++    return group % ngroups
+ 
+ 
+ class _XkbUseExtension(rq.ReplyRequest):
+@@ -125,6 +145,8 @@
+         _placement: Keysym to `(keycode, group, level)` at the lowest group,
+             then level, then keycode carrying it; None until a lookup needs
+             it.
++        _by_group: Keysym to `{group: (keycode, level)}`, the lowest level
++            then keycode carrying it in each group; filled with _placement.
+     """
+ 
+     def __init__(self, xdisplay: Any, major_opcode: int, event_base: int,
+@@ -134,10 +156,12 @@
+         self.event_base = event_base
+         self.core_device = core_device
+         self._placement = None
++        self._by_group = None
+ 
+     def invalidate(self) -> None:
+         """Forget the map; the next lookup refetches it from the server."""
+         self._placement = None
++        self._by_group = None
+ 
+     def locate(self, keysym: int) -> Optional[Tuple[int, int, int]]:
+         """Where the server's keymap puts a keysym.
+@@ -148,10 +172,20 @@
+             the keymap does not carry it.
+         """
+         if self._placement is None:
+-            self._placement = self._fetch_placement()
++            self._placement, self._by_group = self._fetch_placement()
+         return self._placement.get(keysym)
+ 
+-    def _fetch_placement(self) -> Dict[int, Tuple[int, int, int]]:
++    def locate_in_group(self, keysym: int, group: int) -> Optional[Tuple[int, int, int]]:
++        """Where the keymap puts a keysym within one group: `(keycode, group,
++        level)` for the lowest level, then keycode, or None when that group
++        does not carry it."""
++        if self._placement is None:
++            self._placement, self._by_group = self._fetch_placement()
++        found = self._by_group.get(keysym, {}).get(group)
++        return None if found is None else (found[0], group, found[1])
++
++    def _fetch_placement(self) -> Tuple[Dict[int, Tuple[int, int, int]],
++                                        Dict[int, Dict[int, Tuple[int, int]]]]:
+         """Fetch the XKB symbol map and index it by keysym.
+ 
+         Only the key symbol maps are requested: each is the key's group count
+@@ -169,6 +203,7 @@
+             n_mod_map_keys=0, first_vmod_map_key=0, n_vmod_map_keys=0)
+         blob = bytes(reply.map)
+         placement = {}
++        by_group = {}
+         offset = 0
+         for keycode in range(reply.first_key_sym, reply.first_key_sym + reply.n_key_syms):
+             group_info, width, nsyms = struct.unpack_from('=xxxxBBH', blob, offset)
+@@ -185,7 +220,23 @@
+                     have = placement.get(sym)
+                     if have is None or (group, level, keycode) < (have[1], have[2], have[0]):
+                         placement[sym] = (keycode, group, level)
+-        return placement
++            # The per-group index answers for every group the keyboard can
++            # be in, not only the ones this key declares: a one-group key
++            # (XF86Copy, media keys, ...) types the same under any group.
++            if not ngroups:
++                continue
++            for active in range(XKB_NUM_GROUPS):
++                group = _effective_group(active, ngroups, group_info)
++                for level in range(min(width, XKB_INJECTABLE_LEVELS)):
++                    index = group * width + level
++                    sym = syms[index] if index < nsyms else 0
++                    if not sym:
++                        continue
++                    groups = by_group.setdefault(sym, {})
++                    have_g = groups.get(active)
++                    if have_g is None or (level, keycode) < (have_g[1], have_g[0]):
++                        groups[active] = (keycode, level)
++        return placement, by_group
+ 
+     def locked_group(self) -> int:
+         """The group the server currently has locked for the core keyboard."""
+--- a/src/selkies/input_handler.py	2026-10-09 11:49:20.049314299 +0200
++++ b/src/selkies/input_handler.py	2026-10-09 11:53:14.741710982 +0200
+@@ -1624,6 +1624,24 @@
+         placed = self._xkb.locate(keysym)
+         if placed is None:
+             return None
++        # Whistler: type in the group that is in force, never by switching it.
++        # locate() answers the LOWEST group carrying the keysym, and a keysym
++        # of the first group was injected under whatever group was locked, so
++        # with a later group active (Swedish second in us,se) ':' landed on US
++        # Shift+Semicolon and typed the Swedish key there, 'Ö'. And a keysym
++        # only a later group carries is injected by locking that group for
++        # the press, which a desktop that owns the layout (GNOME) resets
++        # within milliseconds -- after the first key every later one in the
++        # linger window typed under the base group (å ä ö came out å ' ;).
++        # So: the active group's placement when it has one, else no placement,
++        # which sends _resolve to an overlay keycode (one group, the same
++        # under any lock) and never touches the user's group.
++        active = (self._group_hold[1] if self._group_hold is not None
++                  else self._xkb.locked_group())
++        if placed[1] != active:
++            placed = self._xkb.locate_in_group(keysym, active)
++            if placed is None:
++                return None
+         kc, group, level = placed
+         if (keysym & 0xFF000000) == 0x01000000 or 0xA0 <= keysym <= 0xFF:
+             if self._spare_keycodes is None:

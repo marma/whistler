@@ -1,21 +1,18 @@
 # vm-gnome-selkies — desktop VM containerDisk (real GNOME Shell + in-guest Selkies)
 
 A KubeVirt **containerDisk** (OCI-wrapped qcow2) running the *real* **GNOME
-Shell 46** (Activities, dynamic workspaces, the overview) with the Selkies 2.x
-streaming stack **baked into the guest**. The GNOME sibling of
-[`../vm-xfce-selkies`](../vm-xfce-selkies/) — read that README first; this one
-documents only what GNOME forces to be different. It backs `runtime: vm`
-desktop templates with `viewer: websockets`
-(`ubuntu-vm-gnome-selkies` in [values-dev-vm.yaml](../../charts/whistler/values-dev-vm.yaml)):
-the portal reverse-proxies the guest's Selkies server exactly like a pod
-desktop's sidecar — per-session Service → virt-launcher pod → masquerade →
-guest `:8082`.
+Shell 46** (Activities, dynamic workspaces, the overview) with the
+**Selkies 2.0** streaming stack **baked into the guest**. It is Whistler's
+desktop image, and it backs `runtime: vm` desktop templates with
+`viewer: websockets` (`vm-desktop` / `vm-desktop-cuda` in
+[values-dev-vm.yaml](../../charts/whistler/values-dev-vm.yaml)): the portal
+reverse-proxies the guest's Selkies server — per-session Service →
+virt-launcher pod → masquerade → guest `:8082`.
 
-**Why baked, not sidecar:** the streamer sidecar can't cross the VM boundary
-(unix sockets don't cross it), so VMs run an in-guest streamer. Same reasoning,
-same in-guest `whistler-streamer.service` + `whistler-desktop@<user>.service`
-split as `vm-xfce-selkies`; cloud-init stays the per-session control plane
-(user/uid/keys, NFS home mount, streamer env, session-unit start — see
+Two system services split the guest: `whistler-streamer.service` (Xvfb +
+PulseAudio + Selkies, baked enabled) and `whistler-desktop@<user>.service` (the
+user's GNOME session). Cloud-init is the per-session control plane
+(user/uid/keys, home mount, streamer env, session-unit start — see
 [whistler/cloudinit.py](../../whistler/cloudinit.py)).
 
 ## The crux: Ubuntu 24.04 / GNOME 46 (not 26.04)
@@ -29,17 +26,20 @@ So this guest is **24.04**, resurrecting the recipe of the retired embedded
 `gnome-selkies2` image (git history) — see
 [design/creating_desktops.md §8](../../design/creating_desktops.md).
 
-That 24.04 pin drives every difference from `vm-xfce-selkies`:
+The 24.04 pin shapes most of what follows.
 
-### 1. The Selkies stack is rebuilt on 24.04, not extracted from `streamer-selkies2`
+### 1. The Selkies stack is built for 24.04, from patched source
 
-`vm-xfce-selkies` extracts `/opt/venv` + `/opt/selkies-web` straight from the
-26.04 [`../streamer-selkies2`](../streamer-selkies2/) image because its guest is
-also 26.04. This guest can't: the streamer's venv is Python 3.13 (26.04) and its
-compiled wheels (pixelflux/pcmflux, evdev, xkbcommon-cffi) are the wrong ABI for
-24.04's Python 3.12. So [`bake/Dockerfile.builder`](bake/Dockerfile.builder) is
-a **24.04 image** that rebuilds the venv (Python 3.12) and the web client from
-the same pinned `SELKIES_COMMIT`; `build.sh` extracts its artifacts the same way.
+[`bake/Dockerfile.builder`](bake/Dockerfile.builder) is a **24.04 image** that
+builds the Selkies venv (Python 3.12, so pixelflux/pcmflux get the right ABI)
+from the pinned `SELKIES_COMMIT` (2.0.0). It is built rather than installed from
+PyPI or the upstream `.deb` because of two patches (see [Keyboard](#keyboard)):
+[`bake/mac-cmd-chords.patch`](bake/mac-cmd-chords.patch) in the web client,
+which 2.0 bundles into the wheel — so the patched client is built with
+upstream's own `scripts/ci/build-web.sh` and the wheel around it — and
+[`bake/xkb-active-group.patch`](bake/xkb-active-group.patch) in the server. `build.sh` extracts `/opt/venv`
+and the libva tree below. `python-xlib` is installed alongside (2.0 vendors its
+own and no longer depends on it) because `whistler-copy-agent` runs on this venv.
 
 ### 2. Vendored libva 2.22 (24.04 ships 2.20)
 
@@ -53,8 +53,8 @@ in the ld.so order, so it wins over the stock 2.20 GNOME pulls in). Check with
 
 ### 3. logind: we trust the VM's live logind (no `/run/systemd` hack)
 
-The container images (`../gnome-plain`, retired `gnome-selkies2`) do
-`rm -rf /run/systemd` before starting gnome-shell. That is **not "removing
+The retired container desktops (`gnome-plain`, `gnome-selkies2`, in git
+history) did `rm -rf /run/systemd` before starting gnome-shell. That is **not "removing
 systemd"** — it works around a *broken* logind: the systemd package bakes an
 empty `/run/systemd/seats` into the image, so gnome-shell picks the systemd
 login manager, but with no logind daemon alive (systemd isn't pid 1) every
@@ -101,10 +101,13 @@ Check `journalctl -u whistler-desktop@<user>` in the guest first.
 ## What's inside the guest
 
 - **`whistler-streamer.service`** (baked enabled, root): Xvfb + PulseAudio +
-  Selkies. Same script as `vm-xfce-selkies`'s streamer **except
-  `--h264-streaming-mode` defaults ON** — see below. Reads optional per-session
-  knobs from `/etc/whistler/streamer.env` (cloud-init writes it from the
-  template's `streamerEnv` + `displayPort`).
+  Selkies, with video streaming mode on (see below). Reads per-session knobs
+  from `/etc/whistler/streamer.env`, which cloud-init writes from the
+  template's `streamerEnv` + `displayPort`. Selkies 2.0 reads any of its
+  settings as `SELKIES_<NAME>` from there (`SELKIES_ENCODER=h265enc`, …; see
+  the [settings reference](https://docs.selkies.io/settings)).
+- **`whistler-copy-agent`** (started by the streamer): app-aware Cmd-C/Cmd-V
+  for Mac clients — see [Keyboard](#keyboard).
 - **`whistler-desktop@<user>.service`** (template unit, `User=%i`): waits for
   the streamer's X and the NFS home mount, then runs `gnome-shell --x11` under
   `dbus-run-session` via
@@ -141,45 +144,75 @@ Check `journalctl -u whistler-desktop@<user>` in the guest first.
 
 ## Streaming mode is required
 
-The streamer defaults **`--h264-streaming-mode=true`** here (XFCE leaves it
-off). mutter is a GL compositor: once it composits a static window it emits no
-further damage, so pixelflux's default damage-based capture leaves static
-windows **black** on the client until a full repaint. Streaming mode
-continuously encodes the whole frame (constant bandwidth/CPU — the right trade
-for a GL compositor). Templates should also set
-`streamerEnv: { SELKIES_H264_STREAMING_MODE: "true" }` (the
-`ubuntu-vm-gnome-selkies` sample does) so the intent is explicit even though the
-in-guest default already covers it.
+The streamer runs with **`--video-streaming-mode=true`** (called
+`--h264-streaming-mode` before 2.0; a template still setting
+`SELKIES_H264_STREAMING_MODE` is honoured). mutter is a GL compositor: once it
+composits a static window it emits no further damage, so damage-based capture
+leaves static windows **black** on the client until a full repaint. Streaming
+mode continuously encodes the whole frame (constant bandwidth/CPU — the right
+trade for a GL compositor). 2.0 defaults it on anyway; the streamer passes it
+explicitly so a changed upstream default cannot bring the bug back, and the
+dev templates set `SELKIES_VIDEO_STREAMING_MODE: "true"` so the intent is
+visible on the template too.
 
-## Streaming is H.264 — but not x264
+## Encoding
 
-`--encoder=x264enc` names the **output mode**, not the encoder implementation.
-Selkies' enum is only `{x264enc, x264enc-striped, jpeg}` (full-frame H.264 /
-striped H.264 / JPEG) — there is no `nvenc` value, and the reported encoder name
-never changes. The backend is a *separate* setting, `--use-cpu`
-(`SELKIES_USE_CPU`), which defaults to **false** and which the streamer does not
-set; with it false pixelflux tries **NVENC** (CUDA driver API) first, then
-**VA-API** (`/dev/dri` render node), and falls back to its bundled libx264 only
-if both fail.
+The default encoder is `h264enc` (H.264). `h265enc`, `vp8enc`, `vp9enc` and
+`av1enc` are available through `SELKIES_ENCODER` in the template's
+`streamerEnv`; `h264enc-striped` and `jpeg` are CPU-only. The name is the
+**codec**, not the implementation: pixelflux encodes on **NVENC** where the
+GPU has the engine (the `-cuda` image's driver brings `libnvidia-encode`),
+then **VA-API** (a `/dev/dri` render node), then its software encoder (x264
+for H.264). A browser that cannot decode the chosen codec steps down a ladder —
+hardware codecs first, then software, then striped H.264, JPEG last — without
+a reload. The lean image and GPU-less sessions get software encoding from the
+identical config.
 
-So a GPU-passthrough session on the `-cuda` image encodes on the GPU while still
-displaying encoder `x264enc` — GPU utilisation with a "software" encoder name is
-expected, not a misconfiguration. The lean image and GPU-less sessions get
-software x264 from the identical config. `jpeg` and `x264enc-striped` force
-`use_cpu=true` server-side and are always CPU.
-
-Only the encode stage moves: capture stays XShm from Xvfb, and GNOME still
-renders on llvmpipe (apps can individually opt out of that via `vgl` — see
-[Three graphics tiers](#three-graphics-tiers)). To see which backend a session
-picked:
+Only the encode stage moves: capture stays on the CPU from Xvfb, and GNOME
+still renders on llvmpipe (apps can individually opt out of that via `vgl` —
+see [Three graphics tiers](#three-graphics-tiers)). The Selkies log says, at
+INFO, which capture and encoder path each display took, and the dashboard's
+stats panel shows the same:
 
 ```bash
-journalctl -u whistler-streamer | grep -Ei 'nvenc|vaapi|x264'
-# "NVENC Encoder Initialized successfully."  → GPU
-# "VAAPI Encoder Initialized successfully."  → GPU
-# "... Falling back to x264" / "to CPU"      → software libx264
+journalctl -u whistler-streamer | grep -Ei 'nvenc|vaapi|encoder'
 nvidia-smi -q -d UTILIZATION | grep -i -A2 encoder   # in-guest confirmation
 ```
+
+Not used yet: 2.0's zero-copy X11 capture (NvFBC on NVIDIA, or DRI3 on
+upstream's patched Xvfb) would keep frames on the GPU from screen to
+bitstream; this image captures a stock Xvfb.
+
+## Keyboard
+
+- **macOS clients**: the web client sends Cmd+key chords as Ctrl+key (the
+  dashboard's "Command as Control" switch, on by default).
+  [`bake/mac-cmd-chords.patch`](bake/mac-cmd-chords.patch) fixes two things
+  upstream still gets wrong: only the *first* chord per Cmd hold worked (Cmd-A
+  then Cmd-C typed a `c`), and plain Cmd-C/Cmd-V cannot mean one X chord
+  everywhere (Ctrl+C is SIGINT in a terminal; VTE's Shift+Insert pastes
+  PRIMARY, not CLIPBOARD — measured). Plain Cmd-C/V are sent as
+  XF86Copy/XF86Paste taps, which the in-session
+  [`whistler-copy-agent`](guest/usr/local/bin/whistler-copy-agent) re-injects
+  as the chord the **focused** window expects — Ctrl+C/V in GUI apps,
+  Ctrl+Shift+C/V in terminals (by WM_CLASS). Physical Ctrl-C still means
+  SIGINT, PRIMARY/middle-click is untouched, and Cmd-Shift-C/V arrive verbatim
+  as Ctrl+Shift+C/V. Full investigation: design/keyboards.md.
+- **Option-key characters** (`|`, `@`, `{`, … via Option, e.g. Option+7 for `|`
+  on a Swedish Mac layout): the client maps the physical Option key to the
+  X11 keysym `Mode_switch`, which no modern keymap binds. `whistler-copy-agent`
+  pre-binds `Mode_switch` (and `ISO_Level3_Shift`) to a spare keycode at
+  startup so it is present before any client needs it.
+- **Several input sources** (e.g. Swedish + US in GNOME Settings) give the X
+  keymap several XKB groups, and the server has to type each character in the
+  group that is active. 2.0 does XKB placement properly but types a keysym in
+  the *lowest* group carrying it, and its group locks are undone by GNOME
+  within milliseconds; measured, it typed wrong characters in 3 of the 4
+  source-order × active-source combinations (`:` → `Ö`, å ä ö → å ' ;).
+  [`bake/xkb-active-group.patch`](bake/xkb-active-group.patch) types in the
+  active group when it carries the keysym and otherwise binds it to a spare
+  keycode, never moving the user's group; all four combinations are correct
+  with it. Re-run that matrix after a Selkies bump (the patch header has it).
 
 ## Three graphics tiers
 
@@ -232,21 +265,20 @@ make vm-gnome-desktop-image CUDA=1   # → …-cuda:latest  (bakes the NVIDIA dr
 make vm-gnome-desktop-image PUSH=1   # …and push to the dev registry
 ```
 
-Like [`../vm-xfce-selkies`](../vm-xfce-selkies/), the default lean image
-carries **no** NVIDIA driver; `CUDA=1` bakes the driver in and
-publishes `whistler-vm-gnome-selkies-cuda`. (That suffix is on the image
-name, not the tag, so the mutable dev tag stays exactly `:latest` — the only tag
-KubeVirt defaults to `imagePullPolicy: Always`; see ../vm-xfce-selkies/README.md.)
+The default lean image carries **no** NVIDIA driver; `CUDA=1` bakes the
+driver in and publishes `whistler-vm-gnome-selkies-cuda`. (That suffix is on
+the image name, not the tag, so the mutable dev tag stays exactly `:latest` —
+the only tag KubeVirt defaults to `imagePullPolicy: Always`; a `:latest-cuda`
+tag would leave nodes booting a stale cached qcow2 after every rebuild.)
 GNOME still renders on llvmpipe in both variants (Xvfb
 serves Mesa swrast GLX — a passthrough GPU can't change that by itself), but
 the two are **not** otherwise identical: the driver brings `libnvidia-encode`,
 so on a `-cuda` passthrough session pixelflux encodes the stream on
-**NVENC** instead of software x264 (see [Streaming is H.264 — but not
-x264](#streaming-is-h264--but-not-x264)). The driver also carries the whole GPU
+**NVENC** instead of in software (see [Encoding](#encoding)). The driver also carries the whole GPU
 compute runtime, and **VirtualGL** (`VIRTUALGL_VERSION`,
 default 3.1.4) lets individual GL apps draw on the GPU via `vgl <app>` — see
 [Three graphics tiers](#three-graphics-tiers). NOTE the 24.04
-packages differ from 26.04's: default driver `nvidia-driver-550-open`, override
+driver packages differ from 26.04's: default driver `nvidia-driver-550-open`, override
 via `NVIDIA_DRIVER_PACKAGE` (a wrong name fails the bake). Heads-up: in current
 noble that package is a **transitional shim** whose only dependency is
 `nvidia-driver-580-open`, so the bake really installs 580.x — the "550" in the
@@ -288,10 +320,11 @@ architecture.
 ```bash
 desktops/vm-gnome-selkies/test.sh   # boots the baked disk with a session-like
                                     # seed; PASS = Selkies on :8082 + gnome-shell up
+                                    # + the data WebSocket stays open
 ```
 
 It generates the seed with the real `whistler.cloudinit.build_user_data`
-(desktop mode, H264 streaming mode on), boots the disk with `hostfwd`, waits for
+(desktop mode, video streaming mode on), boots the disk with `hostfwd`, waits for
 Selkies to serve HTTP, then over SSH fakes the NFS export landing (tmpfs on the
 home mountpoint — no gateway outside the cluster) and asserts `gnome-shell` comes
 up *and stays up* with windows in the streamer's X, and that a fresh SSH
