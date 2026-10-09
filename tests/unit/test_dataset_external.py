@@ -29,6 +29,7 @@ def _manager(external=True, **attrs):
     cm.dataset_external_tls_secret = None
     cm.dataset_external_annotations = {}
     cm.dataset_external_peers = [{"namespaceSelector": {}}]
+    cm.dataset_external_source_filter = "traefik"
     for k, v in attrs.items():
         setattr(cm, k, v)
     return cm
@@ -153,11 +154,19 @@ def test_only_the_ingress_controller_reaches_the_external_port():
     assert rule["ports"] == [{"port": 8082, "protocol": "TCP"}]
 
 
-def _exposure_rig(monkeypatch):
-    cm = _manager()
+def _exposure_rig(monkeypatch, **attrs):
+    cm = _manager(**attrs)
     order = []
-    cm._ensure_object = lambda name, ns, body, **kw: order.append(
-        ("ensure", body["kind"])) or True
+    cm.bodies = {}
+    cm._ensure_object = lambda name, ns, body, **kw: (
+        order.append(("ensure", body["kind"])),
+        cm.bodies.__setitem__(body["kind"], body)) and True
+
+    def delete_mw(group, version, ns, plural, name):
+        assert (group, version, plural) == cfg.TRAEFIK_MIDDLEWARE_API
+        order.append(("delete", "Middleware"))
+    monkeypatch.setattr(cfg.client, "CustomObjectsApi", lambda: SimpleNamespace(
+        delete_namespaced_custom_object=delete_mw))
     monkeypatch.setattr(cfg.client, "NetworkingV1Api", lambda: SimpleNamespace(
         create_namespaced_network_policy=None, read_namespaced_network_policy=None,
         replace_namespaced_network_policy=None, create_namespaced_ingress=None,
@@ -171,10 +180,97 @@ def _exposure_rig(monkeypatch):
 def test_opening_fences_first_and_closing_unroutes_first(monkeypatch):
     cm, order = _exposure_rig(monkeypatch)
     assert cm._ensure_external_exposure("corpus", True)
-    assert order == [("ensure", "NetworkPolicy"), ("ensure", "Ingress")]
+    # Unrestricted: a leftover allow-list goes, after the Ingress stops
+    # naming it.
+    assert order == [("ensure", "NetworkPolicy"), ("ensure", "Ingress"),
+                     ("delete", "Middleware")]
     order.clear()
     assert cm._ensure_external_exposure("corpus", False)
+    assert order == [("delete", "Ingress"), ("delete", "Middleware"),
+                     ("delete", "NetworkPolicy")]
+
+
+# --- where it may be reached from -------------------------------------------- #
+
+def test_source_ranges_are_canonical():
+    assert cfg.normalize_source_ranges(
+        ["2001:db8::/32", " 10.1.2.3/8 ", "192.0.2.7", "", "10.0.0.0/8"]) == \
+        ["10.0.0.0/8", "192.0.2.7/32", "2001:db8::/32"]
+    with pytest.raises(ValueError, match="'lab'"):
+        cfg.normalize_source_ranges(["10.0.0.0/8", "lab"])
+
+
+@pytest.mark.parametrize("definition, expected", [
+    (MANAGED, None),                                    # absent: anywhere
+    ({**MANAGED, "externalSources": None}, None),
+    ({**MANAGED, "externalSources": []}, []),           # empty: nowhere
+    ({**MANAGED, "externalSources": ["192.0.2.1"]}, ["192.0.2.1/32"]),
+    # Malformed (written past the portal): closed, never open.
+    ({**MANAGED, "externalSources": ["nope"]}, []),
+])
+def test_external_sources_absent_and_empty_differ(definition, expected):
+    assert KubeConfigManager.dataset_external_sources(definition) == expected
+
+
+def test_a_dataset_with_a_bad_range_is_refused():
+    problem = KubeConfigManager.dataset_spec_problem(
+        {**MANAGED, "externalSources": ["10.0.0.0/33"]})
+    assert problem and "10.0.0.0/33" in problem
+    assert KubeConfigManager.dataset_spec_problem(
+        {**MANAGED, "externalSources": []}) is None
+
+
+def test_traefik_filters_through_a_per_dataset_allow_list(monkeypatch):
+    cm, order = _exposure_rig(monkeypatch)
+    assert cm._ensure_external_exposure("corpus", True, ["192.0.2.0/24"])
+    # The allow-list exists before the Ingress that routes through it.
+    assert order == [("ensure", "NetworkPolicy"), ("ensure", "Middleware"),
+                     ("ensure", "Ingress")]
+    mw = cm.bodies["Middleware"]
+    assert mw["apiVersion"] == "traefik.io/v1alpha1"
+    assert mw["spec"] == {"ipAllowList": {"sourceRange": ["192.0.2.0/24"]}}
+    ann = cm.bodies["Ingress"]["metadata"]["annotations"]
+    assert ann[cfg.TRAEFIK_MIDDLEWARES_ANNOTATION] == \
+        "whistler-whistler-dataset-corpus-ext@kubernetescrd"
+
+
+def test_the_allow_list_runs_before_the_charts_own_middlewares():
+    cm = _manager(dataset_external_annotations={
+        cfg.TRAEFIK_MIDDLEWARES_ANNOTATION: "kube-system-ratelimit@kubernetescrd"})
+    ann = cm._build_dataset_external_ingress(
+        "corpus", ["192.0.2.0/24"])["metadata"]["annotations"]
+    assert ann[cfg.TRAEFIK_MIDDLEWARES_ANNOTATION] == (
+        "whistler-whistler-dataset-corpus-ext@kubernetescrd,"
+        "kube-system-ratelimit@kubernetescrd")
+
+
+def test_nginx_filters_by_annotation_and_needs_no_middleware(monkeypatch):
+    cm, order = _exposure_rig(monkeypatch,
+                              dataset_external_source_filter="nginx")
+    assert cm._ensure_external_exposure(
+        "corpus", True, ["192.0.2.0/24", "2001:db8::/32"])
+    assert order == [("ensure", "NetworkPolicy"), ("ensure", "Ingress")]
+    ann = cm.bodies["Ingress"]["metadata"]["annotations"]
+    assert ann[cfg.NGINX_SOURCE_RANGE_ANNOTATION] == \
+        "192.0.2.0/24,2001:db8::/32"
+
+
+def test_nowhere_fences_the_dataset_off(monkeypatch):
+    cm, order = _exposure_rig(monkeypatch)
+    assert cm._ensure_external_exposure("corpus", True, [])
+    assert order == [("delete", "Ingress"), ("delete", "Middleware"),
+                     ("delete", "NetworkPolicy")]
+
+
+def test_a_restriction_nothing_enforces_keeps_the_dataset_closed(monkeypatch):
+    cm, order = _exposure_rig(monkeypatch,
+                              dataset_external_source_filter="none")
+    assert cm._ensure_external_exposure("corpus", True, ["192.0.2.0/24"])
     assert order == [("delete", "Ingress"), ("delete", "NetworkPolicy")]
+    # Unrestricted needs no filter at all.
+    order.clear()
+    assert cm._ensure_external_exposure("corpus", True, None)
+    assert order == [("ensure", "NetworkPolicy"), ("ensure", "Ingress")]
 
 
 # --- the account sync -------------------------------------------------------- #
@@ -190,7 +286,9 @@ def _sync_rig(monkeypatch, keys, live_shared, live_external, external=True):
     cm._dataset_server_ip = lambda v: "10.0.0.9"
     cm._ensure_dataset_root_secret = lambda v: "root"
     cm.exposed = []
-    cm._ensure_external_exposure = lambda v, e: cm.exposed.append(e) or True
+    cm.sources = []
+    cm._ensure_external_exposure = lambda v, e, s=None: (
+        cm.exposed.append(e), cm.sources.append(s)) and True
     monkeypatch.setattr(cfg.client, "CoreV1Api", lambda: SimpleNamespace(
         read_namespaced_secret=lambda n, ns: SimpleNamespace(data={
             "accessKeyId": _b64("whistler-root"),
@@ -309,3 +407,34 @@ def test_a_guest_mounts_the_bucket_its_descriptor_names():
              "accessKeyId": "a", "secretAccessKey": "s"}])
     assert "rclone mount corpus:corpus " in ud
     assert "rclone mount old:data " in ud      # an S3 proxy's fixed bucket
+
+
+def test_the_sync_hands_the_datasets_sources_to_the_exposure(monkeypatch):
+    cm, _calls = _sync_rig(monkeypatch, keys={"xro.alice": "k2"},
+                           live_shared={}, live_external={})
+    cm.datasets = {"corpus": {**MANAGED, "externalSources": ["192.0.2.9"]}}
+    assert cm.sync_dataset_accounts("corpus")
+    assert cm.exposed == [True] and cm.sources == [["192.0.2.9/32"]]
+
+
+# --- the portal form --------------------------------------------------------- #
+
+def test_the_form_answers_anywhere_listed_or_nowhere():
+    from fastapi import HTTPException
+    from whistler.portal.management import (_build_dataset_data,
+                                            _parse_external_sources)
+    assert _parse_external_sources("anywhere", "10.0.0.0/8") is None
+    assert _parse_external_sources("nowhere", "10.0.0.0/8") == []
+    assert _parse_external_sources("listed", "192.0.2.1, 10.0.0.0/8\n") == \
+        ["10.0.0.0/8", "192.0.2.1/32"]
+    for reach, text in (("listed", ""), ("listed", "lab"), ("open", "")):
+        with pytest.raises(HTTPException):
+            _parse_external_sources(reach, text)
+    # An S3 dataset has no external listener, so nothing to restrict.
+    s3 = _build_dataset_data("ref", "", "", "b", "", "", "", "", True,
+                             source="s3", external_sources=[])
+    assert s3["externalSources"] is None
+    managed = _build_dataset_data("ref", "", "", "", "", "", "", "", True,
+                                  source="managed", size="1Gi",
+                                  external_sources=[])
+    assert managed["externalSources"] == []

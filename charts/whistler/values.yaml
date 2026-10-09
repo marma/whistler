@@ -719,6 +719,16 @@ whistler:
       # app.kubernetes.io/name in (traefik, ingress-nginx, rke2-ingress-nginx)
       # in any namespace.
       ingressPeers: []
+      # What enforces a dataset's "Reachable from" addresses (set per dataset
+      # in the portal). NetworkPolicy cannot: the listener only ever sees the
+      # ingress controller. traefik = an ipAllowList Middleware per dataset
+      # (Traefik v3, kubernetescrd provider); nginx = the whitelist-source-
+      # range annotation; none = no filter, so a dataset restricted to some
+      # addresses stays closed. Either way the controller judges the address
+      # it sees: it must see the client's (externalTrafficPolicy: Local on its
+      # Service, or PROXY protocol from the load balancer), not a node's.
+      # Fencing a dataset off entirely ("Nowhere") needs no filter.
+      sourceFilter: traefik
 
 # Admin-curated catalog of system templates (Template CRs, user: system).
 #

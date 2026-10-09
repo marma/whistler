@@ -693,8 +693,8 @@ def _accounts_rig(monkeypatch, keys, live):
     cm._dataset_server_ip = lambda v: "10.0.0.9"
     cm._ensure_dataset_root_secret = lambda v: "root"
     cm.exposed = []
-    cm._ensure_external_exposure = lambda v, exposed: cm.exposed.append(
-        exposed) or True
+    cm._ensure_external_exposure = lambda v, exposed, sources=None: \
+        cm.exposed.append(exposed) or True
     monkeypatch.setattr(cfg.client, "CoreV1Api", lambda: SimpleNamespace(
         read_namespaced_secret=lambda n, ns: SimpleNamespace(data={
             "accessKeyId": _b64("whistler-root"),

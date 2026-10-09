@@ -33,6 +33,11 @@ rules:
   - apiGroups: [networking.k8s.io]
     resources: [ingresses]
     verbs: [list, get, create, update, patch, delete]
+  # ...and, with sourceFilter: traefik, the per-dataset IP allow-list its
+  # Ingress routes through. Harmless where Traefik's CRDs do not exist.
+  - apiGroups: [traefik.io]
+    resources: [middlewares]
+    verbs: [list, get, create, update, patch, delete]
 
   # Application: watching & handling for the custom resources we declare.
   - apiGroups: [whistler.martinmalmsten.net]

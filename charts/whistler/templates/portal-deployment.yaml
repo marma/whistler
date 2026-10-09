@@ -75,6 +75,10 @@ spec:
               value: {{ .Values.whistler.datasetServer.external.host | default "" | quote }}
             - name: WHISTLER_DATASET_EXTERNAL_SCHEME
               value: {{ .Values.whistler.datasetServer.external.scheme | default "https" | quote }}
+            # So the dataset form can say whether a source restriction will
+            # be enforced, or keep the dataset closed.
+            - name: WHISTLER_DATASET_EXTERNAL_SOURCE_FILTER
+              value: {{ .Values.whistler.datasetServer.external.sourceFilter | default "traefik" | quote }}
             - name: WHISTLER_SCREENSHOT_INTERVAL
               value: {{ .Values.portal.screenshots.intervalSeconds | quote }}
             # The stored size is the privacy posture, not a display detail:

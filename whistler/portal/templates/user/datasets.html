@@ -42,7 +42,8 @@
 {% if external %}
 <div class="ui small warning message">
   <i class="exclamation triangle icon"></i>
-  These keys work from anywhere: your laptop, a script, another cluster.
+  These keys work from outside the cluster: your laptop, a script, another
+  cluster (unless a dataset below says it is limited to some addresses).
   Treat them like a password. If one leaks, regenerate it — the old key stops
   working within seconds.
 </div>
@@ -59,6 +60,17 @@
     {% endif %}
     {% if d.description %}<div class="sub header">{{ d.description }}</div>{% endif %}
   </h4>
+  {% if d.sources is not none %}
+  {% if d.sources %}
+  <p><i class="map marker alternate icon"></i> Works only from
+    {% for s in d.sources %}<code>{{ s }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.</p>
+  {% else %}
+  <div class="ui small message" style="display:block">
+    <i class="lock icon"></i> An administrator has closed this dataset to access
+    from outside. Your key is kept and works again once it is reopened.
+  </div>
+  {% endif %}
+  {% endif %}
   {% if c %}
   <table class="ui very basic compact table" style="margin-top:0">
     <tbody>

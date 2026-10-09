@@ -134,6 +134,60 @@
       </div>
     </div>
 
+    {% set ext = dataset.externalSources if dataset else none %}
+    {% set reach = 'anywhere' if ext is none else ('nowhere' if not ext else 'listed') %}
+    <div id="managed-external" {% if not managed %}style="display:none"{% endif %}>
+    <div class="ui divider"></div>
+    <h4 class="ui header">Reachable from outside
+      {% if not external_enabled %}<span class="ui grey tiny label">external access not configured</span>{% endif %}</h4>
+    <p class="ui grey text">
+      Applies to users granted this dataset in the access matrix's
+      <code>external</code> column. Their key is the permission; this decides
+      which client addresses may use it. Inside the cluster nothing changes.
+    </p>
+    <div class="grouped fields">
+      <div class="field">
+        <div class="ui radio checkbox">
+          <input type="radio" name="external_reach" value="anywhere" id="reach-anywhere"
+                 {% if reach == 'anywhere' %}checked{% endif %}>
+          <label for="reach-anywhere"><strong>Anywhere</strong> — any address, with a valid key.</label>
+        </div>
+      </div>
+      <div class="field">
+        <div class="ui radio checkbox">
+          <input type="radio" name="external_reach" value="listed" id="reach-listed"
+                 {% if reach == 'listed' %}checked{% endif %}>
+          <label for="reach-listed"><strong>Only these addresses</strong></label>
+        </div>
+      </div>
+      <div class="field">
+        <div class="ui radio checkbox">
+          <input type="radio" name="external_reach" value="nowhere" id="reach-nowhere"
+                 {% if reach == 'nowhere' %}checked{% endif %}>
+          <label for="reach-nowhere"><strong>Nowhere</strong> — fenced off. The way in
+            from outside is removed; grants and keys are kept, so choosing
+            another option reopens it.</label>
+        </div>
+      </div>
+    </div>
+    <div class="field" id="external-sources-field">
+      <textarea name="external_sources" rows="3"
+                placeholder="192.0.2.0/24&#10;198.51.100.7&#10;2001:db8::/32">{{ ext | join('\n') if ext else '' }}</textarea>
+      <div class="ui pointing label">
+        IP addresses or CIDR ranges, one per line. Enforced by the ingress
+        controller ({{ external_source_filter }}), which has to see the
+        client's own address, not a load balancer's or a node's.
+      </div>
+      {% if not external_can_filter %}
+      <div class="ui small warning message" style="display:block">
+        No source filter is configured (<code>whistler.datasetServer.external.sourceFilter</code>
+        is <code>{{ external_source_filter }}</code>), so a dataset limited to some
+        addresses is kept <strong>closed</strong> to everyone outside rather than open.
+      </div>
+      {% endif %}
+    </div>
+    </div>{# #managed-external #}
+
     <div id="s3-credential" {% if managed %}style="display:none"{% endif %}>
     <div class="ui divider"></div>
     <h4 class="ui header">Credential</h4>
@@ -179,12 +233,27 @@
   </form>
 </div>
 
+<script>
+  // The address list matters only for "Only these addresses".
+  (function () {
+    const field = document.getElementById("external-sources-field");
+    function apply() {
+      const chosen = document.querySelector('input[name="external_reach"]:checked');
+      field.style.display = chosen && chosen.value === "listed" ? "" : "none";
+    }
+    document.querySelectorAll('input[name="external_reach"]').forEach(
+      r => r.addEventListener("change", apply));
+    apply();
+  })();
+</script>
+
 {% if not dataset %}
 <script>
   // Show the fields of the chosen source only, and require only those: a
   // hidden `required` input would block the submit with no visible reason.
   (function () {
-    const groups = {managed: ["managed-fields"], s3: ["s3-fields", "s3-credential"]};
+    const groups = {managed: ["managed-fields", "managed-external"],
+                    s3: ["s3-fields", "s3-credential"]};
     function apply() {
       const chosen = document.querySelector('input[name="source"]:checked').value;
       for (const [source, ids] of Object.entries(groups)) {

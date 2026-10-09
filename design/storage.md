@@ -590,6 +590,27 @@ a 15 MB multipart upload) read and wrote through the Ingress, and what they
 wrote was visible inside; anonymous requests were refused; revoking bob's
 external grant killed his key while alice's kept the Ingress up.
 
+**Where from is the admin's, per dataset** (same day). A managed dataset's
+`externalSources` says which client addresses its external listener may be
+reached from: absent is anywhere (the grant is the permission), a list of
+addresses or CIDRs admits only those, and **empty is nowhere** — the Ingress
+and the `-external` policy are removed while every grant and key is kept,
+which is how an admin fences a dataset off without editing the matrix. The
+portal's dataset form asks it as Anywhere / Only these addresses / Nowhere,
+and the user's Datasets page says which applies. NetworkPolicy cannot do the
+middle option: the listener's only peer is the ingress controller, so the
+client's address exists only there. It is enforced by the controller
+(`whistler.datasetServer.external.sourceFilter`): `traefik` (default) puts a
+per-dataset `ipAllowList` Middleware in front of that dataset's Ingress,
+created before the Ingress names it and removed after it stops; `nginx` sets
+`whitelist-source-range` on it. **A restriction nothing enforces fails
+closed**: with `none` (or an unknown value) a restricted dataset is not
+exposed at all, and a malformed stored list reads as empty. Either
+controller judges the address it sees, so its Service must preserve the
+client's (`externalTrafficPolicy: Local` or PROXY protocol); behind an SNAT
+every client is a node address, and a list of outside ranges refuses
+everyone. Not yet verified on a cluster.
+
 What this costs, stated plainly: a user with an external grant can take that
 data anywhere. The zone column does not constrain them, and nothing here
 can. The grid's column header says so.

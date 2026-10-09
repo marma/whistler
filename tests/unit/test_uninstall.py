@@ -186,10 +186,12 @@ def test_leftovers_are_removed_and_helms_own_are_not(monkeypatch):
     helm = {"app.kubernetes.io/managed-by": "Helm"}
     api = MagicMock()
     api.list_namespaced_custom_object.side_effect = \
-        lambda g, v, ns, plural: {"items": {
+        lambda g, v, ns, plural, **kw: {"items": {
             "users": [{"metadata": {"name": "alice"}}],
             "zones": [{"metadata": {"name": "open", "labels": helm}},
-                      {"metadata": {"name": "restricted"}}]}.get(plural, [])}
+                      {"metadata": {"name": "restricted"}}],
+            "middlewares": [{"metadata": {
+                "name": "whistler-dataset-corpus-ext"}}]}.get(plural, [])}
     cm = SimpleNamespace(namespace="whistler", api=api, group="g", version="v",
                          ssh_ca_secret_name="wh-ssh-ca")
     core, apps, net = MagicMock(), MagicMock(), MagicMock()
@@ -218,6 +220,7 @@ def test_leftovers_are_removed_and_helms_own_are_not(monkeypatch):
                  "wh-ssh-ca", "wh-server-host-key"):
         assert f"Secret/{name}" in deleted
     assert "Deployment/whistler-s3-corpus-ro" in deleted
+    assert "Middleware/whistler-dataset-corpus-ext" in deleted
 
 
 def test_leftovers_that_are_already_gone_are_fine():

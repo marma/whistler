@@ -224,6 +224,22 @@ def delete_release_leftovers(cm) -> List[str]:
     for i in net.list_namespaced_ingress(ns, label_selector=selector).items:
         gone("Ingress", i.metadata.name,
              lambda: net.delete_namespaced_ingress(i.metadata.name, ns))
+    # ...and their Traefik IP allow-lists, where Traefik is what filters.
+    from whistler.config import TRAEFIK_MIDDLEWARE_API
+    group, version, plural = TRAEFIK_MIDDLEWARE_API
+    custom = cm.api
+    try:
+        middlewares = custom.list_namespaced_custom_object(
+            group, version, ns, plural, label_selector=selector)["items"]
+    except ApiException as e:
+        if e.status != 404:   # 404: no Traefik CRDs, nothing to remove
+            raise
+        middlewares = []
+    for m in middlewares:
+        name = m["metadata"]["name"]
+        gone("Middleware", name,
+             lambda: custom.delete_namespaced_custom_object(
+                 group, version, ns, plural, name))
 
     # Secrets: by label where Whistler labels them, by name where it names
     # them (the CA and host key names come from the chart).

@@ -47,7 +47,8 @@ from whistler.config import (ACCESS_MODES, CHANNELS, ConfigWriteError,
                              ENFORCED_CHANNELS, GPU_NONE,
                              ENTRY_KIOSK, ENTRY_POINTS, ENTRY_PORTAL,
                              GPU_NODE_LABEL, NEW_USER_ENTRY_POINTS,
-                             NEW_USER_ZONES, OVERRIDE_GROUPS, VIEWERS)
+                             NEW_USER_ZONES, OVERRIDE_GROUPS, VIEWERS,
+                             normalize_source_ranges)
 from whistler.portal.login import (USER_COOKIE, dev_auth, render_login,
                                    render_notice, verify_credentials)
 from whistler.status import GROUP_COLORS, status_group
@@ -1881,7 +1882,7 @@ async def admin_computed_access(request: Request, cm: CM, admin: Admin,
 
 def _build_dataset_data(name, description, endpoint, bucket, prefix, region,
                         provider, credentials_secret, read_only,
-                        source=None, size=None):
+                        source=None, size=None, external_sources=None):
     managed = (source or "").strip() == DATASET_SOURCE_MANAGED
     if managed:
         # A managed dataset has no bucket of its own to describe: the form's
@@ -1889,6 +1890,9 @@ def _build_dataset_data(name, description, endpoint, bucket, prefix, region,
         # rather than saved as if it meant something.
         endpoint = bucket = prefix = region = provider = None
         credentials_secret = None
+    else:
+        # Only a managed dataset has an external listener to restrict.
+        external_sources = None
     return {
         "name": name.strip(),
         "description": (description or "").strip() or None,
@@ -1903,7 +1907,33 @@ def _build_dataset_data(name, description, endpoint, bucket, prefix, region,
         # False must survive as an explicit value, not be dropped as empty:
         # unticking "read-only" is how an admin grants write access.
         "readOnly": bool(read_only),
+        # None = reachable from anywhere (the key is dropped); [] = from
+        # nowhere, which save_dataset keeps, since only None/"" are dropped.
+        "externalSources": external_sources,
     }
+
+
+def _parse_external_sources(reach, sources):
+    """The dataset form's "Reachable from outside" answer as externalSources:
+    None (anywhere), [] (nowhere: fenced off), or the listed ranges."""
+    reach = (reach or "anywhere").strip()
+    if reach == "anywhere":
+        return None
+    if reach == "nowhere":
+        return []
+    if reach != "listed":
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown external reach {reach!r}.")
+    try:
+        ranges = normalize_source_ranges(re.split(r"[\s,]+", sources or ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"{e}.") from e
+    if not ranges:
+        raise HTTPException(
+            status_code=400,
+            detail="List at least one address or range, or choose Nowhere to "
+                   "fence the dataset off.")
+    return ranges
 
 
 async def _dataset_rows(request: Request, cm):
@@ -1921,10 +1951,18 @@ async def admin_datasets(request: Request, cm: CM, admin: Admin):
     )
 
 
+def _external_form_context(cm):
+    return {"external_enabled": cm.dataset_external_enabled,
+            "external_can_filter": cm.dataset_external_can_filter,
+            "external_source_filter": getattr(
+                cm, "dataset_external_source_filter", "none")}
+
+
 async def admin_dataset_new(request: Request, cm: CM, admin: Admin):
     return templates.TemplateResponse(
         request=request, name="admin/dataset_form.html",
-        context=_ctx(admin, is_admin=True, dataset=None, has_credentials=False),
+        context=_ctx(admin, is_admin=True, dataset=None, has_credentials=False,
+                     **_external_form_context(cm)),
     )
 
 
@@ -1943,6 +1981,8 @@ async def admin_dataset_create(
     read_only:          Annotated[Optional[str], Form()] = None,
     access_key_id:      Annotated[Optional[str], Form()] = None,
     secret_access_key:  Annotated[Optional[str], Form()] = None,
+    external_reach:     Annotated[Optional[str], Form()] = None,
+    external_sources:   Annotated[Optional[str], Form()] = None,
 ):
     name = name.strip()
     if not re.fullmatch(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?", name):
@@ -1953,7 +1993,9 @@ async def admin_dataset_create(
     return await _save_dataset(request, cm, admin, name, description, endpoint,
                                bucket, prefix, region, provider,
                                credentials_secret, read_only, access_key_id,
-                               secret_access_key, source, size, create=True)
+                               secret_access_key, source, size, create=True,
+                               external_sources=_parse_external_sources(
+                                   external_reach, external_sources))
 
 
 async def admin_dataset_edit(request: Request, cm: CM, admin: Admin, name: str):
@@ -1969,7 +2011,8 @@ async def admin_dataset_edit(request: Request, cm: CM, admin: Admin, name: str):
         request=request, name="admin/dataset_form.html",
         context=_ctx(admin, is_admin=True,
                      dataset={"name": name, **(defs[name] or {})},
-                     has_credentials=has_creds),
+                     has_credentials=has_creds,
+                     **_external_form_context(cm)),
     )
 
 
@@ -1987,17 +2030,22 @@ async def admin_dataset_update(
     read_only:          Annotated[Optional[str], Form()] = None,
     access_key_id:      Annotated[Optional[str], Form()] = None,
     secret_access_key:  Annotated[Optional[str], Form()] = None,
+    external_reach:     Annotated[Optional[str], Form()] = None,
+    external_sources:   Annotated[Optional[str], Form()] = None,
 ):
     return await _save_dataset(request, cm, admin, name, description, endpoint,
                                bucket, prefix, region, provider,
                                credentials_secret, read_only, access_key_id,
-                               secret_access_key, source, size)
+                               secret_access_key, source, size,
+                               external_sources=_parse_external_sources(
+                                   external_reach, external_sources))
 
 
 async def _save_dataset(request, cm, admin, name, description, endpoint,
                         bucket, prefix, region, provider, credentials_secret,
                         read_only, access_key_id, secret_access_key,
-                        source=None, size=None, create=False):
+                        source=None, size=None, create=False,
+                        external_sources=None):
     """Shared by create and update.
 
     The credential is written FIRST and separately: blank credential fields
@@ -2053,7 +2101,7 @@ async def _save_dataset(request, cm, admin, name, description, endpoint,
 
     data = _build_dataset_data(name, description, endpoint, bucket, prefix,
                               region, provider, credentials_secret, read_only,
-                              source, size)
+                              source, size, external_sources)
     try:
         ok = await request.app.state.run(cm.save_dataset, data, create)
     except DatasetSpecError as e:

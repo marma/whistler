@@ -337,6 +337,24 @@ DATASET_SERVER_APP = "whistler-dataset-server"
 # A managed dataset's bucket is named after it (dataset_bucket_name), so its
 # name must also be a valid S3 bucket name: a DNS label of at least 3.
 MANAGED_DATASET_NAME = re.compile(r"[a-z0-9][-a-z0-9]{1,61}[a-z0-9]")
+
+
+def normalize_source_ranges(items) -> List[str]:
+    """Addresses or CIDR ranges -> canonical CIDRs, de-duplicated, IPv4
+    first. A bare address is its own /32 (or /128), and host bits are
+    cleared (10.1.2.3/8 is 10.0.0.0/8, which is what it admits anyway).
+    Raises ValueError naming the first entry that is neither."""
+    nets = set()
+    for item in items or ():
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            nets.add(ipaddress.ip_network(text, strict=False))
+        except ValueError:
+            raise ValueError(
+                f"{text!r} is not an IP address or CIDR range") from None
+    return [str(n) for n in sorted(nets, key=lambda n: (n.version, n))]
 # Container ports of a managed dataset server: one process per mode, because
 # read-only has to be a property of a process, not a permission inside one.
 DATASET_SERVER_PORTS = {"ro": 8080, "rw": 8081}
@@ -349,6 +367,13 @@ DATASET_SERVER_ADMIN_PORTS = {"ro": 9080, "rw": 9081}
 # DATASET_SERVER_PORTS, which is what sessions may reach.
 DATASET_SERVER_EXTERNAL_PORT = 8082
 DATASET_SERVER_EXTERNAL_ADMIN_PORT = 9082
+# What enforces a dataset's `externalSources` (whistler.datasetServer.external
+# .sourceFilter). Not NetworkPolicy: the listener's only peer is the ingress
+# controller, so the client's address is known there and nowhere after.
+EXTERNAL_SOURCE_FILTERS = ("traefik", "nginx", "none")
+TRAEFIK_MIDDLEWARE_API = ("traefik.io", "v1alpha1", "middlewares")
+NGINX_SOURCE_RANGE_ANNOTATION = "nginx.ingress.kubernetes.io/whitelist-source-range"
+TRAEFIK_MIDDLEWARES_ANNOTATION = "traefik.ingress.kubernetes.io/router.middlewares"
 HOME_VOLUME_PLURAL = "homevolumes"
 # The per-user claim container sessions mount as $HOME (_ensure_pvc).
 POD_HOME_PVC_PREFIX = "whistler-data-"
@@ -1347,6 +1372,18 @@ class KubeConfigManager(ConfigManager):
                     "key": "app.kubernetes.io/name", "operator": "In",
                     "values": ["traefik", "ingress-nginx",
                                "rke2-ingress-nginx"]}]}}])
+        # What enforces a dataset's externalSources. An unknown value is
+        # "none": a restricted dataset then stays closed rather than open.
+        source_filter = (os.environ.get(
+            "WHISTLER_DATASET_EXTERNAL_SOURCE_FILTER") or "traefik"
+        ).strip().lower()
+        if source_filter not in EXTERNAL_SOURCE_FILTERS:
+            logger.error(f"Unknown WHISTLER_DATASET_EXTERNAL_SOURCE_FILTER "
+                         f"{source_filter!r}; expected one of "
+                         f"{', '.join(EXTERNAL_SOURCE_FILTERS)}. Datasets "
+                         f"restricted by source address stay closed.")
+            source_filter = "none"
+        self.dataset_external_source_filter = source_filter
 
     @staticmethod
     def _env_json(name, default):
@@ -5035,6 +5072,32 @@ class KubeConfigManager(ConfigManager):
     def dataset_external_enabled(self) -> bool:
         return bool(getattr(self, "dataset_external_host", ""))
 
+    @property
+    def dataset_external_can_filter(self) -> bool:
+        """Whether a dataset's externalSources can be enforced at all."""
+        return getattr(self, "dataset_external_source_filter",
+                       "none") in ("traefik", "nginx")
+
+    @staticmethod
+    def dataset_external_sources(definition: Dict[str, Any]
+                                 ) -> Optional[List[str]]:
+        """Where a managed dataset's external listener may be reached from.
+
+        None (the field absent) is *anywhere* — the grant is the permission
+        and this narrows nothing. A list admits only those addresses, and an
+        **empty** list admits nobody: the dataset is fenced off from outside
+        while every external grant on it is kept. Absent and empty differ
+        on purpose, as for `channels`. A malformed list (written past the
+        portal) is read as empty: closed, never open."""
+        if (definition or {}).get("externalSources") is None:
+            return None
+        try:
+            return normalize_source_ranges(definition["externalSources"])
+        except (ValueError, TypeError) as e:
+            logger.error(f"Ignoring malformed externalSources, treating the "
+                         f"dataset as fenced off: {e}")
+            return []
+
     def dataset_external_endpoint(self) -> Optional[str]:
         """The URL a user points their S3 client at, or None when external
         access is not configured."""
@@ -5069,7 +5132,9 @@ class KubeConfigManager(ConfigManager):
             mode = self.external_dataset_mode(username, name)
             if mode:
                 out.append({"name": name, "mode": mode,
-                            "description": definitions[name].get("description")})
+                            "description": definitions[name].get("description"),
+                            "sources": self.dataset_external_sources(
+                                definitions[name])})
         return out
 
     def get_dataset_names(self) -> List[str]:
@@ -5265,6 +5330,11 @@ class KubeConfigManager(ConfigManager):
         **A managed dataset only grows.** Kubernetes refuses to shrink a
         claim, and would say so only in the operator's log.
         """
+        if spec.get("externalSources") is not None:
+            try:
+                normalize_source_ranges(spec["externalSources"])
+            except (ValueError, TypeError) as e:
+                return f"External access from: {e}."
         source = cls.dataset_source(spec)
         if source not in DATASET_SOURCES:
             return (f"Unknown dataset source {source!r}; expected one of "
@@ -5911,7 +5981,30 @@ class KubeConfigManager(ConfigManager):
             },
         }
 
-    def _build_dataset_external_ingress(self, volume: str) -> Dict[str, Any]:
+    def _build_dataset_external_middleware(self, volume: str,
+                                           sources: List[str]
+                                           ) -> Dict[str, Any]:
+        """Traefik's half of a dataset's externalSources: an IP allow-list
+        the dataset's Ingress routes through. Pure. A request from anywhere
+        else gets a 403 from Traefik and never reaches the listener.
+
+        Traefik judges the address it sees, which is the client's only if
+        the controller's Service preserves it (`externalTrafficPolicy:
+        Local`, or a load balancer speaking PROXY protocol) — behind an SNAT
+        every request comes from a node address."""
+        group, version, _plural = TRAEFIK_MIDDLEWARE_API
+        return {
+            "apiVersion": f"{group}/{version}",
+            "kind": "Middleware",
+            "metadata": {"name": self.dataset_external_service_name(volume),
+                         "labels": {"app": DATASET_SERVER_APP,
+                                    "volume": volume}},
+            "spec": {"ipAllowList": {"sourceRange": list(sources)}},
+        }
+
+    def _build_dataset_external_ingress(self, volume: str,
+                                        sources: Optional[List[str]] = None
+                                        ) -> Dict[str, Any]:
         """The dataset's path on the shared external host. Pure.
 
         Path-style S3: the bucket is the first path segment, so
@@ -5936,44 +6029,109 @@ class KubeConfigManager(ConfigManager):
         if self.dataset_external_tls_secret:
             spec["tls"] = [{"hosts": [self.dataset_external_host],
                             "secretName": self.dataset_external_tls_secret}]
+        annotations = dict(self.dataset_external_annotations or {})
+        # A restricted dataset (``sources`` a non-empty list; None is
+        # anywhere) carries its filter on its own Ingress, so the
+        # restriction is per dataset even though they share a host.
+        source_filter = getattr(self, "dataset_external_source_filter", "none")
+        if sources and source_filter == "traefik":
+            name = self.dataset_external_service_name(volume)
+            chain = [f"{self.namespace}-{name}@kubernetescrd"]
+            # Ours first, so nothing the chart adds runs for a refused client.
+            if annotations.get(TRAEFIK_MIDDLEWARES_ANNOTATION):
+                chain.append(annotations[TRAEFIK_MIDDLEWARES_ANNOTATION])
+            annotations[TRAEFIK_MIDDLEWARES_ANNOTATION] = ",".join(chain)
+        elif sources and source_filter == "nginx":
+            annotations[NGINX_SOURCE_RANGE_ANNOTATION] = ",".join(sources)
         return {
             "apiVersion": "networking.k8s.io/v1",
             "kind": "Ingress",
             "metadata": {"name": self.dataset_external_service_name(volume),
                          "labels": labels,
-                         "annotations": dict(self.dataset_external_annotations
-                                             or {})},
+                         "annotations": annotations},
             "spec": spec,
         }
 
-    def _ensure_external_exposure(self, volume: str, exposed: bool) -> bool:
+    def _ensure_external_exposure(self, volume: str, exposed: bool,
+                                  sources: Optional[List[str]] = None
+                                  ) -> bool:
         """Open or close the dataset's way in from outside. Opening goes
-        fence first (the controller must be admitted before the path
-        exists); closing goes path first, so there is never a route to a
-        port that has stopped admitting it — and never an open port with no
-        account behind it."""
+        fence first (the controller must be admitted, and a source filter
+        exist, before the path does); closing goes path first, so there is
+        never a route to a port that has stopped admitting it — and never an
+        open port with no account behind it.
+
+        ``sources`` is the dataset's externalSources (dataset_external_
+        sources): None opens it to anywhere, a list only to those addresses,
+        and an empty list keeps it closed whoever holds a key — the admin's
+        way to fence a dataset off without touching the grants. A restricted
+        dataset with nothing configured to enforce the restriction also stays
+        closed: a filter that is not applied must not read as one that is."""
+        if exposed and sources is not None:
+            if not sources:
+                logger.info(f"External access to {volume!r} is fenced off "
+                            f"(externalSources is empty)")
+                exposed = False
+            elif not self.dataset_external_can_filter:
+                logger.error(
+                    f"Dataset {volume!r} restricts external access to "
+                    f"{', '.join(sources)}, but no source filter is "
+                    f"configured (whistler.datasetServer.external."
+                    f"sourceFilter); keeping it closed")
+                exposed = False
         net = client.NetworkingV1Api()
         ns = self.namespace
         policy = self._build_dataset_external_access(volume)
-        ingress = self._build_dataset_external_ingress(volume)
+        ingress = self._build_dataset_external_ingress(
+            volume, sources if exposed else None)
+        traefik = self.dataset_external_source_filter == "traefik"
+        middleware = traefik and exposed and bool(sources)
+        steps = []
+        if traefik:
+            group, version, plural = TRAEFIK_MIDDLEWARE_API
+            co = client.CustomObjectsApi()
+            mw_name = self.dataset_external_service_name(volume)
+            delete_mw = (lambda name, ns_: co.delete_namespaced_custom_object(
+                group, version, ns_, plural, name), mw_name)
         if exposed:
-            return self._ensure_object(
+            ok = self._ensure_object(
                 policy["metadata"]["name"], ns, policy,
                 create=net.create_namespaced_network_policy,
                 read=net.read_namespaced_network_policy,
-                replace=net.replace_namespaced_network_policy) and \
-                self._ensure_object(
-                    ingress["metadata"]["name"], ns, ingress,
-                    create=net.create_namespaced_ingress,
-                    read=net.read_namespaced_ingress,
-                    replace=net.replace_namespaced_ingress)
-        for delete, name in ((net.delete_namespaced_ingress,
-                              ingress["metadata"]["name"]),
-                             (net.delete_namespaced_network_policy,
-                              policy["metadata"]["name"])):
+                replace=net.replace_namespaced_network_policy)
+            if ok and middleware:
+                body = self._build_dataset_external_middleware(volume, sources)
+                ok = self._ensure_object(
+                    mw_name, ns, body,
+                    create=lambda ns_, b: co.create_namespaced_custom_object(
+                        group, version, ns_, plural, b),
+                    read=lambda name, ns_: co.get_namespaced_custom_object(
+                        group, version, ns_, plural, name),
+                    replace=lambda name, ns_, b:
+                        co.replace_namespaced_custom_object(
+                            group, version, ns_, plural, name, b))
+            ok = ok and self._ensure_object(
+                ingress["metadata"]["name"], ns, ingress,
+                create=net.create_namespaced_ingress,
+                read=net.read_namespaced_ingress,
+                replace=net.replace_namespaced_ingress)
+            if not ok:
+                return False
+            # Unrestricted now: the Ingress no longer names the allow-list,
+            # so it can go (after the Ingress, never before).
+            if traefik and not middleware:
+                steps.append(delete_mw)
+        else:
+            steps.append((net.delete_namespaced_ingress,
+                          ingress["metadata"]["name"]))
+            if traefik:
+                steps.append(delete_mw)
+            steps.append((net.delete_namespaced_network_policy,
+                          policy["metadata"]["name"]))
+        for delete, name in steps:
             try:
                 delete(name, ns)
-                logger.info(f"Closed external access to {volume!r} ({name})")
+                logger.info(f"Removed {name} (external access to {volume!r})")
             except ApiException as e:
                 if e.status != 404:
                     logger.error(f"Could not remove {name}: {e}")
@@ -6490,8 +6648,12 @@ class KubeConfigManager(ConfigManager):
         except (OSError, ElementTree.ParseError) as e:
             logger.error(f"Could not sync the accounts of {volume!r}: {e}")
             return False
+        # self.datasets was just reloaded by sync_dataset_keys (through
+        # s3_proxy_peers), so this is the live definition.
+        definition = (getattr(self, "datasets", None) or {}).get(volume)
         return self._ensure_external_exposure(
-            volume, self.dataset_external_enabled and bool(external))
+            volume, self.dataset_external_enabled and bool(external),
+            self.dataset_external_sources(definition))
 
     def get_external_credentials(self, username: str,
                                  volume: str) -> Optional[Dict[str, str]]:

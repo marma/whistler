@@ -876,6 +876,18 @@ spec:
                     managed — its claim and data, so it can be resurrected
                     by clearing this. Deleting it for good is a second,
                     separate act that removes the data too.
+                externalSources:
+                  type: array
+                  items:
+                    type: string
+                  description: >-
+                    Managed datasets only: the client addresses (IPs or CIDR
+                    ranges) its external listener may be reached from,
+                    enforced by the ingress controller (whistler.
+                    datasetServer.external.sourceFilter). Absent = anywhere;
+                    empty = nowhere, i.e. fenced off from outside while every
+                    external grant is kept. A restricted dataset with no
+                    source filter configured stays closed.
                 size:
                   type: string
                   description: >-

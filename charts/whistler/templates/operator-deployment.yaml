@@ -104,6 +104,8 @@ spec:
               value: {{ .Values.whistler.datasetServer.external.tlsSecretName | default "" | quote }}
             - name: WHISTLER_DATASET_EXTERNAL_ANNOTATIONS
               value: {{ .Values.whistler.datasetServer.external.annotations | default dict | toJson | quote }}
+            - name: WHISTLER_DATASET_EXTERNAL_SOURCE_FILTER
+              value: {{ .Values.whistler.datasetServer.external.sourceFilter | default "traefik" | quote }}
             {{- with .Values.whistler.datasetServer.external.ingressPeers }}
             - name: WHISTLER_DATASET_EXTERNAL_PEERS
               value: {{ . | toJson | quote }}
