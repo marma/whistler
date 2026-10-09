@@ -332,7 +332,10 @@ exit 0
                     "Type=notify\n"
                     f"ExecStartPre=/bin/mkdir -p {mount}\n"
                     f"ExecStart=/usr/bin/rclone mount"
-                    f" {name}:{S3_PROXY_BUCKET} {mount}"
+                    # The descriptor names the bucket: a managed dataset's
+                    # is the dataset's own name, an S3 proxy's is the fixed
+                    # S3_PROXY_BUCKET.
+                    f" {name}:{ds.get('bucket') or S3_PROXY_BUCKET} {mount}"
                     f" --config {RCLONE_CONF_PATH}"
                     # allow-other so the session user can read a mount root
                     # made by the unit; uid/gid present it as theirs, since S3

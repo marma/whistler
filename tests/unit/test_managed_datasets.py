@@ -151,7 +151,10 @@ def test_services_look_exactly_like_an_rclone_proxy_to_the_guest():
 def test_server_prepares_the_bucket_and_seeds_the_accounts():
     init = _server()[0]["spec"]["template"]["spec"]["initContainers"][0]
     script = init["command"][-1]
-    assert f"mkdir -p /srv/{S3_PROXY_BUCKET}" in script
+    # The bucket is named after the dataset; a claim from before keeps its
+    # data by a one-time rename of `data/` (xattrs travel with a rename).
+    assert f"mv /srv/{S3_PROXY_BUCKET} /srv/corpus" in script
+    assert "mkdir -p /srv/corpus" in script
     assert "cp /seed/users.json /iam/users.json" in script
 
 
@@ -165,7 +168,7 @@ def test_only_the_operator_reaches_the_writer_and_its_admin_port():
     (rule,) = policy["spec"]["ingress"]
     assert rule["from"] == [{"podSelector": {"matchLabels": {
         "app": "whistler-operator"}}}]
-    assert {p["port"] for p in rule["ports"]} == {8081, 9081}
+    assert {p["port"] for p in rule["ports"]} == {8081, 9081, 9082}
 
 
 def test_guest_never_asks_to_create_the_bucket():
@@ -317,6 +320,9 @@ def test_prune_removes_only_servers_of_undefined_datasets(monkeypatch):
     cm = _manager()
     cm._managed_dataset_names = lambda: {"kept"}
     deleted = []
+    closed = []
+    cm._ensure_external_exposure = lambda v, exposed: closed.append(
+        (v, exposed)) or True
     monkeypatch.setattr(cfg.client, "AppsV1Api", lambda: SimpleNamespace(
         list_namespaced_deployment=lambda ns, label_selector: SimpleNamespace(
             items=[_labelled("whistler-dataset-kept", "kept"),
@@ -328,6 +334,8 @@ def test_prune_removes_only_servers_of_undefined_datasets(monkeypatch):
                    _labelled("whistler-s3-gone-ro", "gone")]),
         delete_namespaced_service=lambda n, ns: deleted.append(n)))
     assert cm.prune_dataset_servers() == ["gone"]
+    # Its way in from outside closes with it.
+    assert closed == [("gone", False)]
     # The claim is never touched, and neither are the policies (fenced to
     # nobody already; deleting one under a terminating pod would open it).
     assert deleted == ["whistler-dataset-gone", "whistler-s3-gone-ro"]
@@ -464,7 +472,8 @@ def _purge_rig(monkeypatch, spec, annotations, pods=()):
         delete_namespaced_service=record("service"),
         delete_namespaced_secret=record("secret")))
     monkeypatch.setattr(cfg.client, "NetworkingV1Api", lambda: SimpleNamespace(
-        delete_namespaced_network_policy=record("policy")))
+        delete_namespaced_network_policy=record("policy"),
+        delete_namespaced_ingress=record("ingress")))
     return cm, order
 
 
@@ -592,7 +601,8 @@ def test_archived_datasets_are_listed_last():
     defs = {"a-old": ARCHIVED, "b-live": MANAGED, "c-live": {"bucket": "x"},
             "0-old": ARCHIVED}
     cm = SimpleNamespace(get_dataset_definitions=lambda: defs,
-                         is_archived_dataset=KubeConfigManager.is_archived_dataset)
+                         is_archived_dataset=KubeConfigManager.is_archived_dataset,
+                         is_managed_dataset=KubeConfigManager.is_managed_dataset)
     rows = asyncio.run(_dataset_rows(_portal_request(cm), cm))
     assert [r["name"] for r in rows] == ["b-live", "c-live", "0-old", "a-old"]
     sections = asyncio.run(_matrix_sections(_portal_request(cm), cm))
@@ -661,7 +671,8 @@ def test_an_existing_key_survives_and_a_revoked_one_goes(monkeypatch):
 
 def test_an_unchanged_key_set_is_not_rewritten(monkeypatch):
     keys = {"rw.alice": "kept"}
-    stored = {**keys, "users.json": dataset_accounts.render_users_json(keys)}
+    stored = {**keys, "users.json": dataset_accounts.render_users_json(keys),
+              "users-ext.json": dataset_accounts.render_users_json({})}
     cm, written = _keys_rig(monkeypatch, ALICE_RW, stored)
     assert cm.sync_dataset_keys("corpus") == keys
     assert written == []
@@ -681,6 +692,9 @@ def _accounts_rig(monkeypatch, keys, live):
     cm.sync_dataset_keys = lambda v: keys
     cm._dataset_server_ip = lambda v: "10.0.0.9"
     cm._ensure_dataset_root_secret = lambda v: "root"
+    cm.exposed = []
+    cm._ensure_external_exposure = lambda v, exposed: cm.exposed.append(
+        exposed) or True
     monkeypatch.setattr(cfg.client, "CoreV1Api", lambda: SimpleNamespace(
         read_namespaced_secret=lambda n, ns: SimpleNamespace(data={
             "accessKeyId": _b64("whistler-root"),
@@ -710,8 +724,8 @@ def test_account_sync_revokes_first_then_grants_then_policy(monkeypatch):
     assert paths[1][2] == "9081/delete-user?access=ro.mallory"
     assert paths[2][1] == "9081/create-user"
     assert b"<Access>ro.bob</Access>" in calls[2][2]
-    assert paths[3][2] == "8081/data?acl"
-    assert paths[4][0] == "PUT" and paths[4][2] == "8081/data?policy"
+    assert paths[3][2] == "8081/corpus?acl"
+    assert paths[4][0] == "PUT" and paths[4][2] == "8081/corpus?policy"
     policy = _json.loads(calls[4][2])
     assert {p for s in policy["Statement"] for p in s["Principal"]["AWS"]} \
         == {"rw.alice", "ro.bob"}
@@ -732,7 +746,7 @@ def test_a_changed_key_is_replaced(monkeypatch):
 def test_nobody_granted_deletes_the_policy(monkeypatch):
     cm, calls = _accounts_rig(monkeypatch, keys={}, live={"ro.x": "s"})
     assert cm.sync_dataset_accounts("corpus")
-    assert ("DELETE", "8081/data?policy", b"") in calls
+    assert ("DELETE", "8081/corpus?policy", b"") in calls
 
 
 def test_no_ready_server_is_a_retry_not_a_failure_to_record(monkeypatch):

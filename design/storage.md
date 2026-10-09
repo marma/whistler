@@ -425,7 +425,7 @@ signature covers a path the Ingress does not rewrite (unverified).
 
 Built first, in order: managed datasets on the internal endpoint only; then
 per-user keys (done 2026-10-09, below); then the external listener and the
-`external` zone, as a separate decision.
+`external` zone (done 2026-10-09, "External access" below).
 
 **Phase 1 built, 2026-10-08: managed datasets, internal only, shared keys.**
 `Dataset.spec.source: managed` + `size`; the portal offers it as the default
@@ -534,6 +534,65 @@ Service.
 Upgrading from phase 1 restarts each managed server (new arguments, new
 root key), and running guests' keys stop working: their `rclone.conf` holds
 the old shared key. A guest gets its own key at its next start.
+
+### External access, 2026-10-09
+
+Built as decided above ("External access reverses this document's rule"):
+a dataset cell in the access matrix's reserved **`external`** column grants
+a key that works from outside the cluster, and nothing else does. Off
+unless `whistler.datasetServer.external.host` is set; managed datasets only.
+
+**The shape.** Each managed dataset's server pod gets a third VersityGW
+process, the *external listener* (8082, admin 9082), with **its own account
+store** holding only external accounts (`xro.alice`, `xrw.alice`). An
+internal key copied out of a guest is therefore unknown there — measured
+from outside, through the Ingress: `InvalidAccessKeyId`. All three listeners
+serve the same bucket under the same policy, which grants each external
+account its mode's actions exactly as for internal ones (`xro` read-only,
+verified: PUT is AccessDenied). The external accounts also live in the
+shared store, because the policy may only name accounts its writer knows;
+that gives them nothing inside, where reach is still the fence.
+
+**One host, path-style.** Users reach `<scheme>://<host>/<dataset>/<key>`;
+each dataset someone holds an external key on gets one Ingress on that host
+with the prefix `/<dataset>`, unrewritten — SigV4 signs the path, so a
+rewrite would break every signature. That is why **the bucket is now named
+after the dataset**, internally too: VersityGW refuses a policy naming any
+bucket but its own (no second name, no wildcard — all tried), so one bucket
+name has to serve every listener. Existing claims are migrated by the init
+container (`mv data <dataset>` once; the ACL xattr travels with the rename,
+verified), guests learn the bucket from their descriptor, and a managed
+dataset's name must now be a valid bucket name (3-63 characters).
+
+**Exposure follows the keys.** The Ingress and the NetworkPolicy admitting
+the ingress controller to 8082 exist only while at least one external
+account does (`_ensure_external_exposure`): opened fence-first, closed
+path-first, and closed when the dataset is archived. A dataset nobody was
+given outside access to has no route in at all — measured: granting created
+both, revoking the last grant removed both and the host answered 404.
+
+**Keys are the user's.** The portal's Datasets page (nav: Datasets) lists
+what the user can mount and where, and for each external grant the endpoint,
+bucket, access key and secret (hidden until revealed; the page is
+`no-store`), ready-to-paste rclone and AWS CLI configuration, and
+**Regenerate**: the portal removes that one key from the keys Secret
+(JSON patch guarded by resourceVersion) and touches the Dataset; the
+operator issues a new key and the old one dies — measured 3.4s from the
+click to a 403, run in the portal pod so its RBAC was exercised. The admin
+grid shows the `external` column always, marked "not configured" when off,
+because saving the grid replaces the whole matrix and a hidden column would
+erase every external grant.
+
+Verified on k3d with Traefik, the chart installed from the tree and the
+phase-2 image upgraded in place: data written before the upgrade read back
+under the renamed bucket; outside clients (curl with SigV4, rclone including
+a 15 MB multipart upload) read and wrote through the Ingress, and what they
+wrote was visible inside; anonymous requests were refused; revoking bob's
+external grant killed his key while alice's kept the Ingress up.
+
+What this costs, stated plainly: a user with an external grant can take that
+data anywhere. The zone column does not constrain them, and nothing here
+can. The grid's column header says so.
 
 **Instances choose their datasets, 2026-10-08.** Until now every dataset a
 user was granted in the session's zone was mounted, chosen or not. Now an

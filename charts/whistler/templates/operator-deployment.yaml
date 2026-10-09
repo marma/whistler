@@ -94,6 +94,20 @@ spec:
               value: {{ .Values.whistler.datasetServer.resources | toJson | quote }}
             - name: WHISTLER_DATASET_STORAGE_CLASS
               value: {{ .Values.whistler.datasetServer.storageClass | quote }}
+            - name: WHISTLER_DATASET_EXTERNAL_HOST
+              value: {{ .Values.whistler.datasetServer.external.host | default "" | quote }}
+            - name: WHISTLER_DATASET_EXTERNAL_SCHEME
+              value: {{ .Values.whistler.datasetServer.external.scheme | default "https" | quote }}
+            - name: WHISTLER_DATASET_EXTERNAL_INGRESS_CLASS
+              value: {{ .Values.whistler.datasetServer.external.ingressClassName | default "" | quote }}
+            - name: WHISTLER_DATASET_EXTERNAL_TLS_SECRET
+              value: {{ .Values.whistler.datasetServer.external.tlsSecretName | default "" | quote }}
+            - name: WHISTLER_DATASET_EXTERNAL_ANNOTATIONS
+              value: {{ .Values.whistler.datasetServer.external.annotations | default dict | toJson | quote }}
+            {{- with .Values.whistler.datasetServer.external.ingressPeers }}
+            - name: WHISTLER_DATASET_EXTERNAL_PEERS
+              value: {{ . | toJson | quote }}
+            {{- end }}
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
           # ensure_pod() runs here now, so the operator needs the same user and

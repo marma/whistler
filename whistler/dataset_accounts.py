@@ -16,6 +16,10 @@ What shaped it, all measured against VersityGW v1.7.0:
   writes it, and only the rw process can write one (the ro process runs
   ``--readonly``). So both processes share one account store, and the policy
   — an xattr on the shared bucket directory — is enforced by both.
+- The bucket is named after the dataset, not a fixed ``data``: a policy may
+  name only the bucket it is set on (no wildcard, no second name), and the
+  external listener's clients sign the path ``/<dataset>/…`` that an Ingress
+  routes on, so one bucket name has to serve every listener.
 - The account store is a plain ``users.json``. The operator renders it into
   a Secret that seeds the pod at start, so a restart loses no account; live
   changes go through the admin API (``PATCH /create-user`` etc.).
@@ -30,6 +34,11 @@ from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 MODES = ("ro", "rw")
+# Accounts of the external listener (design/storage.md, "External access"):
+# granted by the matrix's reserved `external` zone, held in the external
+# process's own account store so an internal key opens nothing outside.
+EXTERNAL_MODES = ("xro", "xrw")
+ALL_MODES = MODES + EXTERNAL_MODES
 
 # What each mode's accounts may do to the bucket and its objects. Never
 # s3:*: that would include PutBucketPolicy/PutBucketAcl, and with them a way
@@ -51,13 +60,22 @@ def account_name(username: str, mode: str) -> str:
 def parse_account_name(access: str) -> Optional[Tuple[str, str]]:
     """``(username, mode)`` for one of ours, else None."""
     mode, _, username = access.partition(".")
-    return (username, mode) if mode in MODES and username else None
+    return (username, mode) if mode in ALL_MODES and username else None
+
+
+def is_external(access: str) -> bool:
+    return (parse_account_name(access) or ("", ""))[1] in EXTERNAL_MODES
+
+
+def external_mode(mode: str) -> str:
+    """The external account mode for an internal one: ro -> xro."""
+    return f"x{mode}"
 
 
 def desired_accounts(holders: Dict[str, Iterable[str]]) -> Dict[str, Tuple[str, str]]:
     """``{access: (username, mode)}`` from ``{mode: usernames}``."""
     return {account_name(u, mode): (u, mode)
-            for mode in MODES for u in (holders.get(mode) or ())}
+            for mode in ALL_MODES for u in (holders.get(mode) or ())}
 
 
 def render_users_json(keys: Dict[str, str]) -> str:
@@ -76,13 +94,14 @@ def build_policy(bucket: str, accounts: Iterable[str]) -> Optional[dict]:
     caller deletes the policy instead)."""
     by_mode = {mode: sorted(a for a in accounts
                             if (parse_account_name(a) or ("", ""))[1] == mode)
-               for mode in MODES}
+               for mode in ALL_MODES}
     resources = [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"]
     statements = [
         {"Effect": "Allow", "Principal": {"AWS": by_mode[mode]},
-         "Action": list(READ_ACTIONS if mode == "ro" else WRITE_ACTIONS),
+         "Action": list(READ_ACTIONS if mode in ("ro", "xro")
+                        else WRITE_ACTIONS),
          "Resource": resources}
-        for mode in MODES if by_mode[mode]]
+        for mode in ALL_MODES if by_mode[mode]]
     return {"Version": "2012-10-17", "Statement": statements} \
         if statements else None
 

@@ -27,6 +27,13 @@ rules:
     resources: [networkpolicies]
     verbs: [list, watch, create, get, update, patch, delete]
 
+  # External dataset access: one Ingress per managed dataset someone holds an
+  # external key on (config._ensure_external_exposure), in the release
+  # namespace only — but a ClusterRole, like the rest of this one.
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses]
+    verbs: [list, get, create, update, patch, delete]
+
   # Application: watching & handling for the custom resources we declare.
   - apiGroups: [whistler.martinmalmsten.net]
     resources: [sessions, templates, sessions/status, users, zones, groups, datasets, homevolumes]

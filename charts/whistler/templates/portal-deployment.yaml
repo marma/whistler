@@ -69,6 +69,12 @@ spec:
               value: {{ .Values.whistler.ssh.domainSuffix | quote }}
             # Periodic desktop screenshots (whistler/portal/screenshots.py):
             # newest-only, in memory, one per session. interval <= 0 disables.
+            # Shown to users on their Datasets page as the endpoint for
+            # their external keys (whistler.datasetServer.external).
+            - name: WHISTLER_DATASET_EXTERNAL_HOST
+              value: {{ .Values.whistler.datasetServer.external.host | default "" | quote }}
+            - name: WHISTLER_DATASET_EXTERNAL_SCHEME
+              value: {{ .Values.whistler.datasetServer.external.scheme | default "https" | quote }}
             - name: WHISTLER_SCREENSHOT_INTERVAL
               value: {{ .Values.portal.screenshots.intervalSeconds | quote }}
             # The stored size is the privacy posture, not a display detail:

@@ -42,6 +42,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from whistler.config import (ACCESS_MODES, CHANNELS, ConfigWriteError,
+                             EXTERNAL_ZONE,
                              DATASET_SOURCE_MANAGED, DatasetSpecError,
                              ENFORCED_CHANNELS, GPU_NONE,
                              ENTRY_KIOSK, ENTRY_POINTS, ENTRY_PORTAL,
@@ -1005,6 +1006,47 @@ async def _home_volume_rows(request: Request, cm, username: str):
     return rows
 
 
+async def user_datasets(request: Request, cm: CM, user: User, is_admin: IsAdmin):
+    """The user's datasets: what they can mount, and where; and — when
+    external access is configured — their keys for reaching a dataset from
+    outside the cluster.
+
+    The page carries the secret keys, so it is never cached. They are the
+    user's own and regenerable, which is why showing them is right: a key a
+    user cannot see is a key they will ask an admin to read out of a
+    Secret."""
+    choices, external = await asyncio.gather(
+        request.app.state.run(cm.get_user_dataset_choices, user),
+        request.app.state.run(cm.get_user_external_datasets, user),
+    )
+    creds = []
+    for d in external:
+        c = await request.app.state.run(cm.get_external_credentials, user,
+                                        d["name"])
+        creds.append({**d, "credentials": c})
+    response = templates.TemplateResponse(
+        request=request, name="user/datasets.html",
+        context=_ctx(user, is_admin=is_admin, choices=choices,
+                     external=creds,
+                     external_enabled=cm.dataset_external_enabled,
+                     endpoint=cm.dataset_external_endpoint()),
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+async def user_dataset_regenerate(request: Request, cm: CM, user: User,
+                                  name: str):
+    """Replace this user's external key on one dataset. The old key stops
+    working when the operator syncs, within seconds; the page shows the new
+    one once it is issued."""
+    ok = await request.app.state.run(cm.regenerate_external_key, user, name)
+    if not ok:
+        raise HTTPException(status_code=404,
+                            detail="You have no external access to that dataset.")
+    return _tr("/datasets", user)
+
+
 async def home_volumes(request: Request, cm: CM, user: User, is_admin: IsAdmin):
     # Only zones the user may already enter. Creating a home in one of those
     # is not an escalation — they could already start an instance there with a
@@ -1258,7 +1300,7 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
         cm.get_user_volume_access, username)
     access_sections = _sections_with_values(
         await _matrix_sections(request, cm, username),
-        zones, own_access, effective_access)
+        _grid_zones(zones), own_access, effective_access)
     channel_grant = await request.app.state.run(cm.get_user_channels, username)
     return templates.TemplateResponse(
         request=request, name="admin/user_detail.html",
@@ -1266,6 +1308,8 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
                      gpu_types=gpu_types, allowed_gpu_types=allowed_gpu_types,
                      user_overrides=user_overrides, override_groups=OVERRIDE_GROUPS,
                      zones=zones, allowed_zones=allowed_zones,
+                     grid_zones=_grid_zones(zones),
+                     external_enabled=cm.dataset_external_enabled,
                      user_groups=user_groups,
                      channels=CHANNELS, enforced_channels=ENFORCED_CHANNELS,
                      own_channels=user_obj.get("channels"),
@@ -1429,8 +1473,11 @@ async def _group_form_context(request, admin, group=None):
     )
     own_access = ((group or {}).get("volumeAccess") or {})
     access_sections = _sections_with_values(
-        await _matrix_sections(request, cm), zones, own_access, own_access)
+        await _matrix_sections(request, cm), _grid_zones(zones),
+        own_access, own_access)
     return _ctx(admin, is_admin=True, group=group, zones=zones,
+                grid_zones=_grid_zones(zones),
+                external_enabled=cm.dataset_external_enabled,
                 gpu_types=gpu_types, all_users=all_users,
                 entry_points=ENTRY_POINTS,
                 channels=CHANNELS, enforced_channels=ENFORCED_CHANNELS,
@@ -1709,13 +1756,24 @@ async def _matrix_sections(request: Request, cm, username: str = None):
         "rows": [{"key": n,
                   "label": f"{n} (archived)" if cm.is_archived_dataset(spec)
                   else n,
-                  "description": (spec or {}).get("description")}
+                  "description": (spec or {}).get("description"),
+                  # Only a managed dataset has an external listener; an S3
+                  # dataset's bucket is someone else's, with its own way in.
+                  "external_ok": cm.is_managed_dataset(spec)}
                  for n, spec in sorted(
                      (datasets or {}).items(),
                      # Archived last, as in the dataset list.
                      key=lambda kv: (cm.is_archived_dataset(kv[1]), kv[0]))],
     })
     return sections
+
+
+def _grid_zones(zones) -> list:
+    """The access grid's columns: every zone, plus the reserved `external`
+    column. Always shown, configured or not, because saving the grid
+    replaces the subject's whole matrix with the cells it rendered — a
+    hidden column would erase every external grant on the next save."""
+    return [z for z in zones if z != EXTERNAL_ZONE] + [EXTERNAL_ZONE]
 
 
 def _sections_with_values(sections, zones, own, effective):
@@ -1757,7 +1815,7 @@ async def admin_user_set_access(request: Request, cm: CM, admin: Admin,
     sections = await _matrix_sections(request, cm, username)
     ok = await request.app.state.run(
         cm.set_user_volume_access, username,
-        _parse_matrix_form(form, zones, sections))
+        _parse_matrix_form(form, _grid_zones(zones), sections))
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to save access.")
     return _tr(f"/admin/users/{username}", admin)
@@ -2801,6 +2859,8 @@ def build_management_app(config_manager):
     app.add_api_route("/admin/zones/{name}",                      admin_zone_update,      methods=["POST"])
     app.add_api_route("/admin/zones/{name}/delete",               admin_zone_delete,      methods=["POST"])
     app.add_api_route("/homes",                                   home_volumes,           methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/datasets",                                user_datasets,          methods=["GET"],  response_class=HTMLResponse)
+    app.add_api_route("/datasets/{name}/regenerate",              user_dataset_regenerate, methods=["POST"])
     app.add_api_route("/homes",                                   home_volume_create,     methods=["POST"])
     app.add_api_route("/homes/{name}/delete",                     home_volume_delete,     methods=["POST"])
     app.add_api_route("/admin/computed-access",                   admin_computed_access,  methods=["GET"],  response_class=HTMLResponse)

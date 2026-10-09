@@ -15,6 +15,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import secrets
 import time
 import urllib.parse
@@ -333,6 +334,9 @@ DATASET_SOURCES = (DATASET_SOURCE_S3, DATASET_SOURCE_MANAGED)
 # The managed dataset server's pods, its deny-all policy and its claim. Not
 # `whistler-dataset`, which labels the S3 datasets' credential Secrets.
 DATASET_SERVER_APP = "whistler-dataset-server"
+# A managed dataset's bucket is named after it (dataset_bucket_name), so its
+# name must also be a valid S3 bucket name: a DNS label of at least 3.
+MANAGED_DATASET_NAME = re.compile(r"[a-z0-9][-a-z0-9]{1,61}[a-z0-9]")
 # Container ports of a managed dataset server: one process per mode, because
 # read-only has to be a property of a process, not a permission inside one.
 DATASET_SERVER_PORTS = {"ro": 8080, "rw": 8081}
@@ -340,6 +344,11 @@ DATASET_SERVER_PORTS = {"ro": 8080, "rw": 8081}
 # the rw one is used — the account store is shared — and only the operator
 # may reach it (_build_dataset_server_operator_access).
 DATASET_SERVER_ADMIN_PORTS = {"ro": 9080, "rw": 9081}
+# The external listener: a third process with its OWN account store, reached
+# only through the Ingress (design/storage.md, "External access"). Not in
+# DATASET_SERVER_PORTS, which is what sessions may reach.
+DATASET_SERVER_EXTERNAL_PORT = 8082
+DATASET_SERVER_EXTERNAL_ADMIN_PORT = 9082
 HOME_VOLUME_PLURAL = "homevolumes"
 # The per-user claim container sessions mount as $HOME (_ensure_pvc).
 POD_HOME_PVC_PREFIX = "whistler-data-"
@@ -453,6 +462,13 @@ USER_NS_LABEL = "whistler.martinmalmsten.net/user"
 ZONE_POLICY_LABEL = "whistler.martinmalmsten.net/zone-policy"
 ZONE_HASH_ANNOTATION = "whistler.martinmalmsten.net/zone-config-hash"
 DEFAULT_ZONE = "default"
+# Not a zone: a reserved column of the access matrix. A dataset cell under
+# `external` grants a key that works from outside the cluster, through the
+# dataset server's external listener (design/storage.md, "External access").
+# No session runs in it, no NetworkPolicy is rendered for it, and no Zone may
+# take the name — a zone called `external` would make every grant in that
+# column mean two things.
+EXTERNAL_ZONE = "external"
 
 # The cluster resolver's canonical labels (CoreDNS/kube-dns on k3s, kubeadm,
 # and managed clusters alike) — target of the dns.clusterOnly zone knob.
@@ -1308,6 +1324,29 @@ class KubeConfigManager(ConfigManager):
             "WHISTLER_DATASET_SERVER_RESOURCES", {})
         self.dataset_storage_class = (
             os.environ.get("WHISTLER_DATASET_STORAGE_CLASS") or None)
+        # External dataset access (whistler.datasetServer.external). No host
+        # means off: no external listener, no Ingress, no external keys —
+        # and the `external` column of the access matrix grants nothing.
+        self.dataset_external_host = (
+            os.environ.get("WHISTLER_DATASET_EXTERNAL_HOST") or "").strip()
+        self.dataset_external_scheme = (
+            os.environ.get("WHISTLER_DATASET_EXTERNAL_SCHEME") or "https")
+        self.dataset_external_ingress_class = (
+            os.environ.get("WHISTLER_DATASET_EXTERNAL_INGRESS_CLASS") or None)
+        self.dataset_external_tls_secret = (
+            os.environ.get("WHISTLER_DATASET_EXTERNAL_TLS_SECRET") or None)
+        self.dataset_external_annotations = self._env_json(
+            "WHISTLER_DATASET_EXTERNAL_ANNOTATIONS", {})
+        # Who may reach the external port: the ingress controller's pods. A
+        # list of NetworkPolicy `from` peers; the default matches the common
+        # controllers in any namespace.
+        self.dataset_external_peers = self._env_json(
+            "WHISTLER_DATASET_EXTERNAL_PEERS", [{
+                "namespaceSelector": {},
+                "podSelector": {"matchExpressions": [{
+                    "key": "app.kubernetes.io/name", "operator": "In",
+                    "values": ["traefik", "ingress-nginx",
+                               "rke2-ingress-nginx"]}]}}])
 
     @staticmethod
     def _env_json(name, default):
@@ -2295,6 +2334,10 @@ class KubeConfigManager(ConfigManager):
             if zones is None:  # file also unreadable: keep the stale catalog
                 return
 
+        if EXTERNAL_ZONE in zones:
+            logger.warning(f"Ignoring Zone {EXTERNAL_ZONE!r}: the name is "
+                           f"reserved for external dataset access")
+            zones.pop(EXTERNAL_ZONE)
         if DEFAULT_ZONE not in zones:
             zones[DEFAULT_ZONE] = self._load_legacy_default_zone()
 
@@ -2344,7 +2387,7 @@ class KubeConfigManager(ConfigManager):
         their label; the rules behind that label change in place.)"""
         data = dict(zone_data)
         name = (data.pop("name", "") or "").strip()
-        if not name:
+        if not name or name == EXTERNAL_ZONE:
             return False
         spec = {k: v for k, v in data.items() if v not in (None, "")}
         try:
@@ -4975,6 +5018,8 @@ class KubeConfigManager(ConfigManager):
         definitions = self.get_dataset_definitions()
         held: Dict[str, Dict[str, str]] = {}
         for zone, cells in (self.get_user_volume_access(username) or {}).items():
+            if zone == EXTERNAL_ZONE:
+                continue   # a key for outside, not a mount
             for name, granted in (cells or {}).items():
                 if name in definitions and \
                         not self.is_archived_dataset(definitions[name]):
@@ -4985,6 +5030,47 @@ class KubeConfigManager(ConfigManager):
                  "description": definitions[name].get("description"),
                  "zones": dict(sorted(held[name].items()))}
                 for name in sorted(held)]
+
+    @property
+    def dataset_external_enabled(self) -> bool:
+        return bool(getattr(self, "dataset_external_host", ""))
+
+    def dataset_external_endpoint(self) -> Optional[str]:
+        """The URL a user points their S3 client at, or None when external
+        access is not configured."""
+        if not self.dataset_external_enabled:
+            return None
+        return f"{self.dataset_external_scheme}://{self.dataset_external_host}"
+
+    def external_dataset_mode(self, username: str,
+                              volume: str) -> Optional[str]:
+        """``ro``/``rw`` if this user holds an external grant on this served
+        managed dataset (readOnly ceiling applied), else None. External
+        access is only offered for managed datasets: an S3 dataset's bucket
+        is someone else's, with its own way in."""
+        if not self.dataset_external_enabled:
+            return None
+        definition = self.get_dataset_definitions().get(volume)
+        if not definition or not self.is_managed_dataset(definition) or \
+                self.is_archived_dataset(definition):
+            return None
+        granted = ((self.get_user_volume_access(username) or {})
+                   .get(EXTERNAL_ZONE) or {}).get(volume)
+        if granted is None:
+            return None
+        return self.dataset_mode(definition,
+                                 "ro" if granted == "read-only" else "rw")
+
+    def get_user_external_datasets(self, username: str) -> List[Dict[str, Any]]:
+        """The datasets this user may reach from outside, with the mode."""
+        definitions = self.get_dataset_definitions()
+        out = []
+        for name in sorted(definitions):
+            mode = self.external_dataset_mode(username, name)
+            if mode:
+                out.append({"name": name, "mode": mode,
+                            "description": definitions[name].get("description")})
+        return out
 
     def get_dataset_names(self) -> List[str]:
         """Dataset names, for the grant pickers. Separate from get_volumes()
@@ -5128,6 +5214,11 @@ class KubeConfigManager(ConfigManager):
                 if e.status != 404:
                     raise
                 problem = self.dataset_spec_problem(spec)
+                if not problem and self.is_managed_dataset(spec) and \
+                        not MANAGED_DATASET_NAME.fullmatch(name):
+                    problem = (f"A managed dataset's name is its bucket's "
+                               f"name, so it must be 3-63 lowercase letters, "
+                               f"digits or '-' (got {name!r}).")
                 if problem:
                     raise DatasetSpecError(problem)
                 self.api.create_namespaced_custom_object(
@@ -5517,6 +5608,8 @@ class KubeConfigManager(ConfigManager):
             # Every allow is explicit: an absent cell is a refusal, so an
             # unconfigured account lands in no proxy at all.
             for zone, cells in (self.get_user_volume_access(username) or {}).items():
+                if zone == EXTERNAL_ZONE:
+                    continue   # not a place sessions run; see EXTERNAL_ZONE
                 granted = (cells or {}).get(volume)
                 if granted is None:
                     continue
@@ -5606,6 +5699,7 @@ class KubeConfigManager(ConfigManager):
                     logger.warning(f"Dataset {name!r}: accounts not synced "
                                    f"yet; the mount retries until they are")
                 secret = keys[access]
+                bucket = self.dataset_bucket_name(name)
             else:
                 secret_name = f"{self._s3_proxy_name(name, mode)}-auth"
                 try:
@@ -5617,12 +5711,14 @@ class KubeConfigManager(ConfigManager):
                 except (ApiException, KeyError, TypeError) as e:
                     logger.error(f"Could not read {secret_name}: {e}")
                     continue
+                bucket = S3_PROXY_BUCKET
             out.append({
                 "name": name,
                 "mode": mode,
                 # The proxy, never the real S3 server. This is the address
                 # Whistler assigned and the zone rules name.
                 "endpoint": f"http://{self._s3_proxy_host(name, mode)}:8080",
+                "bucket": bucket,
                 "accessKeyId": access,
                 "secretAccessKey": secret,
             })
@@ -5726,6 +5822,18 @@ class KubeConfigManager(ConfigManager):
         return ("ro",) if (definition or {}).get("readOnly") else ("ro", "rw")
 
     @staticmethod
+    def dataset_bucket_name(volume: str) -> str:
+        """A managed dataset's bucket is named after it. The external
+        listener's clients sign ``/<dataset>/…`` and the Ingress routes on
+        that same prefix, and a bucket policy may only name the bucket it is
+        set on, so there has to be one name for every listener."""
+        return volume
+
+    @staticmethod
+    def dataset_external_service_name(volume: str) -> str:
+        return f"whistler-dataset-{volume}-ext"
+
+    @staticmethod
     def dataset_root_secret_name(volume: str) -> str:
         return f"whistler-dataset-{volume}-root"
 
@@ -5774,10 +5882,103 @@ class KubeConfigManager(ConfigManager):
                     "ports": [{"port": DATASET_SERVER_PORTS["rw"],
                                "protocol": "TCP"},
                               {"port": DATASET_SERVER_ADMIN_PORTS["rw"],
+                               "protocol": "TCP"},
+                              {"port": DATASET_SERVER_EXTERNAL_ADMIN_PORT,
                                "protocol": "TCP"}],
                 }],
             },
         }
+
+    def _build_dataset_external_access(self, volume: str) -> Dict[str, Any]:
+        """Let the ingress controller (and only it) reach the external
+        listener. Pure. Exists only while someone holds an external key on
+        this dataset (_ensure_external_exposure), so a dataset nobody was
+        given outside access to has no way in from outside at all."""
+        labels = {"app": DATASET_SERVER_APP, "volume": volume}
+        return {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": f"{self.dataset_server_name(volume)}-external",
+                         "labels": labels},
+            "spec": {
+                "podSelector": {"matchLabels": labels},
+                "policyTypes": ["Ingress"],
+                "ingress": [{
+                    "from": copy.deepcopy(self.dataset_external_peers),
+                    "ports": [{"port": DATASET_SERVER_EXTERNAL_PORT,
+                               "protocol": "TCP"}],
+                }],
+            },
+        }
+
+    def _build_dataset_external_ingress(self, volume: str) -> Dict[str, Any]:
+        """The dataset's path on the shared external host. Pure.
+
+        Path-style S3: the bucket is the first path segment, so
+        ``https://<host>/<dataset>/<key>`` routes on ``/<dataset>`` and
+        reaches the listener unrewritten — a rewrite would break every
+        signature, since SigV4 signs the path. Hence the bucket is named
+        after the dataset (dataset_bucket_name). One Ingress per dataset
+        on the same host; controllers merge them."""
+        labels = {"app": DATASET_SERVER_APP, "volume": volume}
+        spec: Dict[str, Any] = {"rules": [{
+            "host": self.dataset_external_host,
+            "http": {"paths": [{
+                "path": f"/{self.dataset_bucket_name(volume)}",
+                "pathType": "Prefix",
+                "backend": {"service": {
+                    "name": self.dataset_external_service_name(volume),
+                    "port": {"number": 80}}},
+            }]},
+        }]}
+        if self.dataset_external_ingress_class:
+            spec["ingressClassName"] = self.dataset_external_ingress_class
+        if self.dataset_external_tls_secret:
+            spec["tls"] = [{"hosts": [self.dataset_external_host],
+                            "secretName": self.dataset_external_tls_secret}]
+        return {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": self.dataset_external_service_name(volume),
+                         "labels": labels,
+                         "annotations": dict(self.dataset_external_annotations
+                                             or {})},
+            "spec": spec,
+        }
+
+    def _ensure_external_exposure(self, volume: str, exposed: bool) -> bool:
+        """Open or close the dataset's way in from outside. Opening goes
+        fence first (the controller must be admitted before the path
+        exists); closing goes path first, so there is never a route to a
+        port that has stopped admitting it — and never an open port with no
+        account behind it."""
+        net = client.NetworkingV1Api()
+        ns = self.namespace
+        policy = self._build_dataset_external_access(volume)
+        ingress = self._build_dataset_external_ingress(volume)
+        if exposed:
+            return self._ensure_object(
+                policy["metadata"]["name"], ns, policy,
+                create=net.create_namespaced_network_policy,
+                read=net.read_namespaced_network_policy,
+                replace=net.replace_namespaced_network_policy) and \
+                self._ensure_object(
+                    ingress["metadata"]["name"], ns, ingress,
+                    create=net.create_namespaced_ingress,
+                    read=net.read_namespaced_ingress,
+                    replace=net.replace_namespaced_ingress)
+        for delete, name in ((net.delete_namespaced_ingress,
+                              ingress["metadata"]["name"]),
+                             (net.delete_namespaced_network_policy,
+                              policy["metadata"]["name"])):
+            try:
+                delete(name, ns)
+                logger.info(f"Closed external access to {volume!r} ({name})")
+            except ApiException as e:
+                if e.status != 404:
+                    logger.error(f"Could not remove {name}: {e}")
+                    return False
+        return True
 
     def _build_dataset_server_manifests(self, *, volume, definition, image,
                                         claim, root_secret, keys_secret,
@@ -5819,22 +6020,35 @@ class KubeConfigManager(ConfigManager):
             "capabilities": {"drop": ["ALL"]},
         }
         # VersityGW's posix backend makes each top-level directory a bucket,
-        # and the guest mounts `<dataset>:<S3_PROXY_BUCKET>`. A bucket made by
-        # mkdir has no ACL until the operator writes one as root
+        # and the bucket is named after the dataset (dataset_bucket_name; the
+        # external listener's clients sign that name). A claim from before
+        # that has its data under `data/`, which is renamed once — xattrs,
+        # the ACL among them, travel with a rename (verified). A bucket made
+        # by mkdir has no ACL until the operator writes one as root
         # (sync_dataset_accounts) — without it CreateBucket and a non-root
         # CopyObject both fail with a 500.
+        bucket = self.dataset_bucket_name(volume)
+        external = self.dataset_external_enabled
+        seed = (f"cp /seed/users.json /iam/users.json && "
+                f"chmod 600 /iam/users.json")
+        if external:
+            seed += (" && cp /seed/users-ext.json /iam-ext/users.json && "
+                     "chmod 600 /iam-ext/users.json")
         init = {
             "name": "prepare",
             "image": image,
             "command": ["sh", "-c",
-                        f"mkdir -p /srv/{S3_PROXY_BUCKET} && "
-                        f"cp /seed/users.json /iam/users.json && "
-                        f"chmod 600 /iam/users.json"],
+                        f"if [ -d /srv/{S3_PROXY_BUCKET} ] && "
+                        f"[ ! -e /srv/{bucket} ]; then "
+                        f"mv /srv/{S3_PROXY_BUCKET} /srv/{bucket}; fi && "
+                        f"mkdir -p /srv/{bucket} && {seed}"],
             "securityContext": hardened,
             "volumeMounts": [{"name": "data", "mountPath": "/srv"},
                              {"name": "iam", "mountPath": "/iam"},
                              {"name": "seed", "mountPath": "/seed",
-                              "readOnly": True}],
+                              "readOnly": True}]
+                            + ([{"name": "iam-ext", "mountPath": "/iam-ext"}]
+                               if external else []),
         }
         root_env = [
             {"name": "ROOT_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {
@@ -5867,6 +6081,36 @@ class KubeConfigManager(ConfigManager):
                                   "readOnly": mode == "ro"},
                                  {"name": "iam", "mountPath": "/iam"}],
             })
+        if external:
+            # The external listener: its OWN account store (only ``x*``
+            # accounts), so a key copied out of a guest opens nothing here
+            # (verified: InvalidAccessKeyId). Read-only in both senses when
+            # the dataset is; otherwise the policy limits an ``xro`` account
+            # to reads.
+            read_only = bool((definition or {}).get("readOnly"))
+            args = ["--port", f":{DATASET_SERVER_EXTERNAL_PORT}",
+                    "--admin-port", f":{DATASET_SERVER_EXTERNAL_ADMIN_PORT}",
+                    "--iam-dir", "/iam", "--iam-cache-disable", "--quiet",
+                    "posix", "/srv"]
+            if read_only:
+                args.insert(0, "--readonly")
+            containers.append({
+                "name": "versitygw-ext",
+                "image": image,
+                "args": args,
+                "env": root_env,
+                "ports": [{"containerPort": DATASET_SERVER_EXTERNAL_PORT,
+                           "name": "s3-ext"},
+                          {"containerPort": DATASET_SERVER_EXTERNAL_ADMIN_PORT,
+                           "name": "admin-ext"}],
+                "securityContext": hardened,
+                "readinessProbe": {"tcpSocket": {
+                    "port": DATASET_SERVER_EXTERNAL_PORT}, "periodSeconds": 10},
+                "resources": resources or {},
+                "volumeMounts": [{"name": "data", "mountPath": "/srv",
+                                  "readOnly": read_only},
+                                 {"name": "iam-ext", "mountPath": "/iam"}],
+            })
         deployment = {
             "apiVersion": "apps/v1",
             "kind": "Deployment",
@@ -5898,13 +6142,33 @@ class KubeConfigManager(ConfigManager):
                             {"name": "seed", "secret": {
                                 "secretName": keys_secret,
                                 "items": [{"key": "users.json",
-                                           "path": "users.json"}]}},
-                        ],
+                                           "path": "users.json"}]
+                                + ([{"key": "users-ext.json",
+                                     "path": "users-ext.json"}]
+                                   if external else [])}},
+                        ] + ([{"name": "iam-ext", "emptyDir": {
+                            "medium": "Memory", "sizeLimit": "16Mi"}}]
+                             if external else []),
                     },
                 },
             },
         }
         services = []
+        if external:
+            # Cluster-internal; the Ingress is what makes it reachable, and
+            # the `-external` NetworkPolicy what lets the controller through.
+            services.append({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"name": self.dataset_external_service_name(volume),
+                             "labels": {**labels, "mode": "external"}},
+                "spec": {
+                    "type": "ClusterIP",
+                    "selector": labels,
+                    "ports": [{"name": "s3", "port": 80,
+                               "targetPort": DATASET_SERVER_EXTERNAL_PORT}],
+                },
+            })
         for mode in self.dataset_modes(definition):
             services.append({
                 "apiVersion": "v1",
@@ -6019,13 +6283,23 @@ class KubeConfigManager(ConfigManager):
         return name
 
     def dataset_account_holders(self, volume: str) -> Dict[str, Set[str]]:
-        """``{mode: usernames}`` who should hold an account on this dataset
-        — exactly the users its fencing admits, by the same rule
-        (s3_proxy_peers: the matrix, the readOnly ceiling, archived means
-        nobody), so the key and the reach can never disagree about who is
-        in."""
-        return {mode: {u for u, _zone in self.s3_proxy_peers(volume, mode)}
-                for mode in dataset_accounts.MODES}
+        """``{mode: usernames}`` who should hold an account on this dataset.
+        Internal modes are exactly the users its fencing admits, by the same
+        rule (s3_proxy_peers: the matrix, the readOnly ceiling, archived means
+        nobody), so the key and the reach can never disagree about who is in.
+        External modes (``xro``/``xrw``) come from the matrix's `external`
+        column, and only while external access is configured."""
+        holders = {mode: {u for u, _zone in self.s3_proxy_peers(volume, mode)}
+                   for mode in dataset_accounts.MODES}
+        for mode in dataset_accounts.EXTERNAL_MODES:
+            holders[mode] = set()
+        if self.dataset_external_enabled:
+            for user in self.list_all_users() or []:
+                username = user.get("name") if isinstance(user, dict) else user
+                mode = username and self.external_dataset_mode(username, volume)
+                if mode:
+                    holders[dataset_accounts.external_mode(mode)].add(username)
+        return holders
 
     def sync_dataset_keys(self, volume: str) -> Optional[Dict[str, str]]:
         """Make the keys Secret hold exactly one key per account the matrix
@@ -6048,7 +6322,14 @@ class KubeConfigManager(ConfigManager):
             self.dataset_account_holders(volume))
         keys = {a: stored.get(a) or secrets.token_urlsafe(24)
                 for a in sorted(wanted)}
-        data = {**keys, "users.json": dataset_accounts.render_users_json(keys)}
+        # The shared store holds every account (a policy may only name
+        # accounts its writer knows); the external listener's holds only the
+        # external ones, which is what makes an internal key useless outside.
+        data = {**keys,
+                "users.json": dataset_accounts.render_users_json(keys),
+                "users-ext.json": dataset_accounts.render_users_json(
+                    {a: k for a, k in keys.items()
+                     if dataset_accounts.is_external(a)})}
         if current is not None and stored == data:
             return keys
         body = {"apiVersion": "v1", "kind": "Secret",
@@ -6150,7 +6431,9 @@ class KubeConfigManager(ConfigManager):
             logger.error(f"Could not read the root key of {volume!r}: {e}")
             return False
         admin = f"http://{ip}:{DATASET_SERVER_ADMIN_PORTS['rw']}"
-        s3 = f"http://{ip}:{DATASET_SERVER_PORTS['rw']}/{S3_PROXY_BUCKET}"
+        ext_admin = f"http://{ip}:{DATASET_SERVER_EXTERNAL_ADMIN_PORT}"
+        bucket = self.dataset_bucket_name(volume)
+        s3 = f"http://{ip}:{DATASET_SERVER_PORTS['rw']}/{bucket}"
 
         def call(method, url, **kw):
             status, body = self._vgw_call(method, url, access, secret, **kw)
@@ -6159,33 +6442,46 @@ class KubeConfigManager(ConfigManager):
                               f"{body[:200]!r}")
             return body
 
-        try:
+        def reconcile_store(endpoint, wanted):
+            # Revocations first: a key that should not exist dies before
+            # anything else happens.
             live = dataset_accounts.parse_list_users(
-                call("PATCH", f"{admin}/list-users"))
+                call("PATCH", f"{endpoint}/list-users"))
             for name in sorted(live):
-                if keys.get(name) != live[name]:
-                    call("PATCH", f"{admin}/delete-user?access="
+                if wanted.get(name) != live[name]:
+                    call("PATCH", f"{endpoint}/delete-user?access="
                                   f"{urllib.parse.quote(name)}")
-                    if name not in keys:
+                    if name not in wanted:
                         logger.info(f"Revoked {name} on dataset {volume!r}")
-            for name in sorted(keys):
-                if live.get(name) != keys[name]:
-                    xml = dataset_accounts.account_xml(name, keys[name])
+            for name in sorted(wanted):
+                if live.get(name) != wanted[name]:
+                    xml = dataset_accounts.account_xml(name, wanted[name])
                     status, body = self._vgw_call(
-                        "PATCH", f"{admin}/create-user", access, secret,
+                        "PATCH", f"{endpoint}/create-user", access, secret,
                         body=xml)
                     if status == 409:
                         # Created since we listed (another process, or a
                         # pass that predates the lock): make it ours.
-                        call("PATCH", f"{admin}/delete-user?access="
+                        call("PATCH", f"{endpoint}/delete-user?access="
                                       f"{urllib.parse.quote(name)}")
-                        call("PATCH", f"{admin}/create-user", body=xml)
+                        call("PATCH", f"{endpoint}/create-user", body=xml)
                     elif status >= 300:
                         raise OSError(f"PATCH create-user -> {status}: "
                                       f"{body[:200]!r}")
                     logger.info(f"Granted {name} on dataset {volume!r}")
+
+        external = {a: k for a, k in keys.items()
+                    if dataset_accounts.is_external(a)}
+        try:
+            # The external store first, so revoking an external grant kills
+            # the key where it can be used from anywhere before anything else.
+            if self.dataset_external_enabled:
+                reconcile_store(ext_admin, external)
+            # The shared store holds every account, external ones included:
+            # the policy below may only name accounts its writer knows.
+            reconcile_store(admin, keys)
             call("PUT", f"{s3}?acl", headers={"x-amz-acl": "private"})
-            policy = dataset_accounts.build_policy(S3_PROXY_BUCKET, keys)
+            policy = dataset_accounts.build_policy(bucket, keys)
             if policy:
                 call("PUT", f"{s3}?policy",
                      body=json.dumps(policy, sort_keys=True).encode())
@@ -6194,6 +6490,57 @@ class KubeConfigManager(ConfigManager):
         except (OSError, ElementTree.ParseError) as e:
             logger.error(f"Could not sync the accounts of {volume!r}: {e}")
             return False
+        return self._ensure_external_exposure(
+            volume, self.dataset_external_enabled and bool(external))
+
+    def get_external_credentials(self, username: str,
+                                 volume: str) -> Optional[Dict[str, str]]:
+        """This user's external key on this dataset, for the portal to show
+        them, or None if they hold no external grant (or the operator has
+        not issued the key yet)."""
+        mode = self.external_dataset_mode(username, volume)
+        if not mode:
+            return None
+        access = dataset_accounts.account_name(
+            username, dataset_accounts.external_mode(mode))
+        try:
+            secret = client.CoreV1Api().read_namespaced_secret(
+                self.dataset_keys_secret_name(volume), self.namespace)
+            key = base64.b64decode((secret.data or {})[access]).decode()
+        except (ApiException, KeyError, TypeError):
+            return None
+        return {"endpoint": self.dataset_external_endpoint(),
+                "bucket": self.dataset_bucket_name(volume),
+                "mode": mode, "accessKeyId": access, "secretAccessKey": key}
+
+    def regenerate_external_key(self, username: str, volume: str) -> bool:
+        """Drop this user's external key so the operator issues a new one;
+        the old one dies at the same sync. The portal's half of
+        "regenerate": a JSON patch removing one entry from the keys Secret,
+        guarded by the version it read, then a touch on the Dataset so the
+        dataset worker syncs now rather than at its backstop."""
+        mode = self.external_dataset_mode(username, volume)
+        if not mode:
+            return False
+        access = dataset_accounts.account_name(
+            username, dataset_accounts.external_mode(mode))
+        core = client.CoreV1Api()
+        name = self.dataset_keys_secret_name(volume)
+        try:
+            current = core.read_namespaced_secret(name, self.namespace)
+            if access in (current.data or {}):
+                core.patch_namespaced_secret(name, self.namespace, [
+                    {"op": "test", "path": "/metadata/resourceVersion",
+                     "value": current.metadata.resource_version},
+                    {"op": "remove", "path": f"/data/{access}"}])
+            self.api.patch_namespaced_custom_object(
+                self.group, self.version, self.namespace, DATASET_PLURAL,
+                volume, {"metadata": {"annotations": {
+                    "whistler/keys-rotated": str(time.time())}}})
+        except ApiException as e:
+            logger.error(f"Could not regenerate {access} on {volume!r}: {e}")
+            return False
+        logger.info(f"{username} regenerated their external key on {volume!r}")
         return True
 
     def sync_all_dataset_accounts(self) -> int:
@@ -6384,6 +6731,9 @@ class KubeConfigManager(ConfigManager):
             volume = (d.metadata.labels or {}).get("volume")
             if not volume or volume in defined:
                 continue
+            # Its way in from outside closes with it: an archived dataset is
+            # skipped by the account sync, which is what normally does this.
+            self._ensure_external_exposure(volume, False)
             try:
                 apps.delete_namespaced_deployment(d.metadata.name, ns)
                 pruned.append(volume)
@@ -6469,6 +6819,12 @@ class KubeConfigManager(ConfigManager):
                    self.dataset_server_name(volume)),
                   (net.delete_namespaced_network_policy,
                    f"{self.dataset_server_name(volume)}-operator")]
+        steps += [(net.delete_namespaced_ingress,
+                   self.dataset_external_service_name(volume)),
+                  (core.delete_namespaced_service,
+                   self.dataset_external_service_name(volume)),
+                  (net.delete_namespaced_network_policy,
+                   f"{self.dataset_server_name(volume)}-external")]
         steps += [(core.delete_namespaced_secret,
                    self.dataset_root_secret_name(volume)),
                   (core.delete_namespaced_secret,

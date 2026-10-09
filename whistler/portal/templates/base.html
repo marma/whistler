@@ -23,6 +23,10 @@
        href="/homes?user={{ current_user }}">
       <i class="hdd icon"></i> Home volumes
     </a>
+    <a class="item {% if request.url.path.startswith('/datasets') %}active{% endif %}"
+       href="/datasets?user={{ current_user }}">
+      <i class="database icon"></i> Datasets
+    </a>
     <a class="item {% if request.url.path == '/dashboard' %}active{% endif %}"
        href="/dashboard?user={{ current_user }}">
       <i class="tachometer alternate icon"></i> Dashboard

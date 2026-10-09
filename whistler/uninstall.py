@@ -220,6 +220,10 @@ def delete_release_leftovers(cm) -> List[str]:
                                                 label_selector=selector).items:
         gone("NetworkPolicy", p.metadata.name,
              lambda: net.delete_namespaced_network_policy(p.metadata.name, ns))
+    # Their external paths (config._ensure_external_exposure).
+    for i in net.list_namespaced_ingress(ns, label_selector=selector).items:
+        gone("Ingress", i.metadata.name,
+             lambda: net.delete_namespaced_ingress(i.metadata.name, ns))
 
     # Secrets: by label where Whistler labels them, by name where it names
     # them (the CA and host key names come from the chart).

@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% block title %}Datasets — Whistler{% endblock %}
+{% block content %}
+
+<h2 class="ui header"><i class="database icon"></i> Datasets</h2>
+
+<p class="ui grey text">
+  Shared data an administrator has granted you. Inside Whistler a dataset is
+  mounted at <code>/shared/&lt;name&gt;</code> in the VM instances that choose
+  it (on the instance's form, or for one run in the start dialog). It is
+  S3, not a filesystem: no file locking, no atomic rename, and the last writer
+  wins.
+</p>
+
+<h3 class="ui header">In your instances</h3>
+{% if choices %}
+<table class="ui celled table">
+  <thead><tr><th>Name</th><th>Description</th><th>Granted in</th></tr></thead>
+  <tbody>
+    {% for d in choices %}
+    <tr>
+      <td style="white-space:nowrap"><strong>{{ d.name }}</strong></td>
+      <td>{{ d.description or "—" }}</td>
+      <td style="white-space:nowrap">
+        {% for z, mode in d.zones.items() %}
+          <div class="ui tiny label">
+            {% if mode == 'ro' %}<i class="eye icon"></i>{% else %}<i class="pencil alternate icon"></i>{% endif %}
+            {{ z }}
+          </div>
+        {% endfor %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="ui grey text">You have not been granted any dataset to mount.</p>
+{% endif %}
+
+{% if external_enabled %}
+<h3 class="ui header">From outside Whistler</h3>
+{% if external %}
+<div class="ui small warning message">
+  <i class="exclamation triangle icon"></i>
+  These keys work from anywhere: your laptop, a script, another cluster.
+  Treat them like a password. If one leaks, regenerate it — the old key stops
+  working within seconds.
+</div>
+
+{% for d in external %}
+{% set c = d.credentials %}
+<div class="ui segment">
+  <h4 class="ui header" style="margin-bottom:0.6em">
+    {{ d.name }}
+    {% if d.mode == 'ro' %}
+      <div class="ui tiny green label"><i class="eye icon"></i> read-only</div>
+    {% else %}
+      <div class="ui tiny yellow label"><i class="pencil alternate icon"></i> read-write</div>
+    {% endif %}
+    {% if d.description %}<div class="sub header">{{ d.description }}</div>{% endif %}
+  </h4>
+  {% if c %}
+  <table class="ui very basic compact table" style="margin-top:0">
+    <tbody>
+      <tr><td class="collapsing">Endpoint</td><td><code>{{ c.endpoint }}</code></td></tr>
+      <tr><td class="collapsing">Bucket</td><td><code>{{ c.bucket }}</code> (path-style addressing)</td></tr>
+      {# Not a place: every S3 signature names a region and the server only
+         accepts this one (another is AuthorizationHeaderMalformed), while
+         the AWS CLI and boto refuse to run without one. #}
+      <tr>
+        <td class="collapsing">Region</td>
+        <td><code>us-east-1</code>
+          <span class="ui grey text">— a required placeholder: your client must
+          sign with exactly this, though it means nothing here</span></td>
+      </tr>
+      <tr><td class="collapsing">Access key</td><td><code>{{ c.accessKeyId }}</code></td></tr>
+      <tr>
+        <td class="collapsing">Secret key</td>
+        <td>
+          <code class="secret-key" data-secret="{{ c.secretAccessKey }}">••••••••••••••••</code>
+          <button type="button" class="ui mini basic button reveal-secret">Show</button>
+          <button type="button" class="ui mini basic button copy-secret">Copy</button>
+        </td>
+      </tr>
+    </tbody>
+  </table>
+  <details>
+    <summary class="ui grey text" style="cursor:pointer">Client configuration</summary>
+    <div class="ui form" style="margin-top:0.8em">
+      <div class="field">
+        <label>rclone (<code>~/.config/rclone/rclone.conf</code>)</label>
+        <textarea rows="7" readonly class="needs-secret" data-template="[{{ d.name }}]
+type = s3
+provider = Other
+endpoint = {{ c.endpoint }}
+access_key_id = {{ c.accessKeyId }}
+secret_access_key = @SECRET@
+force_path_style = true
+no_check_bucket = true"></textarea>
+        <div class="ui pointing label">Then <code>rclone ls {{ d.name }}:{{ c.bucket }}</code>.</div>
+      </div>
+      <div class="field">
+        <label>AWS CLI</label>
+        <textarea rows="3" readonly class="needs-secret" data-template="AWS_ACCESS_KEY_ID={{ c.accessKeyId }} AWS_SECRET_ACCESS_KEY=@SECRET@ \
+  aws --endpoint-url {{ c.endpoint }} --region us-east-1 \
+  s3 ls s3://{{ c.bucket }}/"></textarea>
+      </div>
+    </div>
+  </details>
+  {% else %}
+  <p class="ui grey text"><i class="spinner loading icon"></i>
+    Your key is being issued; reload in a moment.</p>
+  {% endif %}
+  <form method="post" action="/datasets/{{ d.name }}/regenerate?user={{ current_user }}"
+        style="margin-top:0.8em"
+        onsubmit="return confirm('Regenerate your key for {{ d.name }}? The current key stops working within seconds, everywhere it is used.')">
+    <button class="ui small button"><i class="sync icon"></i> Regenerate key</button>
+  </form>
+</div>
+{% endfor %}
+
+<script>
+  // The secret is in the page (it is the user's own, and the page is never
+  // cached), but not on screen until asked for.
+  document.querySelectorAll(".reveal-secret").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      const code = btn.parentElement.querySelector(".secret-key");
+      const shown = btn.textContent === "Hide";
+      code.textContent = shown ? "••••••••••••••••" : code.dataset.secret;
+      btn.textContent = shown ? "Show" : "Hide";
+    });
+  });
+  document.querySelectorAll(".copy-secret").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      const secret = btn.parentElement.querySelector(".secret-key").dataset.secret;
+      navigator.clipboard.writeText(secret).then(function () {
+        btn.textContent = "Copied";
+        setTimeout(function () { btn.textContent = "Copy"; }, 1500);
+      });
+    });
+  });
+  document.querySelectorAll("textarea.needs-secret").forEach(function (ta) {
+    const secret = ta.closest(".segment").querySelector(".secret-key").dataset.secret;
+    ta.value = ta.dataset.template.replace("@SECRET@", secret);
+  });
+</script>
+{% else %}
+<p class="ui grey text">You have no access to any dataset from outside Whistler.
+  An administrator grants that per dataset.</p>
+{% endif %}
+{% endif %}
+
+{% endblock %}

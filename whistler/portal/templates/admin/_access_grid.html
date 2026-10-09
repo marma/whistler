@@ -1,7 +1,9 @@
 {#
   The access grid, shared by the User and Group editors.
 
-  Expects: sections (from _sections_with_values), zones, and `show_group_mark`
+  Expects: sections (from _sections_with_values), grid_zones (the zones plus
+  the reserved `external` column; falls back to zones), external_enabled, and
+  `show_group_mark`
   — true on the user grid, where a cell may be granted by a group and the
   control still edits the user's OWN value. On the group grid there is no
   second source, so the marker would be meaningless.
@@ -10,18 +12,27 @@
   zone columns trim to their heading instead of stretching. The value lives in
   a hidden input, so an untouched cell posts what it was rendered with.
 #}
+{% set gz = grid_zones if grid_zones is defined else zones %}
 <table class="ui celled compact table access-matrix">
   <thead>
     <tr>
       <th class="collapsing">Volume</th>
       <th class="access-buffer"></th>
-      {% for z in zones %}<th class="access-zone">{{ z }}</th>{% endfor %}
+      {% for z in gz %}
+      {% if z == 'external' %}
+      <th class="access-zone"
+          title="Reachable from OUTSIDE the cluster with a key the user gets on their Datasets page. Not fenced by any zone: a grant here lets that data leave.">
+        <i class="globe icon"></i>external
+        {% if not external_enabled %}<div class="ui tiny grey label">not configured</div>{% endif %}
+      </th>
+      {% else %}<th class="access-zone">{{ z }}</th>{% endif %}
+      {% endfor %}
     </tr>
   </thead>
   <tbody>
     {% for section in sections %}
     <tr class="access-section">
-      <td colspan="{{ zones|length + 2 }}">
+      <td colspan="{{ gz|length + 2 }}">
         <strong>{{ section.title }}</strong>
         {% if not section.enforced %}
           <div class="ui tiny orange basic label">not enforced yet</div>
@@ -38,7 +49,12 @@
         {% endif %}
       </td>
       <td class="access-buffer"></td>
-      {% for z in zones %}
+      {% for z in gz %}
+      {% if z == 'external' and not row.external_ok %}
+      {# Homes and S3 datasets have no external listener: nothing to grant,
+         and no input, so nothing is saved. #}
+      <td class="access-zone"></td>
+      {% else %}
       <td class="access-zone">
         <input type="hidden" name="access__{{ z }}__{{ row.key }}"
                value="{{ row.own[z] or '' }}">
@@ -51,11 +67,12 @@
              title="Granted by a group ({{ row.effective[z] }}). Edit that on the group."></i>
         {% endif %}
       </td>
+      {% endif %}
       {% endfor %}
     </tr>
     {% else %}
     <tr>
-      <td colspan="{{ zones|length + 2 }}">
+      <td colspan="{{ gz|length + 2 }}">
         <span class="ui grey text">None defined.</span>
       </td>
     </tr>
