@@ -29,6 +29,7 @@ deploy:
           - charts/whistler/values-dev-vm.yaml
         setValues:
           whistler.auth.allowAny: false
+          whistler.datasetServer.external.host: s3.whistler.martinmalmsten.net
           # k3d/docker-desktop have no "kata" RuntimeClass, so coercing
           # privileged templates to kata would leave pods unschedulable.
           whistler.security.forceKataForPrivileged: false
