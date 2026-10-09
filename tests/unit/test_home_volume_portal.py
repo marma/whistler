@@ -91,6 +91,31 @@ def test_picker_preselects_the_instances_current_volume():
     assert "selected" in picked
 
 
+@pytest.mark.parametrize("tpl", [
+    {"name": "desk", "fullName": "desk", "mode": "desktop"},
+    {"name": "box", "fullName": "box", "mode": "ssh"},
+])
+def test_create_records_the_chosen_home_volume(make_config, tpl):
+    # Desktop templates create through add_desktop_session, which used to take
+    # no home volume at all: the picker's choice was silently dropped and the
+    # session got a fresh home named after itself.
+    import asyncio
+
+    key = "desktop_templates" if tpl["mode"] == "desktop" else "templates"
+    cm = make_config(users={"alice": {"name": "alice"}}, **{key: {"alice": [tpl]}})
+
+    async def _run(func, *args):
+        return func(*args)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(run=_run)))
+
+    asyncio.run(mgmt.instance_create(
+        request=request, cm=cm, user="alice", template_name=tpl["name"],
+        instance_name="mine", home_volume=" research "))
+    created = (cm.get_user_desktop_sessions("alice") if tpl["mode"] == "desktop"
+               else cm._instances["alice"])
+    assert created[-1]["homeVolume"] == "research"
+
+
 @pytest.mark.parametrize("bad", ["Has-Caps", "under_score", "-leading", ""])
 def test_bad_volume_names_are_refused(bad):
     import asyncio

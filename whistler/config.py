@@ -867,7 +867,9 @@ class ConfigManager(ABC):
 
     @abstractmethod
     def add_desktop_session(self, username: str, template_name: str, session_name: str,
-                            overrides: Optional[Dict[str, Any]] = None) -> bool:
+                            overrides: Optional[Dict[str, Any]] = None,
+                            ephemeral: bool = False,
+                            home_volume: Optional[str] = None) -> bool:
         pass
 
     @abstractmethod
@@ -7057,12 +7059,16 @@ class KubeConfigManager(ConfigManager):
 
     def add_desktop_session(self, username: str, template_name: str, session_name: str,
                             overrides: Optional[Dict[str, Any]] = None,
-                            ephemeral: bool = False) -> bool:
+                            ephemeral: bool = False,
+                            home_volume: Optional[str] = None) -> bool:
         user_ns = self._ensure_user_namespace(username)
         spec = {
             "templateRef": template_name,
             "user": username,
         }
+        # Same rule as add_instance: absent means a home named after the session.
+        if home_volume:
+            spec["homeVolume"] = home_volume
         if overrides:
             spec["overrides"] = overrides
         metadata = {

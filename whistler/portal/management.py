@@ -616,9 +616,11 @@ async def instance_create(
         datasets=await _chosen_datasets(request, cm, user, datasets),
     )
 
+    home = (home_volume or "").strip() or None
     if mode == "desktop":
         ok = await request.app.state.run(
             cm.add_desktop_session, user, template_name, name, overrides,
+            False, home,
         )
         if not ok:
             raise HTTPException(status_code=500, detail="Failed to create desktop session.")
@@ -626,7 +628,7 @@ async def instance_create(
 
     ok = await request.app.state.run(
         cm.add_instance, user, template_name, name, preemptible == "on",
-        overrides, False, (home_volume or "").strip() or None,
+        overrides, False, home,
     )
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to create instance.")

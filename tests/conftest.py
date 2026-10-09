@@ -182,7 +182,7 @@ class FakeConfigManager(ConfigManager):
         return list(self._desktop_sessions.get(username, []))
 
     def add_desktop_session(self, username, template_name, session_name, overrides=None,
-                            ephemeral=False):
+                            ephemeral=False, home_volume=None):
         self._desktop_sessions.setdefault(username, []).append({
             "name": session_name,
             "template": template_name,
@@ -192,6 +192,7 @@ class FakeConfigManager(ConfigManager):
             "podName": None,
             "overrides": overrides,
             "ephemeral": ephemeral,
+            "homeVolume": home_volume,
         })
         self.created.append((username, template_name, session_name, ephemeral))
         return True
