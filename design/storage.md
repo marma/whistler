@@ -700,6 +700,9 @@ Per-user keys are the answer to that.
 
 ## Still open
 
+- **Securing external access** — TLS on the external host, running behind a
+  TLS-terminating proxy or tunnel, and why "Only these addresses" does not
+  survive one: [external_s3.md](external_s3.md).
 - **Ceph/Rook** is the target state and the only path to shared POSIX
   filesystems. It is now also the only path to shared volumes on VMs at all,
   since block storage was refused — worth stating in the case for it.
