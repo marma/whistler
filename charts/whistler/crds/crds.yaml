@@ -449,12 +449,24 @@ spec:
                   type: array
                   items:
                     type: string
+                role:
+                  type: string
+                  enum: [basic, standard, manager, admin]
+                  description: >-
+                    What the account may do in the portal. basic: start, stop
+                    and connect to its existing instances. standard: also
+                    create, edit and delete its own instances and home
+                    volumes. manager: also create and edit instances for other
+                    users and edit the access grants of standard and basic
+                    accounts. admin: everything. Absent reads the legacy
+                    `admin` field (true = admin, else standard). Only an admin
+                    can set this.
                 admin:
                   type: boolean
                   default: false
                   description: >-
-                    Grants portal admin rights (template/user/session management
-                    across all users). Only an existing admin can set this.
+                    Legacy; superseded by `role`, and read only when `role` is
+                    absent. The portal keeps it equal to (role == admin).
                 disabled:
                   type: boolean
                   description: >-

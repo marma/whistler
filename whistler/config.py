@@ -573,6 +573,83 @@ ENTRY_POINTS = (ENTRY_KIOSK, ENTRY_PORTAL, ENTRY_GATEWAY)
 NEW_USER_ENTRY_POINTS = list(ENTRY_POINTS)
 NEW_USER_ZONES = [DEFAULT_ZONE]
 
+# --------------------------------------------------------------------------- #
+# Roles: what an account may *do*, as opposed to what it may reach            #
+# --------------------------------------------------------------------------- #
+#
+# The grants above (zones, GPU types, the access matrix, channels, entry
+# points) say what a session may touch. A role says which of the portal's
+# *configuration* acts the person may perform: making and editing instances,
+# managing home volumes, editing other people's access, and the admin catalog.
+# `User.spec.role`, own CR only — like `disabled`, a role is a statement about
+# one person, so no group confers one.
+#
+#   basic     start, stop and connect to the instances they have — the kiosk's
+#             reach, through the portal. Someone else makes their instances.
+#   standard  + create, edit and delete their own instances and home volumes.
+#   manager   + make and edit instances for other people, and edit the access
+#             grants of standard and basic accounts. Nothing destructive in the
+#             catalog (templates, zones, datasets, groups, backups, accounts).
+#   admin     everything.
+#
+# A CR with no `role` reads its legacy `admin` boolean: true → admin, else
+# standard, which is exactly what such an account could do before roles.
+ROLE_BASIC = "basic"
+ROLE_STANDARD = "standard"
+ROLE_MANAGER = "manager"
+ROLE_ADMIN = "admin"
+#: Ascending. The order is what "below manager" means in may_manage_user.
+ROLES = (ROLE_BASIC, ROLE_STANDARD, ROLE_MANAGER, ROLE_ADMIN)
+NEW_USER_ROLE = ROLE_STANDARD
+
+PERM_OWN_INSTANCES = "instances:own"        # create/edit/delete own instances
+PERM_OWN_HOMES = "homes:own"                # create/delete own home volumes
+PERM_CLUSTER_VIEW = "cluster:view"          # the capacity dashboard
+PERM_OTHERS_INSTANCES = "instances:others"  # same, on someone else's behalf
+PERM_USER_ACCESS = "users:access"           # edit another account's grants
+PERM_ADMIN = "admin"                        # the catalog, accounts, backups
+
+#: The one table. Moving a capability between roles is a one-line change here;
+#: every route asks role_may, never compares role names itself.
+_STANDARD_PERMS = frozenset({PERM_OWN_INSTANCES, PERM_OWN_HOMES,
+                             PERM_CLUSTER_VIEW})
+_MANAGER_PERMS = _STANDARD_PERMS | {PERM_OTHERS_INSTANCES, PERM_USER_ACCESS}
+ROLE_PERMISSIONS = {
+    ROLE_BASIC: frozenset(),
+    ROLE_STANDARD: _STANDARD_PERMS,
+    ROLE_MANAGER: _MANAGER_PERMS,
+    ROLE_ADMIN: _MANAGER_PERMS | {PERM_ADMIN},
+}
+
+
+def user_role(spec: Optional[Dict[str, Any]]) -> str:
+    """The role a User spec holds. An unknown value (the CRD enum should make
+    that impossible) reads as basic: fail closed, never up."""
+    spec = spec or {}
+    role = spec.get("role")
+    if role:
+        return role if role in ROLES else ROLE_BASIC
+    return ROLE_ADMIN if spec.get("admin") else ROLE_STANDARD
+
+
+def role_may(role: str, perm: str) -> bool:
+    return perm in ROLE_PERMISSIONS.get(role, frozenset())
+
+
+def may_manage_user(actor_role: str, target_role: str) -> bool:
+    """Whether someone in `actor_role` may edit an account in `target_role`.
+
+    An admin may edit anyone. A manager may edit only accounts *below*
+    manager — not another manager, not an admin, and not themselves, since
+    "change access" on one's own account is granting oneself anything."""
+    if role_may(actor_role, PERM_ADMIN):
+        return True
+    if not role_may(actor_role, PERM_USER_ACCESS):
+        return False
+    rank = ROLES.index
+    return (target_role in ROLES
+            and rank(target_role) < rank(ROLE_MANAGER))
+
 # How a zone's legacy `ssh` posture reads as a channel set, so zones written
 # before Zone.spec.channels keep their exact meaning.
 _POSTURE_CHANNELS = {
@@ -1115,6 +1192,16 @@ class ConfigManager(ABC):
         CR can say it — a group cannot disable its members, and nothing a
         group grants re-enables one."""
         return bool((self.get_user(username) or {}).get("disabled"))
+
+    def get_user_role(self, username: str) -> str:
+        """The user's role (see ROLES). Concrete on the ABC for the same reason
+        as may_enter: every surface asks it, and they must not disagree. A
+        spec with no ``role`` falls back to is_user_admin, which is how a
+        legacy ``admin: true`` account stays an admin."""
+        spec = self.get_user(username) or {}
+        if spec.get("role"):
+            return user_role(spec)
+        return ROLE_ADMIN if self.is_user_admin(username) else ROLE_STANDARD
 
     def is_user_otp_required(self, username: str) -> bool:
         """Whether the kiosk asks this user for a TOTP code. Everyone, unless
@@ -8158,7 +8245,7 @@ class KubeConfigManager(ConfigManager):
 
     def is_user_admin(self, username: str) -> bool:
         self._load_users()
-        return bool(self.users.get(username, {}).get("admin", False))
+        return user_role(self.users.get(username)) == ROLE_ADMIN
 
     def _has_any_access_cell(self, username: str, volume: str) -> bool:
         """Whether the user's OWN matrix mentions this volume in any zone.
@@ -8319,6 +8406,9 @@ class KubeConfigManager(ConfigManager):
                 "kind": "User",
                 "metadata": {"name": name, "namespace": self.namespace},
                 "spec": {"publicKeys": data.get("publicKeys") or [],
+                         "role": ROLE_ADMIN,
+                         # Mirrored so a CRD that predates `role` (pruned
+                         # silently) still reads this account as an admin.
                          "admin": True,
                          "entryPoints": list(NEW_USER_ENTRY_POINTS),
                          "allowedZones": list(NEW_USER_ZONES)},

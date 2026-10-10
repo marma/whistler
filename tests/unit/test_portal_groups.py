@@ -104,6 +104,7 @@ def _request(cm, form=None):
         app=SimpleNamespace(state=SimpleNamespace(cm=cm, run=run)),
         form=lambda: _AwaitableForm(form or _Form()),
         url=SimpleNamespace(path="/admin/groups"),
+        state=SimpleNamespace(role="admin"),
     )
 
 

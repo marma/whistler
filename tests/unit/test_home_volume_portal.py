@@ -106,7 +106,8 @@ def test_create_records_the_chosen_home_volume(make_config, tpl):
 
     async def _run(func, *args):
         return func(*args)
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(run=_run)))
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(run=_run)),
+                              state=SimpleNamespace(role="standard"))
 
     asyncio.run(mgmt.instance_create(
         request=request, cm=cm, user="alice", template_name=tpl["name"],
@@ -121,7 +122,8 @@ def test_bad_volume_names_are_refused(bad):
     import asyncio
     with pytest.raises(HTTPException) as exc:
         asyncio.run(mgmt.home_volume_create(
-            request=None, cm=None, user="alice", name=bad, zone="open"))
+            request=SimpleNamespace(state=SimpleNamespace(role="standard")),
+            cm=None, user="alice", name=bad, zone="open"))
     assert exc.value.status_code == 400
 
 
@@ -141,7 +143,7 @@ def test_a_zone_the_user_cannot_enter_is_refused():
     cm = FakeConfigManager(users={"alice": {"name": "alice",
                                             "allowedZones": ["open"]}},
                            zones={"open": {}, "restricted": {}})
-    request = SimpleNamespace(app=_App)
+    request = SimpleNamespace(app=_App, state=SimpleNamespace(role="standard"))
     with pytest.raises(HTTPException) as exc:
         asyncio.run(mgmt.home_volume_create(
             request=request, cm=cm, user="alice", name="sneaky",

@@ -131,6 +131,8 @@ class FakeBackups:
 
 def _app(backups, admins=("root",)):
     cm = SimpleNamespace(is_user_admin=lambda u: u in admins,
+                         get_user_role=lambda u: ("admin" if u in admins
+                                                  else "standard"),
                          may_enter=lambda u, e: True)
 
     async def run(fn, *args):

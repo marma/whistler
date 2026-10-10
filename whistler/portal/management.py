@@ -47,8 +47,13 @@ from whistler.config import (ACCESS_MODES, CHANNELS, ConfigWriteError,
                              ENFORCED_CHANNELS, GPU_NONE,
                              ENTRY_KIOSK, ENTRY_POINTS, ENTRY_PORTAL,
                              GPU_NODE_LABEL, NEW_USER_ENTRY_POINTS,
-                             NEW_USER_ZONES, OVERRIDE_GROUPS, VIEWERS,
-                             normalize_source_ranges)
+                             NEW_USER_ROLE, NEW_USER_ZONES, OVERRIDE_GROUPS,
+                             PERM_ADMIN, PERM_CLUSTER_VIEW,
+                             PERM_OTHERS_INSTANCES, PERM_OWN_HOMES,
+                             PERM_OWN_INSTANCES, PERM_USER_ACCESS,
+                             ROLE_ADMIN, ROLES, VIEWERS, may_manage_user,
+                             user_role,
+                             normalize_source_ranges, role_may)
 from whistler.portal.login import (USER_COOKIE, dev_auth, render_login,
                                    render_notice, verify_credentials)
 from whistler.status import GROUP_COLORS, status_group
@@ -72,6 +77,18 @@ templates.env.globals["GPU_NODE_LABEL"] = GPU_NODE_LABEL
 # per-route context value because three templates need it and a picker that
 # omitted it would silently lose the option.
 templates.env.globals["GPU_NONE"] = GPU_NONE
+
+
+def _can(request, perm: str) -> bool:
+    """`can(request, "...")` in a template: what the signed-in person's role
+    allows (config.ROLE_PERMISSIONS), resolved once in require_user. Only
+    decides what is *shown*; every route checks for itself."""
+    state = getattr(request, "state", None)
+    return role_may(getattr(state, "role", None), perm)
+
+
+templates.env.globals["can"] = _can
+templates.env.globals["ROLES"] = ROLES
 
 _ADMIN_USERS: set[str] = set(
     u.strip() for u in os.environ.get("WHISTLER_ADMIN_USERS", "").split(",") if u.strip()
@@ -150,20 +167,45 @@ def require_user(request: Request):
         if request.app.state.cm.is_user_disabled(user):
             raise AccountDisabled()
         raise EntryPointDenied()
+    # Resolved once per request so templates (can()) and _need() agree.
+    request.state.role = _role(request, user)
     return user
 
 
-def _is_admin(request: Request, user: str) -> bool:
+def _role(request: Request, user: str) -> str:
+    """The user's role; the WHISTLER_ADMIN_USERS / ALLOW_ADMIN overrides make
+    an admin whatever the CR says."""
     if _ALLOW_ADMIN or user in _ADMIN_USERS:
-        return True
-    return bool(request.app.state.cm.is_user_admin(user))
+        return ROLE_ADMIN
+    return request.app.state.cm.get_user_role(user)
+
+
+def _is_admin(request: Request, user: str) -> bool:
+    return role_may(_role(request, user), PERM_ADMIN)
+
+
+def _need(request: Request, perm: str) -> None:
+    """Refuse the request unless the signed-in role holds `perm`. Call after
+    require_user, which put the role on the request."""
+    if not role_may(getattr(request.state, "role", None), perm):
+        raise HTTPException(status_code=403,
+                            detail="Your role does not allow this.")
 
 
 def require_admin(request: Request):
     user = require_user(request)
-    if not _is_admin(request, user):
-        raise HTTPException(status_code=403, detail="Admin access required.")
+    _need(request, PERM_ADMIN)
     return user
+
+
+def _requires(perm: str):
+    """A dependency: the signed-in user, refused unless their role holds
+    `perm`. `Annotated[str, Depends(_requires(PERM_X))]`."""
+    def dep(request: Request) -> str:
+        user = require_user(request)
+        _need(request, perm)
+        return user
+    return dep
 
 
 # --------------------------------------------------------------------------- #
@@ -177,10 +219,54 @@ def _cm_dep(request: Request):
 CM   = Annotated[object, Depends(_cm_dep)]
 User = Annotated[str, Depends(require_user)]
 Admin = Annotated[str, Depends(require_admin)]
+#: A manager or admin: may edit other accounts' access (subject to
+#: _need_manageable on the target) and see everyone's sessions.
+AccessManager = Annotated[str, Depends(_requires(PERM_USER_ACCESS))]
+SessionManager = Annotated[str, Depends(_requires(PERM_OTHERS_INSTANCES))]
 
 
 def _is_admin_dep(request: Request, user: User) -> bool:
-    return _is_admin(request, user)
+    return role_may(request.state.role, PERM_ADMIN)
+
+
+async def _need_manageable(request: Request, username: str) -> None:
+    """Refuse unless the signed-in person may edit `username`'s account:
+    an admin anyone, a manager only accounts below manager (and so never
+    their own). 404 for a user that does not exist."""
+    cm = request.app.state.cm
+    if not await request.app.state.run(cm.user_exists, username):
+        raise HTTPException(status_code=404, detail="User not found.")
+    target = await request.app.state.run(_role, request, username)
+    if not may_manage_user(request.state.role, target):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your role cannot manage {username}'s account.")
+
+
+async def _resolve_owner(request: Request, user: str,
+                         owner: Optional[str]) -> str:
+    """Whose instance a create/edit/delete acts on. Absent (or naming the
+    signed-in user) is their own, which needs PERM_OWN_INSTANCES; anyone
+    else's needs PERM_OTHERS_INSTANCES *and* an account the actor may manage.
+
+    The instance is the owner's in every respect that matters: it is built
+    in their namespace and checked against their grants at reconcile, which
+    is why the forms are filled from the owner's catalog, not the actor's."""
+    owner = (owner or "").strip()
+    if not owner or owner == user:
+        _need(request, PERM_OWN_INSTANCES)
+        return user
+    _need(request, PERM_OTHERS_INSTANCES)
+    await _need_manageable(request, owner)
+    return owner
+
+
+def _owner_redirect(owner: str, user: str, own_url: str) -> RedirectResponse:
+    """Back to where an on-behalf action started (the owner's account page),
+    or to the user's own page for their own instance."""
+    if owner != user:
+        return _tr(f"/admin/users/{owner}", user)
+    return _tr(own_url, user)
 
 
 IsAdmin = Annotated[bool, Depends(_is_admin_dep)]
@@ -548,11 +634,15 @@ async def instance_template_picker(request: Request, cm: CM, user: User,
                                    is_admin: IsAdmin):
     """The template catalog, as a modal fragment. It left the dashboard when
     "New Instance" grew a picker — the list of machines you have should not be
-    sitting on top of the list of machines you could make."""
+    sitting on top of the list of machines you could make. `?owner=` is the
+    on-behalf picker: the owner's catalog, not the actor's."""
+    owner = await _resolve_owner(request, user,
+                                 request.query_params.get("owner"))
     return templates.TemplateResponse(
         request=request, name="user/_template_picker.html",
         context=_ctx(user, is_admin=is_admin,
-                     tpls=await _user_templates(request, cm, user)),
+                     owner=owner if owner != user else None,
+                     tpls=await _user_templates(request, cm, owner)),
     )
 
 
@@ -561,10 +651,12 @@ async def instance_template_picker(request: Request, cm: CM, user: User,
 # --------------------------------------------------------------------------- #
 
 async def instance_create_form(request: Request, cm: CM, user: User, is_admin: IsAdmin):
+    owner = await _resolve_owner(request, user,
+                                 request.query_params.get("owner"))
     tpls, form_ctx, home_volumes_ = await asyncio.gather(
-        _user_templates(request, cm, user),
-        _override_form_context(request, cm, user),
-        request.app.state.run(cm.get_home_volumes, user),
+        _user_templates(request, cm, owner),
+        _override_form_context(request, cm, owner),
+        request.app.state.run(cm.get_home_volumes, owner),
     )
     # Normally the picker sent us here with a template already chosen, so the
     # form shows what was picked. An unresolvable (or absent) ?template= falls
@@ -577,6 +669,7 @@ async def instance_create_form(request: Request, cm: CM, user: User, is_admin: I
     return templates.TemplateResponse(
         request=request, name="user/create_instance.html",
         context=_ctx(user, is_admin=is_admin, tpls=tpls,
+                     owner=owner if owner != user else None,
                      selected_template=wanted, selected_tpl=selected_tpl,
                      home_volumes=home_volumes_, current_home_volume=None,
                      **form_ctx),
@@ -600,11 +693,13 @@ async def instance_create(
     override_fs_group:     Annotated[Optional[str], Form()] = None,
     override_zone:         Annotated[Optional[str], Form()] = None,
     datasets:              Annotated[Optional[List[str]], Form()] = None,
+    owner:                 Annotated[Optional[str], Form()] = None,
 ):
+    owner = await _resolve_owner(request, user, owner)
     name = instance_name.strip()
     # The template carries the access mode; create the matching Session. Desktop
     # sessions are connected from the desktop portal, ssh ones via the SSH bridge.
-    tpls = await _user_templates(request, cm, user)
+    tpls = await _user_templates(request, cm, owner)
     tpl = next((t for t in tpls
                 if t.get("fullName") == template_name or t.get("name") == template_name), None)
     mode = (tpl or {}).get("mode", "ssh")
@@ -615,37 +710,43 @@ async def instance_create(
         uid=override_uid, gid=override_gid,
         run_as_user=override_run_as_user, run_as_group=override_run_as_group,
         fs_group=override_fs_group, zone=override_zone,
-        datasets=await _chosen_datasets(request, cm, user, datasets),
+        datasets=await _chosen_datasets(request, cm, owner, datasets),
     )
 
     home = (home_volume or "").strip() or None
     if mode == "desktop":
         ok = await request.app.state.run(
-            cm.add_desktop_session, user, template_name, name, overrides,
+            cm.add_desktop_session, owner, template_name, name, overrides,
             False, home,
         )
         if not ok:
             raise HTTPException(status_code=500, detail="Failed to create desktop session.")
-        return _tr("/", user)
+        if owner != user:
+            logger.info(f"{user} created instance {owner}/{name}")
+        return _owner_redirect(owner, user, "/")
 
     ok = await request.app.state.run(
-        cm.add_instance, user, template_name, name, preemptible == "on",
+        cm.add_instance, owner, template_name, name, preemptible == "on",
         overrides, False, home,
     )
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to create instance.")
-    return _tr(f"/instances/{name}", user)
+    if owner != user:
+        logger.info(f"{user} created instance {owner}/{name}")
+    return _owner_redirect(owner, user, f"/instances/{name}")
 
 
 async def instance_edit_form(request: Request, cm: CM, user: User, is_admin: IsAdmin, name: str):
+    owner = await _resolve_owner(request, user,
+                                 request.query_params.get("owner"))
     (instances, desktop_sessions, tpls, form_ctx, cur, home_volumes_) = \
         await asyncio.gather(
-            request.app.state.run(cm.get_user_instances, user),
-            request.app.state.run(cm.get_user_desktop_sessions, user),
-            _user_templates(request, cm, user),
-            _override_form_context(request, cm, user),
-            request.app.state.run(cm.get_instance_config, user, name),
-            request.app.state.run(cm.get_home_volumes, user),
+            request.app.state.run(cm.get_user_instances, owner),
+            request.app.state.run(cm.get_user_desktop_sessions, owner),
+            _user_templates(request, cm, owner),
+            _override_form_context(request, cm, owner),
+            request.app.state.run(cm.get_instance_config, owner, name),
+            request.app.state.run(cm.get_home_volumes, owner),
         )
     # ssh instances and desktop/VM sessions are both Session CRs with an editable
     # spec.overrides — resolve either (desktop phase normalises to "status").
@@ -665,6 +766,7 @@ async def instance_edit_form(request: Request, cm: CM, user: User, is_admin: IsA
     return templates.TemplateResponse(
         request=request, name="user/edit_instance.html",
         context=_ctx(user, is_admin=is_admin, inst=inst, cur=cur, tpls=tpls,
+                     owner=owner if owner != user else None,
                      home_volumes=home_volumes_,
                      current_home_volume=cur.get("homeVolume"), **form_ctx),
     )
@@ -685,22 +787,26 @@ async def instance_update(
     override_fs_group:     Annotated[Optional[str], Form()] = None,
     override_zone:         Annotated[Optional[str], Form()] = None,
     datasets:              Annotated[Optional[List[str]], Form()] = None,
+    owner:                 Annotated[Optional[str], Form()] = None,
 ):
+    owner = await _resolve_owner(request, user, owner)
     overrides = _build_session_overrides(
         cpu=override_cpu, memory=override_memory,
         gpu_type=override_gpu_type, gpu_count=override_gpu_count,
         uid=override_uid, gid=override_gid,
         run_as_user=override_run_as_user, run_as_group=override_run_as_group,
         fs_group=override_fs_group, zone=override_zone,
-        datasets=await _chosen_datasets(request, cm, user, datasets),
+        datasets=await _chosen_datasets(request, cm, owner, datasets),
     )
     ok = await request.app.state.run(
-        cm.update_instance, user, name, preemptible == "on", overrides,
+        cm.update_instance, owner, name, preemptible == "on", overrides,
         (home_volume or "").strip() or None,
     )
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to update instance.")
-    return _tr(f"/instances/{name}", user)
+    if owner != user:
+        logger.info(f"{user} edited instance {owner}/{name}")
+    return _owner_redirect(owner, user, f"/instances/{name}")
 
 
 async def instance_detail(request: Request, cm: CM, user: User, is_admin: IsAdmin, name: str):
@@ -719,8 +825,8 @@ async def instance_detail(request: Request, cm: CM, user: User, is_admin: IsAdmi
     if not inst:
         raise HTTPException(status_code=404, detail="Instance not found.")
     # Both ssh instances and desktop/VM sessions are Session CRs whose
-    # spec.overrides can be edited while at rest.
-    inst = {**inst, "editable": True}
+    # spec.overrides can be edited while at rest — by a role that may.
+    inst = {**inst, "editable": role_may(request.state.role, PERM_OWN_INSTANCES)}
     return templates.TemplateResponse(
         request=request, name="user/instance_detail.html",
         context=_ctx(user, is_admin=is_admin, inst=inst,
@@ -741,7 +847,8 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
     can_override = grants
     inst = next((i for i in instances if i["name"] == name), None)
     # Both ssh instances and desktop/VM sessions are Session CRs with an editable
-    # spec.overrides, so both get an Edit action.
+    # spec.overrides, so both get an Edit action — if the role may edit.
+    may_edit = role_may(getattr(request.state, "role", None), PERM_OWN_INSTANCES)
     editable = False
     status_message = None
     if inst:
@@ -756,7 +863,7 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
         # button vanish the moment the VM started and polling kicked in.
         console_url = (_console_url(user, name)
                        if is_admin and inst.get("runtime") == "vm" else None)
-        editable = True
+        editable = may_edit
     else:
         sess = next((s for s in desktop_sessions if s["name"] == name), None)
         if sess:
@@ -770,7 +877,7 @@ async def _status_badge_response(request: Request, cm, user: str, name: str,
             # disappears the first time the badge refreshes.
             console_url = (_console_url(user, name)
                            if is_admin and sess.get("runtime") == "vm" else None)
-            editable = True
+            editable = may_edit
         else:
             status, connect_url, term_url, console_url = "Unknown", None, None, None
             ready = True
@@ -903,6 +1010,7 @@ async def instance_stop(request: Request, cm: CM, user: User, name: str,
 
 
 async def instance_delete(request: Request, cm: CM, user: User, name: str):
+    _need(request, PERM_OWN_INSTANCES)
     await request.app.state.run(cm.delete_instance, user, name)
     return _tr("/", user)
 
@@ -945,6 +1053,7 @@ def _dashboard_resource_views(resources: dict) -> dict:
 # --------------------------------------------------------------------------- #
 
 async def dashboard(request: Request, cm: CM, user: User, is_admin: IsAdmin):
+    _need(request, PERM_CLUSTER_VIEW)
     resources, all_instances, desktop_sessions = await asyncio.gather(
         request.app.state.run(cm.get_cluster_resources),
         request.app.state.run(cm.get_all_instances),
@@ -971,7 +1080,13 @@ async def dashboard(request: Request, cm: CM, user: User, is_admin: IsAdmin):
     )
 
 
-async def admin_index(request: Request, cm: CM, admin: Admin):
+async def admin_index(request: Request, cm: CM, user: User):
+    """The admin section's front page — also a manager's, with the cards
+    their role does not reach left out (admin/index.html asks can())."""
+    if not (role_may(request.state.role, PERM_USER_ACCESS)
+            or role_may(request.state.role, PERM_OTHERS_INSTANCES)):
+        raise HTTPException(status_code=403, detail="Your role does not allow this.")
+    admin = user
     all_instances = await request.app.state.run(cm.get_all_instances)
     all_users     = await request.app.state.run(cm.list_all_users)
     all_templates = await request.app.state.run(cm.get_all_templates)
@@ -980,7 +1095,9 @@ async def admin_index(request: Request, cm: CM, admin: Admin):
         context=_ctx(admin, is_admin=True, all_instances=all_instances,
                      all_users=all_users, all_templates=all_templates,
                      backups_enabled=_backup_client(request).enabled,
-                     backup_health=await _backup_health(request)),
+                     backup_health=(await _backup_health(request)
+                                    if role_may(request.state.role, PERM_ADMIN)
+                                    else None)),
     )
 
 
@@ -1049,6 +1166,7 @@ async def user_dataset_regenerate(request: Request, cm: CM, user: User,
 
 
 async def home_volumes(request: Request, cm: CM, user: User, is_admin: IsAdmin):
+    _need(request, PERM_OWN_HOMES)
     # Only zones the user may already enter. Creating a home in one of those
     # is not an escalation — they could already start an instance there with a
     # fresh home — which is what makes this self-service instead of a ticket.
@@ -1073,6 +1191,7 @@ async def home_volume_create(
     size:        Annotated[Optional[str], Form()] = None,
     description: Annotated[Optional[str], Form()] = None,
 ):
+    _need(request, PERM_OWN_HOMES)
     name = name.strip()
     if not re.fullmatch(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?", name):
         raise HTTPException(
@@ -1115,6 +1234,7 @@ async def home_volume_delete(
     request: Request, cm: CM, user: User, name: str,
     delete_data: Annotated[Optional[str], Form()] = None,
 ):
+    _need(request, PERM_OWN_HOMES)
     ok = await request.app.state.run(
         cm.delete_home_volume, user, name, delete_data == "on")
     if not ok:
@@ -1236,8 +1356,13 @@ async def admin_template_delete(request: Request, cm: CM, admin: Admin, name: st
 # Admin — users                                                                #
 # --------------------------------------------------------------------------- #
 
-async def admin_users(request: Request, cm: CM, admin: Admin):
-    users = await request.app.state.run(cm.list_all_users)
+async def admin_users(request: Request, cm: CM, admin: AccessManager):
+    users = []
+    for u in await request.app.state.run(cm.list_all_users):
+        role = (ROLE_ADMIN if _ALLOW_ADMIN or u.get("name") in _ADMIN_USERS
+                else user_role(u))
+        users.append({**u, "role": role,
+                      "manageable": may_manage_user(request.state.role, role)})
     return templates.TemplateResponse(
         request=request, name="admin/users.html",
         context=_ctx(admin, is_admin=True, users=users),
@@ -1259,10 +1384,10 @@ async def admin_user_create(
     run_as_user:  Annotated[Optional[str], Form()] = None,
     run_as_group: Annotated[Optional[str], Form()] = None,
     fs_group:     Annotated[Optional[str], Form()] = None,
-    is_admin_flag: Annotated[Optional[str], Form(alias="admin")] = None,
+    role:         Annotated[Optional[str], Form()] = None,
 ):
     user_data = _build_user_data(name, public_keys, run_as_user, run_as_group, fs_group,
-                                  uid, is_admin_flag)
+                                  uid, role or NEW_USER_ROLE)
     # Every allow is explicit, so a user created with nothing ticked holds
     # nothing — including a door to come in through and a zone to launch in.
     # Seed those two here rather than in _build_user_data, which the *edit*
@@ -1277,7 +1402,7 @@ async def admin_user_create(
     return _tr(f"/admin/users/{name}", admin)
 
 
-async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: str):
+async def admin_user_detail(request: Request, cm: CM, admin: AccessManager, username: str):
     """The user's own grants (what the forms edit) *and* their effective ones
     (own unioned with every group they belong to).
 
@@ -1285,11 +1410,14 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
     the checkboxes must reflect and save the User CR's own fields only. Saving
     the effective set would quietly copy a project's grants onto the user, and
     they would keep them after leaving the group."""
+    await _need_manageable(request, username)
     all_users = await request.app.state.run(cm.list_all_users)
     user_obj  = next((u for u in all_users if u.get("name") == username), None)
     if not user_obj:
         raise HTTPException(status_code=404, detail="User not found.")
     instances = await request.app.state.run(cm.get_user_instances, username)
+    desktop_sessions = await request.app.state.run(
+        cm.get_user_desktop_sessions, username)
     gpu_types = await request.app.state.run(cm.get_gpu_types)
     allowed_gpu_types = await request.app.state.run(cm.get_user_allowed_gpu_types, username)
     user_overrides = await request.app.state.run(cm.get_user_overrides, username)
@@ -1306,6 +1434,8 @@ async def admin_user_detail(request: Request, cm: CM, admin: Admin, username: st
     return templates.TemplateResponse(
         request=request, name="admin/user_detail.html",
         context=_ctx(admin, is_admin=True, user_obj=user_obj, instances=instances,
+                     user_role=await request.app.state.run(_role, request, username),
+                     desktop_sessions=desktop_sessions,
                      gpu_types=gpu_types, allowed_gpu_types=allowed_gpu_types,
                      user_overrides=user_overrides, override_groups=OVERRIDE_GROUPS,
                      zones=zones, allowed_zones=allowed_zones,
@@ -1333,10 +1463,15 @@ async def admin_user_update(
     run_as_user:  Annotated[Optional[str], Form()] = None,
     run_as_group: Annotated[Optional[str], Form()] = None,
     fs_group:     Annotated[Optional[str], Form()] = None,
-    is_admin_flag: Annotated[Optional[str], Form(alias="admin")] = None,
+    role:         Annotated[Optional[str], Form()] = None,
 ):
+    # The same reasoning as disabling yourself: an admin demoting their own
+    # account has no use but the lockout (and may be the last admin).
+    if username == admin and role is not None and role != ROLE_ADMIN:
+        raise HTTPException(status_code=400,
+                            detail="You cannot change your own role.")
     user_data = _build_user_data(username, public_keys, run_as_user, run_as_group, fs_group,
-                                  uid, is_admin_flag)
+                                  uid, role)
     ok = await request.app.state.run(cm.save_user, user_data)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to update user.")
@@ -1349,25 +1484,28 @@ async def admin_user_delete(request: Request, cm: CM, admin: Admin, username: st
 
 
 async def admin_user_set_gpu_types(
-    request: Request, cm: CM, admin: Admin, username: str,
+    request: Request, cm: CM, admin: AccessManager, username: str,
     gpu_types: Annotated[Optional[list[str]], Form()] = None,
 ):
+    await _need_manageable(request, username)
     await request.app.state.run(cm.set_user_allowed_gpu_types, username, gpu_types or [])
     return _tr(f"/admin/users/{username}", admin)
 
 
 async def admin_user_set_zones(
-    request: Request, cm: CM, admin: Admin, username: str,
+    request: Request, cm: CM, admin: AccessManager, username: str,
     zone_names: Annotated[Optional[list[str]], Form()] = None,
 ):
+    await _need_manageable(request, username)
     await request.app.state.run(cm.set_user_allowed_zones, username, zone_names or [])
     return _tr(f"/admin/users/{username}", admin)
 
 
 async def admin_user_set_overrides(
-    request: Request, cm: CM, admin: Admin, username: str,
+    request: Request, cm: CM, admin: AccessManager, username: str,
     override_groups: Annotated[Optional[list[str]], Form()] = None,
 ):
+    await _need_manageable(request, username)
     checked = set(override_groups or [])
     overrides = {g: g in checked for g in OVERRIDE_GROUPS}
     await request.app.state.run(cm.set_user_overrides, username, overrides)
@@ -1375,7 +1513,7 @@ async def admin_user_set_overrides(
 
 
 async def admin_user_set_entry_points(
-    request: Request, cm: CM, admin: Admin, username: str,
+    request: Request, cm: CM, admin: AccessManager, username: str,
     entry_points: Annotated[Optional[list[str]], Form()] = None,
 ):
     """Which doors this user may use. No boxes means **no door** — the same
@@ -1387,6 +1525,7 @@ async def admin_user_set_entry_points(
     purpose: the alternative is a special case that makes the field mean
     something different for one account, and `kubectl edit usr` is the way
     back."""
+    await _need_manageable(request, username)
     await request.app.state.run(cm.set_user_entry_points, username,
                                 entry_points or [])
     if username == admin and ENTRY_PORTAL not in (entry_points or []):
@@ -1396,7 +1535,7 @@ async def admin_user_set_entry_points(
 
 
 async def admin_user_set_disabled(
-    request: Request, cm: CM, admin: Admin, username: str,
+    request: Request, cm: CM, admin: AccessManager, username: str,
     disabled: Annotated[Optional[str], Form()] = None,
 ):
     """Suspend or restore an account. Nothing else on the CR is touched, which
@@ -1406,6 +1545,7 @@ async def admin_user_set_disabled(
     Unlike the entry-point form, disabling *yourself* is refused. Binding your
     own account to the kiosk is a thing an admin might do to test the binding;
     suspending your own account has no use but the lockout."""
+    await _need_manageable(request, username)
     if disabled and username == admin:
         raise HTTPException(status_code=400,
                             detail="You cannot disable your own account.")
@@ -1416,10 +1556,11 @@ async def admin_user_set_disabled(
 
 
 async def admin_user_set_otp(
-    request: Request, cm: CM, admin: Admin, username: str,
+    request: Request, cm: CM, admin: AccessManager, username: str,
     otp_disabled: Annotated[Optional[str], Form()] = None,
 ):
     """Whether the kiosk asks this user for a TOTP code after the password."""
+    await _need_manageable(request, username)
     await request.app.state.run(cm.set_user_otp_disabled, username,
                                 bool(otp_disabled))
     logger.info(f"Admin {admin} turned the kiosk second factor "
@@ -1428,13 +1569,14 @@ async def admin_user_set_otp(
 
 
 async def admin_user_set_channels(
-    request: Request, cm: CM, admin: Admin, username: str,
+    request: Request, cm: CM, admin: AccessManager, username: str,
     restrict:  Annotated[Optional[str], Form()] = None,
     channels:  Annotated[Optional[list[str]], Form()] = None,
 ):
     """`restrict` unchecked clears the user's own grant (this user narrows
     nothing); checked writes exactly the boxes ticked — including none of
     them, which is a real grant of nothing and the reason the toggle exists."""
+    await _need_manageable(request, username)
     if not restrict:
         await request.app.state.run(cm.set_user_channels, username, None)
     else:
@@ -1809,8 +1951,9 @@ def _parse_matrix_form(form, zones, sections) -> dict:
     return matrix
 
 
-async def admin_user_set_access(request: Request, cm: CM, admin: Admin,
+async def admin_user_set_access(request: Request, cm: CM, admin: AccessManager,
                                 username: str):
+    await _need_manageable(request, username)
     form = await request.form()
     zones = await request.app.state.run(cm.get_zones)
     sections = await _matrix_sections(request, cm, username)
@@ -1822,7 +1965,7 @@ async def admin_user_set_access(request: Request, cm: CM, admin: Admin,
     return _tr(f"/admin/users/{username}", admin)
 
 
-async def admin_computed_access(request: Request, cm: CM, admin: Admin,
+async def admin_computed_access(request: Request, cm: CM, admin: AccessManager,
                                 name: str = None):
     """What a user's access actually resolves to, and where each cell came
     from. Read-only by construction: it is a *derived* view, and offering an
@@ -2152,7 +2295,7 @@ async def admin_dataset_destroy(
 # Admin — sessions (all users)                                                 #
 # --------------------------------------------------------------------------- #
 
-async def admin_sessions(request: Request, cm: CM, admin: Admin):
+async def admin_sessions(request: Request, cm: CM, admin: SessionManager):
     all_instances = await request.app.state.run(cm.get_all_instances)
     return templates.TemplateResponse(
         request=request, name="admin/sessions.html",
@@ -2160,17 +2303,19 @@ async def admin_sessions(request: Request, cm: CM, admin: Admin):
     )
 
 
-async def admin_session_stop(request: Request, cm: CM, admin: Admin, username: str, name: str):
+async def admin_session_stop(request: Request, cm: CM, admin: SessionManager, username: str, name: str):
+    await _need_manageable(request, username)
     await request.app.state.run(cm.stop_instance, username, name)
     return _tr("/admin/sessions", admin)
 
 
-async def admin_session_delete(request: Request, cm: CM, admin: Admin, username: str, name: str):
+async def admin_session_delete(request: Request, cm: CM, admin: SessionManager, username: str, name: str):
+    await _need_manageable(request, username)
     await request.app.state.run(cm.delete_instance, username, name)
     return _tr("/admin/sessions", admin)
 
 
-async def admin_sessions_rows(request: Request, cm: CM, admin: Admin):
+async def admin_sessions_rows(request: Request, cm: CM, admin: SessionManager):
     """HTMX partial — returns only the <tr> rows for the sessions table."""
     all_instances = await request.app.state.run(cm.get_all_instances)
     return templates.TemplateResponse(
@@ -2322,12 +2467,19 @@ def _template_form_data(*, name, display_name, image, description, cpu, memory,
 
 
 def _build_user_data(name, public_keys, run_as_user, run_as_group, fs_group,
-                     uid=None, admin=None) -> dict:
+                     uid=None, role=None) -> dict:
     keys = [k.strip() for k in (public_keys or "").splitlines() if k.strip()]
-    # admin is always set (not omitted when falsy) so unchecking the "Admin"
-    # box in the edit form actually revokes it, rather than leaving whatever
-    # was already on the CR untouched (save_user only merges present keys).
-    data: dict = {"name": name.strip(), "publicKeys": keys, "admin": bool(admin)}
+    data: dict = {"name": name.strip(), "publicKeys": keys}
+    # A submitted role is written with the legacy `admin` boolean beside it,
+    # kept equal to it: a CRD that predates `role` prunes that field silently,
+    # and the boolean is then what still tells an admin from everyone else.
+    # No role submitted leaves the CR's alone (save_user merges present keys);
+    # an unknown value is refused rather than guessed at.
+    if role is not None:
+        if role not in ROLES:
+            raise HTTPException(status_code=400, detail=f"Unknown role '{role}'.")
+        data["role"] = role
+        data["admin"] = role == ROLE_ADMIN
     if uid and str(uid).strip():
         data["uid"] = int(uid)
     sec_ctx = _nonempty({

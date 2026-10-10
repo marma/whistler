@@ -18,6 +18,15 @@
 
 <div class="ui segment" style="max-width:640px">
   <form class="ui form" method="post" action="/instances/{{ inst.name }}/update?user={{ current_user }}">
+    {% if owner %}
+    {# On behalf of someone else: the server checks the role and the owner
+       again, and fills the pickers below from the owner's grants. #}
+    <input type="hidden" name="owner" value="{{ owner }}">
+    <div class="ui info message" style="display:block">
+      <i class="user icon"></i> For <strong>{{ owner }}</strong>: built in their
+      namespace and limited to the templates, zones and volumes they hold.
+    </div>
+    {% endif %}
 
     <div class="field">
       <label>Instance name</label>
@@ -64,7 +73,7 @@
     <button type="submit" class="ui primary button">
       <i class="save icon"></i> Save Changes
     </button>
-    <a href="/instances/{{ inst.name }}?user={{ current_user }}" class="ui button">Cancel</a>
+    <a href="{% if owner %}/admin/users/{{ owner }}{% else %}/instances/{{ inst.name }}{% endif %}?user={{ current_user }}" class="ui button">Cancel</a>
   </form>
 </div>
 

@@ -21,8 +21,9 @@ from whistler.config import OVERRIDE_GROUPS
 from whistler.portal import management as mgmt
 
 
-def _render(template, path="/", **context):
-    request = SimpleNamespace(url=SimpleNamespace(path=path))
+def _render(template, path="/", role="standard", **context):
+    request = SimpleNamespace(url=SimpleNamespace(path=path),
+                              state=SimpleNamespace(role=role))
     return mgmt.templates.env.get_template(template).render(request=request,
                                                             **context)
 
@@ -42,8 +43,10 @@ NO_GRANTS = {g: False for g in OVERRIDE_GROUPS}
 class _FakeRequest:
     """Enough Request for the route bodies: the executor shim, a form, headers."""
 
-    def __init__(self, form=None, headers=None, query=None, path="/"):
+    def __init__(self, form=None, headers=None, query=None, path="/",
+                 role="standard"):
         self._form = dict(form or {})
+        self.state = SimpleNamespace(role=role)
         self.url = SimpleNamespace(path=path)
         self.headers = headers or {}
         self.query_params = query or {}

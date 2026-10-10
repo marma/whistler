@@ -54,7 +54,8 @@ from functools import partial
 import aiohttp
 from aiohttp import web
 
-from whistler.config import CHANNEL_TERMINAL, ENTRY_KIOSK, ENTRY_PORTAL
+from whistler.config import (CHANNEL_TERMINAL, ENTRY_KIOSK, ENTRY_PORTAL,
+                             PERM_OWN_INSTANCES, role_may)
 from whistler.portal import kiosk, kubevirt, proxy, screenshots, terminal
 from whistler.portal.login import USER_COOKIE as _USER_COOKIE
 from whistler.portal.login import render_notice
@@ -244,6 +245,15 @@ async def _is_admin(request, user):
     if _ALLOW_ADMIN or user in _ADMIN_USERS:
         return True
     return bool(await _run(request, request.app["cm"].is_user_admin, user))
+
+
+async def _may_create(request, user):
+    """The management portal's PERM_OWN_INSTANCES, asked of the same role:
+    a basic account starts and connects, it does not make sessions."""
+    if _ALLOW_ADMIN or user in _ADMIN_USERS:
+        return True
+    role = await _run(request, request.app["cm"].get_user_role, user)
+    return role_may(role, PERM_OWN_INSTANCES)
 
 
 def _resolve_session(sessions, short_name):
@@ -597,13 +607,16 @@ def _resolve_target(instances, desktop_sessions, name):
 
 async def index(request):
     cm, user = request.app["cm"], request["user"]
-    templates = await _run(request, cm.get_user_desktop_templates, user)
+    templates = (await _run(request, cm.get_user_desktop_templates, user)
+                 if await _may_create(request, user) else [])
     sessions = await _run(request, cm.get_user_desktop_sessions, user)
     return web.Response(text=_render_index(user, templates, sessions), content_type="text/html")
 
 
 async def launch(request):
     cm, user = request.app["cm"], request["user"]
+    if not await _may_create(request, user):
+        return web.Response(status=403, text="your role cannot create sessions")
     form = await request.post()
     template = form.get("template")
     name = (form.get("name") or "").strip() or f"d{secrets.token_hex(3)}"

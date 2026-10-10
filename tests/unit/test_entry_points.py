@@ -204,6 +204,9 @@ class _CM:
     def is_user_admin(self, username):
         return False
 
+    def get_user_role(self, username):
+        return "standard"
+
 
 @pytest.fixture
 async def viewer(monkeypatch):

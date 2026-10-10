@@ -19,22 +19,28 @@
        href="/?user={{ current_user }}">
       <i class="th icon"></i> My Instances
     </a>
+    {% if can(request, "homes:own") %}
     <a class="item {% if request.url.path.startswith('/homes') %}active{% endif %}"
        href="/homes?user={{ current_user }}">
       <i class="hdd icon"></i> Home volumes
     </a>
+    {% endif %}
     <a class="item {% if request.url.path.startswith('/datasets') %}active{% endif %}"
        href="/datasets?user={{ current_user }}">
       <i class="database icon"></i> Datasets
     </a>
+    {% if can(request, "cluster:view") %}
     <a class="item {% if request.url.path == '/dashboard' %}active{% endif %}"
        href="/dashboard?user={{ current_user }}">
       <i class="tachometer alternate icon"></i> Dashboard
     </a>
-    {% if is_admin %}
+    {% endif %}
+    {# A manager gets the same section, trimmed to what their role allows
+       (admin/index.html asks can() per card). #}
+    {% if can(request, "users:access") or can(request, "instances:others") %}
     <a class="item {% if request.url.path.startswith('/admin') %}active{% endif %}"
        href="/admin?user={{ current_user }}">
-      <i class="shield alternate icon"></i> Admin
+      <i class="shield alternate icon"></i> {% if can(request, "admin") %}Admin{% else %}Manage{% endif %}
     </a>
     {% endif %}
     <div class="right menu">

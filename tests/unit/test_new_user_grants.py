@@ -107,7 +107,7 @@ async def test_a_user_created_in_the_portal_can_sign_in_and_launch():
     cm = _CM()
     await admin_user_create(_request(cm), cm, "admin", name="alice",
                             public_keys=None, uid=None, run_as_user=None,
-                            run_as_group=None, fs_group=None, is_admin_flag=None)
+                            run_as_group=None, fs_group=None, role=None)
     assert set(cm.saved["entryPoints"]) == set(ENTRY_POINTS)
     assert cm.saved["allowedZones"] == [DEFAULT_ZONE]
     # The grants that cost something are not seeded: the admin grants those on
@@ -124,6 +124,6 @@ async def test_editing_a_user_does_not_re_seed_the_grants():
     cm = _CM()
     await admin_user_update(_request(cm), cm, "admin", "alice",
                             public_keys=None, uid=None, run_as_user=None,
-                            run_as_group=None, fs_group=None, is_admin_flag=None)
+                            run_as_group=None, fs_group=None, role=None)
     assert "entryPoints" not in cm.saved
     assert "allowedZones" not in cm.saved

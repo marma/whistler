@@ -1,0 +1,20 @@
+{# The role select, shared by the new-user and edit forms. `selected` is the
+   current role (None on a new user: the default, "standard"). The meanings
+   are config.ROLE_PERMISSIONS in words; keep them in step. #}
+{% set selected = selected or "standard" %}
+<div class="field">
+  <label>Role</label>
+  <select class="ui dropdown" name="role"{% if role_locked|default(false) %} disabled{% endif %}>
+    <option value="basic" {% if selected == "basic" %}selected{% endif %}>Basic — start, stop and connect to their instances</option>
+    <option value="standard" {% if selected == "standard" %}selected{% endif %}>Standard — also create and edit their own instances and home volumes</option>
+    <option value="manager" {% if selected == "manager" %}selected{% endif %}>Manager — also create instances for others and edit standard/basic users' access</option>
+    <option value="admin" {% if selected == "admin" %}selected{% endif %}>Admin — everything</option>
+  </select>
+  {% if role_locked|default(false) %}
+  {# A disabled select submits nothing; this keeps the value. #}
+  <input type="hidden" name="role" value="{{ selected }}">
+  <div class="ui pointing label">You cannot change your own role.</div>
+  {% else %}
+  <div class="ui pointing label">What the account may do in the portal. Zones, GPUs and volumes are still granted separately below.</div>
+  {% endif %}
+</div>

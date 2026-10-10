@@ -4,11 +4,20 @@
 
 <h2 class="ui header">
   <i class="plus circle icon"></i>
-  <div class="content">New Instance</div>
+  <div class="content">New Instance{% if owner %} for {{ owner }}{% endif %}</div>
 </h2>
 
 <div class="ui segment" style="max-width:640px">
   <form class="ui form" method="post" action="/instances?user={{ current_user }}">
+    {% if owner %}
+    {# On behalf of someone else: the server checks the role and the owner
+       again, and fills the pickers below from the owner's grants. #}
+    <input type="hidden" name="owner" value="{{ owner }}">
+    <div class="ui info message" style="display:block">
+      <i class="user icon"></i> For <strong>{{ owner }}</strong>: built in their
+      namespace and limited to the templates, zones and volumes they hold.
+    </div>
+    {% endif %}
 
     <div class="field">
       <label>Instance name</label>
@@ -28,7 +37,7 @@
              value="{{ selected_tpl.displayName or selected_tpl.name }} [{{ selected_tpl.mode or 'ssh' }}/{{ selected_tpl.runtime or 'container' }}]{% if selected_tpl.image %} — {{ selected_tpl.image }}{% endif %}">
       <input type="hidden" name="template_name" value="{{ selected_tpl.fullName }}">
       <div class="ui pointing label">
-        Chosen from the picker — <a href="/?user={{ current_user }}">pick a different one</a>.
+        Chosen from the picker — <a href="{% if owner %}/admin/users/{{ owner }}{% else %}/{% endif %}?user={{ current_user }}">pick a different one</a>.
       </div>
     </div>
     {% else %}
@@ -79,7 +88,7 @@
     <button type="submit" class="ui primary button">
       <i class="plus icon"></i> Create Instance
     </button>
-    <a href="/?user={{ current_user }}" class="ui button">Cancel</a>
+    <a href="{% if owner %}/admin/users/{{ owner }}{% else %}/{% endif %}?user={{ current_user }}" class="ui button">Cancel</a>
   </form>
 </div>
 

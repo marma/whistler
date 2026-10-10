@@ -42,7 +42,7 @@
           </div>
         </div>
         <div class="extra content">
-          <a href="/instances/new?user={{ current_user }}&template={{ t.fullName }}"
+          <a href="/instances/new?user={{ current_user }}&template={{ t.fullName }}{% if owner %}&owner={{ owner }}{% endif %}"
              class="ui primary fluid button">
             <i class="plus icon"></i> Use Template
           </a>

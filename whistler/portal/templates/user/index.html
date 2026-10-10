@@ -6,6 +6,7 @@
    cards. It is what you consult while *making* an instance, not something the
    list of machines you already have needs to carry underneath it — so both
    entry points below open it as a picker instead (user/_template_picker.html). #}
+{% set may_create = can(request, "instances:own") %}
 {% set new_instance_attrs %}hx-get="/instances/templates?user={{ current_user }}" hx-target="#modal-host" hx-swap="innerHTML"{% endset %}
 
 <div class="ui stackable grid">
@@ -17,9 +18,11 @@
       </h2>
     </div>
     <div class="four wide column" style="text-align:right;padding-top:1.2rem">
+      {% if may_create %}
       <button class="ui primary button" {{ new_instance_attrs }}>
         <i class="plus icon"></i> New Instance
       </button>
+      {% endif %}
     </div>
   </div>
 </div>
@@ -53,7 +56,7 @@
         <span id="actions-{{ inst.name }}">
           {% with name=inst.name, status=inst.status, ready=inst.ready, user=current_user,
                   connect_url=inst.connect_url, term_url=inst.term_url,
-                  console_url=inst.console_url, editable=true,
+                  console_url=inst.console_url, editable=may_create,
                   can_override=can_override %}
           {% include "user/_instance_buttons.html" %}
           {% endwith %}
@@ -69,9 +72,13 @@
     <i class="server icon"></i>
     No instances yet
   </div>
+  {% if may_create %}
   <button class="ui primary button" {{ new_instance_attrs }}>
     Create your first instance
   </button>
+  {% else %}
+  <p>An administrator creates instances for your account.</p>
+  {% endif %}
 </div>
 {% endif %}
 

@@ -7,9 +7,11 @@
     <h2 class="ui header"><i class="users icon"></i> Users</h2>
   </div>
   <div class="four wide column" style="text-align:right;padding-top:1.2rem">
+    {% if can(request, "admin") %}
     <a href="/admin/users/new?user={{ current_user }}" class="ui primary button">
       <i class="plus icon"></i> New User
     </a>
+    {% endif %}
   </div>
 </div>
 
@@ -28,6 +30,7 @@
     {% for u in users %}
     <tr>
       <td><strong>{{ u.name }}</strong>
+        {% if u.role != "standard" %}<span class="ui {{ 'green' if u.role == 'admin' else 'blue' if u.role == 'manager' else 'grey' }} mini label" title="Role">{{ u.role }}</span>{% endif %}
         {% if u.disabled %}<span class="ui red mini label" title="Refused at every door until re-enabled">disabled</span>{% endif %}
         {% if u.otpDisabled %}<span class="ui yellow mini label" title="The kiosk does not ask this user for a TOTP code">no 2FA</span>{% endif %}
         {# This user's own entryPoints. Shown here because a binding an admin
@@ -67,9 +70,11 @@
         {% endfor %}
       </td>
       <td class="collapsing">
+        {% if u.manageable %}
         <a href="/admin/users/{{ u.name }}?user={{ current_user }}" class="ui tiny button">
           <i class="edit icon"></i> Details
         </a>
+        {% endif %}
       </td>
     </tr>
     {% endfor %}
@@ -81,7 +86,9 @@
     <i class="users icon"></i>
     No users defined yet
   </div>
+  {% if can(request, "admin") %}
   <a href="/admin/users/new?user={{ current_user }}" class="ui primary button">Create first user</a>
+  {% endif %}
 </div>
 {% endif %}
 

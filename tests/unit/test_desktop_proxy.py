@@ -102,6 +102,9 @@ class FakeCM:
     def is_user_admin(self, username):
         return username in self.admins
 
+    def get_user_role(self, username):
+        return "admin" if username in self.admins else "standard"
+
     def may_enter(self, username, entry_point):
         """Entry points this double does not restrict — the binding has its own
         tests (test_entry_points.py); here every user holds every door."""

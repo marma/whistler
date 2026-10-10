@@ -4,10 +4,10 @@
 
 <h2 class="ui header">
   <i class="shield alternate icon"></i>
-  <div class="content">Admin Overview</div>
+  <div class="content">{% if can(request, "admin") %}Admin Overview{% else %}Management{% endif %}</div>
 </h2>
 
-{% if backup_health %}
+{% if backup_health and can(request, "admin") %}
 <div class="ui {{ 'negative' if backup_health.level == 'error' else 'warning' }} message">
   <i class="archive icon"></i> {{ backup_health.text }}
   <a href="/admin/backups?user={{ current_user }}">Backups</a>
@@ -34,6 +34,7 @@
 </div>
 
 <div class="ui four stackable cards">
+  {% if can(request, "users:access") %}
   <div class="card">
     <div class="content">
       <div class="header"><i class="users icon"></i> Users</div>
@@ -43,6 +44,8 @@
       <a href="/admin/users?user={{ current_user }}" class="ui primary fluid button">Manage Users</a>
     </div>
   </div>
+  {% endif %}
+  {% if can(request, "admin") %}
   <div class="card">
     <div class="content">
       <div class="header"><i class="users icon"></i> Groups</div>
@@ -52,6 +55,8 @@
       <a href="/admin/groups?user={{ current_user }}" class="ui primary fluid button">Manage Groups</a>
     </div>
   </div>
+  {% endif %}
+  {% if can(request, "admin") %}
   <div class="card">
     <div class="content">
       <div class="header"><i class="copy outline icon"></i> Templates</div>
@@ -61,6 +66,8 @@
       <a href="/admin/templates?user={{ current_user }}" class="ui primary fluid button">Manage Templates</a>
     </div>
   </div>
+  {% endif %}
+  {% if can(request, "users:access") %}
   <div class="card">
     <div class="content">
       <div class="header"><i class="calculator icon"></i> Computed access</div>
@@ -70,7 +77,9 @@
       <a href="/admin/computed-access?user={{ current_user }}" class="ui primary fluid button">Computed Access</a>
     </div>
   </div>
+  {% endif %}
   {% if backups_enabled %}
+  {% if can(request, "admin") %}
   <div class="card">
     <div class="content">
       <div class="header"><i class="archive icon"></i> Backups</div>
@@ -81,6 +90,8 @@
     </div>
   </div>
   {% endif %}
+  {% endif %}
+  {% if can(request, "admin") %}
   <div class="card">
     <div class="content">
       <div class="header"><i class="hdd icon"></i> Home volumes</div>
@@ -90,6 +101,8 @@
       <a href="/admin/homevolumes?user={{ current_user }}" class="ui primary fluid button">View Home Volumes</a>
     </div>
   </div>
+  {% endif %}
+  {% if can(request, "admin") %}
   <div class="card">
     <div class="content">
       <div class="header"><i class="cloud icon"></i> Datasets</div>
@@ -99,6 +112,8 @@
       <a href="/admin/datasets?user={{ current_user }}" class="ui primary fluid button">Manage Datasets</a>
     </div>
   </div>
+  {% endif %}
+  {% if can(request, "admin") %}
   <div class="card">
     <div class="content">
       <div class="header"><i class="shield alternate icon"></i> Zones</div>
@@ -108,6 +123,8 @@
       <a href="/admin/zones?user={{ current_user }}" class="ui primary fluid button">Manage Zones</a>
     </div>
   </div>
+  {% endif %}
+  {% if can(request, "instances:others") %}
   <div class="card">
     <div class="content">
       <div class="header"><i class="list icon"></i> All Sessions</div>
@@ -117,6 +134,7 @@
       <a href="/admin/sessions?user={{ current_user }}" class="ui primary fluid button">View Sessions</a>
     </div>
   </div>
+  {% endif %}
 </div>
 
 {% endblock %}
