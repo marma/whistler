@@ -4,20 +4,24 @@ A **server** guest: no desktop, no X, no Selkies. You reach it the way you
 reach a machine — `ssh <session>.w` through the gateway's jump host — and it is
 set up for development out of the box.
 
-Three variants, one bake script:
+Two variants, one bake script:
 
 | VARIANT    | image                          | what it adds                                       | disk |
 |------------|--------------------------------|----------------------------------------------------|------|
 | `base`     | `whistler-devbase`             | the toolchain only; runs on any node                | 16G  |
 | `cuda`     | `whistler-devbase-cuda`        | + NVIDIA open driver = the GPU **runtime** (no nvcc)| 24G  |
-| `cuda-dev` | `whistler-devbase-cuda-dev`    | + the CUDA **SDK**: nvcc, headers, dev libraries    | 40G  |
 
 ```bash
-make devbase-image                        # base
-make devbase-image VARIANT=cuda           # GPU runtime
-make devbase-image VARIANT=cuda-dev       # GPU runtime + nvcc
-make devbase-image VARIANT=cuda PUSH=1    # and push to the dev registry
+make devbase-image                        # base + cuda
+make devbase-image VARIANT=cuda           # just the GPU runtime one
+make devbase-image PUSH=1                 # and push to the dev registry
 ```
+
+A template names `whistler-devbase`, and a session with a GPU boots
+`whistler-devbase-cuda` in its place (if it is in `whistler.images.vm`),
+which is why the default builds both. Neither bakes the CUDA *SDK*; a user
+who wants nvcc installs it themselves, e.g. in a pixi environment — see
+[Compiling CUDA](#compiling-cuda-bring-your-own-sdk).
 
 Needs docker, curl and a `/dev/kvm` node — nothing else on the host (the qemu
 that boots the guest runs in a container). amd64 only, like its siblings.
@@ -46,7 +50,7 @@ resolved versions; it is also the login MOTD. On Ubuntu 26.04:
 `pixi` itself is a system binary so an image rebuild can update it. Everything
 pixi *installs* stays in `$HOME/.pixi` — and `$HOME` is the user's PVC, mounted
 over NFS from their storage gateway, so a user's `pixi global install`s survive
-session teardown, image rebuilds, and moving between the three variants.
+session teardown, image rebuilds, and moving between the two variants.
 `$HOME/.pixi/bin` is put on PATH by `/etc/profile.d/50-whistler-devbase.sh`.
 
 Note that profile.d is only read by **login shells**: `ssh host -- some-command`
@@ -91,39 +95,18 @@ being precise about because the names are misleading:
   everything a GPU *workload* loads — PyTorch and JAX wheels bring their own
   cudart/cuBLAS/cuDNN, Blender ships precompiled kernels. No nvcc, no headers,
   no documentation.
-- **`cuda-dev`** adds the SDK on top, for compiling CUDA C++ in-guest
-  (flash-attn, DeepSpeed JIT ops, `torch.utils.cpp_extension`): nvcc and the
-  compiler chain, `cuda-libraries-dev` (cuBLAS/cuFFT/cuRAND/cuSOLVER/cuSPARSE/
-  NPP headers + static libs) and the command-line tools (`cuda-gdb`,
-  `compute-sanitizer`, `nvdisasm`, CUPTI, NVTX). ~4.6GB.
+- **The SDK is not baked at all.** Nothing in the image or at session start
+  installs it. A user who compiles CUDA C++ in-guest (flash-attn, DeepSpeed
+  JIT ops, `torch.utils.cpp_extension`) brings nvcc and the dev libraries
+  themselves; a pixi environment is the suggested way, below.
 
-Two deliberate choices there:
+### Compiling CUDA: bring your own SDK
 
-**NVIDIA's apt repo, not 26.04's `nvidia-cuda-toolkit`.** The archive package is
-CUDA 12.4, a major version behind the 595 driver, and its nvcc refuses this
-release's default gcc 15 and clang 21 as host compilers — you would be passing
-`-ccbin gcc-13` forever. `cuda-toolkit-13-3` from
-`developer.download.nvidia.com/compute/cuda/repos/ubuntu2604` matches the
-driver and takes gcc 15.
-
-**A curated package list, not the `cuda-toolkit-13-3` umbrella.** That
-metapackage *Depends* — not Recommends, so `--no-install-recommends` does not
-help — on `cuda-documentation-13-3` and on `cuda-visual-tools-13-3`, which pulls
-the Nsight Compute/Systems **GUI** profilers: ~1.3GB of docs and desktop tooling
-in an image that has no desktop. `CUDA_TOOLKIT_PACKAGES` is the knob if you want
-them anyway (add `cuda-visual-tools-13-3`), or to move CUDA versions.
-
-The pin in `/etc/apt/preferences.d/nvidia-archive-wins` keeps Ubuntu's driver
-authoritative: NVIDIA's repo also ships driver packages that would otherwise
-outrank the archive's by version and silently replace the open driver.
-
-### …or skip `cuda-dev` and install the SDK with pixi
-
+This is something a user *may* do, per project; Whistler does none of it.
 The driver has to be baked — a kernel module and `libcuda.so.1` are not
 userspace — but **everything above it can live in the user's `$HOME`**, and
 conda-forge deliberately does not ship `libcuda`, so a pixi environment binds to
-the baked driver exactly as intended. That makes the `cuda` variant the real
-workhorse and `cuda-dev` a convenience rather than a necessity.
+the baked driver exactly as intended.
 
 ```toml
 # pixi.toml — a per-project CUDA toolchain, no root, no new image
@@ -135,42 +118,36 @@ platforms = ["linux-64"]
 # the level instead:  platforms = [{ platform = "linux-64", cuda = "13" }]
 
 [dependencies]
-cuda-nvcc       = "13.3.*"   # same version the cuda-dev image bakes
+cuda-nvcc       = "13.3.*"
 cuda-cudart-dev = "*"
 libcublas-dev   = "*"
 ```
 
-Measured on conda-forge (`cuda-nvcc` 13.3.73, i.e. version parity with the apt
-SDK): **1.8GB** for nvcc + cudart-dev + cuBLAS-dev, installed cold in seconds on
-a fast link. A *second* environment from the warm cache costs ~0s and ~0 bytes —
-pixi hardlinks packages out of the cache when the cache and the environment sit
-on the same filesystem, which under `$HOME` they do (verified: link count 2,
-cache + two full environments still totalling 1.8G).
+Measured on conda-forge (`cuda-nvcc` 13.3.73): **1.8GB** for nvcc +
+cudart-dev + cuBLAS-dev, installed cold in seconds on a fast link. A *second*
+environment from the warm cache costs ~0s and ~0 bytes — pixi hardlinks
+packages out of the cache when the cache and the environment sit on the same
+filesystem, which under `$HOME` they do (verified: link count 2, cache + two
+full environments still totalling 1.8G).
 
-Three things decide whether this beats baking a third image:
+A baked SDK image (`cuda-dev`, ~4.6GB of NVIDIA's apt packages) existed until
+2026-10-10 and was removed for this: the combinatorial explosion — CUDA version
+× cuDNN × Python × framework — belongs in a `pixi.lock` per project, where it
+is pinned and reproducible, not in image names. Two things to plan for:
 
 1. **Egress.** pixi needs `conda.anaconda.org`, and the default zone blocks
-   package mirrors. Without a zone that permits it, userspace CUDA is simply
-   impossible and the baked SDK is the only path. This is the gating decision,
-   not a detail.
-2. **Home PVC size.** `userVolume` defaults to 10Gi; 1.8G per CUDA stack (plus
-   ~1GB for cuDNN, ~3GB if PyTorch comes along) eats it quickly. Raise it for
-   users who work this way.
-3. **NFS.** An environment is ~6,400 files. Extraction and tooling that stats
-   the tree (clangd, pip) are slower over NFS than on local disk — how much
-   slower against a real storage gateway is unmeasured.
-
-The upside is that the combinatorial explosion — CUDA version × cuDNN × Python ×
-framework — moves into a `pixi.lock` per project, where it is pinned and
-reproducible, instead of into image names.
+   package mirrors. Users who compile CUDA need a zone that permits it.
+2. **Home size.** 1.8G per CUDA stack (plus ~1GB for cuDNN, ~3GB if PyTorch
+   comes along) fills a small home quickly. Size it for users who work this
+   way.
 
 ## How the bake works
 
 Identical in structure to `desktops/vm-gnome-selkies` — read that for the
 shared mechanics —
 minus the artifact *builder* stage, because there is no Selkies venv to
-ABI-match to the guest. Everything comes from the guest's own apt plus two
-pinned upstream downloads (pixi; NVIDIA's CUDA repo for `cuda-dev`).
+ABI-match to the guest. Everything comes from the guest's own apt plus one
+pinned upstream download (pixi).
 
 1. `guest/` is tarred as the NoCloud seed's `artifacts.tar.gz`.
 2. The Ubuntu 26.04 cloud image boots once under qemu/KVM in a container
@@ -189,9 +166,10 @@ the long version.
 ## Using it
 
 `charts/whistler/values-dev-vm.yaml` (the skaffold dev overlay) defines
-`devbase`, `devbase-cuda` and `devbase-cuda-dev` templates and lists the three
-images in `whistler.images.vm` — a VM template whose boot source is not on that
-list is refused by policy at reconcile time.
+the `devbase` template (GPU optional: a session with one boots
+`whistler-devbase-cuda`) and lists both images in `whistler.images.vm`
+— a VM template whose boot source is not on that list is refused by policy at
+reconcile time.
 
 They are `mode: ssh, runtime: vm` templates, which is the point: cloud-init
 creates the user, installs their keys, mounts the NFS home and the session is a

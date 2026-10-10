@@ -4,7 +4,7 @@ A KubeVirt **containerDisk** (OCI-wrapped qcow2) running the *real* **GNOME
 Shell 46** (Activities, dynamic workspaces, the overview) with the
 **Selkies 2.0** streaming stack **baked into the guest**. It is Whistler's
 desktop image, and it backs `runtime: vm` desktop templates with
-`viewer: websockets` (`vm-desktop` / `vm-desktop-cuda` in
+`viewer: websockets` (`vm-desktop` in
 [values-dev-vm.yaml](../../charts/whistler/values-dev-vm.yaml)): the portal
 reverse-proxies the guest's Selkies server — per-session Service →
 virt-launcher pod → masquerade → guest `:8082`.
@@ -171,8 +171,7 @@ identical config.
 Only the encode stage moves: capture stays on the CPU from Xvfb, and GNOME
 still renders on llvmpipe (apps can individually opt out of that via `vgl` —
 see [Three graphics tiers](#three-graphics-tiers)). The Selkies log says, at
-INFO, which capture and encoder path each display took, and the dashboard's
-stats panel shows the same:
+INFO, which capture and encoder path each display took:
 
 ```bash
 journalctl -u whistler-streamer | grep -Ei 'nvenc|vaapi|encoder'
@@ -261,12 +260,16 @@ only full fix is a fixed resolution (no dynamic resize), which we decline. See
 
 ```bash
 make vm-gnome-desktop-image          # → localhost:5000/whistler-vm-gnome-selkies:latest  (lean, no GPU driver)
-make vm-gnome-desktop-image CUDA=1   # → …-cuda:latest  (bakes the NVIDIA driver for passthrough sessions)
+                                     #   and …-cuda:latest  (the NVIDIA driver, for passthrough sessions)
+make vm-gnome-desktop-image CUDA=1   # just the -cuda one (CUDA=0: just the lean one)
 make vm-gnome-desktop-image PUSH=1   # …and push to the dev registry
 ```
 
-The default lean image carries **no** NVIDIA driver; `CUDA=1` bakes the
-driver in and publishes `whistler-vm-gnome-selkies-cuda`. (That suffix is on
+The lean image carries **no** NVIDIA driver; the `-cuda` one has it baked in.
+Templates name the lean image, and a session with a GPU boots
+`whistler-vm-gnome-selkies-cuda` in its place, as long as that image is in
+`whistler.images.vm`. That is why the target bakes both: a rebuild cannot
+leave one variant on an older Selkies than the other. (That suffix is on
 the image name, not the tag, so the mutable dev tag stays exactly `:latest` —
 the only tag KubeVirt defaults to `imagePullPolicy: Always`; a `:latest-cuda`
 tag would leave nodes booting a stale cached qcow2 after every rebuild.)

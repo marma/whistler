@@ -233,3 +233,64 @@ def test_no_username_still_skips_every_per_user_check():
     # user; that must not start failing closed on the zone.
     cm = _manager()
     assert cm._apply_policy({"image": "x"}, "ssh", "container") == "container"
+
+
+# --- GPU image variant -------------------------------------------------- #
+# One template names the lean image; a run with a GPU boots <image>-cuda.
+
+from whistler.config import gpu_image_variant  # noqa: E402
+
+
+@pytest.mark.parametrize("image,variant", [
+    ("localhost:5000/whistler-vm-gnome-selkies:latest",
+     "localhost:5000/whistler-vm-gnome-selkies-cuda:latest"),
+    # A registry port is not a tag.
+    ("localhost:5000/whistler-devbase", "localhost:5000/whistler-devbase-cuda"),
+    ("harbor.example/whistler/desktop:1.4.0",
+     "harbor.example/whistler/desktop-cuda:1.4.0"),
+    # Already a GPU build: keep it, never -cuda-cuda.
+    ("localhost:5000/whistler-devbase-cuda:latest", None),
+    ("localhost:5000/whistler-thing-cuda-12:latest", None),
+    # A digest names one exact build; it has no sibling.
+    ("reg/desktop@sha256:" + "0" * 64, None),
+    (None, None),
+    ("", None),
+])
+def test_gpu_image_variant(image, variant):
+    assert gpu_image_variant(image) == variant
+
+
+_BASE = "reg/desktop:latest"
+_CUDA = "reg/desktop-cuda:latest"
+
+
+def test_gpu_session_boots_the_cuda_image_when_listed():
+    cm = _manager(images={"ssh": [], "desktop": [], "vm": [_BASE, _CUDA]})
+    spec = {"image": _BASE, "resources": {"gpu": "1"}}
+    out = cm._select_gpu_image(spec)
+    assert out["image"] == _CUDA
+    # The input may be the cached template: it must not change under us.
+    assert spec["image"] == _BASE
+
+
+@pytest.mark.parametrize("resources", [{}, {"gpu": "0"}, {"gpu": 0}, None])
+def test_no_gpu_keeps_the_lean_image(resources):
+    cm = _manager(images={"ssh": [], "desktop": [], "vm": [_BASE, _CUDA]})
+    spec = {"image": _BASE, "resources": resources}
+    assert cm._select_gpu_image(spec)["image"] == _BASE
+
+
+def test_unlisted_cuda_image_falls_back_to_the_template_image():
+    """The allow-list is the cluster's statement of which images exist: an
+    unlisted variant is not attempted, and the session still boots."""
+    cm = _manager(images={"ssh": [], "desktop": [], "vm": [_BASE]})
+    spec = {"image": _BASE, "resources": {"gpu": "1"}}
+    out = cm._select_gpu_image(spec)
+    assert out["image"] == _BASE
+    assert cm._apply_policy(out, "desktop", "vm") == "vm"
+
+
+def test_imageurl_templates_are_left_alone():
+    cm = _manager(images={"ssh": [], "desktop": [], "vm": [_CUDA]})
+    spec = {"imageURL": "https://x/disk.img", "resources": {"gpu": "1"}}
+    assert cm._select_gpu_image(spec) is spec

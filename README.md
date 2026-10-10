@@ -627,13 +627,12 @@ guest runs under KVM, so producing arm64 needs an arm64 host.
 
 ```bash
 # Dev server: Ubuntu 26.04, clang 21, Python 3.14, pixi. SSH, no desktop.
-make devbase-image                          # -> localhost:5000/whistler-devbase:latest
-make devbase-image VARIANT=cuda PUSH=1      # + the NVIDIA driver (GPU runtime, no nvcc)
-make devbase-image VARIANT=cuda-dev PUSH=1  # + the CUDA SDK (nvcc, ~4.6GB)
+make devbase-image PUSH=1                   # -> whistler-devbase:latest + whistler-devbase-cuda:latest
+                                            #    (no baked nvcc; users may install it, e.g. with pixi)
 
 # Desktop: GNOME Shell with Selkies baked into the guest.
-make vm-gnome-desktop-image PUSH=1          # -> localhost:5000/whistler-vm-gnome-selkies:latest
-make vm-gnome-desktop-image CUDA=1 PUSH=1   # -> ...-vm-gnome-selkies-cuda:latest
+make vm-gnome-desktop-image PUSH=1          # -> whistler-vm-gnome-selkies:latest + ...-cuda:latest
+make vm-gnome-desktop-image CUDA=1 PUSH=1   # just one variant (CUDA=0|1; VARIANT= for devbase)
 ```
 
 Knobs, on every build script: `IMAGE`, `TAG`, `PUSH=1`, `DISK_SIZE`,
@@ -647,6 +646,12 @@ Two things about naming, both deliberate:
   nodes keep booting a stale cached qcow2 after every rebuild —
   `:latest-cuda` would not match. Production uses immutable versioned tags,
   which correctly default to `IfNotPresent`.
+- **A template names the lean image; a GPU picks the `-cuda` one.** A VM
+  session that has a GPU (from its template, the instance's overrides or the
+  start dialog) boots `<image>-cuda` in place of `<image>`, keeping the tag,
+  if that image is in `whistler.images.vm`. Unlisted, it boots the lean image,
+  which has no NVIDIA driver. So list both, and the `make` targets bake both.
+  A template that names a `-cuda` image or a digest is left alone.
 - Everything is **baked, not installed at session time**, because the default
   zone blocks package mirrors. A session gets what its image has.
 

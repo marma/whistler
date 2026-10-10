@@ -6,7 +6,7 @@ and a desktop is a KubeVirt guest with the streamer baked in.
 
 | Image | Port | Notes |
 |-------|------|-------|
-| [`vm-gnome-selkies`](vm-gnome-selkies/) | 8082 (in-guest) | **KubeVirt containerDisk**: the real GNOME Shell 46 (X11 backend, Ubuntu 24.04) + Selkies 2.0, which streams over plain WebSockets to the browser. For `runtime: vm` + `viewer: websockets` templates. Built by a qemu/KVM bake (`make vm-gnome-desktop-image`, `CUDA=1` for the GPU variant), not skaffold. |
+| [`vm-gnome-selkies`](vm-gnome-selkies/) | 8082 (in-guest) | **KubeVirt containerDisk**: the real GNOME Shell 46 (X11 backend, Ubuntu 24.04) + Selkies 2.0, which streams over plain WebSockets to the browser. For `runtime: vm` + `viewer: websockets` templates. Built by a qemu/KVM bake (`make vm-gnome-desktop-image`, which bakes the lean and the `-cuda` GPU variant; a session with a GPU boots the latter), not skaffold. |
 
 The portal's **websockets** viewer reverse-proxies the guest's Selkies server —
 HTTP and the stream WebSocket both — through the per-session Service, which

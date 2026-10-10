@@ -12,17 +12,4 @@ case ":${PATH}:" in
   *) [ -n "${HOME:-}" ] && PATH="$HOME/.pixi/bin:$PATH" ;;
 esac
 
-# CUDA SDK (the -cuda-dev variant only; the dir does not exist elsewhere).
-# CUDA_HOME is the point of this block — the SDK's *binaries* are symlinked into
-# /usr/local/bin at bake time precisely because profile.d is not enough for
-# `ssh <session>.w nvcc ...`. Keeping the bin dir on PATH too is harmless and
-# covers anything the symlink loop skipped.
-if [ -d /usr/local/cuda/bin ]; then
-  case ":${PATH}:" in
-    *":/usr/local/cuda/bin:"*) ;;
-    *) PATH="$PATH:/usr/local/cuda/bin" ;;
-  esac
-  export CUDA_HOME=/usr/local/cuda
-fi
-
 export PATH

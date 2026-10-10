@@ -8,11 +8,13 @@
 whistler:
   images:
     vm:
-      # Baked desktop VMs (in-guest Selkies) — build & push with
-      # `make vm-gnome-desktop-image PUSH=1`
-      # (+ CUDA=1 for the -cuda image); not skaffold artifacts because the qcow2
-      # bake needs qemu/KVM. Every tag a template references must be listed here
-      # or ensure_session fails closed with a PolicyError.
+      # Baked desktop VMs (in-guest Selkies) — build & push both variants with
+      # `make vm-gnome-desktop-image PUSH=1`; not skaffold artifacts because
+      # the qcow2 bake needs qemu/KVM. Every tag a template references must be
+      # listed here or ensure_session fails closed with a PolicyError.
+      # Templates name the lean image only: a VM with a GPU boots
+      # <image>-cuda instead, and only if that is listed here — unlisted, it
+      # boots the lean image without the NVIDIA driver.
       # `:latest` is deliberate for these mutable dev images: it is the only tag
       # KubeVirt defaults to imagePullPolicy Always, so a rebuild is actually
       # re-pulled instead of booting the node's stale cached qcow2. The CUDA
@@ -20,36 +22,22 @@ whistler:
       # would not match). See desktops/vm-gnome-selkies/build.sh.
       - localhost:5000/whistler-vm-gnome-selkies:latest
       - localhost:5000/whistler-vm-gnome-selkies-cuda:latest
-      # Dev-server VMs (no desktop, SSH only) — `make devbase-image
-      # [VARIANT=cuda|cuda-dev] PUSH=1`; see images/devbase/README.md.
+      # Dev-server VMs (no desktop, SSH only) — `make devbase-image PUSH=1`
+      # bakes base + cuda; see images/devbase/README.md.
       - localhost:5000/whistler-devbase:latest
       - localhost:5000/whistler-devbase-cuda:latest
-      - localhost:5000/whistler-devbase-cuda-dev:latest
 
 templates:
   # containerDisk boot: the qcow2 ships inside an OCI image. Fast pull-and-boot,
   # ephemeral root (home persists on the user PVC via the NFS storage gateway).
-  # GNOME, lean (no GPU) — runs on any node.
+  # GNOME, no GPU by default — runs on any node. One template for both: given
+  # a GPU (instance overrides or the start dialog; k3s-metal only) it boots
+  # whistler-vm-gnome-selkies-cuda instead, which has the NVIDIA driver.
   vm-desktop:
-    description: "Ubuntu 24.04 VM + GNOME"
+    description: "Ubuntu 24.04 VM + GNOME (GPU optional)"
     mode: desktop
     runtime: vm
     image: "localhost:5000/whistler-vm-gnome-selkies:latest"
-    viewer: websockets
-    persistence: persistent
-    displayPort: 8082
-    streamerEnv:
-      SELKIES_VIDEO_STREAMING_MODE: "true"
-    resources:
-      cpu: "4"
-      memory: 8Gi
-
-  # GNOME, CUDA (RTX 4090 passthrough) — k3s-metal only.
-  vm-desktop-cuda:
-    description: "Ubuntu 24.04 VM + GNOME Shell + CUDA"
-    mode: desktop
-    runtime: vm
-    image: "localhost:5000/whistler-vm-gnome-selkies-cuda:latest"
     viewer: websockets
     persistence: persistent
     displayPort: 8082
@@ -70,11 +58,17 @@ templates:
   # session is torn down on disconnect, which is wrong for a box someone leaves
   # a build or a tmux running on.
   #
-  # Toolchain: clang 21, Python 3.14, pixi (+ cmake/ninja/git/editors). Three
-  # variants — see images/devbase/README.md for what "CUDA available" means in
-  # each. Build: `make devbase-image [VARIANT=cuda|cuda-dev] PUSH=1`.
+  # Toolchain: clang 21, Python 3.14, pixi (+ cmake/ninja/git/editors). Two
+  # image variants — see images/devbase/README.md for what "CUDA available"
+  # means. Build: `make devbase-image PUSH=1` (base + cuda).
+  #
+  # No GPU by default. Given one (instance overrides or the start dialog;
+  # k3s-metal only) it boots whistler-devbase-cuda instead: the NVIDIA driver,
+  # i.e. the GPU runtime (libcuda, PTX JIT, NVENC, nvidia-smi) that
+  # PyTorch/JAX wheels load. No nvcc: a user who wants the CUDA SDK installs
+  # it themselves, e.g. with pixi (images/devbase/README.md).
   devbase:
-    description: "Ubuntu 26.04 dev vm"
+    description: "Ubuntu 26.04 dev vm (GPU optional)"
     mode: ssh
     runtime: vm
     image: "localhost:5000/whistler-devbase:latest"
@@ -82,30 +76,3 @@ templates:
     resources:
       cpu: "4"
       memory: 8Gi
-
-  # + the NVIDIA driver, i.e. the GPU runtime (libcuda, PTX JIT, NVENC,
-  # nvidia-smi) — what PyTorch/JAX wheels load. No nvcc. k3s-metal only.
-  devbase-cuda:
-    description: "Ubuntu 26.04 dev server + RTX 4090 runtime (SSH; no nvcc)"
-    mode: ssh
-    runtime: vm
-    image: "localhost:5000/whistler-devbase-cuda:latest"
-    persistence: persistent
-    nodeSelector:
-      nvidia.com/gpu.product: NVIDIA-GeForce-RTX-4090
-    resources:
-      cpu: "4"
-      memory: 16Gi
-      gpu: "1"
-
-  # + the CUDA SDK (nvcc, headers, dev libraries, cuda-gdb/compute-sanitizer)
-  # for compiling CUDA C++ in-guest. k3s-metal only.
-  devbase-cuda-dev:
-    description: "Ubuntu 26.04 dev server + RTX 4090 + CUDA SDK (SSH; nvcc)"
-    mode: ssh
-    runtime: vm
-    image: "localhost:5000/whistler-devbase-cuda-dev:latest"
-    persistence: persistent
-    resources:
-      cpu: "8"
-      memory: 16Gi

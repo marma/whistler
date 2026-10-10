@@ -97,7 +97,8 @@ RUN mkdir /tmp/selkies-src \
  && patch -p1 -d /tmp/selkies-src < /tmp/xkb-active-group.patch \
  && cp -a /tmp/selkies_web /tmp/selkies-src/src/selkies/selkies_web \
  # The archive's pyproject says 0.0.0.dev0; upstream's release build stamps
- # the version the same way, and `selkies --version` / the stats panel show it.
+ # the version the same way, and `selkies --version` / `pip show selkies`
+ # report it. The classic dashboard shows no version anywhere.
  && sed -i -e 's|^version =.*|version = "2.0.0"|' /tmp/selkies-src/pyproject.toml \
  && python3 -m venv /opt/venv \
  && /opt/venv/bin/pip install --no-cache-dir /tmp/selkies-src python-xlib \

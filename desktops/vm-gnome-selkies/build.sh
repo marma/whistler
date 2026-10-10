@@ -26,7 +26,9 @@
 #
 # CUDA=1 bakes the NVIDIA open driver in and publishes the result as
 # <IMAGE>-cuda:<TAG>; the default (CUDA=0) is a LEAN, driver-free image. Two
-# images rather than one: only GPU templates pull the -cuda image, and the variant
+# images rather than one: only a session with a GPU pulls the -cuda image (the
+# operator swaps it in for the template's lean one; gpu_image_variant in
+# whistler/config.py), and `make vm-gnome-desktop-image` bakes both. The variant
 # rides in the image NAME (not the tag) so the mutable dev tag can stay
 # exactly `:latest`, the only tag Kubernetes/KubeVirt default to
 # imagePullPolicy Always — a `:latest-cuda` tag would leave nodes booting a

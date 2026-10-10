@@ -57,7 +57,7 @@ def _manager(monkeypatch, sessions, vmis=(), pods=()):
 def _session(name, runtime, phase, **status):
     return {
         "metadata": {"name": name},
-        "spec": {"templateRef": "devbase-cuda-dev"},
+        "spec": {"templateRef": "devbase"},
         "status": {"runtime": runtime, "phase": phase, **status},
     }
 

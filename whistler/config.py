@@ -790,6 +790,36 @@ def requested_gpu_count(resources: Optional[Dict[str, Any]]) -> int:
         return 0
 
 
+# The suffix the bake scripts put on an image's NAME (never its tag) for the
+# variant with the NVIDIA driver in it: whistler-vm-gnome-selkies:latest and
+# whistler-vm-gnome-selkies-cuda:latest. See gpu_image_variant.
+GPU_IMAGE_SUFFIX = "-cuda"
+
+
+def gpu_image_variant(image: Optional[str]) -> Optional[str]:
+    """The GPU build of a containerDisk ``image``, or None if it has none.
+
+    ``registry:5000/name:tag`` -> ``registry:5000/name-cuda:tag``. The suffix
+    goes on the repository name, not the tag, because that is how the bake
+    scripts publish it: `:latest` is the only tag KubeVirt defaults to pull
+    Always, so `name:latest-cuda` would boot a node's stale cached qcow2.
+
+    None for an image already naming a GPU build (``-cuda``, ``-cuda-*``),
+    so a template that pins one keeps it, and for a digest reference, which
+    names one exact build and so cannot have a sibling."""
+    if not image or "@" in image:
+        return None
+    slash = image.rfind("/")
+    colon = image.rfind(":")
+    if colon > slash:
+        repo, tag = image[:colon], image[colon:]
+    else:
+        repo, tag = image, ""
+    if GPU_IMAGE_SUFFIX in repo[slash + 1:]:
+        return None
+    return f"{repo}{GPU_IMAGE_SUFFIX}{tag}"
+
+
 def _dig(obj, path):
     """Value at a nested dict path, or None if any level is missing."""
     for key in path:
@@ -2334,6 +2364,42 @@ class KubeConfigManager(ConfigManager):
                     f"(allowedZones: {allowed_zones or 'none granted'})"
                 )
         return effective_runtime
+
+    def _select_gpu_image(self, template_spec: Dict[str, Any],
+                          session_name: str = "") -> Dict[str, Any]:
+        """The spec to boot a VM from: with ``<image>-cuda`` if it has a GPU.
+
+        A template names the lean image, and a run with a card attached gets
+        ``<image>-cuda`` (gpu_image_variant), so one template serves both: the
+        driver is only in the image that needs it, and nobody has to choose
+        between two near-identical templates. Called after the run's
+        overrides are applied, so a GPU picked in the start dialog counts.
+
+        The variant is used only if it is in the vm image allow-list, which is
+        the cluster's own statement of which images exist. Otherwise the base
+        image boots as before, without the NVIDIA driver; probing a registry
+        from here would need its address and credentials as the node sees
+        them, which the operator does not have. Runs before _apply_policy, so
+        the image that is checked is the one that boots.
+
+        Returns a copy when it changes the image and never mutates its input,
+        which may be the cached template itself."""
+        if template_spec.get('imageURL'):
+            return template_spec
+        if not requested_gpu_count(template_spec.get('resources')):
+            return template_spec
+        image = template_spec.get('image')
+        variant = gpu_image_variant(image)
+        if not variant:
+            return template_spec
+        if variant not in (self.images.get('vm', []) or []):
+            logger.info("Session %s has a GPU but %s is not in "
+                        "whistler.images.vm; booting %s, which may lack the "
+                        "NVIDIA driver", session_name, variant, image)
+            return template_spec
+        logger.info("Session %s has a GPU: booting %s instead of %s",
+                    session_name, variant, image)
+        return {**template_spec, 'image': variant}
 
     def _apply_overrides(self, template_spec: Dict[str, Any],
                          user_details: Optional[Dict[str, Any]],
@@ -4602,6 +4668,8 @@ class KubeConfigManager(ConfigManager):
         template_spec, user_details = self._apply_overrides(
             template_spec, user_details, effective_session_overrides(spec),
             username)
+        if runtime == 'vm':
+            template_spec = self._select_gpu_image(template_spec, session_name)
 
         # Authoritative policy (may raise PolicyError, may coerce runtime->kata).
         effective_runtime = self._apply_policy(template_spec, mode, runtime, username)

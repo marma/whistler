@@ -9,8 +9,7 @@
 # simpler in one big way: there is no artifact *builder* stage, because there is
 # no Selkies venv to ABI-match. Everything comes from the guest's own apt (the
 # base is Ubuntu 26.04, which ships Python 3.14 and clang 21 in the archive —
-# no deadsnakes, no LLVM apt repo) plus two pinned upstream downloads (pixi,
-# and NVIDIA's CUDA repo for the cuda-dev variant).
+# no deadsnakes, no LLVM apt repo) plus one pinned upstream download (pixi).
 #
 # Pipeline (host needs only docker, curl and a /dev/kvm node):
 #   1. tar up guest/ (profile.d PATH bits + motd) as the NoCloud seed's
@@ -24,9 +23,9 @@
 # PUSH=1 to docker-push, VARIANT (below), DISK_SIZE, QEMU_MEM (4096),
 # QEMU_SMP (min(8,nproc)), BASE_IMAGE_URL, CACHE_DIR
 # (~/.cache/whistler/vm-images), BAKE_TIMEOUT (2700s), PIXI_VERSION,
-# NVIDIA_DRIVER_PACKAGE, CUDA_REPO_DISTRO, CUDA_TOOLKIT_PACKAGES.
+# NVIDIA_DRIVER_PACKAGE.
 #
-# THREE VARIANTS, selected by VARIANT and distinguished by the image NAME:
+# TWO VARIANTS, selected by VARIANT and distinguished by the image NAME:
 #
 #   VARIANT=base      whistler-devbase           no NVIDIA anything. Runs on
 #                     any node; the toolchain only.
@@ -36,11 +35,12 @@
 #                     actually load (they carry their own cudart/cuBLAS/cuDNN).
 #                     No nvcc, no CUDA headers, no docs — the same content
 #                     split as the -cuda desktop images.
-#   VARIANT=cuda-dev  whistler-devbase-cuda-dev  + the CUDA SDK from NVIDIA's
-#                     apt repo: nvcc, headers, the dev libraries and the
-#                     command-line tools (~4.6GB). For compiling CUDA C++
-#                     in-guest — flash-attn, DeepSpeed JIT ops,
-#                     torch.utils.cpp_extension.
+#
+# A template names the base image; a session with a GPU boots the -cuda one in
+# its place (gpu_image_variant in whistler/config.py). The CUDA *SDK* (nvcc,
+# headers, dev libraries) is deliberately not baked: everything above the
+# driver is userspace, so a user who needs it installs it in their own home,
+# e.g. with pixi — see README.md, "Compiling CUDA: bring your own SDK".
 #
 # The variant rides in the image NAME, never the tag, and the dev tag is
 # `latest` — both to keep Kubernetes' tag-based imagePullPolicy defaulting
@@ -76,47 +76,19 @@ PIXI_VERSION="${PIXI_VERSION:-0.76.2}"
 case "$VARIANT" in
   base)
     NVIDIA_DRIVER_PACKAGE=""
-    CUDA_TOOLKIT_PACKAGES=""
     DISK_SIZE="${DISK_SIZE:-16G}"
     ;;
   cuda)
     # 26.04's open-kernel driver branch. A wrong name fails the bake.
     NVIDIA_DRIVER_PACKAGE="${NVIDIA_DRIVER_PACKAGE:-nvidia-driver-595-open}"
-    CUDA_TOOLKIT_PACKAGES=""
     IMAGE="${IMAGE}-cuda"
     DISK_SIZE="${DISK_SIZE:-24G}"
     ;;
-  cuda-dev)
-    NVIDIA_DRIVER_PACKAGE="${NVIDIA_DRIVER_PACKAGE:-nvidia-driver-595-open}"
-    # CUDA 13.3 from NVIDIA's own apt repo, NOT 26.04's archive
-    # `nvidia-cuda-toolkit`: the archive one is CUDA 12.4, whose nvcc rejects
-    # this release's default gcc 15 and clang 21 as host compilers (it would
-    # need gcc-13 and -ccbin on every compile), and its runtime is a major
-    # version behind the 595 driver. 13.3 matches the driver and takes gcc 15.
-    #
-    # A curated package list, not the `cuda-toolkit-13-3` umbrella: that
-    # metapackage *Depends* (not Recommends, so --no-install-recommends does
-    # not help) on cuda-documentation-13-3 and on cuda-visual-tools-13-3, which
-    # drags in the Nsight Compute/Systems GUI profilers — ~1.3GB of docs and
-    # desktop tooling for an image that has no desktop. What's kept:
-    #   cuda-compiler-*           nvcc, ptxas, cicc, nvlink, nvvm  (~0.45GB)
-    #   cuda-libraries-dev-*      cuBLAS/cuFFT/cuRAND/cuSOLVER/cuSPARSE/NPP
-    #                             headers, static libs, cudart-dev  (~3.85GB)
-    #   cuda-command-line-tools-* cuda-gdb, compute-sanitizer, nvdisasm,
-    #                             CUPTI, NVTX  (~0.32GB)
-    #   cuda-nvml-dev-*           NVML headers
-    # Override to widen (e.g. add cuda-visual-tools-13-3) or to move CUDA
-    # versions; empty it and this is just the -cuda variant under a new name.
-    CUDA_TOOLKIT_PACKAGES="${CUDA_TOOLKIT_PACKAGES:-cuda-compiler-13-3 cuda-libraries-dev-13-3 cuda-command-line-tools-13-3 cuda-nvml-dev-13-3}"
-    IMAGE="${IMAGE}-cuda-dev"
-    DISK_SIZE="${DISK_SIZE:-40G}"
-    ;;
   *)
-    echo "ERROR: VARIANT must be one of: base, cuda, cuda-dev (got '$VARIANT')" >&2
+    echo "ERROR: VARIANT must be one of: base, cuda (got '$VARIANT')" >&2
     exit 1
     ;;
 esac
-CUDA_REPO_DISTRO="${CUDA_REPO_DISTRO:-ubuntu2604}"
 # Fixed port is fine: it only exists inside the bake container's netns.
 HTTP_PORT=8099
 
@@ -149,8 +121,6 @@ sed -e "s/@HTTP_PORT@/$HTTP_PORT/g" \
     -e "s/@VARIANT@/$VARIANT/g" \
     -e "s/@PIXI_VERSION@/$PIXI_VERSION/g" \
     -e "s/@NVIDIA_DRIVER_PACKAGE@/$NVIDIA_DRIVER_PACKAGE/g" \
-    -e "s/@CUDA_REPO_DISTRO@/$CUDA_REPO_DISTRO/g" \
-    -e "s/@CUDA_TOOLKIT_PACKAGES@/$CUDA_TOOLKIT_PACKAGES/g" \
     bake/user-data.in > "$SEED_DIR/user-data"
 printf 'instance-id: whistler-bake\nlocal-hostname: bake\n' > "$SEED_DIR/meta-data"
 docker build -f bake/Dockerfile.bake -t whistler-vm-bake bake/

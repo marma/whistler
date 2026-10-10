@@ -45,11 +45,21 @@ integration-keep: # Same, but keep the cluster afterwards for fast iteration
 integration-existing: # C1 round trip against the current kubectl context (kind/docker-desktop)
 	PROVIDER=existing PYTHON=$(PYTHON) scripts/integration.sh
 
-vm-gnome-desktop-image: # Bake the GNOME-Shell+Selkies KubeVirt containerDisk (24.04; needs qemu/KVM; PUSH=1 to push, CUDA=1 for the -cuda GPU variant, IMAGE/TAG to override)
-	PUSH=$(or $(PUSH),0) CUDA=$(or $(CUDA),0) desktops/vm-gnome-selkies/build.sh
+# The GPU variants are not a choice a template makes: a VM with a GPU boots
+# <image>-cuda in place of the image its template names (gpu_image_variant in
+# whistler/config.py). So the two are baked together by default, and a
+# rebuild cannot leave one of them on an older Selkies than the other.
+vm-gnome-desktop-image: # Bake the GNOME-Shell+Selkies KubeVirt containerDisks, lean and -cuda (24.04; needs qemu/KVM; PUSH=1 to push, CUDA=0|1 for just one, IMAGE/TAG to override)
+	set -e; for cuda in $(or $(CUDA),0 1); do \
+	  PUSH=$(or $(PUSH),0) CUDA=$$cuda desktops/vm-gnome-selkies/build.sh; \
+	done
 
-devbase-image: # Bake the devbase dev-server containerDisk — no desktop, SSH only (26.04; needs qemu/KVM; PUSH=1 to push, VARIANT=base|cuda|cuda-dev, IMAGE/TAG to override)
-	PUSH=$(or $(PUSH),0) VARIANT=$(or $(VARIANT),base) images/devbase/build.sh
+# base and cuda together, for the same reason. (No baked CUDA SDK: a user who
+# wants nvcc installs it in the guest, e.g. with pixi; images/devbase/README.md.)
+devbase-image: # Bake the devbase dev-server containerDisks, base and -cuda — no desktop, SSH only (26.04; needs qemu/KVM; PUSH=1 to push, VARIANT=base|cuda for just one, IMAGE/TAG to override)
+	set -e; for variant in $(or $(VARIANT),base cuda); do \
+	  PUSH=$(or $(PUSH),0) VARIANT=$$variant images/devbase/build.sh; \
+	done
 
 clean: # Remove the test image and any leftover cluster
 	-docker rmi $(TEST_IMAGE) 2>/dev/null

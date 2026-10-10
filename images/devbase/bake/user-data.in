@@ -48,8 +48,9 @@ write_files:
       # and nothing else. Notes on the less obvious entries:
       #   build-essential  gcc/g++/make/libc6-dev. Not redundant next to clang:
       #                    clang++ uses GNU libstdc++ headers from g++, the
-      #                    linker driver wants binutils, and nvcc (cuda-dev
-      #                    variant) requires a *GNU* host compiler.
+      #                    linker driver wants binutils, and nvcc (from a
+      #                    user's pixi environment) wants a *GNU* host
+      #                    compiler.
       #   clangd/-format/  the LSP + tooling half of clang. This image is meant
       #     -tidy          to be used from VS Code Remote over the SSH jump
       #                    host, where clangd is what makes C++ navigable.
@@ -94,7 +95,7 @@ write_files:
       /usr/local/bin/pixi --version
       /usr/local/bin/pixi completion --shell bash > /etc/bash_completion.d/pixi
 
-      # --- NVIDIA driver (cuda / cuda-dev variants) ------------------------
+      # --- NVIDIA driver (cuda variant) ------------------------------------
       # The GPU *runtime*: libcuda.so.1, the PTX JIT, OptiX, NVENC, nvidia-smi
       # — which is what PyTorch/JAX wheels (they carry their own
       # cudart/cuBLAS/cuDNN) and Blender actually load. Baked, not
@@ -102,77 +103,6 @@ write_files:
       # nvtop rides along: a GPU box wants a GPU top.
       if [ -n "@NVIDIA_DRIVER_PACKAGE@" ]; then
         $APT install -y --no-install-recommends "@NVIDIA_DRIVER_PACKAGE@" nvtop
-      fi
-
-      # --- CUDA SDK (cuda-dev variant only) --------------------------------
-      # NVIDIA's apt repo, curated package list — see build.sh for why not
-      # 26.04's archive nvidia-cuda-toolkit (CUDA 12.4, rejects gcc 15) and why
-      # not the cuda-toolkit-13-3 umbrella (hard-Depends on the docs and the
-      # Nsight GUI profilers).
-      #
-      # The pin matters: NVIDIA's repo also ships driver packages that would
-      # otherwise outrank Ubuntu's by version, quietly replacing the open
-      # driver installed above with theirs. Priority 400 keeps every
-      # nvidia-driver*/libnvidia* on the Ubuntu archive while the cuda-* and
-      # libcu*/libnpp/libnv* SDK packages (which the archive does not ship at
-      # all) still resolve from NVIDIA.
-      if [ -n "@CUDA_TOOLKIT_PACKAGES@" ]; then
-        curl -fL -o /run/cuda-keyring.deb \
-          "https://developer.download.nvidia.com/compute/cuda/repos/@CUDA_REPO_DISTRO@/x86_64/cuda-keyring_1.1-1_all.deb"
-        dpkg -i /run/cuda-keyring.deb
-        rm -f /run/cuda-keyring.deb
-        printf 'Package: nvidia-* libnvidia-* linux-modules-nvidia-*\nPin: origin developer.download.nvidia.com\nPin-Priority: 400\n' \
-          > /etc/apt/preferences.d/nvidia-archive-wins
-        $APT update
-        # Unquoted on purpose: this is a package *list*.
-        $APT install -y --no-install-recommends @CUDA_TOOLKIT_PACKAGES@
-
-        # /usr/local/cuda: the version-independent path everything (CMake's
-        # FindCUDAToolkit, CUDA_HOME, our profile.d) expects. The versioned
-        # packages normally manage it; create it if this package set didn't.
-        if [ ! -e /usr/local/cuda ]; then
-          CUDA_DIR=$(ls -d /usr/local/cuda-* 2>/dev/null | sort -V | tail -1)
-          [ -n "$CUDA_DIR" ] && ln -s "$CUDA_DIR" /usr/local/cuda
-        fi
-        # The SDK's shared libraries are not on the default ld.so path (NVIDIA
-        # documents LD_LIBRARY_PATH instead); make them findable for everyone,
-        # including non-login shells that never source profile.d.
-        printf '/usr/local/cuda/targets/x86_64-linux/lib\n/usr/local/cuda/lib64\n' \
-          > /etc/ld.so.conf.d/999-cuda.conf
-        ldconfig
-
-        # ...and the same problem for the binaries: /usr/local/cuda/bin is on
-        # PATH only via profile.d, which LOGIN shells read and
-        # `ssh <session>.w nvcc ...` does not — so a remote build command, a
-        # CI-style one-shot ssh, or a VS Code Remote server started without a
-        # login shell all get "nvcc: command not found" on an image that
-        # plainly has nvcc. (Caught by test.sh, which is why it now runs its
-        # checks with pipefail.)
-        #
-        # The fix is PATH in /etc/environment, which pam_env applies to every
-        # sshd session, login or not. The obvious alternative — symlinking the
-        # tools into /usr/local/bin — looks right and is WRONG: nvcc derives
-        # its toolkit root from the path it was invoked as and does not resolve
-        # the symlink, so /usr/local/bin/nvcc hunts for headers under
-        # /usr/local/include and dies with "cuda_runtime.h: No such file or
-        # directory". Measured, not theorised: that is exactly what test.sh's
-        # "nvcc compiles" check reported when this was a symlink loop.
-        #
-        # Caveat: this does not cover `sudo nvcc` (sudo uses its own
-        # secure_path), which is fine — you do not build as root.
-        if grep -q '^PATH=' /etc/environment; then
-          sed -i 's|^PATH="\?\([^"]*\)"\?$|PATH="\1:/usr/local/cuda/bin"|' /etc/environment
-        else
-          echo 'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/cuda/bin"' >> /etc/environment
-        fi
-        grep '^PATH=' /etc/environment | grep -q /usr/local/cuda/bin
-
-        # Assert the SDK is actually usable, not merely present: a real
-        # compile, which is what catches a broken include root.
-        test -x /usr/local/cuda/bin/nvcc
-        printf '__global__ void k(float *p){ p[threadIdx.x] = 1.f; }\n' > /run/t.cu
-        /usr/local/cuda/bin/nvcc -ptx /run/t.cu -o /run/t.ptx
-        rm -f /run/t.cu /run/t.ptx
       fi
 
       # --- VS Code Remote: keep the server off the NFS home ----------------
@@ -188,8 +118,7 @@ write_files:
       #
       # VSCODE_AGENT_FOLDER goes in /etc/environment because pam_env applies it
       # to every sshd session, and VS Code launches its server over ssh with no
-      # login shell — profile.d would never be read (the same reason nvcc lives
-      # there in the cuda-dev variant).
+      # login shell — profile.d would never be read.
       #
       # The cost, stated plainly: this path is the VM's *ephemeral* root disk,
       # so each new session re-downloads the server (~227MB) and re-installs
@@ -221,9 +150,6 @@ write_files:
         echo "  clang     $(clang --version | head -1 | sed 's/.*version //')"
         echo "  gcc       $(gcc -dumpfullversion)"
         echo "  pixi      $(pixi --version | cut -d' ' -f2)"
-        if [ -x /usr/local/cuda/bin/nvcc ]; then
-          echo "  nvcc      $(/usr/local/cuda/bin/nvcc --version | sed -n 's/.*release \([0-9.]*\).*/\1/p')"
-        fi
         if [ -n "@NVIDIA_DRIVER_PACKAGE@" ]; then
           echo "  nvidia    @NVIDIA_DRIVER_PACKAGE@ (GPU runtime; nvidia-smi, nvtop)"
         fi

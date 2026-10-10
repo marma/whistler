@@ -121,22 +121,8 @@ check "git/tmux/vim/jq"   'command -v git tmux vim jq | tr "\n" " "'
 check "nfs client"        'command -v mount.nfs4'
 check "no desktop baked"  '! command -v Xvfb >/dev/null && ! systemctl list-unit-files 2>/dev/null | grep -q whistler-streamer && echo "no X, no streamer (server image)"'
 
-# CUDA variants. nvcc needs no GPU (it is a cross-compiler — this compiles to
-# PTX), which is exactly why it can be tested here; nvidia-smi cannot work
-# under plain qemu with no passthrough device, so it is only reported.
-if "${SSH[@]}" 'test -x /usr/local/cuda/bin/nvcc' 2>/dev/null; then
-  # Every check here runs over `ssh <host> <cmd>`, i.e. a NON-login shell that
-  # never sources profile.d — so a bare `nvcc` succeeding is itself the
-  # regression test for the /etc/environment PATH.
-  check "nvcc"            'nvcc --version | tail -2 | head -1'
-  # And it must resolve to the real toolkit path: nvcc finds its headers
-  # relative to argv[0] without following symlinks, so a /usr/local/bin/nvcc
-  # shim would compile-fail on cuda_runtime.h (it did).
-  check "nvcc real path"  'command -v nvcc | grep "^/usr/local/cuda/bin/nvcc$"'
-  check "nvcc compiles"   'printf "__global__ void k(float*p){p[threadIdx.x]=1.f;}\n" > /tmp/t.cu && nvcc -ptx /tmp/t.cu -o /tmp/t.ptx && head -c 24 /tmp/t.ptx'
-  check "CUDA dev libs"   'test -f /usr/local/cuda/targets/x86_64-linux/include/cublas_v2.h && echo "cuBLAS headers present"'
-  check "cuda on ld path" 'ldconfig -p | grep -c "libcudart\|libcublas" | xargs -I{} echo "{} CUDA libs in ld cache"'
-fi
+# The cuda variant: nvidia-smi cannot work under plain qemu with no
+# passthrough device, so it is only reported.
 if "${SSH[@]}" 'command -v nvidia-smi >/dev/null' 2>/dev/null; then
   echo "note: nvidia-smi present (GPU runtime baked); it cannot run here — no passthrough GPU under this qemu"
 fi
