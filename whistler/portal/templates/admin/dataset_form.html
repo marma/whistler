@@ -134,7 +134,9 @@
       </div>
     </div>
 
-    {% set ext = dataset.externalSources if dataset else none %}
+    {# .get(), not .externalSources: an absent key is Undefined, which is not
+       `none`, and would render "anywhere" as "nowhere". #}
+    {% set ext = dataset.get('externalSources') if dataset else none %}
     {% set reach = 'anywhere' if ext is none else ('nowhere' if not ext else 'listed') %}
     <div id="managed-external" {% if not managed %}style="display:none"{% endif %}>
     <div class="ui divider"></div>

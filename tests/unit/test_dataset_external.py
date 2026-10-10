@@ -212,6 +212,43 @@ def test_external_sources_absent_and_empty_differ(definition, expected):
     assert KubeConfigManager.dataset_external_sources(definition) == expected
 
 
+@pytest.mark.parametrize("definition, reach", [
+    # Absent is the case that broke: Jinja reads a missing key as Undefined,
+    # which is not `none`, so the form showed "anywhere" as "nowhere" — and
+    # saving it unchanged would have fenced the dataset off.
+    (MANAGED, "anywhere"),
+    ({**MANAGED, "externalSources": []}, "nowhere"),
+    ({**MANAGED, "externalSources": ["192.0.2.0/24"]}, "listed"),
+])
+def test_the_edit_form_shows_the_stored_reach(definition, reach):
+    import asyncio
+    import re
+    from whistler.portal import management as mgmt
+
+    class CM:
+        is_archived_dataset = staticmethod(
+            KubeConfigManager.is_archived_dataset)
+        dataset_external_enabled = dataset_external_can_filter = True
+        dataset_external_source_filter = "traefik"
+
+        def get_dataset_definitions(self):
+            return {"d": definition}
+
+        def has_dataset_credentials(self, name):
+            return False
+
+    async def run(func, *args):
+        return func(*args)
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(run=run)),
+        state=SimpleNamespace(role="admin"), query_params={}, cookies={},
+        headers={}, url=SimpleNamespace(path="/"), scope={"type": "http"})
+    html = asyncio.run(
+        mgmt.admin_dataset_edit(request, CM(), "admin", "d")).body.decode()
+    assert re.findall(r'name="external_reach" value="(\w+)"[^>]*\s+checked',
+                      html) == [reach]
+
+
 def test_a_dataset_with_a_bad_range_is_refused():
     problem = KubeConfigManager.dataset_spec_problem(
         {**MANAGED, "externalSources": ["10.0.0.0/33"]})
