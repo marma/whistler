@@ -399,6 +399,14 @@ server:
     type: NodePort
     nodePort: 30022          # ssh here
 
+# The kiosk: at whistler.example.com/kiosk by default. `host` gives it a name
+# of its own that serves only the kiosk and the desktops it shows; `enabled:
+# false` removes it.
+kiosk:
+  enabled: true
+  # host: kiosk.example.com
+  # tls: [{secretName: kiosk-tls, hosts: [kiosk.example.com]}]
+
 portal:
   enabled: true
   # Both portal apps on one origin, through the chart's bundled Traefik pod.

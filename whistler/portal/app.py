@@ -58,7 +58,8 @@ from whistler.config import (CHANNEL_TERMINAL, ENTRY_KIOSK, ENTRY_PORTAL,
                              PERM_OWN_INSTANCES, role_may)
 from whistler.portal import kiosk, kubevirt, proxy, screenshots, terminal
 from whistler.portal.login import USER_COOKIE as _USER_COOKIE
-from whistler.portal.login import render_notice
+from whistler.portal.login import (kiosk_enabled, kiosk_home, portal_home,
+                                   render_notice)
 
 logger = logging.getLogger("whistler.portal")
 
@@ -193,6 +194,10 @@ async def entry_point_middleware(request: web.Request, handler):
     303 would land on a 404 instead of an explanation. Non-navigations get a
     bare 403 for the same reason the lock returns 423 to them."""
     needed = _required_entry_point(request.path)
+    if needed == ENTRY_KIOSK and not request.app["kiosk"]:
+        # No kiosk on this install: its paths are a plain 404, not a refusal
+        # that would imply there is a kiosk someone else may use.
+        return await handler(request)
     # On the kiosk paths, "who is this" is the *kiosk's* answer, not the auth
     # middleware's: that one falls back to a cookie (and then to a default
     # name), so a browser that once visited the portal would be turned away
@@ -219,12 +224,13 @@ async def entry_point_middleware(request: web.Request, handler):
     if (request.headers.get("Sec-Fetch-Mode") == "navigate"
             or "text/html" in request.headers.get("Accept", "")):
         if needed == ENTRY_PORTAL:
-            heading, href, label = ("Kiosk only", "/kiosk", "Go to the kiosk")
+            heading, href, label = ("Kiosk only", kiosk_home(), "Go to the kiosk")
             message = ("This account may only be used through the kiosk. "
                        "The portal, the web terminal and SSH are not available "
                        "to it.")
         else:
-            heading, href, label = ("Not a kiosk account", "/", "Go to the portal")
+            heading, href, label = ("Not a kiosk account", portal_home(),
+                                     "Go to the portal")
             message = ("This account is not granted the kiosk surface. "
                        "Use the portal instead.")
         return web.Response(text=render_notice(heading=heading, message=message,
@@ -974,9 +980,17 @@ def build_app(config_manager):
     # about; entry_point_middleware then decides whether this user gets this
     # surface at all, and lock_middleware — innermost — whether this browser
     # gets anything right now (whistler/portal/kiosk.py).
-    app = web.Application(middlewares=[auth_middleware, entry_point_middleware,
-                                       kiosk.lock_middleware])
+    #
+    # Without the kiosk (kiosk.enabled: false) the lock goes with it: a lock
+    # cookie left from before would otherwise refuse every page while the
+    # only screen that clears it no longer exists.
+    with_kiosk = kiosk_enabled()
+    middlewares = [auth_middleware, entry_point_middleware]
+    if with_kiosk:
+        middlewares.append(kiosk.lock_middleware)
+    app = web.Application(middlewares=middlewares)
     app["cm"] = config_manager
+    app["kiosk"] = with_kiosk
     app.cleanup_ctx.append(_proxy_client_ctx)
     app.cleanup_ctx.append(kubevirt.kube_ws_client_ctx)
     app.cleanup_ctx.append(screenshots.screenshot_ctx)
@@ -1005,5 +1019,6 @@ def build_app(config_manager):
     ])
     # The kiosk surface (/kiosk) lives on this app so its session page can frame
     # /connect same-origin and its cards can load /screenshot — see kiosk.py.
-    kiosk.add_routes(app)
+    if with_kiosk:
+        kiosk.add_routes(app)
     return app

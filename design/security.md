@@ -240,7 +240,7 @@ the boundary; the address check is the location control.**
 is the **surface** described above, built on the viewer app so its session page
 can frame `/connect` same-origin: a login, the user's own desktop sessions as
 cards, one full-screen desktop, and an idle timer
-(`portal.kiosk.idleTimeoutSeconds`, default 900s) that returns from a session
+(`kiosk.idleTimeoutSeconds`, default 900s) that returns from a session
 to the grid and from the grid to a logged-out login screen. There is no
 template picker, no launch form, no web terminal and no admin surface on it —
 not as a policy check, but because the pages have nothing else on them.

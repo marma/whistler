@@ -55,8 +55,9 @@ from whistler.config import (ACCESS_MODES, CHANNELS, ConfigWriteError,
                              ROLE_ADMIN, ROLES, VIEWERS, may_manage_user,
                              user_role,
                              normalize_source_ranges, role_may)
-from whistler.portal.login import (USER_COOKIE, dev_auth, render_login,
-                                   render_notice, verify_credentials)
+from whistler.portal.login import (USER_COOKIE, dev_auth, kiosk_home,
+                                   render_login, render_notice,
+                                   verify_credentials)
 from whistler.status import GROUP_COLORS, status_group
 from whistler.portal.backups import (BackupClient, BackupRefused,
                                      BackupUnavailable, in_cluster_storage)
@@ -394,7 +395,7 @@ def _entry_denied_page() -> HTMLResponse:
             message="This account may only be used through the kiosk. The "
                     "management portal, the web terminal and SSH are not "
                     "available to it.",
-            href="/kiosk", link_label="Go to the kiosk"),
+            href=kiosk_home(), link_label="Go to the kiosk"),
         status_code=403, headers={"Cache-Control": "no-store"})
 
 

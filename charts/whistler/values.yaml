@@ -78,6 +78,7 @@ portal:
     # Empty matches any host, which is what you want when you reach the
     # cluster by IP and have no name yet.
     host: ""
+    # The kiosk can have a host of its own: see kiosk.host below.
     path: /
     pathType: Prefix
     annotations: {}
@@ -179,24 +180,6 @@ portal:
     intervalSeconds: 300
     maxWidth: 960
     maxHeight: 540
-  # The kiosk surface (/kiosk, whistler/portal/kiosk.py): a login, the user's
-  # own desktops as cards, and a full-screen desktop — no templates, no launch
-  # form, no terminal, no admin. This is Whistler's half of the "kiosk
-  # situation" (design/security.md, "Closing the fourth axis"); the other half
-  # is a network on which every client is a controlled device, and neither half
-  # is a boundary alone. Note that serving /kiosk does not yet *bind* a user to
-  # it — nothing stops the same account opening the ordinary portal.
-  #
-  # Locking is the thin client's job, not a setting here: it navigates to
-  # /kiosk/lock?next=<where it was> and the portal refuses every viewer route
-  # but the lock screen until a password is entered. The idle timeout below is
-  # the portal's own, weaker fallback for browsers that do no such thing.
-  kiosk:
-    # Seconds without mouse, key or touch input before a kiosk returns to the
-    # start: from a session back to the card grid, from the grid to a logged-out
-    # login screen. 0 disables — which on an unattended screen means the last
-    # person's desktop stays up until someone else touches it.
-    idleTimeoutSeconds: 900
   # The web terminal (/term). The portal pings every open terminal every 30s so
   # an ingress or load balancer with an idle timeout of its own (ingress-nginx:
   # 60s) does not drop a shell sitting at a prompt; this is the portal's own
@@ -225,6 +208,44 @@ portal:
 # an earlier install left) and sets Retain on its PV. On the next install it
 # is found again and re-attached, and the first admin to sign in is offered
 # the latest backup.
+# The kiosk surface (/kiosk, whistler/portal/kiosk.py): a login, the user's
+# own desktops as cards, and a full-screen desktop — no templates, no launch
+# form, no terminal, no admin. Served by the portal's viewer app. This is
+# Whistler's half of the "kiosk situation" (design/security.md, "Closing the
+# fourth axis"); the other half is a network on which every client is a
+# controlled device, and neither half is a boundary alone. Who may use it is
+# the `kiosk` entry point on a User or Group.
+#
+# Locking is the thin client's job, not a setting here: it navigates to
+# /kiosk/lock?next=<where it was> and the portal refuses every viewer route
+# but the lock screen until a password is entered. The idle timeout below is
+# the portal's own, weaker fallback for browsers that do no such thing.
+kiosk:
+  # false: no kiosk at all. /kiosk is a 404 on every host, the lock goes with
+  # it, and the settings below are ignored. The `kiosk` entry point then
+  # opens nothing.
+  enabled: true
+
+  # A host of its own, e.g. kiosk.example.com. Empty: the kiosk is
+  # <portal.ingress.host>/kiosk. Set, it is a second rule on the portal's
+  # Ingress (so needs portal.ingress.enabled and portal.ingress.host), and
+  # the proxy serves that host ONLY what the kiosk needs — /kiosk and the
+  # desktop paths it frames; every other path there, "/" included,
+  # redirects to /kiosk. So kiosk devices can be allowed this name and
+  # nothing else, and the management UI is not reachable through it.
+  # Cookies are per host, so the two surfaces are signed into separately.
+  # <portal.ingress.host>/kiosk keeps working.
+  host: ""
+  # TLS for `host`, added to the portal Ingress,
+  # e.g. [{secretName: kiosk-tls, hosts: [kiosk.example.com]}]
+  tls: []
+
+  # Seconds without mouse, key or touch input before a kiosk returns to the
+  # start: from a session back to the card grid, from the grid to a logged-out
+  # login screen. 0 disables — which on an unattended screen means the last
+  # person's desktop stays up until someone else touches it.
+  idleTimeoutSeconds: 900
+
 backup:
   enabled: true
   volume:

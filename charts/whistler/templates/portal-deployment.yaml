@@ -90,10 +90,24 @@ spec:
               value: {{ .Values.portal.screenshots.maxWidth | quote }}
             - name: WHISTLER_SCREENSHOT_HEIGHT
               value: {{ .Values.portal.screenshots.maxHeight | quote }}
-            # Kiosk surface (whistler/portal/kiosk.py): idle returns to the
-            # kiosk start. 0 disables.
+            # Kiosk surface (whistler/portal/kiosk.py). Off: no /kiosk routes
+            # and no lock (portal/app.py build_app).
+            - name: WHISTLER_KIOSK_ENABLED
+              value: {{ .Values.kiosk.enabled | ternary "true" "false" | quote }}
+            # Idle returns to the kiosk start. 0 disables.
             - name: WHISTLER_KIOSK_IDLE_TIMEOUT
-              value: {{ .Values.portal.kiosk.idleTimeoutSeconds | quote }}
+              value: {{ .Values.kiosk.idleTimeoutSeconds | quote }}
+            {{- $kioskHost := include "whistler.kiosk.host" . }}
+            {{- if $kioskHost }}
+            {{- $ing := .Values.portal.ingress }}
+            {{- $tls := concat ($ing.tls | default list) (.Values.kiosk.tls | default list) }}
+            # The kiosk has a host of its own, so "Go to the portal" / "Go to
+            # the kiosk" on the refusal pages are absolute (portal/login.py).
+            - name: WHISTLER_PORTAL_URL
+              value: {{ include "whistler.portal.hostURL" (dict "host" $ing.host "tls" $tls) | quote }}
+            - name: WHISTLER_KIOSK_URL
+              value: {{ include "whistler.portal.hostURL" (dict "host" $kioskHost "tls" $tls) | quote }}
+            {{- end }}
             # Web terminal (whistler/portal/terminal.py): closed after this
             # many seconds without a keystroke. 0 disables.
             - name: WHISTLER_TERMINAL_IDLE_TIMEOUT

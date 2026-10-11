@@ -660,3 +660,35 @@ async def test_a_disabled_user_cannot_unlock(portal):
     assert resp.headers["Location"] == "/kiosk"
     # Signed out, not unlocked: the identity cookie is cleared.
     assert not resp.cookies["whistler_user"].value
+
+
+# --------------------------------------------------------------------------- #
+# kiosk.enabled: false                                                         #
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+async def no_kiosk(monkeypatch):
+    monkeypatch.setenv("WHISTLER_AUTH_ALLOW_ANY", "true")
+    monkeypatch.setenv("WHISTLER_SCREENSHOT_INTERVAL", "0")
+    monkeypatch.setenv("WHISTLER_KIOSK_ENABLED", "false")
+    cm = FakeCM()
+    cm.sessions["alice"] = [_desktop("desk")]
+    client = TestClient(TestServer(build_app(cm)))
+    await client.start_server()
+    yield client
+    await client.close()
+
+
+@pytest.mark.parametrize("path", ["/kiosk", "/kiosk/lock", "/kiosk/session/desk"])
+async def test_without_the_kiosk_its_paths_are_not_found(no_kiosk, path):
+    resp = await no_kiosk.get(path, headers={"Sec-Fetch-Mode": "navigate"},
+                              allow_redirects=False)
+    assert resp.status == 404
+
+
+async def test_without_the_kiosk_a_left_over_lock_locks_nothing(no_kiosk):
+    """The lock screen is gone, so a lock cookie set before the kiosk was
+    turned off must not hold the browser on a page that no longer exists."""
+    no_kiosk.session.cookie_jar.update_cookies({kiosk.LOCK_COOKIE: "/kiosk"})
+    resp = await no_kiosk.get("/status/desk?user=alice", allow_redirects=False)
+    assert resp.status not in (303, 423)

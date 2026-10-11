@@ -19,8 +19,20 @@ routers/services in one ConfigMap.
        hostname reaches the proxy; repeating that here would only mean a
        port-forward to the proxy Service (http://localhost:<port>, the dev
        arrangement) matched no router and 404'd on every path. */}}
+{{- /* Without the kiosk, /kiosk is not a viewer path: it falls through to the
+       management catch-all and 404s there. */}}
+{{- if not .Values.kiosk.enabled }}
+{{- $viewerPaths = $viewerPaths | replace " || PathPrefix(`/kiosk`)" "" }}
+{{- end }}
 {{- $viewerRule := $viewerPaths }}
 {{- $mgmtRule := "PathPrefix(`/`)" }}
+{{- /* What a kiosk's own host (kiosk.host) serves: the kiosk,
+       and the desktop paths its session page frames and its cards load
+       (/connect redirects on to /desktop or /vnc). Not /term, /launch or
+       /console — those need the portal entry point anyway — and nothing of
+       the management app. */}}
+{{- $kioskHost := include "whistler.kiosk.host" . }}
+{{- $kioskPaths := "PathPrefix(`/kiosk`) || PathPrefix(`/connect`) || PathPrefix(`/desktop`) || PathPrefix(`/status`) || PathPrefix(`/vnc`) || PathPrefix(`/ws-vnc`) || PathPrefix(`/screenshot`) || PathPrefix(`/static`)" }}
 {{- $auth := .Values.portal.proxy.basicAuth | default dict }}
 {{- /* One middleware in front of both routers: the lock is on the origin, not
        on a subset of its paths. See portal-proxy-auth.yaml for what it is and
@@ -78,6 +90,25 @@ data:
           {{- if $middlewares }}
           middlewares: {{ $middlewares }}
           {{- end }}
+        {{- if $kioskHost }}
+        # The kiosk's own host. Host() matches above every host-less router,
+        # so nothing below is reachable through this name.
+        kiosk-viewer:
+          rule: "Host(`{{ $kioskHost }}`) && ({{ $kioskPaths }})"
+          priority: 300
+          entryPoints: [web]
+          service: portal-viewer
+          {{- if $middlewares }}
+          middlewares: {{ $middlewares }}
+          {{- end }}
+        kiosk-home:
+          rule: "Host(`{{ $kioskHost }}`)"
+          priority: 200
+          entryPoints: [web]
+          # Never reached: the redirect answers first.
+          service: portal-viewer
+          middlewares: [kiosk-home]
+        {{- end }}
       services:
         portal-viewer:
           loadBalancer:
@@ -87,8 +118,18 @@ data:
           loadBalancer:
             servers:
               - url: "http://{{ .Release.Name }}-portal:{{ .Values.portal.service.managementPort }}"
-      {{- if $auth.enabled }}
+      {{- if or $auth.enabled $kioskHost }}
       middlewares:
+      {{- end }}
+      {{- if $kioskHost }}
+        kiosk-home:
+          redirectRegex:
+            # A relative Location: TLS ends at the Ingress in front, so the
+            # scheme this proxy sees is not the one the browser used.
+            regex: "^.*"
+            replacement: "/kiosk"
+      {{- end }}
+      {{- if $auth.enabled }}
         portal-auth:
           basicAuth:
             # The credential lives in a Secret (portal-proxy-auth.yaml), not

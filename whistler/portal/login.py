@@ -116,6 +116,27 @@ def render_notice(*, heading: str, message: str, href: str = None,
             .replace("__LINK__", link))
 
 
+def portal_home() -> str:
+    """Where a "Go to the portal" link points. Same-origin "/" unless the
+    kiosk has a host of its own (portal.ingress.kioskHost), where "/" is the
+    kiosk again and the portal is on another origin."""
+    return os.environ.get("WHISTLER_PORTAL_URL", "").rstrip("/") + "/"
+
+
+def kiosk_enabled() -> bool:
+    """Whether this install serves the kiosk at all (chart: kiosk.enabled).
+    Unset is on, so a dev run and the tests keep the surface."""
+    return os.environ.get("WHISTLER_KIOSK_ENABLED", "true").lower() != "false"
+
+
+def kiosk_home():
+    """Where a "Go to the kiosk" link points, the mirror of portal_home, or
+    None when there is no kiosk to go to."""
+    if not kiosk_enabled():
+        return None
+    return os.environ.get("WHISTLER_KIOSK_URL", "").rstrip("/") + "/kiosk"
+
+
 def dev_auth() -> bool:
     """Whether the portal's dev auth gate is open. Read per request, not at
     import, so tests and a restarted process agree."""

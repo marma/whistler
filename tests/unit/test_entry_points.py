@@ -250,6 +250,23 @@ async def test_a_non_kiosk_user_is_refused_the_kiosk(viewer):
     assert "Not a kiosk account" in body and 'href="/"' in body
 
 
+async def test_with_a_kiosk_host_the_refusals_cross_origins(viewer, monkeypatch):
+    """kiosk.host: on the kiosk's host "/" is the kiosk again,
+    so a same-origin "Go to the portal" would loop back to this refusal."""
+    monkeypatch.setenv("WHISTLER_PORTAL_URL", "https://portal.example.org")
+    monkeypatch.setenv("WHISTLER_KIOSK_URL", "https://kiosk.example.org/")
+    body = await (await viewer.get("/kiosk?user=worker", headers=_NAV)).text()
+    assert 'href="https://portal.example.org/"' in body
+    body = await (await viewer.get("/?user=kiosky", headers=_NAV)).text()
+    assert 'href="https://kiosk.example.org/kiosk"' in body
+
+
+async def test_without_the_kiosk_its_refusal_offers_no_way_to_it(viewer, monkeypatch):
+    monkeypatch.setenv("WHISTLER_KIOSK_ENABLED", "false")
+    body = await (await viewer.get("/?user=kiosky", headers=_NAV)).text()
+    assert "Kiosk only" in body and "/kiosk" not in body
+
+
 async def test_a_stale_portal_cookie_still_gets_the_kiosk_login_form(viewer):
     """The trap this avoids: on a shared machine the auth middleware's cookie
     fallback would name whoever used the portal there last, and the kiosk would
