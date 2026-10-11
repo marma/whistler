@@ -2179,7 +2179,10 @@ def _external_form_context(cm):
     return {"external_enabled": cm.dataset_external_enabled,
             "external_can_filter": cm.dataset_external_can_filter,
             "external_source_filter": getattr(
-                cm, "dataset_external_source_filter", "none")}
+                cm, "dataset_external_source_filter", "none"),
+            # The claims a claim dataset may use (whistler.datasetServer.
+            # claims); the form offers these and nothing else.
+            "dataset_claims": list(getattr(cm, "dataset_claims", []))}
 
 
 async def admin_dataset_new(request: Request, cm: CM, admin: Admin):

@@ -1520,6 +1520,13 @@ class KubeConfigManager(ConfigManager):
             "WHISTLER_DATASET_SERVER_RESOURCES", {})
         self.dataset_storage_class = (
             os.environ.get("WHISTLER_DATASET_STORAGE_CLASS") or None)
+        # The claims `claim` datasets may use: whistler.datasetServer.claims,
+        # which the chart renders (templates/dataset-claims.yaml). Nothing
+        # else is ever mounted as a dataset, so the portal cannot point a
+        # dataset at a home, the backup claim or a managed dataset's claim.
+        self.dataset_claims = sorted(
+            str(c) for c in self._env_json("WHISTLER_DATASET_CLAIMS", [])
+            if isinstance(c, str) and c)
         # External dataset access (whistler.datasetServer.external). No host
         # means off: no external listener, no Ingress, no external keys —
         # and the `external` column of the access matrix grants nothing.
@@ -5324,7 +5331,8 @@ class KubeConfigManager(ConfigManager):
             return None
         definition = self.get_dataset_definitions().get(volume)
         if not definition or not self.has_dataset_server(definition) or \
-                self.is_archived_dataset(definition):
+                self.is_archived_dataset(definition) or \
+                self.dataset_claim_problem(definition):
             return None
         granted = ((self.get_user_volume_access(username) or {})
                    .get(EXTERNAL_ZONE) or {}).get(volume)
@@ -5467,7 +5475,8 @@ class KubeConfigManager(ConfigManager):
                         f"Dataset {name!r} is archived; resurrect it before "
                         f"editing it.")
                 problem = self.dataset_spec_problem(
-                    spec, existing.get("spec") or {})
+                    spec, existing.get("spec") or {}) or \
+                    self.dataset_claim_problem(spec)
                 if problem:
                     raise DatasetSpecError(problem)
                 # Annotations survive the replace (kopf keeps its state there).
@@ -5487,7 +5496,8 @@ class KubeConfigManager(ConfigManager):
             except ApiException as e:
                 if e.status != 404:
                     raise
-                problem = self.dataset_spec_problem(spec)
+                problem = self.dataset_spec_problem(spec) or \
+                    self.dataset_claim_problem(spec)
                 if not problem and self.has_dataset_server(spec) and \
                         not MANAGED_DATASET_NAME.fullmatch(name):
                     problem = (f"A Whistler-served dataset's name is its "
@@ -5508,6 +5518,23 @@ class KubeConfigManager(ConfigManager):
         self._load_datasets()
         self._refresh_s3_proxy_policies(name)
         return True
+
+    def dataset_claim_problem(self, definition: Dict[str, Any]
+                              ) -> Optional[str]:
+        """Why a claim dataset may not use the claim it names, or None: the
+        claim must be one the install hands over (whistler.datasetServer.
+        claims). Asked on save and again by the operator before it mounts
+        anything, so a Dataset written with kubectl is held to it too."""
+        if not self.is_claim_dataset(definition):
+            return None
+        claim = (definition or {}).get("claimName")
+        if claim in getattr(self, "dataset_claims", []):
+            return None
+        return (f"Claim {claim!r} is not offered for datasets. The claims a "
+                f"dataset may use are listed in whistler.datasetServer.claims"
+                + (f" (now: {', '.join(self.dataset_claims)})."
+                   if getattr(self, "dataset_claims", None) else
+                   ", which is empty."))
 
     @staticmethod
     def dataset_source(definition: Dict[str, Any]) -> str:
@@ -6000,6 +6027,10 @@ class KubeConfigManager(ConfigManager):
             # The dataset's readOnly ceiling wins over the grant.
             mode = self.dataset_mode(
                 definition, "ro" if granted == "read-only" else "rw")
+            problem = self.dataset_claim_problem(definition)
+            if problem:
+                logger.error(f"Dataset {name!r} not mounted: {problem}")
+                continue
             try:
                 ready = self.ensure_s3_proxy(name, mode, definition)
             except Exception as e:
@@ -6700,6 +6731,10 @@ class KubeConfigManager(ConfigManager):
         dataset leaves the claim and its PV exactly as they were."""
         api = client.CoreV1Api()
         if self.is_claim_dataset(definition):
+            problem = self.dataset_claim_problem(definition)
+            if problem:
+                logger.error(f"Dataset {volume!r} not served: {problem}")
+                return None
             claim = definition.get("claimName")
             try:
                 api.read_namespaced_persistent_volume_claim(
@@ -7099,6 +7134,16 @@ class KubeConfigManager(ConfigManager):
         if problem:
             logger.error(f"Dataset {volume!r} not served: {problem}")
             return False
+        problem = self.dataset_claim_problem(definition)
+        if problem:
+            # A claim taken off the list (or never on it) is not served, and
+            # a server already running on it stops: the list is what may be
+            # mounted, not what may be mounted next. Fences stay, as on
+            # archive. Not a retry — nothing changes until the values do,
+            # and a values change restarts the operator, which resumes this.
+            logger.error(f"Dataset {volume!r} not served: {problem}")
+            self._stop_dataset_server(volume)
+            return True
         root_secret = self._ensure_dataset_root_secret(volume)
         if not root_secret or self.sync_dataset_keys(volume) is None:
             return False   # the pod's init container needs the seed
@@ -7161,6 +7206,16 @@ class KubeConfigManager(ConfigManager):
                                    f"{volume!r}: {e}")
         return ok
 
+    def _stop_dataset_server(self, volume: str) -> None:
+        """Remove a dataset's server Deployment (pods go, fences stay)."""
+        try:
+            client.AppsV1Api().delete_namespaced_deployment(
+                self.dataset_server_name(volume), self.namespace)
+            logger.info(f"Stopped the server of dataset {volume!r}")
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Could not stop the server of {volume!r}: {e}")
+
     def _managed_dataset_names(self) -> Optional[Set[str]]:
         """Names of the managed Datasets that are served (not archived), read
         straight from the API, or
@@ -7202,7 +7257,8 @@ class KubeConfigManager(ConfigManager):
             annotations = item["metadata"].get("annotations") or {}
             if not self.has_dataset_server(spec) or \
                     self.is_archived_dataset(spec) or \
-                    DELETE_DATA_ANNOTATION in annotations:
+                    DELETE_DATA_ANNOTATION in annotations or \
+                    self.dataset_claim_problem(spec):
                 continue
             volume = item["metadata"]["name"]
             try:

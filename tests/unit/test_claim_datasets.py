@@ -186,7 +186,7 @@ def _core(monkeypatch, exists=True):
 
 def test_an_existing_claim_is_only_looked_up(monkeypatch):
     calls = _core(monkeypatch)
-    cm = _manager()
+    cm = _manager(dataset_claims=["corpus-data"])
     cm.secure_claim = lambda *a: pytest.fail("retained the admin's PV")
     cm.reattach_claim = lambda *a: pytest.fail("re-attached")
     assert cm._ensure_dataset_claim("corpus", CLAIM) == "corpus-data"
@@ -195,7 +195,7 @@ def test_an_existing_claim_is_only_looked_up(monkeypatch):
 
 def test_a_missing_claim_serves_nothing_and_provisions_nothing(monkeypatch):
     _core(monkeypatch, exists=False)
-    cm = _manager()
+    cm = _manager(dataset_claims=["corpus-data"])
     cm.reattach_claim = lambda *a: pytest.fail("re-attached")
     assert cm._ensure_dataset_claim("corpus", CLAIM) is None
 
@@ -239,7 +239,8 @@ def test_the_sweep_never_retains_the_admins_volume():
 
 
 def test_external_access_is_offered_for_a_claim_dataset():
-    cm = _manager(dataset_external_host="s3.example")
+    cm = _manager(dataset_external_host="s3.example",
+                  dataset_claims=["corpus-data"])
     cm.get_dataset_definitions = lambda: {"corpus": CLAIM}
     cm.get_user_volume_access = lambda u: {
         cfg.EXTERNAL_ZONE: {"corpus": "read-only"}}
@@ -302,3 +303,54 @@ def test_portal_trims_a_trailing_slash_and_drops_it_elsewhere():
     data = _build_dataset_data("c", "", "", "", "", "", "", "", True,
                                source="managed", size="1Gi", sub_path="a")
     assert data["subPath"] is None
+
+
+# --- only the claims the install hands over --------------------------------- #
+
+def test_only_listed_claims_may_be_used():
+    cm = _manager(dataset_claims=["corpus-data"])
+    assert cm.dataset_claim_problem(CLAIM) is None
+    problem = cm.dataset_claim_problem({**CLAIM, "claimName": "whistler-backups"})
+    assert "not offered" in problem and "corpus-data" in problem
+    assert "is empty" in _manager(dataset_claims=[]).dataset_claim_problem(CLAIM)
+    # Other sources are not asked.
+    assert cm.dataset_claim_problem(MANAGED) is None
+
+
+def test_an_unlisted_claim_is_never_looked_up(monkeypatch):
+    monkeypatch.setattr(cfg.client, "CoreV1Api", lambda: SimpleNamespace(
+        read_namespaced_persistent_volume_claim=lambda *a: pytest.fail(
+            "read an unlisted claim")))
+    assert _manager(dataset_claims=[])._ensure_dataset_claim(
+        "corpus", CLAIM) is None
+
+
+def test_a_claim_taken_off_the_list_stops_its_server(monkeypatch):
+    stopped = []
+    monkeypatch.setattr(cfg.client, "AppsV1Api", lambda: SimpleNamespace(
+        delete_namespaced_deployment=lambda name, ns: stopped.append(name)))
+    cm = _manager(dataset_claims=[])
+    cm._ensure_dataset_root_secret = lambda v: pytest.fail("built a server")
+    # True: nothing to retry until the values change (which restarts the
+    # operator and resumes this).
+    assert cm.ensure_managed_dataset("corpus", CLAIM) is True
+    assert stopped == ["whistler-dataset-corpus"]
+
+
+def test_a_session_never_mounts_an_unlisted_claim():
+    cm = _manager(dataset_claims=[])
+    cm.ensure_s3_proxy = lambda *a: pytest.fail("prepared an unlisted claim")
+    cm.get_dataset_definitions = lambda: {"corpus": CLAIM}
+    cm.get_user_volume_access = lambda u: {"lab": {"corpus": "allowed"}}
+    assert cm.session_shared_datasets("alice", "lab", ["corpus"]) == []
+
+
+def test_saving_an_unlisted_claim_is_refused():
+    cm = _manager(group="g", version="v1", dataset_claims=["corpus-data"])
+    cm.api = SimpleNamespace(
+        get_namespaced_custom_object=lambda *a: (_ for _ in ()).throw(
+            ApiException(status=404)),
+        create_namespaced_custom_object=lambda *a: pytest.fail("saved"))
+    with pytest.raises(cfg.DatasetSpecError, match="not offered"):
+        cm.save_dataset({"name": "corpus", **CLAIM,
+                         "claimName": "whistler-backups"}, create=True)

@@ -56,11 +56,13 @@
       </div>
       <div class="field">
         <div class="ui radio checkbox">
-          <input type="radio" name="source" value="claim" id="source-claim">
-          <label for="source-claim"><strong>Existing claim</strong> — serve a
-            PersistentVolumeClaim that already exists in Whistler's namespace.
-            Whistler only mounts it: creating or deleting the dataset does not
-            change the claim.</label>
+          <input type="radio" name="source" value="claim" id="source-claim"
+                 {% if not dataset_claims %}disabled{% endif %}>
+          <label for="source-claim"><strong>Existing claim</strong> — serve
+            storage handed over to Whistler in its Helm values. Whistler only
+            mounts it: creating or deleting the dataset does not change it.
+            {% if not dataset_claims %}<span class="ui grey text">None is offered:
+            list claims in <code>whistler.datasetServer.claims</code>.</span>{% endif %}</label>
         </div>
       </div>
       <div class="field">
@@ -92,13 +94,28 @@
     <div id="claim-fields" {% if not from_claim %}style="display:none"{% endif %}>
       <div class="field required">
         <label>Claim</label>
-        <input name="claim_name" type="text" placeholder="reference-data-pvc"
-               pattern="[a-z0-9]([\-a-z0-9.]*[a-z0-9])?" maxlength="253"
-               value="{{ dataset.claimName if dataset and dataset.claimName else '' }}"
-               {% if from_claim %}required{% endif %}>
+        {% set current_claim = dataset.claimName if dataset and dataset.claimName else '' %}
+        <select name="claim_name" class="ui dropdown" {% if from_claim %}required{% endif %}>
+          <option value="">Choose a claim…</option>
+          {% for c in dataset_claims %}
+          <option value="{{ c }}" {% if c == current_claim %}selected{% endif %}>{{ c }}</option>
+          {% endfor %}
+          {% if current_claim and current_claim not in dataset_claims %}
+          {# Kept selectable so the form shows the truth; saving refuses it. #}
+          <option value="{{ current_claim }}" selected>{{ current_claim }} (no longer offered)</option>
+          {% endif %}
+        </select>
+        {% if current_claim and current_claim not in dataset_claims %}
+        <div class="ui small warning message" style="display:block">
+          <code>{{ current_claim }}</code> is no longer listed in
+          <code>whistler.datasetServer.claims</code>, so this dataset is not
+          served. Choose an offered claim, or list it again.
+        </div>
+        {% endif %}
         <div class="ui pointing label">
-          The name of a PersistentVolumeClaim in Whistler's namespace. Its
-          content is the dataset, as it stands. The claim is never resized,
+          One of the claims listed in the Helm values
+          (<code>whistler.datasetServer.claims</code>). Its content is the
+          dataset, as it stands. The claim is never resized,
           retained or deleted by Whistler — not even when the dataset is
           deleted for good.
         </div>
@@ -333,7 +350,7 @@
           sources.includes(chosen) ? "" : "none";
       }
       document.querySelector('input[name="size"]').required = chosen === "managed";
-      document.querySelector('input[name="claim_name"]').required = chosen === "claim";
+      document.querySelector('select[name="claim_name"]').required = chosen === "claim";
       document.querySelector('input[name="bucket"]').required = chosen === "s3";
     }
     document.querySelectorAll('input[name="source"]').forEach(

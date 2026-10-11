@@ -768,19 +768,35 @@ form cannot pre-grant outside access that would open with the dataset.
 Choosing Anywhere or listed addresses unlocks it; nobody is granted anything
 automatically.
 
-**This sets aside the rule stated above** — "the portal can only *create*
-storage, never reference it; a cluster admin hands existing volumes over" —
-deliberately, as a first step: any portal admin can now name any claim in the
-release namespace, which includes Whistler's own (`whistler-backups`, every
-managed dataset's `whistler-dataset-<name>`). Guardrails are the next step,
-and the earlier paragraph is still the shape they should take: a label an
-admin puts on a claim with kubectl to hand it over, the portal choosing only
-among labelled claims, and a refusal of claims Whistler owns. Also open:
-datasets whose directories overlap (the same claim with no `subPath`, the
-same `subPath` twice, or one nested in another — two servers, two lock
-domains, and a grant on one reaching into the other), which nothing refuses
-yet; and claims outside the release namespace, which would need the server
-pod — and its fences and Secrets — to run there.
+**The claims are handed over in Helm values** (same day). The rule stated
+above — "the portal can only *create* storage, never reference it; a cluster
+admin hands existing volumes over" — holds again, with the values file as the
+hand-over: `whistler.datasetServer.claims` lists them, the chart renders each
+claim in the release namespace (and, for an `nfs:` entry, the static Retain PV
+it binds to, reserved by `claimRef`), and **those are the only claims a claim
+dataset may use**. The portal's Claim field is a dropdown of that list, and the
+operator asks the same question (`dataset_claim_problem`) before it looks a
+claim up, so a Dataset written with kubectl is held to it too. Names starting
+`whistler-` are refused by the chart, so Whistler's own claims
+(`whistler-backups`, `whistler-dataset-<name>`) can never be listed. An entry
+must name `nfs` or an existing PV (`volumeName`): a claim provisioned from a
+storage class would be new, empty storage carrying that class's reclaim policy.
+
+Both objects carry `helm.sh/resource-policy: keep`, so neither `helm
+uninstall` nor an upgrade that drops an entry deletes them — and nobody adds or
+deletes anything in the release namespace by hand. **Dropping an entry
+withdraws the claim**: its datasets stop being served at once (the server is
+removed, fences kept, as on archive; no session mounts it; no external key is
+shown) rather than at their next change. The env var carrying the list changes
+with the values, which restarts the operator, and its resume pass is what
+notices. Kept objects keep Helm's ownership annotations, so a reinstall under
+the same release name adopts them; under another name Helm refuses to.
+
+Still open: datasets whose directories overlap (the same claim with no
+`subPath`, the same `subPath` twice, or one nested in another — two servers,
+two lock domains, and a grant on one reaching into the other), which nothing
+refuses yet; and claims outside the release namespace, which would need the
+server pod — and its fences and Secrets — to run there.
 
 **Several datasets on one claim: `subPath`** (same day). A claim dataset may
 name a directory of the claim (`spec.subPath`, relative, no `.`/`..`/empty

@@ -693,6 +693,32 @@ whistler:
     # (ext4/xfs do; most block-backed classes are fine).
     storageClass: ""
 
+    # Existing storage for `claim` datasets (design/storage.md, "Datasets
+    # from existing claims"). Each entry renders a claim of that name in the
+    # release namespace — and, with `nfs`, the static PV it binds to — and
+    # these are the ONLY claims a claim dataset may use: the portal offers
+    # them, the operator refuses any other. Both are kept on uninstall and
+    # when an entry is dropped (helm.sh/resource-policy: keep); a PV made
+    # here is Retain. Whistler never resizes, relabels or deletes them.
+    # Names must not start with "whistler-" (Whistler's own claims do).
+    #
+    # The claim's root (or a dataset's subPath in it) must be readable, and
+    # writable unless the dataset is read-only, by the uid/gid the dataset
+    # names (default 1000/1000); nothing chowns it.
+    claims: {}
+      # research-data:
+      #   size: 1Ti                     # informational for NFS
+      #   accessModes: [ReadWriteMany]  # the default; lets datasets on one
+      #                                 # claim run on different nodes
+      #   # Either an NFS export, for which the chart makes the PV...
+      #   nfs:
+      #     server: nfs.example.org
+      #     path: /export/research
+      #   mountOptions: [nfsvers=4.1]
+      #   # ...or an existing PV to bind to (one of the two is required):
+      #   # volumeName: research-pv
+      #   # storageClassName: ""        # must equal the PV's class
+
     # Access to managed datasets from OUTSIDE the cluster (design/storage.md,
     # "External access"): granted per user in the access matrix's reserved
     # `external` column, with a key the user sees on their Datasets page.

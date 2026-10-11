@@ -1,0 +1,74 @@
+{{- /*
+Existing storage handed over for `claim` datasets (whistler.datasetServer.
+claims; design/storage.md, "Datasets from existing claims"). Each entry is a
+PersistentVolumeClaim in the release namespace and, when it names an NFS
+export, the static PersistentVolume it binds to. These are the ONLY claims a
+claim dataset may use: the portal offers them and nothing else, and the
+operator refuses any other claimName (WHISTLER_DATASET_CLAIMS).
+
+Both carry `helm.sh/resource-policy: keep`: neither an uninstall nor an
+upgrade that drops an entry deletes them. Dropping an entry only takes the
+claim off the list, so datasets on it stop being served. A PV rendered here
+is Retain, so even deleting its claim by hand leaves the export alone.
+*/ -}}
+{{- range $name, $c := .Values.whistler.datasetServer.claims }}
+{{- $c = default dict $c }}
+{{- if or (hasPrefix "whistler-" $name) (not (regexMatch "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$" $name)) }}
+{{- fail (printf "whistler.datasetServer.claims: %q must be a Kubernetes object name and must not start with \"whistler-\" (Whistler's own claims are named so)" $name) }}
+{{- end }}
+{{- if and $c.nfs $c.volumeName }}
+{{- fail (printf "whistler.datasetServer.claims.%s: give `nfs` (the chart makes the PV) or `volumeName` (an existing PV), not both" $name) }}
+{{- end }}
+{{- if not (or $c.nfs $c.volumeName) }}
+{{- fail (printf "whistler.datasetServer.claims.%s: give `nfs` (the chart makes the PV) or `volumeName` (an existing PV). A claim provisioned from a storage class would be new, empty storage, with that class's reclaim policy" $name) }}
+{{- end }}
+{{- $pv := $c.volumeName | default "" }}
+{{- if $c.nfs }}
+{{- $pv = printf "%s-%s" $.Release.Namespace $name }}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ $pv }}
+  labels:
+    whistler.martinmalmsten.net/dataset-claim: {{ $name | quote }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  capacity:
+    storage: {{ $c.size | default "1Ti" | quote }}
+  accessModes: {{ $c.accessModes | default (list "ReadWriteMany") | toJson }}
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  {{- with $c.mountOptions }}
+  mountOptions: {{ toJson . }}
+  {{- end }}
+  nfs:
+    server: {{ required (printf "whistler.datasetServer.claims.%s.nfs.server" $name) $c.nfs.server | quote }}
+    path: {{ required (printf "whistler.datasetServer.claims.%s.nfs.path" $name) $c.nfs.path | quote }}
+    readOnly: {{ $c.nfs.readOnly | default false }}
+  # Reserved for this claim by name, so no other claim can bind it first.
+  claimRef:
+    namespace: {{ $.Release.Namespace }}
+    name: {{ $name }}
+{{- end }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    whistler.martinmalmsten.net/dataset-claim: "true"
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: {{ $c.accessModes | default (list "ReadWriteMany") | toJson }}
+  # Bound to a named PV: static, never provisioned. The class must equal
+  # the PV's for the two to bind ("" for a PV with none).
+  storageClassName: {{ $c.storageClassName | default "" | quote }}
+  volumeName: {{ $pv }}
+  resources:
+    requests:
+      storage: {{ $c.size | default "1Ti" | quote }}
+{{- end }}
