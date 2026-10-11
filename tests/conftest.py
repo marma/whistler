@@ -328,6 +328,10 @@ class FakeConfigManager(ConfigManager):
     def get_group_definitions(self):
         return {name: dict(spec) for name, spec in self.groups.items()}
 
+    def get_dataset_definitions(self):
+        # Tests that care set `datasets` = {name: spec}.
+        return dict(getattr(self, "datasets", None) or {})
+
     def save_group(self, group_data):
         data = dict(group_data)
         name = (data.pop("name", "") or "").strip()

@@ -15,6 +15,10 @@
     padding: 0.2rem 0.4rem; line-height: 1; font-size: 1.15em;
   }
   .access-cell:focus { outline: 2px solid #2185d0; border-radius: 3px; }
+  /* External reach Nowhere: shown as it stands, not editable. */
+  .access-matrix td.access-locked { background: repeating-linear-gradient(
+    45deg, transparent, transparent 4px, rgba(0,0,0,.04) 4px, rgba(0,0,0,.04) 8px); }
+  .access-cell:disabled { cursor: not-allowed; opacity: .45; }
   .access-legend i { margin-left: 0.75rem; }
 </style>
 <div class="ui small basic segment access-legend" style="padding:0.4rem 0">

@@ -26,16 +26,21 @@
              value="{{ dataset.description if dataset else '' }}">
     </div>
 
-    {% set managed = (dataset.source == 'managed') if dataset else true %}
+    {% set source = (dataset.source or 's3') if dataset else 'managed' %}
+    {% set managed = source == 'managed' %}
+    {% set from_claim = source == 'claim' %}
+    {# Served by Whistler's own server: managed or an existing claim. #}
+    {% set served = managed or from_claim %}
     <div class="ui divider"></div>
     <h4 class="ui header">Where the data is</h4>
 
     {% if dataset %}
-    {# The source is fixed once saved: the two are fenced differently, and a
+    {# The source is fixed once saved: they are fenced differently, and a
        switch would strand a managed dataset's data. #}
-    <input type="hidden" name="source" value="{{ 'managed' if managed else 's3' }}">
+    <input type="hidden" name="source" value="{{ source }}">
     <p>
       {% if managed %}<div class="ui blue label"><i class="hdd icon"></i> Whistler-managed volume</div>
+      {% elif from_claim %}<div class="ui teal label"><i class="linkify icon"></i> Existing claim</div>
       {% else %}<div class="ui label"><i class="cloud icon"></i> External S3 bucket</div>{% endif %}
       <span class="ui grey text">Cannot be changed; create a new dataset instead.</span>
     </p>
@@ -47,6 +52,15 @@
           <label for="source-managed"><strong>Whistler-managed volume</strong> —
             Whistler creates the storage and serves it. Fill it from a session
             granted write access.</label>
+        </div>
+      </div>
+      <div class="field">
+        <div class="ui radio checkbox">
+          <input type="radio" name="source" value="claim" id="source-claim">
+          <label for="source-claim"><strong>Existing claim</strong> — serve a
+            PersistentVolumeClaim that already exists in Whistler's namespace.
+            Whistler only mounts it: creating or deleting the dataset does not
+            change the claim.</label>
         </div>
       </div>
       <div class="field">
@@ -75,7 +89,55 @@
       </div>
     </div>
 
-    <div id="s3-fields" {% if managed %}style="display:none"{% endif %}>
+    <div id="claim-fields" {% if not from_claim %}style="display:none"{% endif %}>
+      <div class="field required">
+        <label>Claim</label>
+        <input name="claim_name" type="text" placeholder="reference-data-pvc"
+               pattern="[a-z0-9]([\-a-z0-9.]*[a-z0-9])?" maxlength="253"
+               value="{{ dataset.claimName if dataset and dataset.claimName else '' }}"
+               {% if from_claim %}required{% endif %}>
+        <div class="ui pointing label">
+          The name of a PersistentVolumeClaim in Whistler's namespace. Its
+          content is the dataset, as it stands. The claim is never resized,
+          retained or deleted by Whistler — not even when the dataset is
+          deleted for good.
+        </div>
+      </div>
+      <div class="field">
+        <label>Sub-directory <span class="ui grey tiny label">optional</span></label>
+        <input name="sub_path" type="text" placeholder="projects/imaging"
+               maxlength="1024"
+               value="{{ dataset.subPath if dataset and dataset.subPath else '' }}">
+        <div class="ui pointing label">
+          Serve only this directory of the claim, relative to its root, so one
+          claim can hold several datasets. Nothing outside it is reachable
+          through the dataset. It must already exist: Whistler does not create
+          it, and the dataset stays down until it is there.
+        </div>
+      </div>
+      <div class="two fields">
+        <div class="field">
+          <label>Read and write as UID <span class="ui grey tiny label">optional</span></label>
+          <input name="uid" type="number" min="1" placeholder="1000"
+                 value="{{ dataset.uid if dataset and dataset.uid else '' }}">
+        </div>
+        <div class="field">
+          <label>GID <span class="ui grey tiny label">optional</span></label>
+          <input name="gid" type="number" min="1" placeholder="1000"
+                 value="{{ dataset.gid if dataset and dataset.gid else '' }}">
+        </div>
+      </div>
+      <p class="ui grey text">
+        The identity Whistler's server uses for every read and write, 1000/1000
+        if left blank. On an NFS-backed claim it is the uid and gid the NFS
+        server checks permissions against, and new files are created as them.
+        Whistler changes no ownership or permissions on the claim, so this
+        identity must be able to read it — and write it, unless the dataset is
+        read-only. Not root: an NFS server squashes it anyway.
+      </p>
+    </div>
+
+    <div id="s3-fields" {% if served %}style="display:none"{% endif %}>
     <p class="ui grey text">This is the <em>real</em> S3 server. Only Whistler's proxy
       ever talks to it — sessions are given the proxy's in-cluster address and never
       learn this one.</p>
@@ -135,17 +197,22 @@
     </div>
 
     {# .get(), not .externalSources: an absent key is Undefined, which is not
-       `none`, and would render "anywhere" as "nowhere". #}
-    {% set ext = dataset.get('externalSources') if dataset else none %}
+       `none`, and would render "anywhere" as "nowhere". A NEW dataset starts
+       fenced off (an empty list); an existing one without the field is
+       Anywhere, which is what it meant when it was saved. #}
+    {% set ext = dataset.get('externalSources') if dataset else [] %}
     {% set reach = 'anywhere' if ext is none else ('nowhere' if not ext else 'listed') %}
-    <div id="managed-external" {% if not managed %}style="display:none"{% endif %}>
+    <div id="managed-external" {% if not served %}style="display:none"{% endif %}>
     <div class="ui divider"></div>
     <h4 class="ui header">Reachable from outside
       {% if not external_enabled %}<span class="ui grey tiny label">external access not configured</span>{% endif %}</h4>
     <p class="ui grey text">
       Applies to users granted this dataset in the access matrix's
       <code>external</code> column. Their key is the permission; this decides
-      which client addresses may use it. Inside the cluster nothing changes.
+      which client addresses may use it. While it is <em>Nowhere</em> that
+      column's cell for this dataset is locked in every user and group grid —
+      choose one of the other options to be able to grant it. Inside the
+      cluster nothing changes.
     </p>
     <div class="grouped fields">
       <div class="field">
@@ -167,8 +234,9 @@
           <input type="radio" name="external_reach" value="nowhere" id="reach-nowhere"
                  {% if reach == 'nowhere' %}checked{% endif %}>
           <label for="reach-nowhere"><strong>Nowhere</strong> — fenced off. The way in
-            from outside is removed; grants and keys are kept, so choosing
-            another option reopens it.</label>
+            from outside is removed and the <code>external</code> cell cannot be
+            granted; grants and keys already given are kept, so choosing another
+            option reopens it for them.</label>
         </div>
       </div>
     </div>
@@ -190,7 +258,7 @@
     </div>
     </div>{# #managed-external #}
 
-    <div id="s3-credential" {% if managed %}style="display:none"{% endif %}>
+    <div id="s3-credential" {% if served %}style="display:none"{% endif %}>
     <div class="ui divider"></div>
     <h4 class="ui header">Credential</h4>
     <p class="ui grey text">
@@ -254,17 +322,18 @@
   // Show the fields of the chosen source only, and require only those: a
   // hidden `required` input would block the submit with no visible reason.
   (function () {
-    const groups = {managed: ["managed-fields", "managed-external"],
-                    s3: ["s3-fields", "s3-credential"]};
+    const groups = {"managed-fields": ["managed"],
+                    "claim-fields": ["claim"],
+                    "managed-external": ["managed", "claim"],
+                    "s3-fields": ["s3"], "s3-credential": ["s3"]};
     function apply() {
       const chosen = document.querySelector('input[name="source"]:checked').value;
-      for (const [source, ids] of Object.entries(groups)) {
-        for (const id of ids) {
-          const el = document.getElementById(id);
-          el.style.display = source === chosen ? "" : "none";
-        }
+      for (const [id, sources] of Object.entries(groups)) {
+        document.getElementById(id).style.display =
+          sources.includes(chosen) ? "" : "none";
       }
       document.querySelector('input[name="size"]').required = chosen === "managed";
+      document.querySelector('input[name="claim_name"]').required = chosen === "claim";
       document.querySelector('input[name="bucket"]').required = chosen === "s3";
     }
     document.querySelectorAll('input[name="source"]').forEach(

@@ -698,6 +698,116 @@ waking one debounced worker, with a 300s backstop. Still not cut: an
 established connection, if the CNI's conntrack lets it outlive the policy.
 Per-user keys are the answer to that.
 
+### Datasets from existing claims, 2026-10-11
+
+`Dataset.spec.source: claim` + `claimName`: serve a PersistentVolumeClaim
+that already exists in the release namespace, through the same per-dataset
+VersityGW server as a managed dataset — per-user keys, per-mode fences, the
+`external` column, archive and resurrect all apply unchanged. The predicate
+split in config.py is the whole design: `has_dataset_server` (managed or
+claim) is asked by everything about the *server*, `is_managed_dataset` only by
+what concerns *owning the claim* — creating, growing, `Retain`, the
+`user-data` label, re-attach, and deletion on purge. So **creating, archiving
+or deleting a claim dataset leaves the claim and its PV exactly as they
+were**; delete-for-good removes Whistler's server, fences, Services and keys
+and says so in the modal. The uninstall hook already selects dataset claims by
+Whistler's label, which an admin's claim does not carry.
+
+How the claim is served without being changed, all verified on k3s-metal
+against a claim seeded with root-owned files:
+
+- **The claim is mounted *as* the bucket directory**, at `/srv/<dataset>` over
+  an emptyDir root, rather than as the gateway root. What is in it is the
+  bucket's content as it stands: no `data/` rename, no `mkdir` inside it, and
+  the init container never mounts it.
+- **VersityGW's metadata goes to a `--sidecar` emptyDir**, not into xattrs on
+  the claim — the bucket's ACL and policy, and each written object's etag,
+  content-type and checksums (three small files per object, so the emptyDir
+  has no `sizeLimit`; exceeding one evicts the pod). Nothing is written as an
+  xattr on the admin's files, and a claim on a filesystem without user xattrs
+  (NFS) works. The cost is that a server restart loses the policy until the
+  operator's next account sync rewrites it (it does on every pass): measured,
+  that window **fails closed** — every user key gets AccessDenied, and access
+  returns with the rewrite. Pre-existing files have no stored etag and list
+  with an empty one.
+- **No `fsGroup`**, which on a managed claim makes a fresh volume writable but
+  on an existing one would chgrp the whole tree. Instead the dataset names the
+  identity its server runs as, `spec.uid`/`spec.gid` (default 1000/1000, never
+  root) — the whole pod's `runAsUser`/`runAsGroup`. On an NFS-backed claim
+  that is what the NFS server checks (AUTH_SYS) and what every new file is
+  created as. VersityGW's `--chuid`/`--chgid` were not the tool: they chown to
+  the requesting *account's* uid, which needs root, which NFS squashes.
+
+The quirks that follow, accepted for now:
+
+- **Ownership.** A file written or overwritten through the dataset becomes
+  `uid:gid`, mode 0644 (an overwrite is a new inode), so the identity should
+  be the one that owns the tree. Verified on k3s-metal against a Ganesha
+  export (`Root_Squash`) of a tree owned 2000:2000, mode 755: with uid/gid
+  2000 reads, new writes, an overwrite and a two-part multipart upload all
+  worked and landed 2000:2000 (no copy_file_range hang, which VersityGW
+  warns about on some NFS servers); with the default 1000 reads worked and
+  every write failed — as an S3 **500 InternalError**, not a 403, so a wrong
+  identity reads as a server fault. One identity per dataset: users of a
+  dataset do not write as themselves.
+- **S3 semantics on a real tree.** Deleting the last object under a
+  directory removes the directory (measured); empty directories do not
+  appear in listings; VersityGW keeps a `.sgwtmp/` at the bucket root
+  (hidden from listings) once anything is written.
+- **The name** must be a valid bucket name (3-63 chars), as for a managed
+  dataset, because the bucket is named after the dataset.
+
+**External reach starts at Nowhere** (same day). A new dataset's form
+defaults to Nowhere (`externalSources: []`), and so does a create that does
+not answer; an existing dataset without the field still reads as Anywhere,
+which is what it meant when saved. While a dataset is Nowhere its cell in
+the access matrix's `external` column is **locked** in every user and group
+grid (`external_fenced`): shown and posted as it stands, not changeable, and
+pinned to its previous value on save (`_keep_fenced_external`), so a crafted
+form cannot pre-grant outside access that would open with the dataset.
+Choosing Anywhere or listed addresses unlocks it; nobody is granted anything
+automatically.
+
+**This sets aside the rule stated above** — "the portal can only *create*
+storage, never reference it; a cluster admin hands existing volumes over" —
+deliberately, as a first step: any portal admin can now name any claim in the
+release namespace, which includes Whistler's own (`whistler-backups`, every
+managed dataset's `whistler-dataset-<name>`). Guardrails are the next step,
+and the earlier paragraph is still the shape they should take: a label an
+admin puts on a claim with kubectl to hand it over, the portal choosing only
+among labelled claims, and a refusal of claims Whistler owns. Also open:
+datasets whose directories overlap (the same claim with no `subPath`, the
+same `subPath` twice, or one nested in another — two servers, two lock
+domains, and a grant on one reaching into the other), which nothing refuses
+yet; and claims outside the release namespace, which would need the server
+pod — and its fences and Secrets — to run there.
+
+**Several datasets on one claim: `subPath`** (same day). A claim dataset may
+name a directory of the claim (`spec.subPath`, relative, no `.`/`..`/empty
+components, no backslash or control characters) and serves only that. It is
+kubelet's subPath on every process's data mount — a bind mount of that
+directory alone — so neither a `..` key nor a symlink in the data reaches the
+rest of the claim; VersityGW's `--bucketlinks` with a symlinked bucket was
+the alternative and was not taken for exactly that reason. Measured with two
+datasets on directories `a/` and `b/` of one claim: each listed only its own
+directory, writes landed in it, and `..` keys (plain and percent-encoded)
+were refused by the gateway with a 400 before the bind mount was ever the
+question.
+
+**A missing subPath is refused, not created.** Kubelet creates one
+silently — measured: root-owned, **mode 0777**, even for a read-only mount,
+and then served as an empty dataset — so a typo would scatter
+world-writable directories over someone's claim. The pod's first init
+container (`check-sub-path`) mounts the whole claim read-only, runs as the
+dataset's uid/gid, and fails unless the directory exists; kubelet prepares a
+container's subPath only when that container starts, so nothing is created
+(verified: `Init:Error`, the claim unchanged). The cost is that the check
+needs the identity to traverse the parents, which the bind mount itself would
+not; on an NFS claim with `root_squash` kubelet needs the same. The refusal is
+visible only as the server pod's `Init:Error` and the check's log line — the
+portal does not show it yet. On an RWO claim every dataset's server must land
+on one node; Kubernetes enforces that by leaving the others Pending.
+
 ## Still open
 
 - **Securing external access** — TLS on the external host, running behind a

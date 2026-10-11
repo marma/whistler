@@ -326,17 +326,64 @@ DATASET_PLURAL = "datasets"
 # Where a dataset's data lives (Dataset spec.source). `s3` is an admin's
 # bucket fronted by an rclone proxy; `managed` is a claim Whistler creates in
 # the release namespace and serves with VersityGW (design/storage.md,
-# "Datasets are always S3"). Absent means s3, which is what every Dataset
-# written before the field existed is.
+# "Datasets are always S3"); `claim` is an EXISTING claim in the release
+# namespace, served by the same VersityGW server but never created, resized,
+# retained, re-attached or deleted by Whistler ("Datasets from existing
+# claims"). Absent means s3, which is what every Dataset written before the
+# field existed is.
 DATASET_SOURCE_S3 = "s3"
 DATASET_SOURCE_MANAGED = "managed"
-DATASET_SOURCES = (DATASET_SOURCE_S3, DATASET_SOURCE_MANAGED)
+DATASET_SOURCE_CLAIM = "claim"
+DATASET_SOURCES = (DATASET_SOURCE_S3, DATASET_SOURCE_MANAGED,
+                   DATASET_SOURCE_CLAIM)
+# The sources served by a per-dataset VersityGW server (rather than an rclone
+# proxy over someone else's bucket).
+DATASET_SERVER_SOURCES = (DATASET_SOURCE_MANAGED, DATASET_SOURCE_CLAIM)
+# A Kubernetes object name (DNS-1123 subdomain), which a claim's name is.
+CLAIM_NAME = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
+# One component of a claim dataset's subPath: anything but a separator, a
+# backslash or a control character ("." and ".." are refused separately).
+SUB_PATH_COMPONENT = re.compile(r"[^/\\\x00-\x1f\x7f]+")
+
+
+def sub_path_problem(value) -> Optional[str]:
+    """Why ``value`` is not a usable subPath (a directory relative to the
+    claim's root), or None. Pure."""
+    if not isinstance(value, str) or not value or len(value) > 1024:
+        return f"The sub-directory must be a path of 1-1024 characters " \
+               f"(got {value!r})."
+    if value.startswith("/"):
+        return (f"The sub-directory is relative to the claim's root; drop "
+                f"the leading '/' (got {value!r}).")
+    for part in value.split("/"):
+        if part in ("", ".", "..") or not SUB_PATH_COMPONENT.fullmatch(part):
+            return (f"The sub-directory {value!r} has an empty, '.' or '..' "
+                    f"component, or a backslash or control character.")
+    return None
+
+
+# The identity a dataset server runs as. A claim dataset may name its own
+# (spec.uid / spec.gid): on an NFS-backed claim the process's uid and gid are
+# what the NFS server checks (AUTH_SYS) and what new files are created as.
+DATASET_SERVER_UID = 1000
+DATASET_SERVER_GID = 1000
 # The managed dataset server's pods, its deny-all policy and its claim. Not
 # `whistler-dataset`, which labels the S3 datasets' credential Secrets.
 DATASET_SERVER_APP = "whistler-dataset-server"
 # A managed dataset's bucket is named after it (dataset_bucket_name), so its
 # name must also be a valid S3 bucket name: a DNS label of at least 3.
 MANAGED_DATASET_NAME = re.compile(r"[a-z0-9][-a-z0-9]{1,61}[a-z0-9]")
+
+
+def external_fenced(definition: Optional[Dict[str, Any]]) -> bool:
+    """A dataset Whistler serves whose external reach is Nowhere
+    (``externalSources: []``). Its cell in the access matrix's `external`
+    column is locked: kept as it is, never newly set, until the dataset is
+    opened to Anywhere or to listed addresses. Absent externalSources is
+    Anywhere (what every dataset before the field was), so not fenced."""
+    definition = definition or {}
+    return (definition.get("source") in DATASET_SERVER_SOURCES
+            and definition.get("externalSources") == [])
 
 
 def normalize_source_ranges(items) -> List[str]:
@@ -5269,7 +5316,7 @@ class KubeConfigManager(ConfigManager):
         if not self.dataset_external_enabled:
             return None
         definition = self.get_dataset_definitions().get(volume)
-        if not definition or not self.is_managed_dataset(definition) or \
+        if not definition or not self.has_dataset_server(definition) or \
                 self.is_archived_dataset(definition):
             return None
         granted = ((self.get_user_volume_access(username) or {})
@@ -5434,10 +5481,10 @@ class KubeConfigManager(ConfigManager):
                 if e.status != 404:
                     raise
                 problem = self.dataset_spec_problem(spec)
-                if not problem and self.is_managed_dataset(spec) and \
+                if not problem and self.has_dataset_server(spec) and \
                         not MANAGED_DATASET_NAME.fullmatch(name):
-                    problem = (f"A managed dataset's name is its bucket's "
-                               f"name, so it must be 3-63 lowercase letters, "
+                    problem = (f"A Whistler-served dataset's name is its "
+                               f"bucket's name, so it must be 3-63 lowercase letters, "
                                f"digits or '-' (got {name!r}).")
                 if problem:
                     raise DatasetSpecError(problem)
@@ -5461,7 +5508,24 @@ class KubeConfigManager(ConfigManager):
 
     @classmethod
     def is_managed_dataset(cls, definition: Dict[str, Any]) -> bool:
+        """Whistler owns the claim: it creates, grows, retains, re-attaches
+        and (on a purge) deletes it. Not true of a `claim` dataset."""
         return cls.dataset_source(definition) == DATASET_SOURCE_MANAGED
+
+    @classmethod
+    def is_claim_dataset(cls, definition: Dict[str, Any]) -> bool:
+        """Served from an existing claim the admin named, which Whistler
+        mounts and otherwise leaves alone."""
+        return cls.dataset_source(definition) == DATASET_SOURCE_CLAIM
+
+    @classmethod
+    def has_dataset_server(cls, definition: Dict[str, Any]) -> bool:
+        """Served by Whistler's own VersityGW server (per-user keys, the
+        external listener) rather than an rclone proxy: managed and claim
+        datasets alike. Everything about the server — fences, accounts,
+        revival, pruning — asks this; only the claim's lifecycle asks
+        is_managed_dataset."""
+        return cls.dataset_source(definition) in DATASET_SERVER_SOURCES
 
     @staticmethod
     def is_archived_dataset(definition: Dict[str, Any]) -> bool:
@@ -5484,6 +5548,12 @@ class KubeConfigManager(ConfigManager):
 
         **A managed dataset only grows.** Kubernetes refuses to shrink a
         claim, and would say so only in the operator's log.
+
+        **A claim dataset names its claim**, which must be in the release
+        namespace (a pod mounts only claims in its own), and may name the
+        non-root uid/gid its server reads and writes it as. Whether it exists is
+        the operator's question, not a save-time refusal: the portal has no
+        read on claims, and a claim may reasonably be created afterwards.
         """
         if spec.get("externalSources") is not None:
             try:
@@ -5497,9 +5567,36 @@ class KubeConfigManager(ConfigManager):
         if existing is not None and cls.dataset_source(existing) != source:
             return ("A dataset's source cannot be changed. Create a new "
                     "dataset instead.")
+        if source != DATASET_SOURCE_CLAIM and \
+                (spec.get("uid") is not None or spec.get("gid") is not None):
+            return ("A UID and GID can only be set on a dataset from an "
+                    "existing claim.")
+        if source != DATASET_SOURCE_CLAIM and spec.get("subPath") is not None:
+            return ("A sub-directory can only be set on a dataset from an "
+                    "existing claim.")
         if source == DATASET_SOURCE_S3:
             if not spec.get("bucket"):
                 return "An S3 dataset needs a bucket."
+            return None
+        if source == DATASET_SOURCE_CLAIM:
+            claim = spec.get("claimName") or ""
+            if not CLAIM_NAME.fullmatch(claim):
+                return (f"A dataset from an existing claim needs the claim's "
+                        f"name, a Kubernetes object name (got {claim!r}).")
+            if spec.get("subPath") is not None:
+                problem = sub_path_problem(spec["subPath"])
+                if problem:
+                    return problem
+            for key in ("uid", "gid"):
+                value = spec.get(key)
+                if value is None:
+                    continue
+                # Not root: the server runs runAsNonRoot, and an NFS server
+                # squashes root anyway, so 0 would never mean what it says.
+                if isinstance(value, bool) or not isinstance(value, int) \
+                        or not 0 < value < 2 ** 31:
+                    return (f"The {key.upper()} must be a whole number from 1 "
+                            f"to {2 ** 31 - 1} (got {value!r}).")
             return None
         size = spec.get("size")
         try:
@@ -5908,7 +6005,7 @@ class KubeConfigManager(ConfigManager):
                 logger.error(
                     f"S3 proxy for {name}/{mode} not ready; skipping mount")
                 continue
-            if self.is_managed_dataset(definition):
+            if self.has_dataset_server(definition):
                 # This user's own account, never a shared key: revoking them
                 # deletes it (sync_dataset_accounts). Synced here so a grant
                 # made a moment ago is live before the guest first mounts; a
@@ -6321,8 +6418,34 @@ class KubeConfigManager(ConfigManager):
 
         **Recreate, not RollingUpdate**: the claim is usually RWO, and a new
         pod scheduled to another node while the old one holds it never starts.
+
+        **A claim dataset's claim is the bucket, untouched.** It is mounted
+        AT ``/srv/<bucket>`` over an emptyDir root, so the data already in it
+        is the bucket's content as it stands — no rename, no mkdir inside it
+        — and the init container never mounts it. VersityGW's metadata
+        (bucket ACL and policy, object etags) goes to a ``--sidecar`` emptyDir
+        instead of xattrs on the claim, which also serves a claim whose
+        filesystem has none (NFS); the operator rewrites ACL and policy on
+        every account sync, so a restart loses nothing it needs for long.
+        No ``fsGroup``: it would chgrp the whole existing tree. Instead the
+        whole pod runs as the dataset's ``uid``/``gid`` (default 1000/1000),
+        which is the identity an NFS server sees and the owner of every file
+        the gateway writes; the claim must let that identity read it, and
+        write it unless the dataset is read-only.
+
+        **A subPath serves one directory of the claim**, so one claim can
+        hold several datasets. It is kubelet's own subPath, a bind mount of
+        that directory alone: ``..`` from the bucket's root, or a symlink in
+        the data, cannot reach the rest of the claim. Kubelet would create a
+        missing subPath — measured: root-owned, mode 0777, even for a
+        read-only mount, then served empty — so a first init container,
+        holding the whole claim read-only and running as the dataset's
+        identity, refuses to go on unless the directory exists. Kubelet
+        prepares a container's subPath only when that container starts, so
+        a refusal there creates nothing (verified).
         """
         name = self.dataset_server_name(volume)
+        existing_claim = self.is_claim_dataset(definition)
         labels = {"app": DATASET_SERVER_APP, "volume": volume}
         # Nothing here needs root, a writable root filesystem or any
         # capability: VersityGW only touches the claim and the account store
@@ -6347,22 +6470,58 @@ class KubeConfigManager(ConfigManager):
         if external:
             seed += (" && cp /seed/users-ext.json /iam-ext/users.json && "
                      "chmod 600 /iam-ext/users.json")
+        sub_path = definition.get("subPath") if existing_claim else None
+        if existing_claim:
+            prepare, prepare_mounts = seed, []
+        else:
+            prepare = (f"if [ -d /srv/{S3_PROXY_BUCKET} ] && "
+                       f"[ ! -e /srv/{bucket} ]; then "
+                       f"mv /srv/{S3_PROXY_BUCKET} /srv/{bucket}; fi && "
+                       f"mkdir -p /srv/{bucket} && {seed}")
+            prepare_mounts = [{"name": "data", "mountPath": "/srv"}]
         init = {
             "name": "prepare",
             "image": image,
-            "command": ["sh", "-c",
-                        f"if [ -d /srv/{S3_PROXY_BUCKET} ] && "
-                        f"[ ! -e /srv/{bucket} ]; then "
-                        f"mv /srv/{S3_PROXY_BUCKET} /srv/{bucket}; fi && "
-                        f"mkdir -p /srv/{bucket} && {seed}"],
+            "command": ["sh", "-c", prepare],
             "securityContext": hardened,
-            "volumeMounts": [{"name": "data", "mountPath": "/srv"},
+            "volumeMounts": prepare_mounts + [
                              {"name": "iam", "mountPath": "/iam"},
                              {"name": "seed", "mountPath": "/seed",
                               "readOnly": True}]
                             + ([{"name": "iam-ext", "mountPath": "/iam-ext"}]
                                if external else []),
         }
+        def data_mounts(read_only: bool) -> List[Dict[str, Any]]:
+            if not existing_claim:
+                return [{"name": "data", "mountPath": "/srv",
+                         "readOnly": read_only}]
+            # The root only holds the bucket's mount point; a --readonly
+            # process writes no metadata, so its sidecar is read-only too.
+            data = {"name": "data", "mountPath": f"/srv/{bucket}",
+                    "readOnly": read_only}
+            if sub_path:
+                data["subPath"] = sub_path
+            return [{"name": "root", "mountPath": "/srv"}, data,
+                    {"name": "meta", "mountPath": "/meta",
+                     "readOnly": read_only}]
+
+        check = {
+            "name": "check-sub-path",
+            "image": image,
+            # The path rides in the environment, never in the script.
+            "env": [{"name": "SUB_PATH", "value": sub_path or ""},
+                    {"name": "CLAIM", "value": claim}],
+            "command": ["sh", "-c",
+                        'test -d "/claim/$SUB_PATH" || { echo "whistler: '
+                        '$SUB_PATH is not a directory in claim $CLAIM that '
+                        'uid $(id -u) can reach; not creating it" >&2; '
+                        'exit 1; }'],
+            "securityContext": hardened,
+            "volumeMounts": [{"name": "data", "mountPath": "/claim",
+                              "readOnly": True}],
+        }
+        backend = (["posix", "--sidecar", "/meta", "/srv"] if existing_claim
+                   else ["posix", "/srv"])
         root_env = [
             {"name": "ROOT_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {
                 "name": root_secret, "key": "accessKeyId"}}},
@@ -6377,7 +6536,7 @@ class KubeConfigManager(ConfigManager):
                     "--iam-dir", "/iam", "--iam-cache-disable", "--quiet"]
             if mode == "ro":
                 args.insert(0, "--readonly")
-            args += ["posix", "/srv"]
+            args += backend
             containers.append({
                 "name": f"versitygw-{mode}",
                 "image": image,
@@ -6390,9 +6549,8 @@ class KubeConfigManager(ConfigManager):
                 "readinessProbe": {"tcpSocket": {"port": port},
                                    "periodSeconds": 10},
                 "resources": resources or {},
-                "volumeMounts": [{"name": "data", "mountPath": "/srv",
-                                  "readOnly": mode == "ro"},
-                                 {"name": "iam", "mountPath": "/iam"}],
+                "volumeMounts": data_mounts(mode == "ro")
+                                + [{"name": "iam", "mountPath": "/iam"}],
             })
         if external:
             # The external listener: its OWN account store (only ``x*``
@@ -6404,7 +6562,7 @@ class KubeConfigManager(ConfigManager):
             args = ["--port", f":{DATASET_SERVER_EXTERNAL_PORT}",
                     "--admin-port", f":{DATASET_SERVER_EXTERNAL_ADMIN_PORT}",
                     "--iam-dir", "/iam", "--iam-cache-disable", "--quiet",
-                    "posix", "/srv"]
+                    *backend]
             if read_only:
                 args.insert(0, "--readonly")
             containers.append({
@@ -6420,10 +6578,34 @@ class KubeConfigManager(ConfigManager):
                 "readinessProbe": {"tcpSocket": {
                     "port": DATASET_SERVER_EXTERNAL_PORT}, "periodSeconds": 10},
                 "resources": resources or {},
-                "volumeMounts": [{"name": "data", "mountPath": "/srv",
-                                  "readOnly": read_only},
-                                 {"name": "iam-ext", "mountPath": "/iam"}],
+                "volumeMounts": data_mounts(read_only)
+                                + [{"name": "iam-ext", "mountPath": "/iam"}],
             })
+        definition = definition or {}
+        pod_security = {
+            "runAsNonRoot": True,
+            "runAsUser": DATASET_SERVER_UID,
+            "runAsGroup": DATASET_SERVER_GID,
+            "seccompProfile": {"type": "RuntimeDefault"},
+        }
+        if existing_claim:
+            pod_security["runAsUser"] = definition.get("uid") or \
+                DATASET_SERVER_UID
+            pod_security["runAsGroup"] = definition.get("gid") or \
+                DATASET_SERVER_GID
+        if not existing_claim:
+            # Makes a fresh claim writable by uid 1000.
+            pod_security.update(fsGroup=1000,
+                                fsGroupChangePolicy="OnRootMismatch")
+        extra_volumes = [
+            {"name": "root", "emptyDir": {"sizeLimit": "1Mi"}},
+            # Object metadata of what is written through the gateway (three
+            # small files per object), plus the bucket's ACL and policy. No
+            # sizeLimit: exceeding one evicts the pod, and this grows with
+            # every object written. Lost on restart, which costs written
+            # objects their stored etag and content-type, nothing more.
+            {"name": "meta", "emptyDir": {}},
+        ] if existing_claim else []
         deployment = {
             "apiVersion": "apps/v1",
             "kind": "Deployment",
@@ -6436,16 +6618,9 @@ class KubeConfigManager(ConfigManager):
                     "metadata": {"labels": labels},
                     "spec": {
                         "automountServiceAccountToken": False,
-                        "securityContext": {
-                            "runAsNonRoot": True,
-                            "runAsUser": 1000,
-                            "runAsGroup": 1000,
-                            # Makes a fresh claim writable by uid 1000.
-                            "fsGroup": 1000,
-                            "fsGroupChangePolicy": "OnRootMismatch",
-                            "seccompProfile": {"type": "RuntimeDefault"},
-                        },
-                        "initContainers": [init],
+                        "securityContext": pod_security,
+                        "initContainers": ([check] if sub_path else [])
+                        + [init],
                         "containers": containers,
                         "volumes": [
                             {"name": "data", "persistentVolumeClaim": {
@@ -6461,7 +6636,7 @@ class KubeConfigManager(ConfigManager):
                                    if external else [])}},
                         ] + ([{"name": "iam-ext", "emptyDir": {
                             "medium": "Memory", "sizeLimit": "16Mi"}}]
-                             if external else []),
+                             if external else []) + extra_volumes,
                     },
                 },
             },
@@ -6510,11 +6685,28 @@ class KubeConfigManager(ConfigManager):
         uninstall, or after deleting and re-creating it under the same name.
         A larger ``size`` is applied to an existing claim (the class must
         allow expansion); a smaller one never gets here
-        (dataset_spec_problem)."""
+        (dataset_spec_problem).
+
+        A **claim** dataset's claim is only looked up: it must exist, and is
+        then mounted as it is. Nothing here, or anywhere else, creates,
+        grows, labels, retains or deletes it, so creating and deleting the
+        dataset leaves the claim and its PV exactly as they were."""
+        api = client.CoreV1Api()
+        if self.is_claim_dataset(definition):
+            claim = definition.get("claimName")
+            try:
+                api.read_namespaced_persistent_volume_claim(
+                    claim, self.namespace)
+            except ApiException as e:
+                logger.error(
+                    f"Dataset {volume!r}: claim {claim!r} "
+                    + (f"does not exist in namespace {self.namespace!r}"
+                       if e.status == 404 else f"could not be read: {e}"))
+                return None
+            return claim
         ns, claim = self.namespace, self.dataset_claim_name(volume)
         labels = {"app": DATASET_SERVER_APP, "volume": volume}
         size = definition.get("size")
-        api = client.CoreV1Api()
         try:
             pvc = api.read_namespaced_persistent_volume_claim(claim, ns)
         except ApiException as e:
@@ -6874,7 +7066,7 @@ class KubeConfigManager(ConfigManager):
         done = 0
         for item in items:
             spec = item.get("spec") or {}
-            if not self.is_managed_dataset(spec) or \
+            if not self.has_dataset_server(spec) or \
                     self.is_archived_dataset(spec) or DELETE_DATA_ANNOTATION \
                     in (item["metadata"].get("annotations") or {}):
                 continue
@@ -6976,7 +7168,7 @@ class KubeConfigManager(ConfigManager):
             logger.warning(f"Could not list datasets to prune servers: {e}")
             return None
         return {item["metadata"]["name"] for item in items
-                if self.is_managed_dataset(item.get("spec") or {})
+                if self.has_dataset_server(item.get("spec") or {})
                 and not self.is_archived_dataset(item.get("spec") or {})}
 
     def revive_dataset_servers(self) -> List[str]:
@@ -7001,7 +7193,7 @@ class KubeConfigManager(ConfigManager):
         for item in items:
             spec = item.get("spec") or {}
             annotations = item["metadata"].get("annotations") or {}
-            if not self.is_managed_dataset(spec) or \
+            if not self.has_dataset_server(spec) or \
                     self.is_archived_dataset(spec) or \
                     DELETE_DATA_ANNOTATION in annotations:
                 continue
@@ -7076,9 +7268,10 @@ class KubeConfigManager(ConfigManager):
         serves it (managed server or S3 proxies) and wait for them to be gone
         — the fences must outlive the pods, or a terminating pod is selected
         by no policy, i.e. open; then, for a managed dataset, set the PV back
-        to Delete and delete the claim, which takes the data; then the
-        fences, Services and keys; the record last, because it carries the
-        mark this retries from."""
+        to Delete and delete the claim, which takes the data (a claim
+        dataset's claim is the admin's, and is left exactly as it was); then
+        the fences, Services and keys; the record last, because it carries
+        the mark this retries from."""
         ns = self.namespace
         apps, core = client.AppsV1Api(), client.CoreV1Api()
         net = client.NetworkingV1Api()
@@ -7172,7 +7365,8 @@ class KubeConfigManager(ConfigManager):
 
     def secure_dataset_claims(self) -> None:
         """The sweep's share: Retain every managed dataset's PV, and retry a
-        deletion (destroy_dataset) the event handler did not finish."""
+        deletion (destroy_dataset) the event handler did not finish. A claim
+        dataset's PV is not Whistler's to retain, and is not touched."""
         try:
             items = self.api.list_namespaced_custom_object(
                 self.group, self.version, self.namespace,
@@ -7208,7 +7402,7 @@ class KubeConfigManager(ConfigManager):
 
         A managed dataset has no proxy; its server serves both modes and is
         ensured whole (ensure_managed_dataset)."""
-        if self.is_managed_dataset(definition):
+        if self.has_dataset_server(definition):
             return self.ensure_managed_dataset(volume, definition or {})
         if not (definition or {}).get("credentialsSecret"):
             # No credential means no working proxy. Refuse here, where the

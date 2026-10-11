@@ -55,11 +55,15 @@
          and no input, so nothing is saved. #}
       <td class="access-zone"></td>
       {% else %}
-      <td class="access-zone">
+      {# Reach Nowhere: the cell keeps (and posts) what it holds but cannot
+         be changed here; the save pins it server-side too. #}
+      {% set locked = z == 'external' and row.external_fenced %}
+      <td class="access-zone{% if locked %} access-locked{% endif %}">
         <input type="hidden" name="access__{{ z }}__{{ row.key }}"
                value="{{ row.own[z] or '' }}">
         <button type="button" class="access-cell"
-                aria-label="{{ row.label }} in {{ z }}">
+                aria-label="{{ row.label }} in {{ z }}"
+                {% if locked %}disabled data-locked-title="Fenced off: this dataset's external reach is Nowhere. Open it to Anywhere or to listed addresses on the dataset to grant outside access."{% endif %}>
           <i class="icon"></i>
         </button>
         {% if show_group_mark and row.effective[z] and not row.own[z] %}
@@ -97,9 +101,11 @@
         const state = ACCESS_STATES.find(s => s.value === input.value)
                       || ACCESS_STATES[0];
         icon.className = state.icon;
-        btn.title = state.title;
+        btn.title = btn.dataset.lockedTitle
+          ? state.title + ". " + btn.dataset.lockedTitle : state.title;
       }
       btn.addEventListener("click", function () {
+        if (btn.disabled) return;
         const i = ACCESS_STATES.findIndex(s => s.value === input.value);
         input.value = ACCESS_STATES[(i + 1) % ACCESS_STATES.length].value;
         paint();

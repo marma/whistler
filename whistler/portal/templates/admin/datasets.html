@@ -15,8 +15,9 @@
 
 <p class="ui grey text">
   Shared data, mounted in VM sessions at <code>/shared/&lt;name&gt;</code> over S3.
-  A dataset is either a <em>Whistler-managed volume</em> — storage Whistler
-  creates and serves — or an <em>external S3 bucket</em>, reached through a
+  A dataset is a <em>Whistler-managed volume</em> — storage Whistler
+  creates and serves — an <em>existing claim</em> Whistler serves but does
+  not own, or an <em>external S3 bucket</em>, reached through a
   proxy that holds the bucket credential. Either way sessions only ever see a
   Whistler-run endpoint, fenced so only granted users can reach it. Grant a
   dataset in the access matrix of the <a href="/admin/groups?user={{ current_user }}">Groups</a>
@@ -47,12 +48,15 @@
   <tbody>
     {% for d in datasets %}
     {% set managed = d.source == "managed" %}
+    {% set from_claim = d.source == "claim" %}
     <tr {% if d.archived %}class="archived-dataset"{% endif %}>
       <td style="white-space:nowrap"><strong>{{ d.name }}</strong></td>
       <td>{{ d.description or "—" }}</td>
       <td class="center aligned">
         {% if managed %}
           <i class="large blue hdd icon" title="Whistler-managed volume"></i>
+        {% elif from_claim %}
+          <i class="large teal linkify icon" title="Existing claim {{ d.claimName }}{% if d.subPath %}, directory {{ d.subPath }}{% endif %}"></i>
         {% else %}
           <i class="large cloud icon" title="External S3 bucket"></i>
         {% endif %}
@@ -76,7 +80,10 @@
           <button class="ui tiny button"><i class="undo icon"></i> Resurrect</button>
         </form>
         <button type="button" class="ui red tiny button"
-                onclick="openDestroy('{{ d.name }}', {{ 'true' if managed else 'false' }})">
+                data-name="{{ d.name }}" data-source="{{ d.source or 's3' }}"
+                data-claim="{{ d.claimName or '' }}{% if d.subPath %}/{{ d.subPath }}{% endif %}"
+                {# Data attributes, not a JS string: a sub-directory may hold a quote. #}
+                onclick="openDestroy(this.dataset.name, this.dataset.source, this.dataset.claim)">
           <i class="trash icon"></i> Delete
         </button>
         {% else %}
@@ -85,7 +92,7 @@
         </a>
         <form method="post" action="/admin/datasets/{{ d.name }}/archive?user={{ current_user }}"
               style="display:inline"
-              onsubmit="return confirm('Delete dataset {{ d.name }}? It is archived: nobody can reach it from now on, and sessions holding a mount keep it only until they stop. {% if managed %}Its data and its grants are kept{% else %}Its grants are kept, and the bucket is not touched{% endif %}; you can resurrect it from the archive, or delete it for good there.')">
+              onsubmit="return confirm('Delete dataset {{ d.name }}? It is archived: nobody can reach it from now on, and sessions holding a mount keep it only until they stop. {% if managed %}Its data and its grants are kept{% elif from_claim %}Its grants are kept, and the claim is not touched{% else %}Its grants are kept, and the bucket is not touched{% endif %}; you can resurrect it from the archive, or delete it for good there.')">
           <button class="ui red tiny button"><i class="trash icon"></i> Delete</button>
         </form>
         {% endif %}
@@ -107,6 +114,9 @@
       its volume is removed from the cluster and cannot be recovered.</p>
     <p class="destroy-s3">This deletes the dataset's record, endpoints and
       keys for good. The S3 bucket itself is not touched.</p>
+    <p class="destroy-claim">This deletes the dataset's record, endpoints and
+      keys for good. The claim <code class="destroy-claim-name"></code> and its
+      data are not touched.</p>
     <form class="ui form" method="post" id="destroy-form">
       <div class="field">
         <label>Type <code class="destroy-name"></code> to confirm</label>
@@ -123,11 +133,13 @@
 </div>
 
 <script>
-  function openDestroy(name, managed) {
+  function openDestroy(name, source, claim) {
     const $m = $('#destroy-modal');
     $m.find('.destroy-name').text(name);
-    $m.find('.destroy-managed').toggle(managed);
-    $m.find('.destroy-s3').toggle(!managed);
+    $m.find('.destroy-claim-name').text(claim);
+    $m.find('.destroy-managed').toggle(source === 'managed');
+    $m.find('.destroy-claim').toggle(source === 'claim');
+    $m.find('.destroy-s3').toggle(source === 's3');
     $('#destroy-form').attr('action',
       '/admin/datasets/' + encodeURIComponent(name) + '/destroy?user={{ current_user }}');
     const input = document.getElementById('destroy-confirm');

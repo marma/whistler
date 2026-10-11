@@ -867,13 +867,18 @@ spec:
                   type: string
                 source:
                   type: string
-                  enum: ["s3", "managed"]
+                  enum: ["s3", "managed", "claim"]
                   description: >-
                     Where the data lives. `s3` (the default when absent) is
                     an admin's bucket fronted by a Whistler-run rclone proxy
                     and needs `bucket`. `managed` is a claim Whistler creates
                     in the release namespace and serves with VersityGW, and
-                    needs `size`. Sessions see the same thing either way: an
+                    needs `size`. `claim` is an existing claim in the release
+                    namespace, named by `claimName`, served by the same
+                    VersityGW server and otherwise never touched: Whistler
+                    does not create, resize, retain or delete it, and
+                    deleting the dataset leaves it as it was. Sessions see
+                    the same thing in every case: an
                     S3 endpoint mounted at /shared/<name>. Cannot be changed
                     once set (the portal refuses it), since the two are
                     fenced by differently-shaped NetworkPolicies. See
@@ -908,6 +913,40 @@ spec:
                     allows expansion; never shrinks. The claim's PV is set to
                     Retain, and deleting the dataset archives it with the data
                     kept (see `archived`).
+                claimName:
+                  type: string
+                  description: >-
+                    `claim` datasets only: the PersistentVolumeClaim, in the
+                    release namespace, whose content is served as the
+                    dataset (its root is the bucket's root). It must be
+                    readable — and, unless the dataset is read-only,
+                    writable — by `uid`/`gid` without help: no fsGroup is
+                    applied, since that would chgrp the whole tree. Files
+                    written through the dataset are owned by `uid`/`gid`.
+                subPath:
+                  type: string
+                  description: >-
+                    `claim` datasets only: serve this directory of the claim
+                    (relative to its root, no `..`) instead of the whole of
+                    it, so one claim can hold several datasets. A bind mount
+                    of that directory alone. It must already exist: the
+                    server refuses to start rather than let kubelet create
+                    it.
+                uid:
+                  type: integer
+                  minimum: 1
+                  description: >-
+                    `claim` datasets only: the uid the dataset's server runs
+                    as (default 1000) — on an NFS-backed claim the uid the
+                    NFS server sees, and the owner of every file written
+                    through the dataset. Not root.
+                gid:
+                  type: integer
+                  minimum: 1
+                  description: >-
+                    `claim` datasets only: the gid the dataset's server runs
+                    as (default 1000), and the group of every file written
+                    through the dataset.
                 endpoint:
                   type: string
                   description: >-

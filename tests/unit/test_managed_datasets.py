@@ -602,7 +602,7 @@ def test_archived_datasets_are_listed_last():
             "0-old": ARCHIVED}
     cm = SimpleNamespace(get_dataset_definitions=lambda: defs,
                          is_archived_dataset=KubeConfigManager.is_archived_dataset,
-                         is_managed_dataset=KubeConfigManager.is_managed_dataset)
+                         has_dataset_server=KubeConfigManager.has_dataset_server)
     rows = asyncio.run(_dataset_rows(_portal_request(cm), cm))
     assert [r["name"] for r in rows] == ["b-live", "c-live", "0-old", "a-old"]
     sections = asyncio.run(_matrix_sections(_portal_request(cm), cm))

@@ -43,7 +43,8 @@ from fastapi.templating import Jinja2Templates
 
 from whistler.config import (ACCESS_MODES, CHANNELS, ConfigWriteError,
                              EXTERNAL_ZONE,
-                             DATASET_SOURCE_MANAGED, DatasetSpecError,
+                             DATASET_SOURCE_CLAIM, DATASET_SOURCE_MANAGED,
+                             DatasetSpecError, external_fenced,
                              ENFORCED_CHANNELS, GPU_NONE,
                              ENTRY_KIOSK, ENTRY_POINTS, ENTRY_PORTAL,
                              GPU_NODE_LABEL, NEW_USER_ENTRY_POINTS,
@@ -1653,9 +1654,20 @@ async def _save_group_or_400(request, verb: str, name: str, form):
     CRD is not installed") — showing it beats a flat "Failed to create group."
     that sends an admin to the pod logs for a message the server already had.
     """
+    cm = request.app.state.cm
+    data = _build_group_data(name, form)
+    groups, datasets = await asyncio.gather(
+        request.app.state.run(cm.get_group_definitions),
+        request.app.state.run(cm.get_dataset_definitions))
+    matrix = _keep_fenced_external(
+        data.get("volumeAccess") or {},
+        ((groups or {}).get(name) or {}).get("volumeAccess") or {}, datasets)
+    if matrix:
+        data["volumeAccess"] = matrix
+    else:
+        data.pop("volumeAccess", None)
     try:
-        ok = await request.app.state.run(
-            request.app.state.cm.save_group, _build_group_data(name, form))
+        ok = await request.app.state.run(cm.save_group, data)
     except ConfigWriteError as e:
         raise HTTPException(status_code=500,
                             detail=f"Failed to {verb} group: {e}") from e
@@ -1900,9 +1912,13 @@ async def _matrix_sections(request: Request, cm, username: str = None):
                   "label": f"{n} (archived)" if cm.is_archived_dataset(spec)
                   else n,
                   "description": (spec or {}).get("description"),
-                  # Only a managed dataset has an external listener; an S3
-                  # dataset's bucket is someone else's, with its own way in.
-                  "external_ok": cm.is_managed_dataset(spec)}
+                  # Only a dataset Whistler serves has an external listener;
+                  # an S3 dataset's bucket is someone else's, with its own
+                  # way in.
+                  "external_ok": cm.has_dataset_server(spec),
+                  # Reach is Nowhere: the cell is shown as it stands but
+                  # cannot be changed (_keep_fenced_external enforces it).
+                  "external_fenced": external_fenced(spec)}
                  for n, spec in sorted(
                      (datasets or {}).items(),
                      # Archived last, as in the dataset list.
@@ -1934,6 +1950,27 @@ def _sections_with_values(sections, zones, own, effective):
     return out
 
 
+def _keep_fenced_external(matrix: dict, previous: dict, datasets: dict) -> dict:
+    """Pin the `external` cell of every fenced-off dataset (reach Nowhere,
+    external_fenced) to what it was before this save. The grid renders those
+    cells locked, but a posted form is the client's; without this a crafted
+    one could grant outside access to a dataset whose admin closed it, which
+    would then open the moment its reach did. Returns ``matrix``, changed in
+    place."""
+    before = (previous or {}).get(EXTERNAL_ZONE) or {}
+    after = matrix.setdefault(EXTERNAL_ZONE, {})
+    for name, spec in (datasets or {}).items():
+        if not external_fenced(spec):
+            continue
+        if name in before:
+            after[name] = before[name]
+        else:
+            after.pop(name, None)
+    if not after:
+        matrix.pop(EXTERNAL_ZONE)
+    return matrix
+
+
 def _parse_matrix_form(form, zones, sections) -> dict:
     """Read the grid back as ``{zone: {volume: mode}}``.
 
@@ -1957,9 +1994,15 @@ async def admin_user_set_access(request: Request, cm: CM, admin: AccessManager,
     form = await request.form()
     zones = await request.app.state.run(cm.get_zones)
     sections = await _matrix_sections(request, cm, username)
+    all_users = await request.app.state.run(cm.list_all_users)
+    previous = next((u.get("volumeAccess") or {} for u in all_users
+                     if u.get("name") == username), {})
+    datasets = await request.app.state.run(cm.get_dataset_definitions)
     ok = await request.app.state.run(
         cm.set_user_volume_access, username,
-        _parse_matrix_form(form, _grid_zones(zones), sections))
+        _keep_fenced_external(
+            _parse_matrix_form(form, _grid_zones(zones), sections),
+            previous, datasets))
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to save access.")
     return _tr(f"/admin/users/{username}", admin)
@@ -2023,24 +2066,56 @@ async def admin_computed_access(request: Request, cm: CM, admin: AccessManager,
 # user/group editors) and mounted by cloud-init at boot — never picked as an
 # instance mount. See design/storage.md.
 
+def _dataset_form_source(source) -> Optional[str]:
+    """The form's source as saved: None for s3 (the absent default), else
+    the value; anything unknown is passed through for dataset_spec_problem
+    to refuse by name."""
+    source = (source or "").strip()
+    return None if source in ("", "s3") else source
+
+
+def _form_id(value):
+    """A UID/GID field: blank is None (the default), digits an int, and
+    anything else is passed through for dataset_spec_problem to refuse by
+    name rather than dropped as if it had not been typed."""
+    value = (value or "").strip() if isinstance(value, str) else value
+    if value in (None, ""):
+        return None
+    return int(value) if isinstance(value, str) and value.isdigit() else value
+
+
 def _build_dataset_data(name, description, endpoint, bucket, prefix, region,
                         provider, credentials_secret, read_only,
-                        source=None, size=None, external_sources=None):
-    managed = (source or "").strip() == DATASET_SOURCE_MANAGED
-    if managed:
-        # A managed dataset has no bucket of its own to describe: the form's
-        # S3 fields are hidden for it, and anything left in them is dropped
-        # rather than saved as if it meant something.
+                        source=None, size=None, external_sources=None,
+                        claim_name=None, uid=None, gid=None, sub_path=None):
+    source = _dataset_form_source(source)
+    from_claim = source == DATASET_SOURCE_CLAIM
+    served = source in (DATASET_SOURCE_MANAGED, DATASET_SOURCE_CLAIM)
+    if served:
+        # A dataset Whistler serves has no bucket of its own to describe: the
+        # form's S3 fields are hidden for it, and anything left in them is
+        # dropped rather than saved as if it meant something.
         endpoint = bucket = prefix = region = provider = None
         credentials_secret = None
     else:
-        # Only a managed dataset has an external listener to restrict.
+        # Only a dataset Whistler serves has an external listener to restrict.
         external_sources = None
     return {
         "name": name.strip(),
         "description": (description or "").strip() or None,
-        "source": DATASET_SOURCE_MANAGED if managed else None,
-        "size": ((size or "").strip() or None) if managed else None,
+        "source": source,
+        "size": ((size or "").strip() or None)
+        if source == DATASET_SOURCE_MANAGED else None,
+        "claimName": ((claim_name or "").strip() or None)
+        if from_claim else None,
+        # The identity the server reads and writes the claim as; the
+        # operator defaults both to 1000.
+        # Trailing slashes are how people type directories; anything else
+        # odd is kept for dataset_spec_problem to refuse by name.
+        "subPath": ((sub_path or "").strip().rstrip("/") or None)
+        if from_claim else None,
+        "uid": _form_id(uid) if from_claim else None,
+        "gid": _form_id(gid) if from_claim else None,
         "endpoint": (endpoint or "").strip() or None,
         "bucket": (bucket or "").strip() or None,
         "prefix": (prefix or "").strip().strip("/") or None,
@@ -2056,10 +2131,12 @@ def _build_dataset_data(name, description, endpoint, bucket, prefix, region,
     }
 
 
-def _parse_external_sources(reach, sources):
+def _parse_external_sources(reach, sources, default="anywhere"):
     """The dataset form's "Reachable from outside" answer as externalSources:
-    None (anywhere), [] (nowhere: fenced off), or the listed ranges."""
-    reach = (reach or "anywhere").strip()
+    None (anywhere), [] (nowhere: fenced off), or the listed ranges. A form
+    that does not answer gets ``default``: Nowhere when creating, so a new
+    dataset is fenced off unless someone chose otherwise."""
+    reach = (reach or "").strip() or default
     if reach == "anywhere":
         return None
     if reach == "nowhere":
@@ -2115,6 +2192,10 @@ async def admin_dataset_create(
     bucket:             Annotated[Optional[str], Form()] = None,
     source:             Annotated[Optional[str], Form()] = None,
     size:               Annotated[Optional[str], Form()] = None,
+    claim_name:         Annotated[Optional[str], Form()] = None,
+    sub_path:           Annotated[Optional[str], Form()] = None,
+    uid:                Annotated[Optional[str], Form()] = None,
+    gid:                Annotated[Optional[str], Form()] = None,
     description:        Annotated[Optional[str], Form()] = None,
     endpoint:           Annotated[Optional[str], Form()] = None,
     prefix:             Annotated[Optional[str], Form()] = None,
@@ -2138,7 +2219,10 @@ async def admin_dataset_create(
                                credentials_secret, read_only, access_key_id,
                                secret_access_key, source, size, create=True,
                                external_sources=_parse_external_sources(
-                                   external_reach, external_sources))
+                                   external_reach, external_sources,
+                                   default="nowhere"),
+                               claim_name=claim_name, uid=uid, gid=gid,
+                               sub_path=sub_path)
 
 
 async def admin_dataset_edit(request: Request, cm: CM, admin: Admin, name: str):
@@ -2164,6 +2248,10 @@ async def admin_dataset_update(
     bucket:             Annotated[Optional[str], Form()] = None,
     source:             Annotated[Optional[str], Form()] = None,
     size:               Annotated[Optional[str], Form()] = None,
+    claim_name:         Annotated[Optional[str], Form()] = None,
+    sub_path:           Annotated[Optional[str], Form()] = None,
+    uid:                Annotated[Optional[str], Form()] = None,
+    gid:                Annotated[Optional[str], Form()] = None,
     description:        Annotated[Optional[str], Form()] = None,
     endpoint:           Annotated[Optional[str], Form()] = None,
     prefix:             Annotated[Optional[str], Form()] = None,
@@ -2181,14 +2269,17 @@ async def admin_dataset_update(
                                credentials_secret, read_only, access_key_id,
                                secret_access_key, source, size,
                                external_sources=_parse_external_sources(
-                                   external_reach, external_sources))
+                                   external_reach, external_sources),
+                               claim_name=claim_name, uid=uid, gid=gid,
+                               sub_path=sub_path)
 
 
 async def _save_dataset(request, cm, admin, name, description, endpoint,
                         bucket, prefix, region, provider, credentials_secret,
                         read_only, access_key_id, secret_access_key,
                         source=None, size=None, create=False,
-                        external_sources=None):
+                        external_sources=None, claim_name=None, uid=None,
+                        gid=None, sub_path=None):
     """Shared by create and update.
 
     The credential is written FIRST and separately: blank credential fields
@@ -2215,8 +2306,10 @@ async def _save_dataset(request, cm, admin, name, description, endpoint,
             status_code=400,
             detail=f"Dataset {name!r} is archived; resurrect it before "
                    f"editing it.")
-    if (source or "").strip() == DATASET_SOURCE_MANAGED:
-        # Whistler owns the storage and its keys; there is no credential.
+    served = _dataset_form_source(source) in (DATASET_SOURCE_MANAGED,
+                                              DATASET_SOURCE_CLAIM)
+    if served:
+        # Whistler serves the storage and owns its keys; no credential.
         access_key_id = secret_access_key = credentials_secret = ""
     elif access_key_id and secret_access_key:
         ok = await request.app.state.run(
@@ -2234,8 +2327,7 @@ async def _save_dataset(request, cm, admin, name, description, endpoint,
             status_code=400,
             detail="Give both the access key and the secret, or neither "
                    "(neither leaves the stored credential unchanged).")
-    elif not credentials_secret and (source or "").strip() != \
-            DATASET_SOURCE_MANAGED:
+    elif not credentials_secret:
         # Blank everything means "leave the credential alone" — including the
         # LINK to it. Dropping the reference while keeping the Secret leaves a
         # dataset that looks configured and cannot authenticate, which is what
@@ -2244,7 +2336,8 @@ async def _save_dataset(request, cm, admin, name, description, endpoint,
 
     data = _build_dataset_data(name, description, endpoint, bucket, prefix,
                               region, provider, credentials_secret, read_only,
-                              source, size, external_sources)
+                              source, size, external_sources, claim_name,
+                              uid, gid, sub_path)
     try:
         ok = await request.app.state.run(cm.save_dataset, data, create)
     except DatasetSpecError as e:

@@ -180,11 +180,13 @@ def _refence_datasets_loop(cm, wake=_refence_wake,
 
 # --------------------------------------------------------------------------- #
 # Managed datasets: the portal writes the Dataset CR, the operator makes the   #
-# claim and the server (config.ensure_managed_dataset). Built when the CR      #
-# appears rather than on first mount, so a dataset exists to be filled before  #
-# anyone is granted it. No on.delete (no finalizer). Archiving removes the     #
-# server through the prune above and keeps the data; deleting an archived      #
-# dataset for good is a mark (config.destroy_dataset), carried out here.       #
+# claim and the server (config.ensure_managed_dataset). A `claim` dataset gets #
+# the same server over an existing claim, which is never created or deleted.  #
+# Built when the CR appears rather than on first mount, so a dataset exists to #
+# be filled before anyone is granted it. No on.delete (no finalizer).          #
+# Archiving removes the server through the prune above and keeps the data;     #
+# deleting an archived dataset for good is a mark (config.destroy_dataset),    #
+# carried out here.                                                            #
 # --------------------------------------------------------------------------- #
 
 def _marked(meta):
@@ -192,7 +194,7 @@ def _marked(meta):
 
 
 def _served(spec, meta, **_):
-    return (KubeConfigManager.is_managed_dataset(spec)
+    return (KubeConfigManager.has_dataset_server(spec)
             and not KubeConfigManager.is_archived_dataset(spec)
             and not _marked(meta))
 
