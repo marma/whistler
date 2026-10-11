@@ -369,13 +369,14 @@ def test_a_failed_vmi_without_a_reason_has_no_message(monkeypatch):
     assert message is None
 
 
-def _tick(monkeypatch, probe_result, phase_before="Booting"):
+def _tick(monkeypatch, probe_result, phase_before="Booting", **status_before):
     monkeypatch.setattr(operator, "_probe_vmi",
                         lambda namespace, name, logger: probe_result)
     patch = _Patch()
     operator.session_phase_timer(
         spec={"user": "alice"}, name="alice-desk", namespace="ns",
-        meta={"annotations": {}}, status={"phase": phase_before, "runtime": "vm"},
+        meta={"annotations": {}},
+        status={"phase": phase_before, "runtime": "vm", **status_before},
         patch=patch, logger=_LOG)
     return patch
 
@@ -388,9 +389,18 @@ def test_the_timer_writes_the_reason_with_a_failed_phase(monkeypatch):
 
 def test_the_timer_clears_the_reason_on_any_other_phase(monkeypatch):
     # A VM that recovers must not keep last week's reason next to Running.
-    patch = _tick(monkeypatch, ("Booting", "alice-desk", None, None), phase_before="Failed")
+    patch = _tick(monkeypatch, ("Booting", "alice-desk", None, None),
+                  phase_before="Failed", statusMessage="KubeVirt reports X")
     assert patch.status["phase"] == "Booting"
     assert patch.status["statusMessage"] is None
+
+
+def test_a_tick_that_changes_nothing_writes_nothing(monkeypatch):
+    # Every session, every 10s: an unconditional patch is an API write and a
+    # log line each time.
+    patch = _tick(monkeypatch, ("Ready", "alice-desk", None, None),
+                  phase_before="Ready", vmiName="alice-desk")
+    assert patch.status == {}
 
 
 # --- a stop survives a policy refusal --------------------------------------- #

@@ -39,3 +39,55 @@ def test_the_libraries_can_still_be_asked_for_by_name(monkeypatch):
 def test_asyncssh_is_left_alone(monkeypatch):
     """Per-connection, not per-poll — and it is how you read a handshake."""
     assert "asyncssh" not in CHATTY_LIBRARY_LOGGERS
+
+
+def test_the_operator_level_reaches_kopf(monkeypatch):
+    """`kopf run --verbose` sets the root logger; operator.logLevel has to
+    win over it, not just over Whistler's own loggers."""
+    from whistler.logsetup import configure_operator_logging
+    monkeypatch.delenv("WHISTLER_LIB_LOG_LEVEL", raising=False)
+    root = logging.getLogger()
+    before = root.level
+    try:
+        root.setLevel(logging.DEBUG)
+        configure_operator_logging("error")
+        assert logging.getLogger("kopf.objects").getEffectiveLevel() == logging.ERROR
+        assert logging.getLogger("whistler.operator").getEffectiveLevel() == logging.ERROR
+    finally:
+        root.setLevel(before)
+        logging.getLogger("whistler").setLevel(logging.NOTSET)
+
+
+def _kopf_records(level, message):
+    from whistler.logsetup import configure_operator_logging
+    configure_operator_logging(level)
+    seen = []
+
+    class _Keep(logging.Handler):
+        def emit(self, record):
+            seen.append(record)
+
+    objects = logging.getLogger("kopf.objects")
+    h = _Keep()
+    objects.addHandler(h)
+    try:
+        objects.info(message)
+    finally:
+        objects.removeHandler(h)
+        logging.getLogger().setLevel(logging.WARNING)
+        logging.getLogger("whistler").setLevel(logging.NOTSET)
+    return seen
+
+
+def test_a_routine_timer_success_is_not_an_info_line():
+    assert _kopf_records("INFO", "Timer 'session_phase_timer' succeeded.") == []
+
+
+def test_a_routine_timer_success_is_still_there_at_debug():
+    [record] = _kopf_records("DEBUG", "Timer 'session_phase_timer' succeeded.")
+    assert record.levelno == logging.DEBUG
+
+
+def test_other_kopf_info_lines_are_untouched():
+    [record] = _kopf_records("INFO", "Handler 'access_changed_fn' succeeded.")
+    assert record.levelno == logging.INFO

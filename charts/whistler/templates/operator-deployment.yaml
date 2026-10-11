@@ -22,7 +22,9 @@ spec:
         - name: operator
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["kopf", "run", "whistler/operator.py", "--verbose"]
+          # No --verbose: operator.logLevel (OPERATOR_LOG_LEVEL) sets the level,
+          # kopf's included, from the startup handler on.
+          command: ["kopf", "run", "whistler/operator.py"]
           env:
             - name: PYTHONUNBUFFERED
               value: "1"

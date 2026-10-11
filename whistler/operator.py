@@ -6,7 +6,7 @@ import time
 import kopf
 from kubernetes import client
 
-from whistler.logsetup import quiet_chatty_libraries
+from whistler.logsetup import configure_operator_logging
 from whistler.config import (
     ARCHIVE_ANNOTATION,
     DELETE_DATA_ANNOTATION,
@@ -51,12 +51,10 @@ _instance_short_name = _session_short_name
 
 @kopf.on.startup()
 def configure(settings: kopf.OperatorSettings, **_):
-    level = os.environ.get("OPERATOR_LOG_LEVEL", "INFO").upper()
-    logging.getLogger("whistler").setLevel(level)
-    # `kopf run --verbose` sets the root logger to DEBUG, which turns on the
-    # kubernetes client's per-request logging — including the body of every
-    # Secret it reads (whistler/logsetup.py).
-    quiet_chatty_libraries(level)
+    # The whole process, kopf included, whatever `kopf run` was given; the
+    # kubernetes client stays at INFO or above even at DEBUG, since its DEBUG
+    # is the body of every Secret it reads (whistler/logsetup.py).
+    configure_operator_logging(os.environ.get("OPERATOR_LOG_LEVEL", "INFO"))
     # Instantiate eagerly so config-loading problems surface at startup.
     cm = _get_config_manager()
     # Seed the first admin account (whistler.bootstrapAdmin) if it doesn't
@@ -596,10 +594,16 @@ def session_phase_timer(spec, name, namespace, meta, status, patch, logger, **kw
         # would report a misleading Stopped. Leave phase/statusMessage intact.
         return
 
+    # Write only what changed: an unconditional patch is an API write per
+    # session every 10s, and a DEBUG line for each.
+    def put(key, value):
+        if status.get(key) != value:
+            patch.status[key] = value
+
     runtime = status.get('runtime')
     if runtime == 'vm':
         new_phase, child_name, address, message = _probe_vmi(namespace, name, logger)
-        patch.status['vmiName'] = child_name
+        put('vmiName', child_name)
         # A VM that is down while the CR still says run is either a guest that
         # powered itself off or a start still on its way; only the first is a
         # stop, and only the VM's own status can tell them apart.
@@ -607,19 +611,19 @@ def session_phase_timer(spec, name, namespace, meta, status, patch, logger, **kw
             _record_guest_shutdown(namespace, name, patch, logger)
     else:
         new_phase, child_name, address, message = _probe_pod(namespace, name, logger)
-        patch.status['podName'] = child_name
+        put('podName', child_name)
 
-    patch.status['phase'] = new_phase
+    put('phase', new_phase)
     # A Failed phase carries its reason in the same field the reconcile handler
     # uses for a policy refusal — the gateway prints it when a connect fails,
     # and `get_user_instances` hands it to the portal. Cleared on any other
     # phase so a VM that recovers does not keep last week's reason; the policy
     # message is safe because policyFailed returned above.
-    patch.status['statusMessage'] = message if new_phase == 'Failed' else None
+    put('statusMessage', message if new_phase == 'Failed' else None)
     # Only desktop sessions have a Service / reachable address; ssh sessions are
     # bridged via `kubectl exec` and have no Service to point at.
     if status.get('mode') == 'desktop' and address:
-        patch.status['address'] = address
+        put('address', address)
 
 
 @kopf.on.delete('whistler.martinmalmsten.net', 'v1', 'sessions')

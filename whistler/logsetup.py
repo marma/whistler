@@ -34,3 +34,36 @@ def quiet_chatty_libraries(app_level: str = "INFO") -> str:
     for name in CHATTY_LIBRARY_LOGGERS:
         logging.getLogger(name).setLevel(level)
     return level
+
+
+class _DemoteRoutineTimers(logging.Filter):
+    """kopf logs every successful timer run at INFO — for the 10s Session
+    phase timer that is one line per session every 10 seconds, which is most
+    of an INFO log. Treat it as the DEBUG line it is, which also keeps it off
+    kopf's Event poster (it posts INFO and up)."""
+
+    def filter(self, record):
+        if record.levelno == logging.INFO:
+            msg = record.getMessage()
+            if msg.startswith("Timer ") and msg.endswith(" succeeded."):
+                if not logging.getLogger(record.name).isEnabledFor(logging.DEBUG):
+                    return False
+                record.levelno, record.levelname = logging.DEBUG, "DEBUG"
+        return True
+
+
+def configure_operator_logging(level: str = "INFO") -> str:
+    """Apply OPERATOR_LOG_LEVEL to the whole operator, kopf included.
+
+    `kopf run` sets the root level from its own flags (`--verbose` → DEBUG)
+    before any handler runs; setting only the `whistler` logger left kopf's
+    per-object lines at whatever the command line said, whatever the chart's
+    `operator.logLevel` was."""
+    level = (level or "INFO").strip().upper()
+    logging.getLogger().setLevel(level)
+    logging.getLogger("whistler").setLevel(level)
+    objects = logging.getLogger("kopf.objects")
+    if not any(isinstance(f, _DemoteRoutineTimers) for f in objects.filters):
+        objects.addFilter(_DemoteRoutineTimers())
+    quiet_chatty_libraries(level)
+    return level
