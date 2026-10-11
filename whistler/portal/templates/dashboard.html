@@ -22,6 +22,14 @@
 {% include "_resource_meter.html" %}
 {% endwith %}
 
+{# VM guest RAM: a reserved pool is not in Memory above, and a hugepage-backed
+   VM requests only its overhead there. #}
+{% for hp in res.hugepages %}
+{% with title="Hugepages (" ~ hp.size ~ ")", view=hp %}
+{% include "_resource_meter.html" %}
+{% endwith %}
+{% endfor %}
+
 <h3 class="ui header" style="margin-top:2rem">
   <i class="microchip icon"></i>
   <div class="content">GPUs</div>

@@ -1037,11 +1037,15 @@ def _resource_meter_view(summary: dict, *, unit: str, to_display=float, decimals
 
 
 def _dashboard_resource_views(resources: dict) -> dict:
-    """Build the CPU/memory/per-GPU-type meter view-models for dashboard.html."""
+    """Build the CPU/memory/hugepage/per-GPU-type meter view-models for dashboard.html."""
+    gib = lambda v: float(v) / (1024 ** 3)  # noqa: E731
     return {
         "cpu": _resource_meter_view(resources["cpu"], unit="cores"),
-        "memory": _resource_meter_view(
-            resources["memory"], unit="GiB", to_display=lambda v: float(v) / (1024 ** 3)),
+        "memory": _resource_meter_view(resources["memory"], unit="GiB", to_display=gib),
+        "hugepages": [
+            {"size": h["size"], **_resource_meter_view(h, unit="GiB", to_display=gib)}
+            for h in resources.get("hugepages", [])
+        ],
         "gpus": [
             {"type": g["type"], **_resource_meter_view(g, unit="GPUs", to_display=int, decimals=0)}
             for g in resources["gpus"]

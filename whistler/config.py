@@ -279,6 +279,13 @@ def _non_negative_int_env(name: str, default: int) -> int:
     return value
 
 
+def _hugepage_quantities(resources: Dict[str, Any]) -> Dict[str, Any]:
+    """The ``hugepages-<size>`` entries of a resource map (node allocatable
+    or container requests), keyed by page size: ``{"2Mi": "32Gi"}``."""
+    return {name[len("hugepages-"):]: qty for name, qty in (resources or {}).items()
+            if name.startswith("hugepages-")}
+
+
 def _format_quantity(num_bytes: int) -> str:
     """A byte count as the largest binary Kubernetes quantity that divides it
     exactly (``2147483648`` -> ``"2Gi"``). Pure.
@@ -1162,7 +1169,7 @@ class ConfigManager(ABC):
 
     @abstractmethod
     def get_cluster_resources(self) -> Dict[str, Any]:
-        """Cluster-wide CPU/memory/GPU capacity vs requests, for the Dashboard tab."""
+        """Cluster-wide CPU/memory/hugepage/GPU capacity vs requests, for the Dashboard tab."""
         pass
 
     @abstractmethod
@@ -9028,8 +9035,8 @@ class KubeConfigManager(ConfigManager):
         return instances
 
     def get_cluster_resources(self) -> Dict[str, Any]:
-        """Cluster-wide capacity snapshot for the Dashboard tab: total CPU/RAM
-        and per-GPU-type counts, each split into free / used by whistler /
+        """Cluster-wide capacity snapshot for the Dashboard tab: total CPU/RAM,
+        hugepage pools per page size and per-GPU-type counts, each split into free / used by whistler /
         used by whistler (preemptible) / used by other workloads.
 
         Accounting is by resource *requests* (the scheduler's own ledger),
@@ -9077,6 +9084,7 @@ class KubeConfigManager(ConfigManager):
             nodes.append({
                 "cpu": allocatable.get("cpu", "0"),
                 "memory": allocatable.get("memory", "0"),
+                "hugepages": _hugepage_quantities(allocatable),
                 "gpuType": gpu_type,
                 "gpuCount": gpu_count,
             })
@@ -9122,6 +9130,7 @@ class KubeConfigManager(ConfigManager):
 
             cpu = Decimal(0)
             memory = Decimal(0)
+            hugepages: Dict[str, Decimal] = {}
             gpu_count = 0
             requested_vm_type = None
             for container in (pod.spec.containers or []):
@@ -9130,6 +9139,8 @@ class KubeConfigManager(ConfigManager):
                     cpu += parse_quantity(requests["cpu"])
                 if "memory" in requests:
                     memory += parse_quantity(requests["memory"])
+                for size, qty in _hugepage_quantities(requests).items():
+                    hugepages[size] = hugepages.get(size, Decimal(0)) + parse_quantity(qty)
                 if GPU_POD_RESOURCE in requests:
                     gpu_count += int(parse_quantity(requests[GPU_POD_RESOURCE]))
                 for rname in vm_resources:
@@ -9144,7 +9155,7 @@ class KubeConfigManager(ConfigManager):
 
             pod_requests.append({
                 "bucket": bucket, "cpu": cpu, "memory": memory,
-                "gpuType": gpu_type, "gpuCount": gpu_count,
+                "hugepages": hugepages, "gpuType": gpu_type, "gpuCount": gpu_count,
             })
 
         return self._summarize_cluster_resources(nodes, pod_requests)
@@ -9155,15 +9166,25 @@ class KubeConfigManager(ConfigManager):
         it's testable with plain dicts.
 
         ``nodes``: one entry per node with raw allocatable quantities, e.g.
-        ``{"cpu": "4", "memory": "16Gi", "gpuType": "A100" | None, "gpuCount": "2"}``.
+        ``{"cpu": "4", "memory": "16Gi", "hugepages": {"2Mi": "32Gi"},
+        "gpuType": "A100" | None, "gpuCount": "2"}``.
         ``pod_requests``: one entry per non-terminal pod, already summed
         across its own containers, with the ownership bucket
         (``"whistler" | "whistlerPreemptible" | "other"``) and GPU type
         already resolved, e.g.
-        ``{"bucket": "whistler", "cpu": Decimal("0.5"), "memory": Decimal(2**30), "gpuType": "A100", "gpuCount": 1}``.
+        ``{"bucket": "whistler", "cpu": Decimal("0.5"), "memory": Decimal(2**30), "hugepages": {"2Mi": Decimal(2**35)}, "gpuType": "A100", "gpuCount": 1}``.
 
-        Returns ``{"cpu": summary, "memory": summary, "gpus": [{"type": ..., **summary}, ...]}``
-        where a ``summary`` is ``{"total", "free", "whistler", "whistlerPreemptible", "other"}``.
+        Returns ``{"cpu": summary, "memory": summary, "hugepages": [{"size": ..., **summary}, ...],
+        "gpus": [{"type": ..., **summary}, ...]}`` where a ``summary`` is
+        ``{"total", "free", "whistler", "whistlerPreemptible", "other"}``.
+
+        Hugepages get their own meters because they are invisible in
+        ``memory``: a node's reserved pool is subtracted from its allocatable
+        memory, and a VM backed by them requests its guest RAM as
+        ``hugepages-<size>`` with only KubeVirt's overhead under ``memory``.
+        Without them a 32GiB VM reads as a few hundred MiB on the dashboard.
+        Sizes no node reserves and no pod requests are left out — every
+        x86 node advertises ``hugepages-1Gi: 0`` and ``hugepages-2Mi: 0``.
         """
         buckets = ("whistler", "whistlerPreemptible", "other")
 
@@ -9178,11 +9199,19 @@ class KubeConfigManager(ConfigManager):
 
         cpu_used = {b: Decimal(0) for b in buckets}
         mem_used = {b: Decimal(0) for b in buckets}
+        hp_total: Dict[str, Decimal] = {}
+        for n in nodes:
+            for size, qty in (n.get("hugepages") or {}).items():
+                hp_total[size] = hp_total.get(size, Decimal(0)) + parse_quantity(qty)
+        hp_used: Dict[str, Dict[str, Decimal]] = {}
         gpu_used: Dict[str, Dict[str, int]] = {}
         for req in pod_requests:
             bucket = req["bucket"]
             cpu_used[bucket] += parse_quantity(req.get("cpu", 0))
             mem_used[bucket] += parse_quantity(req.get("memory", 0))
+            for size, qty in (req.get("hugepages") or {}).items():
+                used = hp_used.setdefault(size, {b: Decimal(0) for b in buckets})
+                used[bucket] += parse_quantity(qty)
             gpu_count = int(req.get("gpuCount") or 0)
             if gpu_count:
                 gpu_type = req.get("gpuType") or "unknown"
@@ -9198,9 +9227,17 @@ class KubeConfigManager(ConfigManager):
             for gpu_type in sorted(set(gpu_total) | set(gpu_used))
         ]
 
+        hugepages = [
+            {"size": size, **_summary(hp_total.get(size, Decimal(0)),
+                                      hp_used.get(size, {b: Decimal(0) for b in buckets}))}
+            for size in sorted(set(hp_total) | set(hp_used), key=parse_quantity)
+            if hp_total.get(size) or any((hp_used.get(size) or {}).values())
+        ]
+
         return {
             "cpu": _summary(cpu_total, cpu_used),
             "memory": _summary(mem_total, mem_used),
+            "hugepages": hugepages,
             "gpus": gpus,
         }
 

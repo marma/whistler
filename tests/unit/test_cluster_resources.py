@@ -76,3 +76,45 @@ def test_free_never_goes_negative_when_used_exceeds_total():
     pod_requests = [{"bucket": "whistler", "cpu": "3"}]
     result = _manager()._summarize_cluster_resources(nodes, pod_requests)
     assert result["cpu"]["free"] == 0
+
+
+def test_hugepages_are_their_own_meter_per_page_size():
+    # A hugepage-backed VM requests its guest RAM as hugepages-<size> and only
+    # KubeVirt's overhead as memory, so without this meter it barely registers.
+    nodes = [
+        {"memory": "64Gi", "hugepages": {"2Mi": "32Gi", "1Gi": "0"}},
+        {"memory": "64Gi", "hugepages": {"2Mi": "16Gi", "1Gi": "8Gi"}},
+    ]
+    pod_requests = [
+        {"bucket": "whistler", "memory": "300Mi", "hugepages": {"2Mi": Decimal(16 * 2**30)}},
+        {"bucket": "whistlerPreemptible", "hugepages": {"1Gi": Decimal(4 * 2**30)}},
+    ]
+    result = _manager()._summarize_cluster_resources(nodes, pod_requests)
+    hp = {h["size"]: h for h in result["hugepages"]}
+    assert [h["size"] for h in result["hugepages"]] == ["2Mi", "1Gi"]
+    assert hp["2Mi"]["total"] == 48 * 2**30
+    assert hp["2Mi"]["whistler"] == 16 * 2**30
+    assert hp["2Mi"]["free"] == 32 * 2**30
+    assert hp["1Gi"]["whistlerPreemptible"] == 4 * 2**30
+    assert hp["1Gi"]["free"] == 4 * 2**30
+    assert result["memory"]["whistler"] == 300 * 2**20
+
+
+def test_unreserved_hugepage_sizes_are_left_out():
+    # Every x86 node advertises hugepages-1Gi: 0 and hugepages-2Mi: 0.
+    nodes = [{"hugepages": {"2Mi": "0", "1Gi": "0"}}]
+    assert _manager()._summarize_cluster_resources(nodes, [])["hugepages"] == []
+
+
+def test_hugepages_requested_with_no_pool_still_show():
+    # A pod requesting a size no node reserves is the case worth seeing: it pends.
+    pod_requests = [{"bucket": "whistler", "hugepages": {"2Mi": "8Gi"}}]
+    hp = _manager()._summarize_cluster_resources([], pod_requests)["hugepages"]
+    assert hp[0]["size"] == "2Mi" and hp[0]["total"] == 0 and hp[0]["whistler"] == 8 * 2**30
+
+
+def test_hugepage_quantities_picks_out_the_pools():
+    from whistler.config import _hugepage_quantities
+    assert _hugepage_quantities({"cpu": "4", "memory": "1Gi", "hugepages-2Mi": "2Gi",
+                                 "hugepages-1Gi": "0"}) == {"2Mi": "2Gi", "1Gi": "0"}
+    assert _hugepage_quantities(None) == {}
