@@ -32,8 +32,9 @@ import ipaddress
 import logging
 import os
 import re
+import time
 from typing import Annotated, List, Optional
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
@@ -55,8 +56,11 @@ from whistler.config import (ACCESS_MODES, CHANNELS, ConfigWriteError,
                              ROLE_ADMIN, ROLES, VIEWERS, may_manage_user,
                              user_role,
                              normalize_source_ranges, role_may)
-from whistler.portal.login import (USER_COOKIE, dev_auth, kiosk_home,
-                                   render_login, render_notice,
+from whistler import passwords
+from whistler.portal.login import (CHANGE_COOKIE, PURPOSE_CHANGE,
+                                   PURPOSE_PORTAL, USER_COOKIE, check_password,
+                                   dev_auth, kiosk_home, render_change_password,
+                                   render_login, render_notice, sign, unsign,
                                    verify_credentials)
 from whistler.status import GROUP_COLORS, status_group
 from whistler.portal.backups import (BackupClient, BackupRefused,
@@ -148,10 +152,11 @@ def _get_identity(request: Request) -> Optional[str]:
                     or request.query_params.get("user"))
         if explicit:
             return explicit.split("-")[0]
-    if request.cookies.get(PORTAL_COOKIE) != "1":
+    user = unsign(request.cookies.get(USER_COOKIE))
+    if not user or unsign(request.cookies.get(PORTAL_COOKIE),
+                          PURPOSE_PORTAL) != user:
         return None
-    raw = request.cookies.get(USER_COOKIE)
-    return raw.split("-")[0] if raw else None
+    return user
 
 
 def require_user(request: Request):
@@ -351,7 +356,9 @@ async def login_submit(
     arrives in login.py, for both surfaces."""
     name = user.strip().split("-")[0]
     next_to = _safe_next(next)
-    if not verify_credentials(name, password):
+    verdict = await request.app.state.run(
+        check_password, request.app.state.cm, name, password)
+    if verdict == passwords.REFUSED:
         logger.warning(f"Portal login refused for {user!r}")
         return _login_page(next_to, "Sign-in failed.", status_code=401)
     # The password was right and the surface is still wrong. Say which, and
@@ -367,12 +374,115 @@ async def login_submit(
         logger.warning(f"Portal login refused for {name}: no "
                        f"'{ENTRY_PORTAL}' entry point")
         return _entry_denied_page()
+    if verdict == passwords.CHANGE:
+        # A temporary password earns one thing: the form to replace it. No
+        # session until then, so the temporary password cannot be used as one.
+        logger.info(f"Portal login for {name} with a temporary password; "
+                    f"asking for a new one")
+        response = RedirectResponse(
+            f"{CHANGE_PATH}?next={quote(next_to)}" if next_to != "/"
+            else CHANGE_PATH, status_code=303)
+        response.set_cookie(CHANGE_COOKIE, sign(name, PURPOSE_CHANGE),
+                            path="/", samesite="lax", httponly=True)
+        return response
     logger.info(f"Portal login for {name}")
-    response = RedirectResponse(_next_url(next_to, name), status_code=303)
-    response.set_cookie(USER_COOKIE, name, path="/", samesite="lax")
-    response.set_cookie(PORTAL_COOKIE, "1", path="/", samesite="lax",
-                        httponly=True)
+    return _signed_in(RedirectResponse(_next_url(next_to, name),
+                                       status_code=303), name)
+
+
+def _signed_in(response, name: str):
+    response.set_cookie(USER_COOKIE, sign(name), path="/", samesite="lax")
+    response.set_cookie(PORTAL_COOKIE, sign(name, PURPOSE_PORTAL), path="/",
+                        samesite="lax", httponly=True)
+    response.delete_cookie(CHANGE_COOKIE, path="/")
     return response
+
+
+# The form a temporary password leads to (and the only thing it leads to).
+CHANGE_PATH = LOGIN_PATH + "/password"
+
+
+def _change_page(user: str, next_to: str, error: str = None,
+                 status_code: int = 200) -> HTMLResponse:
+    return HTMLResponse(
+        render_change_password(action=CHANGE_PATH, user=user, error=error,
+                               hidden={"next": "" if next_to == "/" else next_to}),
+        status_code=status_code, headers={"Cache-Control": "no-store"})
+
+
+async def change_form(request: Request):
+    user = unsign(request.cookies.get(CHANGE_COOKIE), PURPOSE_CHANGE)
+    if not user:
+        return RedirectResponse(LOGIN_PATH, status_code=303)
+    return _change_page(user, _safe_next(request.query_params.get("next")))
+
+
+async def change_submit(
+    request: Request,
+    password: Annotated[str, Form()] = "",
+    confirm:  Annotated[str, Form()] = "",
+    next:     Annotated[str, Form()] = "",
+):
+    """Store the chosen password and sign in. The temporary one proved who
+    this is a moment ago (the signed cookie, good for 15 minutes), so it is
+    not asked for again."""
+    user = unsign(request.cookies.get(CHANGE_COOKIE), PURPOSE_CHANGE)
+    next_to = _safe_next(next)
+    if not user:
+        return _login_page(next_to, "That took too long — sign in again.",
+                           status_code=401)
+    problem = passwords.new_password_problem(user, password, confirm)
+    if problem:
+        return _change_page(user, next_to, problem, status_code=400)
+    cm = request.app.state.cm
+    if not await request.app.state.run(cm.may_enter, user, ENTRY_PORTAL):
+        return _entry_denied_page()
+    if await request.app.state.run(cm.set_password, user, password) is None:
+        return _change_page(user, next_to, "The password could not be saved. "
+                            "Try again, or ask an administrator.",
+                            status_code=500)
+    logger.info(f"Portal login for {user} after choosing a password")
+    return _signed_in(RedirectResponse(_next_url(next_to, user),
+                                       status_code=303), user)
+
+
+# Changing one's own password while signed in.
+ACCOUNT_PASSWORD_PATH = "/account/password"
+
+
+def _account_page(user: str, error: str = None,
+                  status_code: int = 200) -> HTMLResponse:
+    return HTMLResponse(
+        render_change_password(action=ACCOUNT_PASSWORD_PATH, user=user,
+                               error=error, ask_current=True),
+        status_code=status_code, headers={"Cache-Control": "no-store"})
+
+
+async def account_password_form(request: Request, user: User):
+    return _account_page(user)
+
+
+async def account_password_submit(
+    request: Request, user: User,
+    current:  Annotated[str, Form()] = "",
+    password: Annotated[str, Form()] = "",
+    confirm:  Annotated[str, Form()] = "",
+):
+    cm = request.app.state.cm
+    if not await request.app.state.run(verify_credentials, cm, user, current):
+        return _account_page(user, "The current password is wrong.",
+                             status_code=401)
+    problem = passwords.new_password_problem(user, password, confirm, current)
+    if problem:
+        return _account_page(user, problem, status_code=400)
+    if await request.app.state.run(cm.set_password, user, password) is None:
+        return _account_page(user, "The password could not be saved.",
+                             status_code=500)
+    return HTMLResponse(
+        render_notice(heading="Password changed",
+                      message="Use the new password the next time you sign in.",
+                      href=f"/?user={quote(user)}", link_label="Back to the portal"),
+        headers={"Cache-Control": "no-store"})
 
 
 async def logout(request: Request):
@@ -381,6 +491,7 @@ async def logout(request: Request):
     response = RedirectResponse(LOGIN_PATH, status_code=303)
     response.delete_cookie(USER_COOKIE, path="/")
     response.delete_cookie(PORTAL_COOKIE, path="/")
+    response.delete_cookie(CHANGE_COOKIE, path="/")
     return response
 
 
@@ -1364,10 +1475,12 @@ async def admin_template_delete(request: Request, cm: CM, admin: Admin, name: st
 
 async def admin_users(request: Request, cm: CM, admin: AccessManager):
     users = []
+    password_states = await request.app.state.run(cm.password_states)
     for u in await request.app.state.run(cm.list_all_users):
         role = (ROLE_ADMIN if _ALLOW_ADMIN or u.get("name") in _ADMIN_USERS
                 else user_role(u))
         users.append({**u, "role": role,
+                      "password": password_states.get(u.get("name"), "none"),
                       "manageable": may_manage_user(request.state.role, role)})
     return templates.TemplateResponse(
         request=request, name="admin/users.html",
@@ -1405,7 +1518,43 @@ async def admin_user_create(
     ok = await request.app.state.run(cm.save_user, user_data)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to create user.")
-    return _tr(f"/admin/users/{name}", admin)
+    return await _temporary_password_page(request, cm, admin, name, created=True)
+
+
+async def _temporary_password_page(request: Request, cm, admin: str,
+                                   username: str, created: bool = False):
+    """Issue a temporary password and show it, once. Never a redirect: the
+    plaintext must not travel in a URL or survive in anything the browser
+    keeps, hence no-store."""
+    try:
+        password, expires = await request.app.state.run(
+            cm.issue_temporary_password, username)
+    except RuntimeError:
+        raise HTTPException(status_code=500,
+                            detail="The temporary password could not be stored.")
+    logger.info(f"{admin} issued a temporary password for {username}")
+    return templates.TemplateResponse(
+        request=request, name="admin/user_password.html",
+        context=_ctx(admin, is_admin=True, username=username, password=password,
+                     created=created, dev_auth=dev_auth(),
+                     expires=time.strftime("%Y-%m-%d %H:%M UTC",
+                                           time.gmtime(expires))),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def admin_user_reset_password(request: Request, cm: CM,
+                                    admin: AccessManager, username: str):
+    """A new temporary password; the old password stops working at once.
+    Not for one's own account — that is /account/password, which asks for
+    the current one."""
+    await _need_manageable(request, username)
+    if username == admin:
+        raise HTTPException(status_code=400,
+                            detail="Change your own password from your account page.")
+    if not await request.app.state.run(cm.user_exists, username):
+        raise HTTPException(status_code=404, detail="User not found.")
+    return await _temporary_password_page(request, cm, admin, username)
 
 
 async def admin_user_detail(request: Request, cm: CM, admin: AccessManager, username: str):
@@ -1437,9 +1586,12 @@ async def admin_user_detail(request: Request, cm: CM, admin: AccessManager, user
         await _matrix_sections(request, cm, username),
         _grid_zones(zones), own_access, effective_access)
     channel_grant = await request.app.state.run(cm.get_user_channels, username)
+    password_state = passwords.status(
+        await request.app.state.run(cm.get_password_record, username))
     return templates.TemplateResponse(
         request=request, name="admin/user_detail.html",
         context=_ctx(admin, is_admin=True, user_obj=user_obj, instances=instances,
+                     password_state=password_state,
                      user_role=await request.app.state.run(_role, request, username),
                      desktop_sessions=desktop_sessions,
                      gpu_types=gpu_types, allowed_gpu_types=allowed_gpu_types,
@@ -3110,6 +3262,10 @@ def build_management_app(config_manager):
     app.add_api_route(LOGIN_PATH,  login_form,   methods=["GET"], response_class=HTMLResponse)
     app.add_api_route(LOGIN_PATH,  login_submit, methods=["POST"])
     app.add_api_route("/logout",   logout,       methods=["POST"])
+    app.add_api_route(CHANGE_PATH, change_form,  methods=["GET"], response_class=HTMLResponse)
+    app.add_api_route(CHANGE_PATH, change_submit, methods=["POST"])
+    app.add_api_route(ACCOUNT_PASSWORD_PATH, account_password_form, methods=["GET"], response_class=HTMLResponse)
+    app.add_api_route(ACCOUNT_PASSWORD_PATH, account_password_submit, methods=["POST"])
 
     # User routes
     app.add_api_route("/",                                user_index,            methods=["GET"],  response_class=HTMLResponse)
@@ -3147,6 +3303,7 @@ def build_management_app(config_manager):
     app.add_api_route("/admin/users/{username}/channels",         admin_user_set_channels, methods=["POST"])
     app.add_api_route("/admin/users/{username}/disabled",         admin_user_set_disabled, methods=["POST"])
     app.add_api_route("/admin/users/{username}/otp",              admin_user_set_otp,      methods=["POST"])
+    app.add_api_route("/admin/users/{username}/password",         admin_user_reset_password, methods=["POST"], response_class=HTMLResponse)
     app.add_api_route("/admin/groups",                            admin_groups,           methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/groups/new",                        admin_group_new,        methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/groups",                            admin_group_create,     methods=["POST"])

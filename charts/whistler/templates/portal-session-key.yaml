@@ -1,0 +1,31 @@
+{{- if .Values.portal.enabled }}
+{{- /*
+The key the portal signs its cookies with (whistler/portal/login.py, sign):
+the identity, the portal and kiosk markers, the kiosk's half-way cookie and
+the password-change cookie. Without it any cookie could be written by hand.
+
+Generated once and then kept: an upgrade reuses the key already in the
+cluster (lookup), so signed-in browsers stay signed in. Deleting this Secret
+and upgrading rotates it, which signs everybody out. `helm template` has no
+cluster to look in and always renders a fresh one.
+*/ -}}
+{{- $name := printf "%s-portal-session-key" .Release.Name }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
+{{- $key := "" }}
+{{- if and $existing $existing.data }}
+{{- $key = get $existing.data "key" }}
+{{- end }}
+{{- if not $key }}
+{{- $key = randAlphaNum 64 | b64enc }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: whistler-portal
+type: Opaque
+data:
+  key: {{ $key | quote }}
+{{- end }}

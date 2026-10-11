@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Tuple
 from kubernetes import client
 from kubernetes.client.rest import ApiException
 
+from whistler import passwords
 from whistler.backup import BackupError, archive
 from whistler.config import (ARCHIVE_NAMESPACE, DATASET_PLURAL,
                              DELETE_DATA_ANNOTATION, GROUP_PLURAL,
@@ -149,6 +150,18 @@ def _collect_secrets(cm) -> Tuple[List[Dict[str, Any]], List[str]]:
     for secret in items:
         out.append(_with_role(_as_dict(secret),
                               archive.ROLE_DATASET_CREDENTIALS, release_ns))
+    # Password hashes (whistler/passwords.py). A restore without them leaves
+    # every account unable to sign in until an admin resets it — and the
+    # admin included, short of the operator's bootstrap password.
+    try:
+        items = core.list_namespaced_secret(
+            release_ns,
+            label_selector=f"{passwords.SECRET_LABEL}=password").items
+    except ApiException as e:
+        raise BackupError(f"Could not read passwords: {e.reason}")
+    for secret in items:
+        out.append(_with_role(_as_dict(secret), archive.ROLE_PASSWORD,
+                              release_ns))
     return out, warnings
 
 

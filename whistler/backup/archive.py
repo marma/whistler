@@ -54,7 +54,9 @@ ROLE_ANNOTATION = "whistler/backup-role"
 ROLE_SSH_CA = "ssh-ca"
 ROLE_SERVER_HOST_KEY = "server-host-key"
 ROLE_DATASET_CREDENTIALS = "dataset-credentials"
-ROLES = (ROLE_SSH_CA, ROLE_SERVER_HOST_KEY, ROLE_DATASET_CREDENTIALS)
+ROLE_PASSWORD = "password"          # a user's portal/kiosk password hash
+ROLES = (ROLE_SSH_CA, ROLE_SERVER_HOST_KEY, ROLE_DATASET_CREDENTIALS,
+         ROLE_PASSWORD)
 
 # Metadata that belongs to the live object, not to its meaning.
 _DROPPED_ANNOTATION_PREFIXES = ("kopf.zalando.org/", "kubectl.kubernetes.io/",

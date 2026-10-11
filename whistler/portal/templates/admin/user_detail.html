@@ -79,6 +79,23 @@
         {% endif %}
       </form>
       <div class="ui divider"></div>
+      <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/password?user={{ current_user }}">
+        <p>
+          <strong>Password:</strong>
+          {% if password_state == "set" %}chosen by the user.
+          {% elif password_state == "temporary" %}<span class="ui yellow mini label">temporary</span> issued, not yet replaced.
+          {% elif password_state == "expired" %}<span class="ui red mini label">expired</span> the temporary password was never used.
+          {% else %}<span class="ui grey mini label">none</span> this account cannot sign in to the portal or kiosk.{% endif %}
+        </p>
+        {% if user_obj.name == current_user %}
+        <a class="ui button" href="/account/password"><i class="key icon"></i> Change My Password</a>
+        {% else %}
+        <p class="ui grey text">Resetting issues a temporary password, shown once, valid for 7 days, that must be replaced at the next sign-in. The current password stops working immediately.</p>
+        <button type="submit" class="ui button"
+                onclick="return confirm('Reset the password of {{ user_obj.name }}?')"><i class="key icon"></i> Reset Password</button>
+        {% endif %}
+      </form>
+      <div class="ui divider"></div>
       <form class="ui form" method="post" action="/admin/users/{{ user_obj.name }}/otp?user={{ current_user }}">
         <div class="field">
           <div class="ui checkbox">

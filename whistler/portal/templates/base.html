@@ -49,6 +49,7 @@
       </div>
       {# A button, not a link: signing out drops the identity cookie the viewer
          app shares, so it is a state change and belongs behind a POST. #}
+      <a class="item" href="/account/password" title="Change your password"><i class="key icon"></i></a>
       <div class="item">
         <form method="post" action="/logout" style="margin:0">
           <button class="ui inverted basic mini button" type="submit">Sign out</button>

@@ -14,7 +14,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from whistler.config import (DEFAULT_ZONE, ENTRY_POINTS, KubeConfigManager,
+from whistler import passwords
+from whistler.config import (BOOTSTRAP_PASSWORD_SECRET, DEFAULT_ZONE,
+                             ENTRY_POINTS, KubeConfigManager,
                              NEW_USER_ENTRY_POINTS, NEW_USER_ZONES)
 from whistler.portal.management import admin_user_create
 
@@ -48,6 +50,15 @@ class _Api:
 def _not_found():
     from kubernetes.client.rest import ApiException
     return ApiException(status=404, reason="Not Found")
+
+
+@pytest.fixture(autouse=True)
+def _no_cluster(monkeypatch):
+    """Nothing here may reach a real cluster: the bootstrap path writes
+    Secrets, and a developer's kubeconfig names one."""
+    def refuse():
+        raise AssertionError("unit test reached the Kubernetes API")
+    monkeypatch.setattr("whistler.config.client.CoreV1Api", refuse)
 
 
 def _manager(api):
@@ -86,6 +97,57 @@ def test_an_existing_admin_is_never_re_seeded(tmp_path, monkeypatch):
     assert api.created == []
 
 
+class _Core:
+    """Just enough CoreV1Api to watch the bootstrap password Secret go by."""
+
+    def __init__(self):
+        self.secrets = []
+
+    def create_namespaced_secret(self, ns, body):
+        self.secrets.append(body)
+
+
+def _with_passwords(monkeypatch, cm, records):
+    core = _Core()  # replaces _no_cluster's refusal for this test
+    monkeypatch.setattr("whistler.config.client.CoreV1Api", lambda: core)
+    cm.get_password_record = records.get
+    def set_password(user, password, temporary=False):
+        records[user] = passwords.new_record(password, temporary)
+        return records[user]
+    cm.set_password = set_password
+    return core
+
+
+def test_the_bootstrap_admin_gets_a_temporary_password(tmp_path, monkeypatch):
+    seed = tmp_path / "bootstrapAdmin.yaml"
+    seed.write_text("name: marma\n")
+    monkeypatch.setattr("whistler.config.BOOTSTRAP_ADMIN_FILE", str(seed))
+    cm = _manager(_Api())
+    records = {}
+    core = _with_passwords(monkeypatch, cm, records)
+    cm.ensure_bootstrap_admin()
+    (secret,) = core.secrets
+    assert secret["metadata"]["name"] == BOOTSTRAP_PASSWORD_SECRET
+    password = secret["stringData"]["password"]
+    assert passwords.check(records["marma"], password) == passwords.CHANGE
+
+
+def test_a_chosen_password_is_never_replaced_at_startup(tmp_path, monkeypatch):
+    """Also the upgrade path: an existing admin with no password gets one, an
+    admin who chose one keeps it."""
+    seed = tmp_path / "bootstrapAdmin.yaml"
+    seed.write_text("name: marma\n")
+    monkeypatch.setattr("whistler.config.BOOTSTRAP_ADMIN_FILE", str(seed))
+    cm = _manager(_Api(existing={"marma": {"spec": {}}}))
+    records = {"marma": passwords.new_record("a-real-password", False)}
+    core = _with_passwords(monkeypatch, cm, records)
+    cm.ensure_bootstrap_admin()
+    assert core.secrets == []
+    del records["marma"]
+    cm.ensure_bootstrap_admin()
+    assert len(core.secrets) == 1
+
+
 # --- the portal's "New User" form ------------------------------------------ #
 
 class _CM:
@@ -103,7 +165,12 @@ def _request(cm):
     return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(cm=cm, run=run)))
 
 
-async def test_a_user_created_in_the_portal_can_sign_in_and_launch():
+async def test_a_user_created_in_the_portal_can_sign_in_and_launch(monkeypatch):
+    issued = []
+
+    async def page(request, cm, admin, username, created=False):
+        issued.append((username, created))
+    monkeypatch.setattr("whistler.portal.management._temporary_password_page", page)
     cm = _CM()
     await admin_user_create(_request(cm), cm, "admin", name="alice",
                             public_keys=None, uid=None, run_as_user=None,
@@ -114,6 +181,8 @@ async def test_a_user_created_in_the_portal_can_sign_in_and_launch():
     # the detail page, one at a time, which is the point of explicit access.
     assert "allowedVolumes" not in cm.saved
     assert "allowedGpuTypes" not in cm.saved
+    # And a temporary password to come in with, shown to the admin once.
+    assert issued == [("alice", True)]
 
 
 async def test_editing_a_user_does_not_re_seed_the_grants():

@@ -24,7 +24,7 @@ from xml.etree import ElementTree
 
 from whistler.cloudinit import (HOME_DISK_SERIAL, S3_PROXY_BUCKET,
                                 build_user_data, resolve_uid, resolve_gid)
-from whistler import dataset_accounts, hostca, reattach
+from whistler import dataset_accounts, hostca, passwords, reattach
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +172,10 @@ IMAGES_FILE = os.path.join(CONFIG_DIR, "images.yaml")
 # Seeds the first admin User CR at operator startup (KubeConfigManager.
 # ensure_bootstrap_admin); create-if-absent only, see values.yaml bootstrapAdmin.
 BOOTSTRAP_ADMIN_FILE = os.path.join(CONFIG_DIR, "bootstrapAdmin.yaml")
+# Where the operator leaves the bootstrap admin's temporary password:
+#   kubectl -n <ns> get secret whistler-bootstrap-admin \
+#     -o jsonpath='{.data.password}' | base64 -d
+BOOTSTRAP_PASSWORD_SECRET = "whistler-bootstrap-admin"
 
 # KubeVirt API coordinates for the VM desktop backend. KubeVirt may be absent
 # from a given cluster; every call against these is guarded so the operator
@@ -1291,6 +1295,27 @@ class ConfigManager(ABC):
         """Whether the kiosk asks this user for a TOTP code. Everyone, unless
         their own CR sets ``otpDisabled``."""
         return not (self.get_user(username) or {}).get("otpDisabled")
+
+    # Portal/kiosk passwords (whistler/passwords.py). Defaults so a manager
+    # without a store — the test fakes — simply has no passwords.
+    def get_password_record(self, username: str) -> Optional[Dict[str, Any]]:
+        return None
+
+    def set_password(self, username: str, password: str,
+                     temporary: bool = False) -> Optional[Dict[str, Any]]:
+        return None
+
+    def password_states(self) -> Dict[str, str]:
+        return {}
+
+    def issue_temporary_password(self, username: str):
+        """A new temporary password for ``username``: ``(password,
+        expiresAt)``. The plaintext is returned once, to be shown once."""
+        password = passwords.generate_temporary()
+        record = self.set_password(username, password, temporary=True)
+        if record is None:
+            raise RuntimeError(f"Could not store a password for {username}")
+        return password, record["expiresAt"]
 
     @abstractmethod
     def get_user_overrides(self, username: str) -> Dict[str, bool]:
@@ -8568,6 +8593,79 @@ class KubeConfigManager(ConfigManager):
                 logger.error(f"Failed to delete user {username}: {e}")
             return False
 
+    # ------------------------------------------------------------------ #
+    # Passwords: one Secret per user in the release namespace              #
+    # (whistler/passwords.py says why not the User CR).                    #
+    # ------------------------------------------------------------------ #
+
+    def get_password_record(self, username: str) -> Optional[Dict[str, Any]]:
+        try:
+            secret = client.CoreV1Api().read_namespaced_secret(
+                passwords.secret_name(username), self.namespace)
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Could not read the password of {username}: "
+                             f"{e.reason}")
+            return None
+        return passwords.from_secret_data(secret.data)
+
+    def set_password(self, username: str, password: str,
+                     temporary: bool = False) -> Optional[Dict[str, Any]]:
+        """Hash and store; returns the record, or None on failure. The Secret
+        is owned by the User CR, so deleting the user deletes it (the portal
+        has no delete verb on Secrets, and needs none)."""
+        record = passwords.new_record(password, temporary)
+        metadata = {"name": passwords.secret_name(username),
+                    "namespace": self.namespace,
+                    "labels": {passwords.SECRET_LABEL: "password",
+                               passwords.SECRET_USER_LABEL: username}}
+        try:
+            user_cr = self.api.get_namespaced_custom_object(
+                self.group, self.version, self.namespace, USER_PLURAL, username)
+            metadata["ownerReferences"] = [{
+                "apiVersion": f"{self.group}/{self.version}", "kind": "User",
+                "name": username, "uid": user_cr["metadata"]["uid"]}]
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Could not read user {username}: {e.reason}")
+                return None
+        body = {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+                "metadata": metadata, "data": passwords.to_secret_data(record)}
+        core = client.CoreV1Api()
+        try:
+            try:
+                core.create_namespaced_secret(self.namespace, body)
+            except ApiException as e:
+                if e.status != 409:
+                    raise
+                core.replace_namespaced_secret(metadata["name"],
+                                               self.namespace, body)
+        except ApiException as e:
+            logger.error(f"Could not store the password of {username}: "
+                         f"{e.reason}")
+            return None
+        logger.info(f"Password for {username} set "
+                    f"({'temporary' if temporary else 'chosen by the user'})")
+        return record
+
+    def password_states(self) -> Dict[str, str]:
+        """{user: none|temporary|expired|set} for every user with a record,
+        in one list call (the admin user list)."""
+        try:
+            items = client.CoreV1Api().list_namespaced_secret(
+                self.namespace,
+                label_selector=f"{passwords.SECRET_LABEL}=password").items
+        except ApiException as e:
+            logger.error(f"Could not list passwords: {e.reason}")
+            return {}
+        out = {}
+        for secret in items:
+            user = (secret.metadata.labels or {}).get(passwords.SECRET_USER_LABEL)
+            if user:
+                out[user] = passwords.status(
+                    passwords.from_secret_data(secret.data))
+        return out
+
     def is_user_admin(self, username: str) -> bool:
         self._load_users()
         return user_role(self.users.get(username)) == ROLE_ADMIN
@@ -8745,6 +8843,49 @@ class KubeConfigManager(ConfigManager):
                 logger.info(f"Created bootstrap admin user '{name}'.")
             except ApiException as ce:
                 logger.error(f"Failed to create bootstrap admin '{name}': {ce}")
+                return
+        try:
+            self._ensure_bootstrap_password(name)
+        except Exception as e:      # never fatal to operator startup
+            logger.error(f"Could not issue a password for bootstrap admin "
+                         f"'{name}': {e}")
+
+    def _ensure_bootstrap_password(self, name: str) -> None:
+        """Give the bootstrap admin a way in without the dev gate: a temporary
+        password in the Secret BOOTSTRAP_PASSWORD_SECRET, read with kubectl
+        (the Argo CD initial-admin pattern). Only while the account has no
+        usable password — none, or a temporary one that expired unused — so
+        it also covers an install that predates passwords, and never touches
+        a password the admin has chosen."""
+        state = passwords.status(self.get_password_record(name))
+        if state in ("set", "temporary"):
+            return
+        try:
+            password, expires = self.issue_temporary_password(name)
+        except RuntimeError as e:
+            logger.error(str(e))
+            return
+        body = {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+                "metadata": {"name": BOOTSTRAP_PASSWORD_SECRET,
+                             "namespace": self.namespace},
+                "stringData": {"username": name, "password": password,
+                               "expiresAt": time.strftime(
+                                   "%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires))}}
+        core = client.CoreV1Api()
+        try:
+            try:
+                core.create_namespaced_secret(self.namespace, body)
+            except ApiException as e:
+                if e.status != 409:
+                    raise
+                core.replace_namespaced_secret(BOOTSTRAP_PASSWORD_SECRET,
+                                               self.namespace, body)
+        except ApiException as e:
+            logger.error(f"Could not write {BOOTSTRAP_PASSWORD_SECRET}: {e.reason}")
+            return
+        logger.info(f"Temporary password for bootstrap admin '{name}' is in "
+                    f"Secret {BOOTSTRAP_PASSWORD_SECRET} (must be changed at "
+                    f"first sign-in)")
 
     # ------------------------------------------------------------------ #
     # Groups: a project's shared grants (design/security.md, "Group")      #

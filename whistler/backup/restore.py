@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 from kubernetes import client
 from kubernetes.client.rest import ApiException
 
+from whistler import passwords
 from whistler.backup import BackupError, archive
 from whistler.backup.export import (PLURALS, USER_NS_PREFIX,
                                     host_key_secret_name)
@@ -96,6 +97,9 @@ def secret_target_name(secret, cm) -> Optional[str]:
         dataset = (meta.get("labels") or {}).get("dataset")
         return cm.dataset_credentials_secret_name(dataset) if dataset \
             else meta.get("name")
+    if role == archive.ROLE_PASSWORD:
+        user = (meta.get("labels") or {}).get(passwords.SECRET_USER_LABEL)
+        return passwords.secret_name(user) if user else None
     return None
 
 

@@ -356,3 +356,24 @@ def test_the_cli_previews_unless_told_to_apply(host_key_env, monkeypatch,
         assert cli.main(["restore"]) == 0
     assert target.crs == {}
     assert "Nothing written" in capsys.readouterr().out
+
+
+def test_passwords_are_backed_up_as_secrets_and_restored_by_user(host_key_env):
+    """A password is a Secret in the backup — encrypted with the rest when
+    there is a passphrase — and lands back under its user's name."""
+    from whistler import passwords
+    source = _populated()
+    record = passwords.new_record("a-real-password", temporary=False)
+    source.put_secret("whistler", passwords.secret_name("alice"),
+                      passwords.to_secret_data(record),
+                      {passwords.SECRET_LABEL: "password",
+                       passwords.SECRET_USER_LABEL: "alice"})
+    data = _export(source)[0]
+    roles = [s["metadata"]["annotations"][archive.ROLE_ANNOTATION]
+             for s in archive.read(data).secrets]
+    assert roles.count(archive.ROLE_PASSWORD) == 1
+    target = FakeCluster()
+    _restore(target, data)
+    restored = target.secrets[("whistler", passwords.secret_name("alice"))]
+    assert passwords.check(passwords.from_secret_data(restored["data"]),
+                           "a-real-password") == passwords.OK

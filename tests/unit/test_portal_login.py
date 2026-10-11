@@ -4,22 +4,24 @@ The form is the kiosk's, so what is worth testing here is what the *portal*
 does differently: no second factor, its own marker cookie, and a ?next= that
 cannot be talked into pointing off-site. The dev gate is the same one the rest
 of the portal runs on — any password while WHISTLER_AUTH_ALLOW_ANY is set, and
-nothing at all without it — so these tests also pin the "no credential store"
-answer in both directions.
+the stored password (whistler/passwords.py) without it — and the cookies are
+signed, so these tests also pin that an unsigned one is nobody.
 """
 from types import SimpleNamespace
 
 import pytest
 from starlette.requests import Request
 
+from whistler import passwords
 from whistler.config import ENTRY_PORTAL
 from whistler.portal import login
-from whistler.portal.login import USER_COOKIE
-from whistler.portal.management import (LOGIN_PATH, LoginRequired,
+from whistler.portal.login import (CHANGE_COOKIE, PURPOSE_CHANGE, PURPOSE_KIOSK,
+                                   PURPOSE_PORTAL, USER_COOKIE, sign, unsign)
+from whistler.portal.management import (CHANGE_PATH, LOGIN_PATH, LoginRequired,
                                         PORTAL_COOKIE, _get_identity,
                                         _login_required, _next_url, _safe_next,
-                                        login_form, login_submit, logout,
-                                        require_user)
+                                        change_submit, login_form, login_submit,
+                                        logout, require_user)
 
 
 @pytest.fixture
@@ -52,6 +54,15 @@ class _CM:
 
     def is_user_disabled(self, username):
         return False
+
+    records = {}
+
+    def get_password_record(self, username):
+        return self.records.get(username)
+
+    def set_password(self, username, password, temporary=False):
+        self.records[username] = passwords.new_record(password, temporary)
+        return self.records[username]
 
 
 def _app(cm=None):
@@ -97,9 +108,8 @@ def test_the_form_posts_to_login_and_asks_for_both_fields(dev):
 def test_the_form_says_whether_a_password_is_being_checked(dev, monkeypatch):
     assert "any password is accepted" in login.render_login(action=LOGIN_PATH)
     monkeypatch.delenv("WHISTLER_AUTH_ALLOW_ANY")
-    # Not silence: a form that cannot let anyone in has to say so, rather than
-    # implying the password it is asking for means something.
-    assert "No credential store" in login.render_login(action=LOGIN_PATH)
+    # Outside dev mode the password is real, and the way back is an admin.
+    assert "An administrator can reset it" in login.render_login(action=LOGIN_PATH)
 
 
 def test_next_is_round_tripped_as_an_escaped_hidden_field(dev):
@@ -128,10 +138,29 @@ def test_no_cookies_means_no_identity(dev):
 def test_the_identity_cookie_alone_is_not_a_portal_sign_in(dev):
     """A kiosk sign-in sets the shared identity cookie. It must not also hand
     someone the management UI — that is what a kiosk is for."""
+    assert _get_identity(_request(cookies={
+        USER_COOKIE: sign("alice"),
+        "whistler_kiosk": sign("alice", PURPOSE_KIOSK)})) is None
+    # A kiosk marker cannot be passed off as a portal one either.
+    assert _get_identity(_request(cookies={
+        USER_COOKIE: sign("alice"),
+        PORTAL_COOKIE: sign("alice", PURPOSE_KIOSK)})) is None
+    assert _get_identity(_request(cookies={
+        USER_COOKIE: sign("alice"),
+        PORTAL_COOKIE: sign("alice", PURPOSE_PORTAL)})) == "alice"
+
+
+def test_unsigned_cookies_are_nobody(dev):
+    """Before signing, these two cookies typed into a browser were a sign-in
+    as anyone at all."""
     assert _get_identity(_request(cookies={USER_COOKIE: "alice",
-                                           "whistler_kiosk": "1"})) is None
-    assert _get_identity(_request(cookies={USER_COOKIE: "alice",
-                                           PORTAL_COOKIE: "1"})) == "alice"
+                                           PORTAL_COOKIE: "1"})) is None
+
+
+def test_a_portal_marker_for_someone_else_is_nobody(dev):
+    assert _get_identity(_request(cookies={
+        USER_COOKIE: sign("mallory"),
+        PORTAL_COOKIE: sign("alice", PURPOSE_PORTAL)})) is None
 
 
 def test_the_marker_without_a_name_is_not_an_identity(dev):
@@ -152,7 +181,8 @@ def test_the_dev_shortcut_is_gated_on_dev_mode(no_dev):
 def test_a_cookie_beats_no_query(dev):
     """?user= wins when present — every internal link carries it — but its
     absence must not log a signed-in browser out."""
-    request = _request(cookies={USER_COOKIE: "alice", PORTAL_COOKIE: "1"},
+    request = _request(cookies={USER_COOKIE: sign("alice"),
+                                PORTAL_COOKIE: sign("alice", PURPOSE_PORTAL)},
                        query="user=bob")
     assert _get_identity(request) == "bob"
 
@@ -167,7 +197,8 @@ async def test_signing_in_sets_both_cookies_and_lands_on_the_dashboard(dev):
     assert response.status_code == 303
     assert response.headers["location"] == "/?user=alice"
     cookies = _cookies(response)
-    assert cookies[USER_COOKIE] == "alice" and cookies[PORTAL_COOKIE] == "1"
+    assert unsign(cookies[USER_COOKIE]) == "alice"
+    assert unsign(cookies[PORTAL_COOKIE], PURPOSE_PORTAL) == "alice"
 
 
 async def test_the_marker_cookie_is_httponly_and_the_identity_one_is_not(dev):
@@ -188,12 +219,59 @@ async def test_a_nameless_sign_in_is_refused(dev):
     assert not _cookies(response)
 
 
-async def test_outside_dev_mode_nothing_is_accepted(no_dev):
+async def test_outside_dev_mode_no_password_is_no_sign_in(no_dev):
     response = await login_submit(_request(method="POST"), user="alice",
                                   password="hunter2")
     assert response.status_code == 401
     assert not _cookies(response)
-    assert login.verify_credentials("alice", "hunter2") is False
+    assert login.verify_credentials(_CM(), "alice", "hunter2") is False
+
+
+async def test_a_temporary_password_leads_to_the_change_form(no_dev):
+    cm = _CM()
+    cm.records = {}
+    cm.set_password("alice", "temp-pass-1234", temporary=True)
+    response = await login_submit(_request(method="POST", cm=cm), user="alice",
+                                  password="temp-pass-1234", next="/homes")
+    assert response.status_code == 303
+    assert response.headers["location"].startswith(CHANGE_PATH)
+    cookies = _cookies(response)
+    assert USER_COOKIE not in cookies and PORTAL_COOKIE not in cookies
+    change = cookies[CHANGE_COOKIE]
+    assert unsign(change, PURPOSE_CHANGE) == "alice"
+
+    request = _request(method="POST", cm=cm, cookies={CHANGE_COOKIE: change})
+    refused = await change_submit(request, password="too-short",
+                                  confirm="too-short", next="/homes")
+    assert refused.status_code == 400
+    response = await change_submit(request, password="a-real-password",
+                                   confirm="a-real-password", next="/homes")
+    assert response.status_code == 303
+    assert response.headers["location"] == "/homes?user=alice"
+    assert unsign(_cookies(response)[USER_COOKIE]) == "alice"
+    assert passwords.status(cm.records["alice"]) == "set"
+
+
+async def test_the_chosen_password_signs_in(no_dev):
+    cm = _CM()
+    cm.records = {}
+    cm.set_password("alice", "a-real-password")
+    response = await login_submit(_request(method="POST", cm=cm), user="alice",
+                                  password="a-real-password")
+    assert response.status_code == 303
+    assert response.headers["location"] == "/?user=alice"
+
+
+async def test_guessing_is_throttled(no_dev, monkeypatch):
+    monkeypatch.setattr(login, "_THROTTLE", passwords.Throttle())
+    cm = _CM()
+    cm.records = {}
+    cm.set_password("alice", "a-real-password")
+    for _ in range(passwords.Throttle.FREE + 1):
+        assert login.check_password(cm, "alice", "wrong") == passwords.REFUSED
+    # Now even the right one waits.
+    assert login.check_password(cm, "alice", "a-real-password") == passwords.REFUSED
+    assert login.check_password(cm, "bob", "x") == passwords.REFUSED  # others unaffected
 
 
 async def test_signing_in_returns_to_where_the_browser_was_going(dev):
@@ -204,7 +282,8 @@ async def test_signing_in_returns_to_where_the_browser_was_going(dev):
 
 async def test_an_already_signed_in_browser_skips_the_form(dev):
     request = _request(query="next=/homes",
-                       cookies={USER_COOKIE: "alice", PORTAL_COOKIE: "1"})
+                       cookies={USER_COOKIE: sign("alice"),
+                                PORTAL_COOKIE: sign("alice", PURPOSE_PORTAL)})
     response = await login_form(request)
     assert response.status_code == 303
     assert response.headers["location"] == "/homes?user=alice"
@@ -221,7 +300,7 @@ async def test_signing_out_drops_both_cookies(dev):
     assert response.headers["location"] == LOGIN_PATH
     for header in response.headers.getlist("set-cookie"):
         assert 'expires=Thu, 01 Jan 1970' in header or "Max-Age=0" in header
-    assert set(_cookies(response)) == {USER_COOKIE, PORTAL_COOKIE}
+    assert set(_cookies(response)) == {USER_COOKIE, PORTAL_COOKIE, CHANGE_COOKIE}
 
 
 # --------------------------------------------------------------------------- #

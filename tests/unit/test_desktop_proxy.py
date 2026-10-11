@@ -10,6 +10,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from whistler.config import CHANNELS, CHANNEL_TERMINAL
+from whistler.portal.login import unsign
 from whistler.portal import kubevirt, screenshots
 from whistler.portal.app import build_app
 
@@ -329,7 +330,7 @@ async def test_relaunch_different_template_conflicts(portal):
 async def test_connect_page_sets_identity_cookie_used_by_proxy(portal):
     resp = await portal.get("/connect/d1", params={"user": "alice"})
     assert resp.status == 200
-    assert any(c.key == "whistler_user" and c.value == "alice"
+    assert any(c.key == "whistler_user" and unsign(c.value) == "alice"
                for c in portal.session.cookie_jar)
     # No ?user= here: only the cookie identifies alice.
     resp = await portal.get("/desktop/d1/status")

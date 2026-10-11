@@ -116,6 +116,10 @@ from whistler.portal.login import dev_auth as _dev_auth
 from whistler.portal.login import render_login as _render_login_form
 from whistler.portal.login import USER_COOKIE as _USER_COOKIE
 from whistler.portal.login import verify_credentials as _verify_credentials
+from whistler import passwords
+from whistler.portal.login import (CHANGE_COOKIE, PURPOSE_CHANGE, PURPOSE_KIOSK,
+                                   PURPOSE_PENDING, check_password,
+                                   render_change_password, sign, unsign)
 from whistler.status import status_group
 
 logger = logging.getLogger("whistler.portal")
@@ -200,10 +204,11 @@ def kiosk_identity(request: web.Request):
         # Dev auto-forward: ?user= skips the form, matching the rest of the
         # portal's dev identity.
         return explicit.split("-")[0]
-    if request.cookies.get(KIOSK_COOKIE) != "1":
+    user = unsign(request.cookies.get(_USER_COOKIE))
+    if not user or unsign(request.cookies.get(KIOSK_COOKIE),
+                          PURPOSE_KIOSK) != user:
         return None
-    raw = request.cookies.get(_USER_COOKIE)
-    return raw.split("-")[0] if raw else None
+    return user
 
 
 # The kiosk's own paths. Everything else on this app is refused while a browser
@@ -211,6 +216,7 @@ def kiosk_identity(request: web.Request):
 # than pattern-matched.
 LOCK_PATH = "/kiosk/lock"
 OTP_PATH = "/kiosk/otp"
+PASSWORD_PATH = "/kiosk/password"
 # The OTP step is deliberately *not* here: it belongs to a browser that is not
 # signed in yet, and a locked browser is one that already is. Nothing on it
 # would help someone standing in front of a lock.
@@ -254,10 +260,11 @@ def _unlock(response: web.StreamResponse) -> web.StreamResponse:
 # middleware's own cookie write is skipped on these paths and the kiosk sets
 # the identity cookie explicitly rather than leaning on it.
 def _sign_in(response: web.StreamResponse, user: str) -> web.StreamResponse:
-    response.set_cookie(_USER_COOKIE, user, path="/", samesite="Lax")
-    response.set_cookie(KIOSK_COOKIE, "1", path="/", samesite="Lax",
-                        httponly=True)
+    response.set_cookie(_USER_COOKIE, sign(user), path="/", samesite="Lax")
+    response.set_cookie(KIOSK_COOKIE, sign(user, PURPOSE_KIOSK), path="/",
+                        samesite="Lax", httponly=True)
     response.del_cookie(PENDING_COOKIE, path="/")
+    response.del_cookie(CHANGE_COOKIE, path="/")
     return _unlock(response)
 
 
@@ -265,20 +272,21 @@ def _sign_out(response: web.StreamResponse) -> web.StreamResponse:
     response.del_cookie(_USER_COOKIE, path="/")
     response.del_cookie(KIOSK_COOKIE, path="/")
     response.del_cookie(PENDING_COOKIE, path="/")
+    response.del_cookie(CHANGE_COOKIE, path="/")
     return _unlock(response)
 
 
 def _pend(response: web.StreamResponse, user: str) -> web.StreamResponse:
     """Park a browser between the two factors."""
-    response.set_cookie(PENDING_COOKIE, user, path="/", samesite="Lax",
-                        httponly=True)
+    response.set_cookie(PENDING_COOKIE, sign(user, PURPOSE_PENDING), path="/",
+                        samesite="Lax", httponly=True)
     return response
 
 
 def _pending(request: web.Request):
     """The half-authenticated user, or None. Never an identity: the caller may
     only show the code prompt with it, never a session."""
-    return request.cookies.get(PENDING_COOKIE) or None
+    return unsign(request.cookies.get(PENDING_COOKIE), PURPOSE_PENDING)
 
 
 # --------------------------------------------------------------------------- #
@@ -844,7 +852,8 @@ async def kiosk_login(request: web.Request):
         user = kiosk_identity(request)
         if user is None:                     # lock outlived the identity
             raise _sign_out(web.HTTPSeeOther("/kiosk"))
-        if not _verify_credentials(user, password):
+        if not await _run(_verify_credentials, request.app["cm"], user,
+                          password):
             logger.warning(f"Kiosk unlock refused for {user}")
             return _html(_render_lock(user, "Wrong password."), status=401)
         # Disabled while the screen was locked: the password is still right,
@@ -857,7 +866,8 @@ async def kiosk_login(request: web.Request):
         raise _unlock(web.HTTPSeeOther(return_to))
 
     user = (form.get("user") or "").strip().split("-")[0]
-    if not _verify_credentials(user, password):
+    verdict = await _run(check_password, request.app["cm"], user, password)
+    if verdict == passwords.REFUSED:
         logger.warning(f"Kiosk login refused for {user!r}")
         return _html(_render_login("Sign-in failed."), status=401)
     # The password was right and this is the wrong door. entry_point_middleware
@@ -872,13 +882,61 @@ async def kiosk_login(request: web.Request):
                        f"'{ENTRY_KIOSK}' entry point")
         return _html(_render_login("This account cannot use the kiosk."),
                      status=403)
+    if verdict == passwords.CHANGE:
+        # A temporary password: choose a real one first. The second factor
+        # (if any) comes after, from kiosk_password_submit.
+        logger.info(f"Kiosk login for {user} with a temporary password; "
+                    f"asking for a new one")
+        response = web.HTTPSeeOther(PASSWORD_PATH)
+        response.set_cookie(CHANGE_COOKIE, sign(user, PURPOSE_CHANGE),
+                            path="/", samesite="Lax", httponly=True)
+        raise response
+    raise await _after_password(request, user)
+
+
+async def _after_password(request: web.Request, user: str):
+    """A password has been accepted: on to the second factor, or in."""
     if await _run(_otp_required, request.app["cm"], user):
         # Not signed in yet: the password only earns the pending cookie, so a
         # browser stopped here has no identity and can reach nothing.
         logger.info(f"Kiosk password accepted for {user}; second factor pending")
-        raise _pend(web.HTTPSeeOther(OTP_PATH), user)
+        return _pend(web.HTTPSeeOther(OTP_PATH), user)
     logger.info(f"Kiosk login for {user}")
-    raise _sign_in(web.HTTPSeeOther("/kiosk"), user)
+    return _sign_in(web.HTTPSeeOther("/kiosk"), user)
+
+
+def _render_password(user: str, error: str = None) -> str:
+    return render_change_password(action=PASSWORD_PATH, user=user, error=error)
+
+
+async def kiosk_password(request: web.Request):
+    user = unsign(request.cookies.get(CHANGE_COOKIE), PURPOSE_CHANGE)
+    if user is None:
+        raise web.HTTPSeeOther("/kiosk")
+    return _html(_render_password(user))
+
+
+async def kiosk_password_submit(request: web.Request):
+    """Store the chosen password, then carry on exactly as a password sign-in
+    would. The door is asked again: an account unbound or disabled since the
+    temporary password was accepted must not get as far as saving one."""
+    user = unsign(request.cookies.get(CHANGE_COOKIE), PURPOSE_CHANGE)
+    if user is None:
+        raise web.HTTPSeeOther("/kiosk")
+    form = await request.post()
+    password = form.get("password") or ""
+    problem = passwords.new_password_problem(user, password,
+                                             form.get("confirm") or "")
+    if problem:
+        return _html(_render_password(user, problem), status=400)
+    cm = request.app["cm"]
+    if not await _run(cm.may_enter, user, ENTRY_KIOSK):
+        raise _sign_out(web.HTTPSeeOther("/kiosk"))
+    if await _run(cm.set_password, user, password) is None:
+        return _html(_render_password(
+            user, "The password could not be saved. Ask an administrator."),
+            status=500)
+    raise await _after_password(request, user)
 
 
 async def kiosk_otp(request: web.Request):
@@ -1011,6 +1069,8 @@ def add_routes(app: web.Application) -> None:
         web.get(LOCK_PATH, kiosk_lock),
         web.post("/kiosk/login", kiosk_login),
         web.get(OTP_PATH, kiosk_otp),
+        web.get(PASSWORD_PATH, kiosk_password),
+        web.post(PASSWORD_PATH, kiosk_password_submit),
         web.post(OTP_PATH, kiosk_otp_verify),
         web.post("/kiosk/logout", kiosk_logout),
         web.get("/kiosk/sessions", kiosk_sessions),

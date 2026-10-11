@@ -428,10 +428,12 @@ portal:
       username: whistler
       password: "change-me"  # or `users: ["alice:$2y$05$..."]` from htpasswd -nB
   auth:
-    # No web SSO yet. allowAny accepts any password at /login and is the only
-    # way in today; allowAdmin would additionally make everyone an admin, so
-    # name your admins here instead.
-    allowAny: true
+    # Off (the default): each user signs in with their own password. Accounts
+    # start with a temporary one, valid 7 days and replaced at first sign-in.
+    # On: any password signs in as anyone (dev only), so keep the basicAuth
+    # lock above in front of it. allowAdmin would additionally make everyone
+    # an admin, so name your admins here instead.
+    allowAny: false
     allowAdmin: false
     adminUsers: "alice"
   screenshots:
@@ -581,10 +583,29 @@ kubectl -n whistler port-forward svc/whistler-portal-proxy 8080:80
 ```
 
 Either way the browser asks for the `proxy.basicAuth` name and password first
-(`whistler` / `change-me` above), and then the portal's own `/login` asks for a
-Whistler username — any password, since `auth.allowAny` is what accepts it.
-Two prompts, answering two different questions: the first says you may reach
-this origin at all, the second says who you are once you have.
+(`whistler` / `change-me` above), and then the portal's own `/login` asks for
+your Whistler user and password. Two prompts, answering two different
+questions: the first says you may reach this origin at all, the second says
+who you are once you have.
+
+The bootstrap admin's first password is temporary, made by the operator:
+
+```bash
+kubectl -n whistler get secret whistler-bootstrap-admin \
+  -o jsonpath='{.data.password}' | base64 -d; echo
+```
+
+It is good for 7 days and leads only to a form where you choose your own. If
+it expires unused, restart the operator for a new one. Other accounts get
+theirs from an admin: **New user** and **Reset password** on the user page
+show a temporary password once. Locked out with no admin left to reset you:
+
+```bash
+kubectl -n whistler exec deploy/whistler-operator -- \
+  python -m whistler.passwords reset <user>
+```
+
+Passwords are for the portal and kiosk; SSH stays key-only.
 
 ## 5. Optional: an image registry in the cluster
 

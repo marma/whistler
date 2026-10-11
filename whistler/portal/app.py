@@ -47,6 +47,7 @@ import asyncio
 import html
 import logging
 import os
+from urllib.parse import quote, urlencode
 import secrets
 import time
 from functools import partial
@@ -58,6 +59,7 @@ from whistler.config import (CHANNEL_TERMINAL, ENTRY_KIOSK, ENTRY_PORTAL,
                              PERM_OWN_INSTANCES, role_may)
 from whistler.portal import kiosk, kubevirt, proxy, screenshots, terminal
 from whistler.portal.login import USER_COOKIE as _USER_COOKIE
+from whistler.portal.login import dev_auth, sign, unsign
 from whistler.portal.login import (kiosk_enabled, kiosk_home, portal_home,
                                    render_notice)
 
@@ -77,25 +79,48 @@ logger = logging.getLogger("whistler.portal")
 
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
-    if request.path == "/healthz" or request.path.startswith("/static/"):
+    """Who this request is: the signed identity cookie set by a portal or
+    kiosk sign-in (login.py ``sign``). It is what the /desktop/<id>/* proxy
+    and the WebSockets rely on, since the Selkies client's own requests carry
+    nothing else.
+
+    Dev mode keeps its shortcut: ?user= / X-Whistler-User names the user
+    (first segment, the SSH server's convention), the name is echoed back as
+    a signed cookie, and an anonymous request is "tester".
+
+    Without an identity, the kiosk's own paths go on to the kiosk, which has
+    its login screen; anything else is sent to the portal's sign-in (a
+    navigation) or refused (everything else)."""
+    path = request.path
+    if path == "/healthz" or path.startswith("/static/"):
         return await handler(request)
-    if os.environ.get("WHISTLER_AUTH_ALLOW_ANY") != "true":
-        return web.Response(
-            status=401,
-            text="Portal web auth (SSO/OIDC) is not implemented yet. "
-                 "For dev, set WHISTLER_AUTH_ALLOW_ANY=true and pass ?user=<name>.",
-        )
-    # Dev: identity from header or query; first segment is the real user (mirrors
-    # the SSH server's username convention). The cookie fallback exists for the
-    # /desktop/<id>/* proxy: the Selkies client's own asset/WS requests carry no
-    # ?user=, so the identity that loaded the page is echoed back via cookie.
-    explicit = request.headers.get("X-Whistler-User") or request.query.get("user")
-    raw = explicit or request.cookies.get(_USER_COOKIE) or "tester"
-    request["user"] = raw.split("-")[0]
+    explicit = None
+    if dev_auth():
+        explicit = (request.headers.get("X-Whistler-User")
+                    or request.query.get("user"))
+    if explicit:
+        user = explicit.split("-")[0]
+    else:
+        user = unsign(request.cookies.get(_USER_COOKIE))
+        if not user and dev_auth():
+            user = "tester"
+    request["user"] = user
+    if not user and not (path == "/kiosk" or path.startswith("/kiosk/")):
+        if (request.headers.get("Sec-Fetch-Mode") == "navigate"
+                or "text/html" in request.headers.get("Accept", "")):
+            raise web.HTTPSeeOther(f"/login?next={quote(path_qs_without_user(request))}")
+        return web.Response(status=401, text="Not signed in.")
     response = await handler(request)
     if explicit and isinstance(response, web.StreamResponse) and not response.prepared:
-        response.set_cookie(_USER_COOKIE, raw, path="/", samesite="Lax")
+        response.set_cookie(_USER_COOKIE, sign(user), path="/", samesite="Lax")
     return response
+
+
+def path_qs_without_user(request: web.Request) -> str:
+    """Where to come back to after signing in. ``user=`` is dropped: the
+    portal's sign-in adds the signed-in name itself."""
+    query = [(k, v) for k, v in request.query.items() if k != "user"]
+    return request.path + (f"?{urlencode(query)}" if query else "")
 
 
 async def _run(request, func, *args):

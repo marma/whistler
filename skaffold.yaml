@@ -35,11 +35,17 @@ deploy:
           whistler.security.forceKataForPrivileged: false
           server.service.type: NodePort
           server.service.nodePort: 30022
-          portal.auth.allowAny: true
-          portal.auth.allowAdmin: true
-          # Those two together mean any password signs anyone in, as an admin.
-          # That is fine behind the port-forward below; it is not fine on the
-          # ingress hostname further down. To put a shared name/password on the
+          # Real passwords (whistler/passwords.py). The bootstrap admin's
+          # first one: kubectl -n whistler get secret whistler-bootstrap-admin
+          #   -o jsonpath='{.data.password}' | base64 -d
+          # Set allowAny back to true for the old any-password + ?user= loop.
+          portal.auth.allowAny: false
+          portal.auth.allowAdmin: false
+          # Off, so roles (basic/standard/manager/admin) mean what they say;
+          # marma is an admin by its own User CR. allowAdmin: true makes every
+          # signed-in user an admin, and with allowAny on as well any password
+          # signs anyone in as one: fine behind the port-forward below, not on
+          # the ingress hostname further down. To put a shared name/password on the
           # bundled proxy — covering both portal apps and both ways in — add:
           #   portal.proxy.basicAuth.enabled: true
           #   portal.proxy.basicAuth.password: <something>

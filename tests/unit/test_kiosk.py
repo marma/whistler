@@ -12,6 +12,9 @@ from aiohttp.test_utils import TestClient, TestServer
 
 import segno
 
+from whistler import passwords
+from whistler.portal.login import (CHANGE_COOKIE, PURPOSE_KIOSK,
+                                   PURPOSE_PENDING, unsign)
 from whistler.portal import kiosk, totp
 from whistler.portal.app import build_app
 from whistler.status import STATUS_GROUPS
@@ -22,6 +25,14 @@ class FakeCM:
         self.sessions = {}
         self.disabled = set()
         self.otp_off = set()
+        self.records = {}
+
+    def get_password_record(self, username):
+        return self.records.get(username)
+
+    def set_password(self, username, password, temporary=False):
+        self.records[username] = passwords.new_record(password, temporary)
+        return self.records[username]
 
     def get_user_desktop_sessions(self, username):
         return self.sessions.get(username, [])
@@ -104,8 +115,8 @@ async def test_dev_user_param_signs_in_and_redirects_to_the_bare_path(portal):
                             allow_redirects=False)
     assert resp.status == 303
     assert resp.headers["Location"] == "/kiosk"
-    assert resp.cookies[kiosk.KIOSK_COOKIE].value == "1"
-    assert resp.cookies["whistler_user"].value == "alice"
+    assert unsign(resp.cookies[kiosk.KIOSK_COOKIE].value, PURPOSE_KIOSK) == "alice"
+    assert unsign(resp.cookies["whistler_user"].value) == "alice"
 
 
 async def test_the_password_alone_only_earns_the_otp_step(portal):
@@ -118,7 +129,7 @@ async def test_the_password_alone_only_earns_the_otp_step(portal):
     assert resp.headers["Location"] == "/kiosk/otp"
     assert kiosk.KIOSK_COOKIE not in resp.cookies
     assert "whistler_user" not in resp.cookies
-    assert resp.cookies[kiosk.PENDING_COOKIE].value == "alice"
+    assert unsign(resp.cookies[kiosk.PENDING_COOKIE].value, PURPOSE_PENDING) == "alice"
 
 
 async def test_passing_the_otp_signs_in(portal):
@@ -127,7 +138,7 @@ async def test_passing_the_otp_signs_in(portal):
                              allow_redirects=False)
     assert resp.status == 303
     assert resp.headers["Location"] == "/kiosk"
-    assert resp.cookies[kiosk.KIOSK_COOKIE].value == "1"
+    assert unsign(resp.cookies[kiosk.KIOSK_COOKIE].value, PURPOSE_KIOSK) == "alice"
 
 
 async def test_login_refuses_an_empty_user(portal):
@@ -137,11 +148,11 @@ async def test_login_refuses_an_empty_user(portal):
 
 
 async def test_login_is_refused_when_dev_auth_is_off(portal, monkeypatch):
-    """There is no password store yet, so outside dev mode there is nothing a
-    credential could be checked against and the answer must be no — never a
+    """Outside dev mode a user with no stored password has nothing a
+    credential could be checked against, and the answer must be no — never a
     default yes."""
     monkeypatch.delenv("WHISTLER_AUTH_ALLOW_ANY")
-    assert kiosk._verify_credentials("alice", "hunter2") is False
+    assert kiosk._verify_credentials(portal.cm, "alice", "hunter2") is False
 
 
 async def test_signed_in_browser_gets_the_grid(portal):
@@ -375,7 +386,7 @@ async def test_unlocking_clears_the_lock(portal):
 async def test_a_failed_unlock_leaves_the_lock_in_place(portal, monkeypatch):
     """The one thing a wrong password must never do."""
     await _locked(portal)
-    monkeypatch.setattr(kiosk, "_verify_credentials", lambda u, p: False)
+    monkeypatch.setattr(kiosk, "_verify_credentials", lambda cm, u, p: False)
     resp = await portal.post("/kiosk/login", data={"password": "nope"})
     assert resp.status == 401
     assert "Locked" in await resp.text()
@@ -574,7 +585,7 @@ async def test_the_dev_user_param_still_skips_both_factors(portal):
     resp = await portal.get("/kiosk", params={"user": "alice"},
                             allow_redirects=False)
     assert resp.status == 303
-    assert resp.cookies[kiosk.KIOSK_COOKIE].value == "1"
+    assert unsign(resp.cookies[kiosk.KIOSK_COOKIE].value, PURPOSE_KIOSK) == "alice"
 
 
 def test_the_qr_encodes_the_provisioning_uri_for_real():
@@ -628,8 +639,8 @@ async def test_a_user_with_otp_off_signs_in_on_the_password(portal):
                              allow_redirects=False)
     assert resp.status == 303
     assert resp.headers["Location"] == "/kiosk"
-    assert resp.cookies[kiosk.KIOSK_COOKIE].value == "1"
-    assert resp.cookies["whistler_user"].value == "alice"
+    assert unsign(resp.cookies[kiosk.KIOSK_COOKIE].value, PURPOSE_KIOSK) == "alice"
+    assert unsign(resp.cookies["whistler_user"].value) == "alice"
 
 
 async def test_otp_off_for_one_user_leaves_everyone_else_asked(portal):
@@ -692,3 +703,75 @@ async def test_without_the_kiosk_a_left_over_lock_locks_nothing(no_kiosk):
     no_kiosk.session.cookie_jar.update_cookies({kiosk.LOCK_COOKIE: "/kiosk"})
     resp = await no_kiosk.get("/status/desk?user=alice", allow_redirects=False)
     assert resp.status not in (303, 423)
+
+
+# --------------------------------------------------------------------------- #
+# Real passwords (dev gate off)                                                #
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+async def real(monkeypatch):
+    monkeypatch.delenv("WHISTLER_AUTH_ALLOW_ANY", raising=False)
+    monkeypatch.setenv("WHISTLER_SCREENSHOT_INTERVAL", "0")
+    monkeypatch.setattr("whistler.portal.login._THROTTLE", passwords.Throttle())
+    kiosk._MOCK_ENROLMENTS.clear()
+    cm = FakeCM()
+    cm.sessions["alice"] = [_desktop("desk")]
+    cm.otp_off.add("alice")
+    client = TestClient(TestServer(build_app(cm)))
+    await client.start_server()
+    client.cm = cm
+    yield client
+    await client.close()
+
+
+async def test_a_temporary_password_leads_only_to_choosing_one(real):
+    real.cm.set_password("alice", "temp-pass-1234", temporary=True)
+    resp = await real.post("/kiosk/login", data={"user": "alice",
+                                                 "password": "temp-pass-1234"},
+                           allow_redirects=False)
+    assert resp.status == 303 and resp.headers["Location"] == "/kiosk/password"
+    assert "whistler_user" not in resp.cookies
+    # Nothing behind the kiosk is open on the strength of it.
+    assert (await real.get("/kiosk/sessions")).status in (401, 403)
+    resp = await real.post("/kiosk/password",
+                           data={"password": "short", "confirm": "short"})
+    assert resp.status == 400
+    resp = await real.post("/kiosk/password",
+                           data={"password": "a-real-password",
+                                 "confirm": "a-real-password"},
+                           allow_redirects=False)
+    assert resp.status == 303 and resp.headers["Location"] == "/kiosk"
+    assert unsign(resp.cookies["whistler_user"].value) == "alice"
+    assert passwords.status(real.cm.records["alice"]) == "set"
+
+
+async def test_the_chosen_password_signs_in_and_the_temporary_one_does_not(real):
+    real.cm.set_password("alice", "a-real-password")
+    resp = await real.post("/kiosk/login", data={"user": "alice",
+                                                 "password": "temp-pass-1234"})
+    assert resp.status == 401
+    resp = await real.post("/kiosk/login", data={"user": "alice",
+                                                 "password": "a-real-password"},
+                           allow_redirects=False)
+    assert resp.status == 303 and resp.headers["Location"] == "/kiosk"
+
+
+async def test_a_forged_cookie_is_nobody(real):
+    """The reason cookies are signed: before, this was a sign-in."""
+    real.session.cookie_jar.update_cookies(
+        {"whistler_user": "alice", kiosk.KIOSK_COOKIE: "1"})
+    body = await (await real.get("/kiosk")).text()
+    assert "/kiosk/login" in body
+    resp = await real.get("/connect/desk", allow_redirects=False)
+    assert resp.status == 401
+
+
+async def test_the_change_form_needs_the_signed_change_cookie(real):
+    real.session.cookie_jar.update_cookies({CHANGE_COOKIE: "alice"})
+    resp = await real.post("/kiosk/password",
+                           data={"password": "a-real-password",
+                                 "confirm": "a-real-password"},
+                           allow_redirects=False)
+    assert resp.status == 303 and resp.headers["Location"] == "/kiosk"
+    assert "alice" not in real.cm.records

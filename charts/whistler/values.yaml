@@ -139,9 +139,18 @@ portal:
 
   logLevel: INFO
   auth:
-    # Minimal/dev only this round. When false the portal returns 401 (real web
-    # SSO/OIDC is a follow-up). Mirrors whistler.auth.allowAny semantics.
+    # DEV ONLY. true: any password signs in as any user, ?user=<name> skips
+    # the form, and nobody is asked to change a temporary password. false
+    # (the default): each user's own password (whistler/passwords.py) —
+    # created as a temporary one by an admin (New user / Reset password) or,
+    # for bootstrapAdmin, by the operator into the Secret
+    # whistler-bootstrap-admin:
+    #   kubectl -n <ns> get secret whistler-bootstrap-admin \
+    #     -o jsonpath='{.data.password}' | base64 -d
+    # Mirrors whistler.auth.allowAny semantics (which is SSH, keys only).
     allowAny: false
+    # How long a portal or kiosk sign-in lasts before the form is shown again.
+    sessionMaxAgeSeconds: 43200
     # Grant every authenticated user admin access (dev only).
     allowAdmin: false
     # Comma-separated list of usernames with admin access in production.
