@@ -548,6 +548,25 @@ def test_claim_re_attaches_before_it_provisions(monkeypatch):
     assert calls == [("reattach", "whistler-dataset-corpus")]
 
 
+@pytest.mark.parametrize("mode", ["ReadWriteMany", "ReadWriteOnce"])
+def test_a_new_claim_takes_the_configured_access_mode(monkeypatch, mode):
+    # whistler.datasetServer.accessMode: RWX by default, so a rescheduled
+    # server can attach; RWO for classes that offer nothing else (local-path).
+    cm = _manager(dataset_storage_class=None, dataset_access_mode=mode)
+    cm.reattach_claim = lambda ns, claim, labels: False
+    created = []
+
+    def read(name, ns):
+        raise ApiException(status=404)
+    monkeypatch.setattr(cfg.client, "CoreV1Api", lambda: SimpleNamespace(
+        read_namespaced_persistent_volume_claim=read,
+        create_namespaced_persistent_volume_claim=lambda ns, body:
+            created.append(body)))
+    assert cm._ensure_dataset_claim("corpus", MANAGED) == \
+        "whistler-dataset-corpus"
+    assert created[0]["spec"]["accessModes"] == [mode]
+
+
 # --- the portal's confirmation ---------------------------------------------- #
 
 @pytest.mark.parametrize("typed", [None, "", "corpu", " corpus2"])

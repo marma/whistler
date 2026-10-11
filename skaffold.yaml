@@ -62,6 +62,8 @@ deploy:
           portal.ingress.enabled: true
           portal.ingress.host: whistler.martinmalmsten.net
           userVolume.accessMode: ReadWriteOnce
+          # local-path offers nothing else; the chart default is RWX.
+          whistler.datasetServer.accessMode: ReadWriteOnce
           userVolume.size: 10Mi
           # Seed the initial admin account for local dev.
           whistler.bootstrapAdmin.name: marma

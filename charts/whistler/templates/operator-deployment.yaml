@@ -94,6 +94,8 @@ spec:
               value: {{ .Values.whistler.datasetServer.resources | toJson | quote }}
             - name: WHISTLER_DATASET_STORAGE_CLASS
               value: {{ .Values.whistler.datasetServer.storageClass | quote }}
+            - name: WHISTLER_DATASET_ACCESS_MODE
+              value: {{ .Values.whistler.datasetServer.accessMode | quote }}
             # The claims `claim` datasets may use (templates/dataset-claims.yaml).
             - name: WHISTLER_DATASET_CLAIMS
               value: {{ keys (.Values.whistler.datasetServer.claims | default dict) | sortAlpha | toJson | quote }}

@@ -420,6 +420,11 @@ DATASET_SERVER_PORTS = {"ro": 8080, "rw": 8081}
 # the rw one is used — the account store is shared — and only the operator
 # may reach it (_build_dataset_server_operator_access).
 DATASET_SERVER_ADMIN_PORTS = {"ro": 9080, "rw": 9081}
+# Where a managed dataset's VersityGW keeps its metadata: a directory at the
+# claim's root, beside the bucket, mounted on its own at /meta (VersityGW
+# refuses a sidecar inside the root it serves). The leading dot makes it an
+# invalid bucket name, so it is neither listed nor addressable as a bucket.
+DATASET_META_DIR = ".whistler-meta"
 # The external listener: a third process with its OWN account store, reached
 # only through the Ingress (design/storage.md, "External access"). Not in
 # DATASET_SERVER_PORTS, which is what sessions may reach.
@@ -1545,6 +1550,8 @@ class KubeConfigManager(ConfigManager):
             "WHISTLER_DATASET_SERVER_RESOURCES", {})
         self.dataset_storage_class = (
             os.environ.get("WHISTLER_DATASET_STORAGE_CLASS") or None)
+        self.dataset_access_mode = (
+            os.environ.get("WHISTLER_DATASET_ACCESS_MODE") or "ReadWriteMany")
         # The claims `claim` datasets may use: whistler.datasetServer.claims,
         # which the chart renders (templates/dataset-claims.yaml). Nothing
         # else is ever mounted as a dataset, so the portal cannot point a
@@ -6506,6 +6513,17 @@ class KubeConfigManager(ConfigManager):
         identity, refuses to go on unless the directory exists. Kubelet
         prepares a container's subPath only when that container starts, so
         a refusal there creates nothing (verified).
+
+        **A managed dataset's metadata lives on its claim, not in xattrs**
+        (2026-10-11): in ``DATASET_META_DIR`` beside the bucket, mounted at
+        ``/meta`` by subPath. xattrs were VersityGW's default and an NFS
+        storage class has none (VersityGW exits at startup with "xattrs are
+        not supported", which a guest saw as ``ls`` hanging on its mount);
+        a 4.2 mount does not help unless the server implements RFC 8276.
+        Unlike a claim dataset's emptyDir, this sidecar survives a restart,
+        so objects keep their etag, content type and rclone's mtime. A
+        dataset created before this loses the metadata it held in xattrs
+        once; the ACL and policy are rewritten by the next account sync.
         """
         name = self.dataset_server_name(volume)
         existing_claim = self.is_claim_dataset(definition)
@@ -6540,7 +6558,8 @@ class KubeConfigManager(ConfigManager):
             prepare = (f"if [ -d /srv/{S3_PROXY_BUCKET} ] && "
                        f"[ ! -e /srv/{bucket} ]; then "
                        f"mv /srv/{S3_PROXY_BUCKET} /srv/{bucket}; fi && "
-                       f"mkdir -p /srv/{bucket} && {seed}")
+                       f"mkdir -p /srv/{bucket} /srv/{DATASET_META_DIR} && "
+                       f"{seed}")
             prepare_mounts = [{"name": "data", "mountPath": "/srv"}]
         init = {
             "name": "prepare",
@@ -6556,7 +6575,12 @@ class KubeConfigManager(ConfigManager):
         }
         def data_mounts(read_only: bool) -> List[Dict[str, Any]]:
             if not existing_claim:
+                # The sidecar is made by `prepare` first: a subPath kubelet
+                # had to create would be root-owned 0777.
                 return [{"name": "data", "mountPath": "/srv",
+                         "readOnly": read_only},
+                        {"name": "data", "mountPath": "/meta",
+                         "subPath": DATASET_META_DIR,
                          "readOnly": read_only}]
             # The root only holds the bucket's mount point; a --readonly
             # process writes no metadata, so its sidecar is read-only too.
@@ -6583,8 +6607,7 @@ class KubeConfigManager(ConfigManager):
             "volumeMounts": [{"name": "data", "mountPath": "/claim",
                               "readOnly": True}],
         }
-        backend = (["posix", "--sidecar", "/meta", "/srv"] if existing_claim
-                   else ["posix", "/srv"])
+        backend = ["posix", "--sidecar", "/meta", "/srv"]
         root_env = [
             {"name": "ROOT_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {
                 "name": root_secret, "key": "accessKeyId"}}},
@@ -6810,7 +6833,7 @@ class KubeConfigManager(ConfigManager):
         except PolicyError as e:
             logger.error(f"Dataset {volume!r}: {e}")
             return None
-        spec = {"accessModes": ["ReadWriteOnce"],
+        spec = {"accessModes": [self.dataset_access_mode],
                 "volumeMode": "Filesystem",
                 "resources": {"requests": {"storage": size}}}
         if self.dataset_storage_class:

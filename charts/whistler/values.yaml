@@ -718,10 +718,16 @@ whistler:
     image: ghcr.io/versity/versitygw:v1.7.0
     # Per container; a dataset that is not read-only runs two.
     resources: {}
-    # "" uses the cluster's default class. The posix backend keeps object
-    # metadata in extended attributes, so the class must support them
-    # (ext4/xfs do; most block-backed classes are fine).
+    # "" uses the cluster's default class. Any filesystem class works, NFS
+    # included: object metadata is kept in a directory on the claim, not in
+    # extended attributes.
     storageClass: ""
+    # For the claims of `managed` datasets. ReadWriteMany so a server pod
+    # rescheduled to another node can attach its claim; a class that offers
+    # only ReadWriteOnce (local-path, most block classes) leaves the claim
+    # Pending, so set ReadWriteOnce there. Read at creation only: a claim's
+    # access mode cannot change afterwards.
+    accessMode: ReadWriteMany
 
     # Existing storage for `claim` datasets (design/storage.md, "Datasets
     # from existing claims"). Each entry renders a claim of that name in the

@@ -154,13 +154,26 @@ def test_the_claim_is_never_prepared_or_chowned():
     assert "fsGroupChangePolicy" not in pod["securityContext"]
 
 
-def test_a_managed_dataset_is_built_as_before():
+def test_a_managed_dataset_keeps_its_metadata_on_its_own_claim():
+    # Not xattrs (an NFS class has none, and VersityGW exits), and not an
+    # emptyDir: the claim is Whistler's, so the sidecar can outlive the pod.
     pod = _pod(_server(MANAGED)[0])
     assert pod["securityContext"]["fsGroup"] == 1000
+    assert all(v["name"] not in ("root", "meta") for v in pod["volumes"])
+    prepare = pod["initContainers"][-1]["command"][-1]
+    assert f" /srv/{cfg.DATASET_META_DIR} && " in prepare
     for c in pod["containers"]:
-        assert "--sidecar" not in c["args"]
-        assert _mounts(c)["data"]["mountPath"] == "/srv"
-        assert "root" not in _mounts(c) and "meta" not in _mounts(c)
+        assert c["args"][-4:] == ["posix", "--sidecar", "/meta", "/srv"]
+        mounts = {m["mountPath"]: m for m in c["volumeMounts"]}
+        assert mounts["/srv"]["name"] == "data"
+        assert "subPath" not in mounts["/srv"]
+        # Beside the bucket on disk, outside the served root to VersityGW
+        # (which refuses a sidecar inside it).
+        assert mounts["/meta"]["name"] == "data"
+        assert mounts["/meta"]["subPath"] == cfg.DATASET_META_DIR
+        ro = c["name"] == "versitygw-ro"
+        assert mounts["/srv"]["readOnly"] is ro
+        assert mounts["/meta"]["readOnly"] is ro
 
 
 # --- the claim is left alone ------------------------------------------------ #
