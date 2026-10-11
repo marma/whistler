@@ -253,10 +253,10 @@ async def test_a_non_kiosk_user_is_refused_the_kiosk(viewer):
 async def test_with_a_kiosk_host_the_refusals_cross_origins(viewer, monkeypatch):
     """kiosk.host: on the kiosk's host "/" is the kiosk again,
     so a same-origin "Go to the portal" would loop back to this refusal."""
-    monkeypatch.setenv("WHISTLER_PORTAL_URL", "https://portal.example.org")
+    monkeypatch.setenv("WHISTLER_PORTAL_URL", "//portal.example.org")
     monkeypatch.setenv("WHISTLER_KIOSK_URL", "https://kiosk.example.org/")
     body = await (await viewer.get("/kiosk?user=worker", headers=_NAV)).text()
-    assert 'href="https://portal.example.org/"' in body
+    assert 'href="//portal.example.org/"' in body
     body = await (await viewer.get("/?user=kiosky", headers=_NAV)).text()
     assert 'href="https://kiosk.example.org/kiosk"' in body
 

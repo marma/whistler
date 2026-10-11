@@ -57,16 +57,12 @@ Each legacy key therefore names its replacement and stops the render.
 {{- end -}}
 
 {{/*
-The scheme://host a browser reaches a portal host at: https when a `tls` entry
-names it. Used for the cross-surface links once the kiosk has a host of its own.
+How the cross-surface links name a portal host: scheme-relative (//host), so
+they keep whatever scheme the browser is on. Deriving it from `tls` would say
+http:// wherever TLS ends in front of the cluster rather than at this Ingress.
 */}}
 {{- define "whistler.portal.hostURL" -}}
-{{- $host := .host -}}
-{{- $scheme := "http" -}}
-{{- range .tls -}}
-{{- if has $host (.hosts | default list) -}}{{- $scheme = "https" -}}{{- end -}}
-{{- end -}}
-{{- printf "%s://%s" $scheme $host -}}
+{{- printf "//%s" .host -}}
 {{- end -}}
 
 {{/*

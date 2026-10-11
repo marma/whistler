@@ -118,8 +118,9 @@ def render_notice(*, heading: str, message: str, href: str = None,
 
 def portal_home() -> str:
     """Where a "Go to the portal" link points. Same-origin "/" unless the
-    kiosk has a host of its own (portal.ingress.kioskHost), where "/" is the
-    kiosk again and the portal is on another origin."""
+    kiosk has a host of its own (kiosk.host), where "/" is the kiosk again
+    and the portal is on another origin. The chart sets it scheme-relative
+    (//host), so it keeps whatever scheme the browser is on."""
     return os.environ.get("WHISTLER_PORTAL_URL", "").rstrip("/") + "/"
 
 

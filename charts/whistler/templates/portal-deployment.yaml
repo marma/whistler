@@ -100,13 +100,12 @@ spec:
             {{- $kioskHost := include "whistler.kiosk.host" . }}
             {{- if $kioskHost }}
             {{- $ing := .Values.portal.ingress }}
-            {{- $tls := concat ($ing.tls | default list) (.Values.kiosk.tls | default list) }}
             # The kiosk has a host of its own, so "Go to the portal" / "Go to
             # the kiosk" on the refusal pages are absolute (portal/login.py).
             - name: WHISTLER_PORTAL_URL
-              value: {{ include "whistler.portal.hostURL" (dict "host" $ing.host "tls" $tls) | quote }}
+              value: {{ include "whistler.portal.hostURL" (dict "host" $ing.host) | quote }}
             - name: WHISTLER_KIOSK_URL
-              value: {{ include "whistler.portal.hostURL" (dict "host" $kioskHost "tls" $tls) | quote }}
+              value: {{ include "whistler.portal.hostURL" (dict "host" $kioskHost) | quote }}
             {{- end }}
             # Web terminal (whistler/portal/terminal.py): closed after this
             # many seconds without a keystroke. 0 disables.
