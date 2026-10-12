@@ -266,6 +266,31 @@ async def watch_host_key(config_manager, secret_name, key_in_use,
         return
 
 
+def _keep_tasks_lazy(loop):
+    """Stop Textual from making every task on the gateway's loop eager.
+
+    `App.run_async` calls `loop.set_task_factory(asyncio.eager_task_factory)`
+    on the running loop and never puts it back. Here that loop is shared by
+    every connection, so after the first launcher session every task in the
+    process ran eagerly — and asyncssh 2.24.1 builds a server auth handler
+    as `conn._auth = lookup_server_auth(...)`, whose constructor starts the
+    auth task and whose replies are sent only `if self._conn.auth is self`.
+    Eager, that task finished inside the constructor, before the assignment,
+    so the "key acceptable" reply was silently dropped and every later login
+    (`ssh gw known-hosts`, the launcher, a jump) hung after the key offer.
+    Textual runs fine with lazy tasks (it does on 3.11, which has no eager
+    factory), so its request is the one refused.
+    """
+    set_task_factory = loop.set_task_factory
+
+    def guarded(factory):
+        if factory is getattr(asyncio, "eager_task_factory", None):
+            return
+        set_task_factory(factory)
+
+    loop.set_task_factory = guarded
+
+
 def _restart_for_new_host_key():
     global _exit_code
     _exit_code = EXIT_HOST_KEY_CHANGED
@@ -273,6 +298,8 @@ def _restart_for_new_host_key():
 
 
 async def start_server():
+    _keep_tasks_lazy(asyncio.get_running_loop())
+
     parser = argparse.ArgumentParser(description="Whistler SSH Server")
     parser.add_argument("--kubeconfig", help="Path to kubeconfig file")
     parser.add_argument("--in-cluster", action="store_true", help="Run in Kubernetes in-cluster mode")
