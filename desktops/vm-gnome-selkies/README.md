@@ -318,6 +318,18 @@ the base cloud image URL (`BASE_IMAGE_URL` in `build.sh`) is **load-bearing at
 24.04** — moving to 26.04 forfeits both the X11 Shell and the unprivileged
 architecture.
 
+**Which cloud image.** By default the bake uses upstream's newest build of
+the release (`releases/24.04/release/`), checked again on every bake. To use a
+specific build, pin it with `BASE_IMAGE_SERIAL=<serial>`, for example
+`make vm-gnome-desktop-image BASE_IMAGE_SERIAL=20260927`; the serials are the
+`release-<serial>/` directories under
+<https://cloud-images.ubuntu.com/releases/24.04/>. `BASE_IMAGE_URL` overrides
+both. [`scripts/fetch_cloud_image.sh`](../../scripts/fetch_cloud_image.sh)
+checks the download against upstream's `SHA256SUMS` and caches it by hash in
+`~/.cache/whistler/vm-images`, so switching between builds re-downloads only
+the ones not already cached. The bake log prints the serial it used, and a
+booted guest has it in `/etc/cloud/build.info`.
+
 ## Verify without a cluster
 
 ```bash

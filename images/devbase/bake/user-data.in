@@ -69,6 +69,11 @@ write_files:
       #                    kernel mount (see whistler/cloudinit.py).
       #   bash-completion  makes /etc/bash_completion.d (pixi's completions,
       #                    written below) actually load.
+      #   docker.io        Docker from the archive, like everything else here
+      #     + compose-v2   (no download.docker.com repo). compose and buildx are
+      #     + buildx       the `docker compose` / `docker buildx` plugins; pigz
+      #     pigz           is what dockerd decompresses layers with when present.
+      #                    Wiring (socket group, on-demand start) is below.
       $APT install -y --no-install-recommends \
         build-essential pkg-config make cmake ninja-build \
         clang clang-format clang-tidy clangd libclang-rt-dev lld lldb gdb \
@@ -77,7 +82,38 @@ write_files:
         vim nano tmux htop less man-db manpages bash-completion \
         ca-certificates gnupg openssh-server nfs-common \
         rclone fuse3 \
+        docker.io docker-compose-v2 docker-buildx pigz \
         sudo
+
+      # --- Docker: started on demand ---------------------------------------
+      # Socket activation only: dockerd and containerd start on the first
+      # `docker` command, not at boot. docker.service orders itself after
+      # network-online.target and is part of multi-user.target, which is what
+      # cloud-init's final stage waits behind — a session boot should not pay
+      # for a daemon most sessions never touch. The price: a container with a
+      # restart policy does not come back after a reboot until something
+      # touches the socket (`sudo systemctl enable docker` restores the stock
+      # behaviour on a box that wants it).
+      #
+      # The socket's group is `sudo` (guest/etc/systemd/system/docker.socket.d),
+      # and a preset (guest/etc/systemd/system-preset) keeps systemd's
+      # first-boot preset-all, which every session boot is, from re-enabling
+      # docker.service.
+      #
+      # /etc/docker/daemon.json (guest/etc/docker):
+      #   bip, default-address-pools  Docker's bridges live in 198.18.0.0/15
+      #       (RFC 2544 benchmarking, routed nowhere real) instead of the
+      #       stock 172.17-31.0.0/16 + 192.168.0.0/16. A session sees its
+      #       clients' real addresses, and the guest routes any bridge's subnet
+      #       to that bridge — so with the stock pools a client in one of them
+      #       (a 192.168 pod network, a k3d docker network, an office LAN) is
+      #       cut off the moment dockerd starts or `docker compose up` makes a
+      #       network. Measured: test.sh's own ssh arrives from 172.17.0.1,
+      #       and the first `docker version` killed it.
+      #   log-driver: local  rotates; the default json-file grows without
+      #       bound on a root disk.
+      systemctl disable docker.service containerd.service
+      systemctl enable docker.socket
 
       # --- pixi ------------------------------------------------------------
       # Pinned static musl build straight to /usr/local/bin, system-wide and
@@ -150,6 +186,7 @@ write_files:
         echo "  clang     $(clang --version | head -1 | sed 's/.*version //')"
         echo "  gcc       $(gcc -dumpfullversion)"
         echo "  pixi      $(pixi --version | cut -d' ' -f2)"
+        echo "  docker    $(dockerd --version | sed 's/^Docker version \([^,]*\).*/\1/')"
         if [ -n "@NVIDIA_DRIVER_PACKAGE@" ]; then
           echo "  nvidia    @NVIDIA_DRIVER_PACKAGE@ (GPU runtime; nvidia-smi, nvtop)"
         fi

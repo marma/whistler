@@ -43,6 +43,8 @@ resolved versions; it is also the login MOTD. On Ubuntu 26.04:
 - git, git-lfs, curl, wget, rsync, jq, unzip/zip, xz, zstd.
 - python3-dev, python3-venv, python3-pip, pipx.
 - vim, nano, tmux, htop, less, man.
+- **Docker** — `docker.io` from the archive, with the `compose` and `buildx`
+  plugins; see [Docker](#docker).
 - `nvtop` in the two CUDA variants.
 
 ### pixi and $HOME
@@ -58,6 +60,38 @@ does not get it. Use absolute paths in scripts. The CUDA SDK's tools are
 therefore *symlinked* into `/usr/local/bin` at bake time rather than left to
 profile.d — `ssh <session>.w nvcc …` has to work — and `test.sh` asserts exactly
 that with a stripped `env -i` PATH.
+
+### Docker
+
+`docker` works as the session user without `sudo`: the socket's group is
+`sudo` (`guest/etc/systemd/system/docker.socket.d`), not `docker`. Socket
+access is root on the machine, and the session user already has NOPASSWD sudo,
+so this grants nothing new — it just avoids a group the per-session cloud-init
+would have to add.
+
+dockerd is **socket-activated**: it starts on the first `docker` command, not
+at boot, so sessions that never use it don't pay for it at startup. A container
+with a restart policy therefore stays down after a reboot until the socket is
+touched; `sudo systemctl enable docker` restores the stock behaviour.
+
+Images and containers live in `/var/lib/docker` on the **root disk**, not the
+home. On a containerDisk boot that disk is ephemeral and 16G (24G for `-cuda`),
+so pulled images are gone at the next session and large ones fill it. Pulling
+also needs a zone with egress to the registry (`registry-1.docker.io`,
+`production.cloudflare.docker.com` for Docker Hub). Container logs use the
+`local` driver, which rotates.
+
+Docker's networks use `198.18.0.0/15` (the default bridge is `198.18.0.1/24`;
+`docker network create` takes /24s from `198.19.0.0/16`), not the stock
+`172.17.0.0/16`-and-up. The guest routes every bridge's subnet to that bridge,
+and SSH clients reach a session from their real address, so a stock pool that
+overlapped a client's network would lock that client out as soon as dockerd
+started. 198.18/15 is reserved for benchmarking and is not used on real
+networks. If it collides anyway, change `/etc/docker/daemon.json` and
+`sudo systemctl restart docker`.
+
+GPUs in containers (`docker run --gpus`) are not wired up: that needs the
+NVIDIA Container Toolkit, which is not in the Ubuntu archive.
 
 ### VS Code Remote
 
@@ -156,6 +190,18 @@ pinned upstream download (pixi).
    Console output lands in `build/console.log` — the first place to look when a
    bake fails.
 3. The qcow2 is wrapped as a KubeVirt containerDisk.
+
+**Which cloud image.** By default the bake uses upstream's newest build of
+the release (`releases/26.04/release/`), checked again on every bake. To use a
+specific build, pin it with `BASE_IMAGE_SERIAL=<serial>`, for example
+`make devbase-image BASE_IMAGE_SERIAL=20260927`; the serials are the
+`release-<serial>/` directories under
+<https://cloud-images.ubuntu.com/releases/26.04/>. `BASE_IMAGE_URL` overrides
+both. [`scripts/fetch_cloud_image.sh`](../../scripts/fetch_cloud_image.sh)
+checks the download against upstream's `SHA256SUMS` and caches it by hash in
+`~/.cache/whistler/vm-images`, so switching between builds re-downloads only
+the ones not already cached. The bake log prints the serial it used, and a
+booted guest has it in `/etc/cloud/build.info`.
 
 The variant rides in the image **name**, never the tag, and the dev tag is
 literally `:latest`: kubelet and KubeVirt default only that exact tag to

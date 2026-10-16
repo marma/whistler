@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Bake the devbase KubeVirt containerDisk: a *server* VM guest — no desktop, no
 # Selkies, no X — set up for development and reached over SSH (mode: ssh,
-# runtime: vm). The toolchain is clang/clang++, pixi and Python 3.14, plus the
-# usual build/VCS/editor tools; see README.md for the full list and the why.
+# runtime: vm). The toolchain is clang/clang++, pixi, Python 3.14 and Docker,
+# plus the usual build/VCS/editor tools; see README.md for the full list and
+# the why.
 #
 # Sibling of ../../desktops/vm-gnome-selkies/build.sh and deliberately
 # structured the same — read it for the shared mechanics. This one is
@@ -21,7 +22,7 @@
 #
 # Knobs (env): IMAGE (default localhost:5000/whistler-devbase), TAG (latest),
 # PUSH=1 to docker-push, VARIANT (below), DISK_SIZE, QEMU_MEM (4096),
-# QEMU_SMP (min(8,nproc)), BASE_IMAGE_URL, CACHE_DIR
+# QEMU_SMP (min(8,nproc)), BASE_IMAGE_SERIAL (release = newest), BASE_IMAGE_URL, CACHE_DIR
 # (~/.cache/whistler/vm-images), BAKE_TIMEOUT (2700s), PIXI_VERSION,
 # NVIDIA_DRIVER_PACKAGE.
 #
@@ -64,7 +65,17 @@ PUSH="${PUSH:-0}"
 VARIANT="${VARIANT:-base}"
 QEMU_MEM="${QEMU_MEM:-4096}"
 QEMU_SMP="${QEMU_SMP:-$(( $(nproc) < 8 ? $(nproc) : 8 ))}"
-BASE_IMAGE_URL="${BASE_IMAGE_URL:-https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img}"
+# The Ubuntu cloud image to bake on. BASE_IMAGE_SERIAL=release (default) is
+# upstream's newest build, re-resolved on every bake; a serial such as 20260927
+# pins that build (the dated dirs under releases/26.04/). BASE_IMAGE_URL
+# overrides both. scripts/fetch_cloud_image.sh caches by sha256, so moving
+# between builds re-downloads only what is not cached already.
+BASE_IMAGE_SERIAL="${BASE_IMAGE_SERIAL:-release}"
+case "$BASE_IMAGE_SERIAL" in
+  release) _base_dir=release ;;
+  *)       _base_dir="release-${BASE_IMAGE_SERIAL#release-}" ;;
+esac
+BASE_IMAGE_URL="${BASE_IMAGE_URL:-https://cloud-images.ubuntu.com/releases/26.04/$_base_dir/ubuntu-26.04-server-cloudimg-amd64.img}"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/whistler/vm-images}"
 BAKE_TIMEOUT="${BAKE_TIMEOUT:-2700}"
 # Pinned so a rebuild is reproducible; bump deliberately. The static musl build
@@ -113,8 +124,7 @@ cp -a guest/. "$STAGE_DIR/"
 tar --owner=0 --group=0 --mode=go-w -czf "$SEED_DIR/artifacts.tar.gz" -C "$STAGE_DIR" .
 
 echo "==> [2/4] Base cloud image"
-BASE_IMG="$CACHE_DIR/$(basename "$BASE_IMAGE_URL")"
-[ -s "$BASE_IMG" ] || curl -fL --progress-bar -o "$BASE_IMG" "$BASE_IMAGE_URL"
+BASE_NAME="$(../../scripts/fetch_cloud_image.sh "$BASE_IMAGE_URL" "$CACHE_DIR")"
 
 echo "==> [3/4] Bake boot (qemu/KVM in docker; console: $BUILD_DIR/console.log)"
 sed -e "s/@HTTP_PORT@/$HTTP_PORT/g" \
@@ -131,7 +141,7 @@ timeout --foreground "$BAKE_TIMEOUT" docker run --rm \
   --device /dev/kvm \
   --user "$(id -u):$(id -g)" --group-add "$(stat -c %g /dev/kvm)" \
   -v "$BUILD_DIR:/build" -v "$CACHE_DIR:/cache:ro" -v "$SEED_DIR:/seed:ro" \
-  -e BASE_NAME="$(basename "$BASE_IMG")" \
+  -e BASE_NAME="$BASE_NAME" \
   -e DISK_SIZE="$DISK_SIZE" -e QEMU_MEM="$QEMU_MEM" -e QEMU_SMP="$QEMU_SMP" \
   -e HTTP_PORT="$HTTP_PORT" \
   whistler-vm-bake \

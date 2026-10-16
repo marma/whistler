@@ -1,0 +1,8 @@
+# dockerd is socket-activated in this image (see bake/user-data.in). The bake
+# disables docker.service and containerd.service, but `cloud-init clean
+# --machine-id` makes every session's boot a systemd *first boot*, which runs
+# `preset-all` — and Ubuntu's presets enable everything. This file keeps that
+# from turning dockerd back on at boot.
+disable docker.service
+disable containerd.service
+enable docker.socket
