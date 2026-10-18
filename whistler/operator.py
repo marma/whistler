@@ -708,6 +708,15 @@ def archive_home_volume_fn(name, namespace, **_):
             f"Archiving home volume {namespace}/{name} is not done yet", delay=5)
 
 
+# Growing a home (config.py, "Growing a home"): the portal raises spec.size,
+# this grows the claim, or the disk image on it where the claim cannot grow.
+# No retry on failure: waiting does not make room on a volume. The refusal is
+# recorded on the HomeVolume; the next start using it and the sweep try again.
+@kopf.on.update('whistler.martinmalmsten.net', 'v1', 'homevolumes', field='spec.size')
+def grow_home_volume_fn(name, namespace, **_):
+    _get_config_manager().grow_home_volume(namespace, name)
+
+
 def _restoring(spec, **_):
     return bool(spec.get("fromArchive"))
 

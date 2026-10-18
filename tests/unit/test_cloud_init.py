@@ -260,6 +260,34 @@ def test_mount_unit_and_script_written():
     assert 'mkdir -p "$HOME_DIR"' in body
 
 
+def test_filesystem_grown_after_mount_and_never_fatal():
+    """A grown claim reaches the guest as a larger disk; the script grows ext4
+    into it once mounted (online, so no fsck), and a failure must not fail
+    the mount."""
+    body = _script()
+    mount_at = body.index('mount -o nosuid,nodev "$DISK" "$HOME_DIR"')
+    grow_at = body.index('resize2fs "$DISK"')
+    assert grow_at > mount_at
+    assert 'resize2fs "$DISK" >/dev/null 2>&1 ||' in body
+
+
+def test_live_grow_wired_to_the_home_disks_resize_event():
+    files = {f["path"]: f["content"] for f in _doc()["write_files"]}
+    rule = files["/etc/udev/rules.d/90-whistler-home-grow.rules"]
+    assert 'ACTION=="change"' in rule and 'ENV{RESIZE}=="1"' in rule
+    # Only the home disk, picked by its serial, never by device order.
+    assert f'ATTRS{{serial}}=="{HOME_DISK_SERIAL}"' in rule
+    assert "--no-block whistler-home-grow.service" in rule
+    unit = files["/etc/systemd/system/whistler-home-grow.service"]
+    assert "ConditionPathIsMountPoint=/home/alice" in unit
+    assert f"ExecStart=/sbin/resize2fs {HOME_DISK_PATH}" in unit
+
+
+def test_no_grow_machinery_without_a_home_disk():
+    paths = {f["path"] for f in _doc(home_disk=False)["write_files"]}
+    assert not any("home-grow" in p for p in paths)
+
+
 def test_hostname_set():
     assert _doc()["hostname"] == "desk"
 

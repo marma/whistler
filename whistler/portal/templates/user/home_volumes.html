@@ -39,7 +39,7 @@
         {% for z in zs|sort %}<div class="ui tiny blue label">{{ z }}</div>{% endfor %}
         {% if not zs %}<div class="ui tiny red label">no zone</div>{% endif %}
       </td>
-      <td>{{ v.size or "default" }}</td>
+      <td>{% set grow_action = "/homes/" ~ v.name ~ "/size?user=" ~ current_user %}{% include "user/_home_size.html" %}</td>
       <td>
         {% if v.inUseBy %}
           <div class="ui tiny yellow label"><i class="lock icon"></i> {{ v.inUseBy }}</div>
@@ -98,7 +98,7 @@
       <div class="field">
         <label>Size <span class="ui grey tiny label">optional</span></label>
         <input name="size" type="text" placeholder="20Gi">
-        <div class="ui pointing label">Fixed when the disk is first created; growing it later is a manual step.</div>
+        <div class="ui pointing label">Can be grown later from the table above, but never shrunk.</div>
       </div>
       <div class="field">
         <label>Description <span class="ui grey tiny label">optional</span></label>

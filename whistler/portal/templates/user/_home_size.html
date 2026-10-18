@@ -1,0 +1,28 @@
+{# One home volume's Size cell: how big its disk is, a grow still to happen
+   or refused, and the form that asks for more. Expects `v` (a volume row)
+   and `grow_action` (the POST URL). #}
+{% set claim = v.claimSize or {} %}
+{% if claim.disk %}
+  <strong>{{ claim.disk }}</strong>
+  {% if claim.pending and not v.resizeProblem %}
+    {% if v.inUseBy %}
+      <div class="ui tiny orange label" title="The disk cannot grow while {{ v.inUseBy }} is running, unless the storage grows it live">{{ v.size }} at next start</div>
+    {% else %}
+      <div class="ui tiny orange label">growing to {{ v.size }}</div>
+    {% endif %}
+  {% endif %}
+{% else %}
+  {{ v.size or "default" }}
+  <br><span class="ui grey text" style="font-size:0.85em">not created yet</span>
+{% endif %}
+{% if v.resizeProblem %}
+  <div class="ui tiny red label" title="{{ v.resizeProblem }}"><i class="exclamation triangle icon"></i> could not grow</div>
+  <div class="ui grey text" style="font-size:0.8em; max-width:16rem">{{ v.resizeProblem }}</div>
+{% endif %}
+<form class="ui mini action input" method="post" action="{{ grow_action }}"
+      style="margin-top:0.35rem"
+      onsubmit="return confirm('Grow {{ v.name }} to ' + this.size.value + '?\n\nA home can only grow, never shrink. If it is in use, the extra space appears at the instance\'s next start (or sooner, where the storage can grow it live).')">
+  <input name="size" type="text" required placeholder="e.g. 100Gi" style="width:7rem"
+         pattern="[0-9]+(\.[0-9]+)?([KMGTPE]i?)?">
+  <button class="ui mini button" type="submit"><i class="expand icon"></i> Grow</button>
+</form>

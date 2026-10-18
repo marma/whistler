@@ -1235,9 +1235,12 @@ async def _home_volume_rows(request: Request, cm, username: str):
     for vol in volumes:
         holder = await request.app.state.run(
             cm.home_volume_holder, username, vol)
+        claim = await request.app.state.run(
+            cm.home_volume_claim_size, username, vol)
         rows.append({**vol,
                      "pvcName": cm.home_volume_pvc_name(vol),
-                     "inUseBy": holder})
+                     "inUseBy": holder,
+                     "claimSize": claim})
     return rows
 
 
@@ -1947,6 +1950,22 @@ async def admin_zone_delete(request: Request, cm: CM, admin: Admin, name: str):
 
 
 # --------------------------------------------------------------------------- #
+async def home_volume_resize(
+    request: Request, cm: CM, user: User, name: str,
+    size: Annotated[str, Form()],
+):
+    """Ask for a bigger home. The same power as choosing a size at creation,
+    which a user already has, so it is theirs too. Allowed while the volume is
+    attached: where the claim can expand it grows live, otherwise at the
+    instance's next start."""
+    _need(request, PERM_OWN_HOMES)
+    ok, message = await request.app.state.run(
+        cm.request_home_volume_size, user, name, size)
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return _tr("/homes", user)
+
+
 # Admin — home volumes (every user's) and the access matrix                    #
 # --------------------------------------------------------------------------- #
 
@@ -1966,11 +1985,14 @@ async def admin_home_volumes(request: Request, cm: CM, admin: Admin):
                 cm.home_volume_holder, username, vol)
             access = await request.app.state.run(
                 cm.get_user_volume_access, username)
+            claim = await request.app.state.run(
+                cm.home_volume_claim_size, username, vol)
             rows.append({
                 **vol,
                 "user": username,
                 "pvcName": cm.home_volume_pvc_name(vol),
                 "inUseBy": holder,
+                "claimSize": claim,
                 # Which zones this volume is actually usable in, straight from
                 # the matrix — there is nowhere else it could come from.
                 "zones": sorted(z for z, cells in access.items()
@@ -2017,6 +2039,16 @@ async def admin_archived_home_volume_delete(request: Request, cm: CM,
     if not ok:
         raise HTTPException(status_code=400,
                             detail="Could not delete that archived volume.")
+    return _tr("/admin/homevolumes", admin)
+
+
+async def admin_home_volume_resize(request: Request, cm: CM, admin: Admin,
+                                   username: str, name: str,
+                                   size: Annotated[str, Form()]):
+    ok, message = await request.app.state.run(
+        cm.request_home_volume_size, username, name, size)
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
     return _tr("/admin/homevolumes", admin)
 
 
@@ -3321,11 +3353,13 @@ def build_management_app(config_manager):
     app.add_api_route("/datasets/{name}/regenerate",              user_dataset_regenerate, methods=["POST"])
     app.add_api_route("/homes",                                   home_volume_create,     methods=["POST"])
     app.add_api_route("/homes/{name}/delete",                     home_volume_delete,     methods=["POST"])
+    app.add_api_route("/homes/{name}/size",                       home_volume_resize,     methods=["POST"])
     app.add_api_route("/admin/computed-access",                   admin_computed_access,  methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/users/{username}/access",           admin_user_set_access,  methods=["POST"])
     app.add_api_route("/admin/homevolumes",                       admin_home_volumes,     methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/homevolumes/{username}/{name}/delete", admin_home_volume_delete, methods=["POST"])
     app.add_api_route("/admin/homevolumes/{username}/{name}/archive", admin_home_volume_archive, methods=["POST"])
+    app.add_api_route("/admin/homevolumes/{username}/{name}/size", admin_home_volume_resize, methods=["POST"])
     # Backups (the offer first: it is a fixed path under the same prefix)
     app.add_api_route("/admin/backups",                         admin_backups,              methods=["GET"],  response_class=HTMLResponse)
     app.add_api_route("/admin/backups/offer",                   admin_backup_offer,         methods=["GET"],  response_class=HTMLResponse)

@@ -208,6 +208,12 @@ mount -o {mount_opts} "$DISK" "$HOME_DIR" || exit 1
 # any ownership the user set deliberately.
 chown "$OWNER" "$HOME_DIR"
 chmod 0755 "$HOME_DIR"
+# Grow the filesystem to the disk. A home whose claim was enlarged comes up
+# with a larger disk (KubeVirt grows disk.img at boot), and ext4 grows online,
+# so this is the whole of the guest's part; on an unchanged disk it is a
+# no-op. Never fatal: a home at its old size is still a home.
+resize2fs "$DISK" >/dev/null 2>&1 || \
+    echo "whistler: could not grow the filesystem on $DISK" >&2
 {getty_respawn.strip() or ":"}
 exit 0
 """
@@ -279,6 +285,31 @@ exit 0
                     "\n"
                     "[Install]\n"
                     "WantedBy=multi-user.target\n"
+                ),
+            },
+            # Growing while running: KubeVirt resizes the virtio disk under a
+            # live guest when its claim grows, and the kernel announces that
+            # as a change event with RESIZE=1. The unit does nothing until
+            # the home is mounted, which is when the mount script grows it.
+            {
+                "path": "/etc/udev/rules.d/90-whistler-home-grow.rules",
+                "content": (
+                    'ACTION=="change", SUBSYSTEM=="block", ENV{RESIZE}=="1", '
+                    f'ATTRS{{serial}}=="{HOME_DISK_SERIAL}", '
+                    'RUN+="/bin/systemctl start --no-block '
+                    'whistler-home-grow.service"\n'
+                ),
+            },
+            {
+                "path": "/etc/systemd/system/whistler-home-grow.service",
+                "content": (
+                    "[Unit]\n"
+                    "Description=Grow the Whistler home filesystem to its disk\n"
+                    f"ConditionPathIsMountPoint={home}\n"
+                    "\n"
+                    "[Service]\n"
+                    "Type=oneshot\n"
+                    f"ExecStart=/sbin/resize2fs {HOME_DISK_PATH}\n"
                 ),
             },
         ])

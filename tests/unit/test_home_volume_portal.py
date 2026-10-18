@@ -242,3 +242,78 @@ def test_computed_view_offers_no_way_to_edit():
     assert html.count('method="post"') == 1 and 'action="/logout"' in html
     # Provenance is the point of the view.
     assert "lab-staff" in html
+
+
+# --- growing a home ----------------------------------------------------------- #
+
+def test_size_cell_shows_the_disk_and_a_grow_in_progress():
+    vols = [{**VOLUMES[0], "size": "100Gi",
+             "claimSize": {"requested": "50Gi", "capacity": "50Gi",
+                           "disk": "50Gi", "pending": True}}]
+    html = _render("user/home_volumes.html", current_user="alice",
+                   is_admin=False, volumes=vols)
+    assert "<strong>50Gi</strong>" in html and "growing to 100Gi" in html
+    assert 'action="/homes/research/size?user=alice"' in html
+
+
+def test_a_held_home_grows_at_its_next_start():
+    vols = [{**VOLUMES[1], "size": "100Gi",
+             "claimSize": {"requested": "20Gi", "capacity": "20Gi",
+                           "disk": "20Gi", "pending": True}}]
+    html = _render("user/home_volumes.html", current_user="alice",
+                   is_admin=False, volumes=vols)
+    assert "100Gi at next start" in html
+
+
+def test_size_cell_before_the_claim_exists_and_after_a_refusal():
+    vols = [{**VOLUMES[1], "claimSize": {"requested": None, "capacity": None},
+             "resizeProblem": "50Gi: storageclass must support resize"}]
+    html = _render("user/home_volumes.html", current_user="alice",
+                   is_admin=False, volumes=vols)
+    assert "not created yet" in html
+    assert "could not grow" in html and "must support resize" in html
+
+
+def test_admin_page_grows_through_its_own_route():
+    vols = [{**VOLUMES[0], "user": "bob", "zones": ["default"],
+             "claimSize": {"requested": "50Gi", "capacity": "50Gi",
+                           "disk": "50Gi", "pending": False}}]
+    html = _render("admin/home_volumes.html", path="/admin/homevolumes",
+                   current_user="admin", is_admin=True, volumes=vols,
+                   archived=[], usernames=["bob"])
+    assert 'action="/admin/homevolumes/bob/research/size?user=admin"' in html
+    assert "growing" not in html
+
+
+def _resize_request(result):
+    calls = []
+
+    async def _run(fn, *args):
+        calls.append((fn, args))
+        return result
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(run=_run)),
+        state=SimpleNamespace(role="standard"))
+    cm = SimpleNamespace(request_home_volume_size=object())
+    return request, cm, calls
+
+
+def test_resize_route_asks_the_config_layer_for_the_users_own_volume():
+    import asyncio
+    request, cm, calls = _resize_request((True, ""))
+    asyncio.run(mgmt.home_volume_resize(request=request, cm=cm, user="alice",
+                                        name="research", size="100Gi"))
+    assert calls == [(cm.request_home_volume_size,
+                      ("alice", "research", "100Gi"))]
+
+
+def test_resize_route_refusal_is_the_reason():
+    import asyncio
+    request, cm, _ = _resize_request((False, "A home can only grow"))
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(mgmt.home_volume_resize(request=request, cm=cm,
+                                            user="alice", name="research",
+                                            size="1Gi"))
+    assert exc.value.status_code == 400
+    assert "only grow" in exc.value.detail

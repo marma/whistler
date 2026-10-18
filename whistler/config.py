@@ -17,6 +17,7 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 import urllib.parse
 import yaml
@@ -373,6 +374,161 @@ def sub_path_problem(value) -> Optional[str]:
     return None
 
 
+def home_volume_size_problem(size, current=None) -> Optional[str]:
+    """Why ``size`` is not a size a home may be given, or None. ``current`` is
+    what its claim asks for now (None before the claim exists, when any size
+    goes). Pure.
+
+    Only grows: Kubernetes refuses to shrink a claim, and an ext4 filesystem
+    shrinks only offline — neither is a thing to offer from a form."""
+    try:
+        wanted = parse_quantity(size) if size else None
+    except ValueError:
+        wanted = None
+    if not wanted or wanted <= 0:
+        return (f"A home needs a size as a Kubernetes quantity such as 50Gi "
+                f"(got {size!r}).")
+    if current:
+        try:
+            have = parse_quantity(current)
+        except ValueError:
+            return None
+        if wanted < have:
+            return (f"A home can only grow: its disk is {current}, so it "
+                    f"cannot become {size}.")
+        if wanted == have:
+            return f"The home is already {current}."
+    return None
+
+
+def quantity_at_least(have, want) -> bool:
+    """``have >= want`` as Kubernetes quantities; False when ``have`` is
+    absent. Raises ValueError on a malformed quantity."""
+    return bool(have) and parse_quantity(have) >= parse_quantity(want)
+
+
+def home_disk_size(requested, capacity, grown=None) -> Optional[str]:
+    """How big a home's disk is, as a quantity, from its claim and what
+    Whistler grew the file to. KubeVirt makes the file min(request, capacity)
+    (less a filesystem overhead, ignored here); a file grown directly is
+    larger than the claim says. Pure."""
+    sizes = [q for q in (requested, capacity) if q]
+    claim = min(sizes, key=parse_quantity) if sizes else None
+    candidates = [q for q in (claim, grown) if q]
+    if not candidates:
+        return None
+    try:
+        return max(candidates, key=parse_quantity)
+    except ValueError:
+        return claim
+
+
+def _claim_sizes(pvc) -> Tuple[Optional[str], Optional[str]]:
+    requests = ((pvc.spec.resources.requests or {})
+                if pvc.spec and pvc.spec.resources else {})
+    capacity = ((pvc.status.capacity or {})
+                if pvc.status and pvc.status.capacity else {})
+    return requests.get("storage"), capacity.get("storage")
+
+
+def _terminated_state(pod):
+    for status in (pod.status.container_statuses or []) if pod.status else []:
+        if status.state and status.state.terminated:
+            return status.state.terminated
+    return None
+
+
+# Run in the grow pod as `python3 -I -c HOME_GROW_SCRIPT <path> <bytes>`.
+# Grows a raw disk image (all KubeVirt makes) by extending the file, sparse;
+# never shrinks. Refuses when the volume could not hold the file at its new
+# size — KubeVirt's own bound (getUsableDiskSize: what the file occupies plus
+# what the filesystem has free) — since a guest promised room the volume does
+# not have gets I/O errors when it fills, not ENOSPC. A missing image (a claim
+# never booted) is created at the size, which is what KubeVirt would do with a
+# claim of that size. Its last line, also the termination message, is the
+# answer.
+HOME_GROW_SCRIPT = r"""
+import os, sys
+path, want = sys.argv[1], int(sys.argv[2])
+def done(message, code=0):
+    print(message)
+    try:
+        with open("/dev/termination-log", "w") as f:
+            f.write(message)
+    except OSError:
+        pass
+    sys.exit(code)
+try:
+    st = os.stat(path)
+except FileNotFoundError:
+    st = None
+have = st.st_size if st else 0
+if have >= want:
+    done(f"disk image is already {have} bytes")
+vfs = os.statvfs(os.path.dirname(path))
+usable = (st.st_blocks * 512 if st else 0) + vfs.f_bavail * vfs.f_frsize
+if want > usable:
+    done(f"the volume has room for {usable // 2**20} MiB, not "
+         f"{want // 2**20} MiB", 1)
+if st is None:
+    os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o660))
+os.truncate(path, want)
+done(f"grew disk image from {have} to {want} bytes")
+"""
+
+
+def home_grow_pod_manifest(volume: str, claim: str, size_bytes: int, *,
+                           image: str, pull_policy: str) -> Dict[str, Any]:
+    """The pod that grows a home's disk.img in place (HOME_GROW_SCRIPT). It
+    mounts the claim as KubeVirt's qemu uid, which owns the file, and needs
+    nothing else: no token, no network, no writable root. Pure."""
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": f"whistler-grow-{volume}",
+            "labels": {"app": "whistler", "component": "home-grow",
+                       "whistler-home-volume": volume[:63]},
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "activeDeadlineSeconds": HOME_GROW_TIMEOUT,
+            "automountServiceAccountToken": False,
+            "enableServiceLinks": False,
+            "securityContext": {
+                "runAsUser": QEMU_UID, "runAsGroup": QEMU_UID,
+                "runAsNonRoot": True,
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+            "containers": [{
+                "name": "grow",
+                "image": image,
+                "imagePullPolicy": pull_policy,
+                "command": ["python3", "-I", "-c", HOME_GROW_SCRIPT,
+                            "/disk/disk.img", str(size_bytes)],
+                "securityContext": {
+                    "allowPrivilegeEscalation": False,
+                    "readOnlyRootFilesystem": True,
+                    "capabilities": {"drop": ["ALL"]},
+                },
+                "resources": {"requests": {"cpu": "10m", "memory": "32Mi"},
+                              "limits": {"memory": "64Mi"}},
+                "volumeMounts": [{"name": "home", "mountPath": "/disk"}],
+            }],
+            "volumes": [{"name": "home",
+                         "persistentVolumeClaim": {"claimName": claim}}],
+        },
+    }
+
+
+def _api_message(e: ApiException) -> str:
+    """The API server's own sentence for a refusal, else the HTTP reason."""
+    try:
+        return json.loads(e.body).get("message") or str(e.reason)
+    except (TypeError, ValueError, AttributeError):
+        return str(e.reason)
+
+
 # The identity a dataset server runs as. A claim dataset may name its own
 # (spec.uid / spec.gid): on an NFS-backed claim the process's uid and gid are
 # what the NFS server checks (AUTH_SYS) and what new files are created as.
@@ -446,6 +602,18 @@ DELETE_DATA_ANNOTATION = "whistler/delete-data"
 # On a HomeVolume: archive it (request_archive_home_volume); the value is the
 # admin who asked. Carried out by the operator (archive_home_volume).
 ARCHIVE_ANNOTATION = "whistler/archive"
+# On a HomeVolume: why its claim could not be grown to spec.size, as
+# "<size>: <reason>" (grow_home_volume). Written by the operator, cleared by it
+# once the claim asks for the size, and by the portal on a new request.
+RESIZE_PROBLEM_ANNOTATION = "whistler/resize-problem"
+# On a HomeVolume: the size its disk image was last grown to by Whistler
+# directly (grow_home_volume, step 2), where the claim could not be expanded
+# and so no longer says how big the disk is.
+DISK_SIZE_ANNOTATION = "whistler/disk-size"
+# How long a grow pod may take, scheduling included.
+HOME_GROW_TIMEOUT = 120
+# The uid KubeVirt gives disk.img (its qemu user), which the grow pod runs as.
+QEMU_UID = 107
 # Where archived homes live: one claim + one HomeVolume record each, no user,
 # no sessions. Created by the operator on first use, like user namespaces.
 ARCHIVE_NAMESPACE = os.environ.get("WHISTLER_ARCHIVE_NAMESPACE",
@@ -1512,6 +1680,12 @@ class KubeConfigManager(ConfigManager):
             "WHISTLER_STORAGE_GATEWAY_NODE_SELECTOR", {})
         self.storage_gateway_resources = self._env_json(
             "WHISTLER_STORAGE_GATEWAY_RESOURCES", {})
+        # Whistler's own image, for the short pods the operator runs itself
+        # (growing a home's disk image).
+        self.self_image = os.environ.get(
+            "WHISTLER_IMAGE", "ghcr.io/marma/whistler:latest")
+        self.self_image_pull_policy = os.environ.get(
+            "WHISTLER_IMAGE_PULL_POLICY", "IfNotPresent")
         # Default size of a VM's per-instance home disk. A template may raise
         # it per-session with `homeDiskSize`; this is the floor every VM gets.
         self.home_disk_size = os.environ.get(
@@ -3029,11 +3203,19 @@ class KubeConfigManager(ConfigManager):
         type(self)._warned_no_home_volume_crd = False
         # A volume marked for deletion with its data, or for the archive, is
         # already gone as far as anyone choosing a home is concerned.
-        out = [{**(item.get("spec") or {}),
-                "name": item["metadata"]["name"]}
-               for item in resp.get("items", [])
-               if not ({DELETE_DATA_ANNOTATION, ARCHIVE_ANNOTATION}
-                       & set(item["metadata"].get("annotations") or {}))]
+        out = []
+        for item in resp.get("items", []):
+            annotations = item["metadata"].get("annotations") or {}
+            if {DELETE_DATA_ANNOTATION, ARCHIVE_ANNOTATION} & set(annotations):
+                continue
+            vol = {**(item.get("spec") or {}), "name": item["metadata"]["name"]}
+            # Not spec: the operator's note on a grow it could not make, for
+            # the volumes pages (save_home_volume never writes it back).
+            if annotations.get(RESIZE_PROBLEM_ANNOTATION):
+                vol["resizeProblem"] = annotations[RESIZE_PROBLEM_ANNOTATION]
+            if annotations.get(DISK_SIZE_ANNOTATION):
+                vol["diskSize"] = annotations[DISK_SIZE_ANNOTATION]
+            out.append(vol)
         return sorted(out, key=lambda v: v.get("name") or "")
 
     def get_home_volume(self, username: str, name: str) -> Optional[Dict[str, Any]]:
@@ -3048,6 +3230,8 @@ class KubeConfigManager(ConfigManager):
         costs nothing and a storage class that cannot bind fails where the
         user can see it."""
         data = dict(volume)
+        data.pop("resizeProblem", None)
+        data.pop("diskSize", None)
         name = (data.pop("name", "") or "").strip()
         if not name:
             return False
@@ -3983,6 +4167,13 @@ class KubeConfigManager(ConfigManager):
                 logger.warning(f"Could not move home volume "
                                f"{ns}/{item['metadata']['name']}: {e}")
                 continue
+            # The retry for a grow the event handler missed or failed.
+            try:
+                self.grow_home_volume(ns, item["metadata"]["name"], item=item,
+                                      retry_recorded=False)
+            except ApiException as e:
+                logger.warning(f"Could not grow home volume "
+                               f"{ns}/{item['metadata']['name']}: {e}")
             if spec.get("pvName") or ns == ARCHIVE_NAMESPACE:
                 continue
             username = spec.get("user") or ns[len("whistler-user-"):]
@@ -4057,6 +4248,17 @@ class KubeConfigManager(ConfigManager):
             except Exception as e:
                 (logger or globals()["logger"]).warning(
                     f"Could not retain the disk behind {pvc_name}: {e}")
+            # A size raised since the claim was made. Before the VM is built,
+            # which is the moment a disk image the claim could not grow for us
+            # is free to be grown directly. Never fatal: the home is usable
+            # at its old size.
+            if volume.get("size") and volume.get("name"):
+                try:
+                    self.grow_home_volume(user_ns, volume["name"],
+                                          logger=logger)
+                except Exception as e:
+                    (logger or globals()["logger"]).warning(
+                        f"Could not grow {pvc_name}: {e}")
             return pvc_name
 
         if volume.get("fromArchive"):
@@ -4102,6 +4304,262 @@ class KubeConfigManager(ConfigManager):
             if logger:
                 logger.error(f"Failed to create home volume claim: {e}")
             raise
+
+    # ------------------------------------------------------------------ #
+    # Growing a home. A home is a disk.img on a claim, so what has to     #
+    # grow is that FILE, then the ext4 inside it (the guest: resize2fs    #
+    # after the mount, cloudinit). The claim's size is not the disk's:    #
+    # KubeVirt sizes the file to min(request, capacity) minus overhead    #
+    # when it creates it, and grows it only when those grow — which on    #
+    # local-path or NFS (no expansion; and no quota either, so the claim  #
+    # size is nominal) is never. So, in grow_home_volume:                 #
+    #   1. Grow the claim. Where the class allows it, KubeVirt grows the  #
+    #      file itself, at boot or live (ExpandDisks, GA since v1.8), and #
+    #      a class that enforces a quota gets the room the file needs.    #
+    #   2. Where the API refuses, grow the file directly: a short pod     #
+    #      mounting the claim (HOME_GROW_SCRIPT), only while no running   #
+    #      instance holds the home — else at its next start.              #
+    # KubeVirt never shrinks a file larger than the claim says, so the    #
+    # two do not fight. DISK_SIZE_ANNOTATION records what (2) achieved.   #
+    # ------------------------------------------------------------------ #
+
+    def home_volume_claim_size(self, username: str,
+                               volume: Dict[str, Any]) -> Dict[str, Any]:
+        """What the claim behind a home asks for and has been given, and the
+        size of the disk on it: ``{"requested", "capacity", "disk"}``, all None
+        before its first attach, and ``pending`` — spec.size is more than the
+        disk has yet."""
+        try:
+            pvc = client.CoreV1Api().read_namespaced_persistent_volume_claim(
+                self.home_volume_pvc_name(volume),
+                self._get_user_namespace(username))
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning(f"Could not read the claim of home volume "
+                               f"{volume.get('name')!r}: {e.reason}")
+            return {"requested": None, "capacity": None, "disk": None,
+                    "pending": False}
+        requested, capacity = _claim_sizes(pvc)
+        disk = home_disk_size(requested, capacity, volume.get("diskSize"))
+        try:
+            pending = bool(volume.get("size")) and \
+                not quantity_at_least(disk, volume["size"])
+        except ValueError:
+            pending = False
+        return {"requested": requested, "capacity": capacity, "disk": disk,
+                "pending": pending}
+
+    def request_home_volume_size(self, username: str, name: str,
+                                 size: str) -> Tuple[bool, str]:
+        """Ask for a home to become ``size``. A request, like the archive's
+        marks: this writes spec.size and the operator does the growing, since
+        the portal has no write on claims or pods. Returns (ok, message)."""
+        size = (size or "").strip()
+        volume = self.get_home_volume(username, name)
+        if not volume:
+            return False, f"No home volume {name!r}."
+        if volume.get("fromArchive"):
+            return False, (f"Home volume {name!r} is still being restored "
+                           f"from the archive.")
+        # Against the disk when there is one: spec.size may be empty (the
+        # template's or the cluster's default) or behind what the disk has.
+        current = self.home_volume_claim_size(username, volume)["disk"]
+        problem = home_volume_size_problem(size, current)
+        if problem:
+            return False, problem
+        try:
+            self.api.patch_namespaced_custom_object(
+                self.group, self.version, self._get_user_namespace(username),
+                HOME_VOLUME_PLURAL, name,
+                {"metadata": {"annotations": {RESIZE_PROBLEM_ANNOTATION: None}},
+                 "spec": {"size": size}})
+        except ApiException as e:
+            logger.error(f"Could not resize home volume {name!r}: {e}")
+            return False, "Could not save the new size."
+        logger.info(f"Home volume {username}/{name}: size {size} requested")
+        return True, ""
+
+    def grow_home_volume(self, namespace: str, name: str,
+                         item: Optional[Dict[str, Any]] = None,
+                         retry_recorded: bool = True,
+                         logger=None) -> bool:
+        """Grow a home's disk to its spec.size, if it is smaller (see the
+        section comment for how). Idempotent; never shrinks. A home with no
+        claim yet needs nothing: it is created at that size.
+
+        Returns False when the disk could not be grown, and records why on
+        the HomeVolume (RESIZE_PROBLEM_ANNOTATION). A home held by a running
+        instance is not a failure: its file waits for the next start.
+        ``retry_recorded=False`` (the sweep) leaves alone a size that already
+        failed, so a refusal is not re-logged every pass; ``item`` lets the
+        sweep skip the obvious no-ops without a read."""
+        log = logger or globals()["logger"]
+        if item is not None and not self._may_need_growing(namespace, item,
+                                                           retry_recorded):
+            return True
+        # One grow per home at a time in this process: the update handler,
+        # a start and the sweep can all arrive together, and the second must
+        # see what the first did rather than race it on the same claim.
+        with self._home_grow_lock(namespace, name):
+            try:
+                item = self.api.get_namespaced_custom_object(
+                    self.group, self.version, namespace, HOME_VOLUME_PLURAL,
+                    name)
+            except ApiException as e:
+                if e.status == 404:
+                    return True
+                raise
+            if not self._may_need_growing(namespace, item, retry_recorded):
+                return not (item["metadata"].get("annotations") or {}).get(
+                    RESIZE_PROBLEM_ANNOTATION)
+            return self._grow_home_volume_locked(namespace, name, item, log)
+
+    def _may_need_growing(self, namespace: str, item: Dict[str, Any],
+                          retry_recorded: bool) -> bool:
+        spec = item.get("spec") or {}
+        annotations = item["metadata"].get("annotations") or {}
+        size = spec.get("size")
+        if (not size or namespace == ARCHIVE_NAMESPACE or spec.get("fromArchive")
+                or {DELETE_DATA_ANNOTATION, ARCHIVE_ANNOTATION} & set(annotations)):
+            return False
+        recorded = annotations.get(RESIZE_PROBLEM_ANNOTATION)
+        if not retry_recorded and recorded and recorded.startswith(f"{size}:"):
+            return False
+        grown = annotations.get(DISK_SIZE_ANNOTATION)
+        if grown and quantity_at_least(grown, size):
+            return False
+        return True
+
+    def _home_grow_lock(self, namespace: str, name: str):
+        locks = self.__dict__.setdefault("_home_grow_locks", {})
+        guard = self.__dict__.setdefault("_home_grow_locks_guard",
+                                         threading.Lock())
+        with guard:
+            return locks.setdefault((namespace, name), threading.Lock())
+
+    def _grow_home_volume_locked(self, namespace: str, name: str,
+                                 item: Dict[str, Any], log) -> bool:
+        spec = item.get("spec") or {}
+        annotations = item["metadata"].get("annotations") or {}
+        size = spec["size"]
+        claim = self.home_volume_pvc_name({**spec, "name": name})
+        core = client.CoreV1Api()
+        try:
+            pvc = core.read_namespaced_persistent_volume_claim(claim, namespace)
+        except ApiException as e:
+            if e.status == 404:
+                return True
+            raise
+        requested, capacity = _claim_sizes(pvc)
+        try:
+            if quantity_at_least(home_disk_size(
+                    requested, capacity,
+                    annotations.get(DISK_SIZE_ANNOTATION)), size):
+                return self._record_grow(namespace, name, annotations, None)
+            # Asked of the claim already (an earlier pass): KubeVirt grows
+            # the file once the capacity follows. Nothing to do but wait.
+            if requested and quantity_at_least(requested, size):
+                return True
+        except ValueError:
+            log.warning(f"Home volume {namespace}/{name}: size {size!r} is "
+                        f"not a quantity; not growing it")
+            return False
+
+        # 1. The claim.
+        try:
+            core.patch_namespaced_persistent_volume_claim(
+                claim, namespace,
+                {"spec": {"resources": {"requests": {"storage": size}}}})
+            log.info(f"Growing home claim {namespace}/{claim} from "
+                     f"{requested} to {size}")
+            return self._record_grow(namespace, name, annotations, None)
+        except ApiException as e:
+            if e.status not in (403, 422):
+                problem = _api_message(e)
+                log.error(f"Could not grow home claim {namespace}/{claim} to "
+                          f"{size}: {problem}")
+                return self._record_grow(namespace, name, annotations,
+                                         f"{size}: {problem}")
+            # The class cannot expand (or the claim was not dynamically
+            # provisioned). Usual on local-path and NFS, where the claim's
+            # size is nominal anyway: the file is what has to grow.
+            log.info(f"Home claim {namespace}/{claim} cannot be expanded "
+                     f"({_api_message(e)}); growing its disk image instead")
+
+        # 2. The file, while nothing has it open.
+        username = spec.get("user") or namespace[len("whistler-user-"):]
+        holder = self.home_volume_holder(username, {**spec, "name": name})
+        if holder:
+            log.info(f"Home volume {namespace}/{name} is in use by {holder}; "
+                     f"its disk grows to {size} at that instance's next start")
+            return True
+        problem = self._grow_home_disk_image(namespace, name, claim,
+                                             int(parse_quantity(size)), log)
+        if problem:
+            log.error(f"Could not grow the disk of home volume "
+                      f"{namespace}/{name} to {size}: {problem}")
+            return self._record_grow(namespace, name, annotations,
+                                     f"{size}: {problem}")
+        log.info(f"Grew the disk of home volume {namespace}/{name} to {size}")
+        return self._record_grow(namespace, name, annotations, None,
+                                 disk_size=size)
+
+    def _record_grow(self, namespace: str, name: str,
+                     annotations: Dict[str, str], problem: Optional[str],
+                     disk_size: Optional[str] = None) -> bool:
+        patch_ = {}
+        if annotations.get(RESIZE_PROBLEM_ANNOTATION) != problem:
+            patch_[RESIZE_PROBLEM_ANNOTATION] = problem
+        if disk_size:
+            patch_[DISK_SIZE_ANNOTATION] = disk_size
+        if patch_:
+            try:
+                self.api.patch_namespaced_custom_object(
+                    self.group, self.version, namespace, HOME_VOLUME_PLURAL,
+                    name, {"metadata": {"annotations": patch_}})
+            except ApiException as e:
+                globals()["logger"].warning(
+                    f"Could not record the resize state of home volume "
+                    f"{namespace}/{name}: {e.reason}")
+        return problem is None
+
+    def _grow_home_disk_image(self, namespace: str, name: str, claim: str,
+                              size_bytes: int, log) -> Optional[str]:
+        """Run the grow pod against ``claim`` and wait for it. None on
+        success, else why not. The pod is always removed afterwards."""
+        core = client.CoreV1Api()
+        body = home_grow_pod_manifest(
+            name, claim, size_bytes, image=self.self_image,
+            pull_policy=self.self_image_pull_policy)
+        pod_name = body["metadata"]["name"]
+        try:
+            core.create_namespaced_pod(namespace, body)
+        except ApiException as e:
+            if e.status != 409:   # a leftover from an interrupted run
+                return f"could not start the resize pod: {_api_message(e)}"
+        try:
+            deadline = time.monotonic() + HOME_GROW_TIMEOUT
+            while time.monotonic() < deadline:
+                pod = core.read_namespaced_pod(pod_name, namespace)
+                phase = pod.status.phase if pod.status else None
+                if phase in ("Succeeded", "Failed"):
+                    term = _terminated_state(pod)
+                    message = ((term.message or "").strip() if term else "") \
+                        or phase
+                    return None if phase == "Succeeded" else message
+                time.sleep(1)
+            return (f"the resize pod did not finish within "
+                    f"{HOME_GROW_TIMEOUT}s (is the volume's node up?)")
+        except ApiException as e:
+            return f"lost track of the resize pod: {_api_message(e)}"
+        finally:
+            try:
+                core.delete_namespaced_pod(pod_name, namespace,
+                                           grace_period_seconds=0)
+            except ApiException as e:
+                if e.status != 404:
+                    log.warning(f"Could not remove resize pod "
+                                f"{namespace}/{pod_name}: {e.reason}")
 
     def _load_volume_definitions_from_file(self):
         try:

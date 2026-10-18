@@ -81,7 +81,13 @@ Until that lands, what the per-instance home costs, stated plainly:
   [Shared homes as a deployment option](security.md#shared-homes-as-a-deployment-option)
   still needs a file-level share and therefore still needs the gateway.
 - **Admin loses file-level inspection and backup.** It is an image.
-- **Resizing** needs a guest-side step after the PVC grows.
+- **Resizing** grows only, and grows the *file*: the claim's size is
+  nominal on local-path and NFS, and KubeVirt sizes `disk.img` from the claim
+  only when it creates or (with expansion) grows it. Since 2026-10-17 the
+  operator first expands the claim — KubeVirt then grows the file, live or at
+  boot — and where the class refuses, extends `disk.img` itself with a short
+  pod while no instance is running on it; the guest runs `resize2fs` after
+  mounting. See CLAUDE.md, "Homes grow".
 
 What it deletes, which is most of the difficulty this replaced: no ganesha on
 the VM path, no FSAL to crash, no `resolve_posix_filesystem` refusal, no

@@ -38,7 +38,7 @@
         {% for z in v.zones %}<div class="ui tiny blue label">{{ z }}</div>{% endfor %}
         {% if not v.zones %}<div class="ui tiny red label">no zone</div>{% endif %}
       </td>
-      <td>{{ v.size or "default" }}</td>
+      <td>{% set grow_action = "/admin/homevolumes/" ~ v.user ~ "/" ~ v.name ~ "/size?user=" ~ current_user %}{% include "user/_home_size.html" %}</td>
       <td><code style="font-size:0.85em">{{ v.pvcName }}</code></td>
       <td>
         {% if v.inUseBy %}

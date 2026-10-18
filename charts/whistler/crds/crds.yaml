@@ -1028,10 +1028,14 @@ spec:
                 size:
                   type: string
                   description: >-
-                    Requested size, e.g. "20Gi". Applied when the backing PVC
-                    is created and not afterwards — growing a home needs the
-                    PVC expanded and then the filesystem grown inside the
-                    guest, which is not automated.
+                    Requested size, e.g. "20Gi". The claim is created at
+                    this size. Raising it later grows the disk image on the
+                    claim — through the claim where its class can expand
+                    (KubeVirt then grows the file, live), else directly while
+                    no instance is running on it — and the guest grows the
+                    filesystem. Only grows. The operator records the result
+                    in the whistler/disk-size and whistler/resize-problem
+                    annotations.
                 storageClassName:
                   type: string
                   description: >-
