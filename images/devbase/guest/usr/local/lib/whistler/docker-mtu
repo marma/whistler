@@ -1,0 +1,86 @@
+#!/usr/bin/python3
+"""Give Docker's networks the MTU of the guest's uplink, every time dockerd starts.
+
+dockerd makes docker0 and every new network 1500 whatever the uplink is, and a
+session's uplink is whatever the cluster network hands KubeVirt: 1450 under
+flannel VXLAN, 1500 under host-gw, 8950 on jumbo frames. Above the uplink's MTU
+a container's packets are not refused, they are dropped on the way out, so
+small requests work and a TLS handshake or a `docker pull` stalls. A fixed
+value in daemon.json would be right on one cluster and wrong on the next, and
+a persistent root moves between them, so this reads it at start
+(ExecStartPre, docker.service.d/10-whistler-mtu.conf).
+
+Writes `mtu` (docker0) and the bridge driver's default
+`com.docker.network.driver.mtu` (`docker network create`, compose) into
+/etc/docker/daemon.json, keeping every other key, and only when they change.
+Networks created before keep the MTU they were made with. Never fails the
+start: with no default route it leaves the file alone. To pin your own MTU,
+delete the drop-in and `systemctl daemon-reload`.
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+DAEMON_JSON = "/etc/docker/daemon.json"
+MTU_OPT = "com.docker.network.driver.mtu"
+
+
+def uplink_mtu():
+    """MTU of the default route: its own `mtu` metric if set, else its device's."""
+    for family in ("-4", "-6"):
+        try:
+            out = subprocess.run(
+                ["ip", "-j", family, "route", "show", "default"],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            routes = json.loads(out or "[]")
+        except (OSError, subprocess.CalledProcessError, ValueError):
+            continue
+        for route in routes:
+            for metric in route.get("metrics") or []:
+                if isinstance(metric, dict) and metric.get("mtu"):
+                    return int(metric["mtu"])
+            dev = route.get("dev")
+            if dev:
+                try:
+                    with open(f"/sys/class/net/{dev}/mtu") as f:
+                        return int(f.read())
+                except (OSError, ValueError):
+                    pass
+    return None
+
+
+def main():
+    mtu = uplink_mtu()
+    if not mtu:
+        print("docker-mtu: no default route; leaving daemon.json alone", file=sys.stderr)
+        return
+    try:
+        with open(DAEMON_JSON) as f:
+            conf = json.load(f)
+    except FileNotFoundError:
+        conf = {}
+    except (OSError, ValueError) as e:
+        print(f"docker-mtu: cannot read {DAEMON_JSON} ({e}); leaving it alone", file=sys.stderr)
+        return
+
+    want = json.loads(json.dumps(conf))
+    want["mtu"] = mtu
+    opts = want.setdefault("default-network-opts", {}).setdefault("bridge", {})
+    opts[MTU_OPT] = str(mtu)
+    if want == conf:
+        return
+
+    tmp = DAEMON_JSON + ".whistler-tmp"
+    with open(tmp, "w") as f:
+        json.dump(want, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, DAEMON_JSON)
+    print(f"docker-mtu: Docker networks set to the uplink's MTU, {mtu}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

@@ -112,6 +112,13 @@ write_files:
       #       and the first `docker version` killed it.
       #   log-driver: local  rotates; the default json-file grows without
       #       bound on a root disk.
+      #   mtu, default-network-opts  NOT in the shipped file: written at each
+      #       dockerd start by /usr/local/lib/whistler/docker-mtu (an
+      #       ExecStartPre in guest/etc/systemd/system/docker.service.d) from
+      #       the uplink's MTU. Stock dockerd makes every network 1500, and a
+      #       pod network is often smaller (1450 under flannel VXLAN), where a
+      #       container's full-size packets are dropped; a fixed value would be
+      #       wrong on the next cluster.
       systemctl disable docker.service containerd.service
       systemctl enable docker.socket
 
@@ -139,6 +146,42 @@ write_files:
       # nvtop rides along: a GPU box wants a GPU top.
       if [ -n "@NVIDIA_DRIVER_PACKAGE@" ]; then
         $APT install -y --no-install-recommends "@NVIDIA_DRIVER_PACKAGE@" nvtop
+      fi
+
+      # --- NVIDIA Container Toolkit (cuda variant) -------------------------
+      # So `docker run --gpus all` (and compose's `driver: nvidia`
+      # reservations) reach the passed-through GPU. Not in Ubuntu's archive:
+      # NVIDIA's own repo, version pinned in build.sh. The signing key is
+      # checked against a pinned sha256 rather than trusted on first fetch
+      # (fingerprint C95B321B61E88C1809C4F759DDCAE044F796ECB0); apt reads the
+      # armored key as-is, so no gnupg is needed to dearmor it. The repo stays
+      # configured so `apt upgrade` can move it on a zone that reaches
+      # nvidia.github.io.
+      #
+      # All four packages pinned: the toolkit depends on the exact version of
+      # -base and the -tools, but libnvidia-container1 only by >=.
+      #
+      # The `nvidia` runtime is registered in daemon.json AFTER the guest
+      # payload below, which ships that file. Device nodes and the CDI spec
+      # (/var/run/cdi/nvidia.yaml, for `--device nvidia.com/gpu=all`) are made
+      # at session boot by the package's own nvidia-cdi-refresh, which udev
+      # starts when the nvidia module loads; there is no GPU at bake time.
+      if [ -n "@NVIDIA_CONTAINER_TOOLKIT_VERSION@" ]; then
+        NVCT_KEY=/usr/share/keyrings/nvidia-container-toolkit.asc
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey -o "$NVCT_KEY"
+        echo "c880576d6cf75a48e5027a871bac70fd0421ab07d2b55f30877b21f1c87959c9  $NVCT_KEY" | sha256sum -c -
+        chmod 0644 "$NVCT_KEY"
+        printf '%s\n' \
+          "Types: deb" \
+          "URIs: https://nvidia.github.io/libnvidia-container/stable/deb/amd64/" \
+          "Suites: /" \
+          "Signed-By: $NVCT_KEY" \
+          > /etc/apt/sources.list.d/nvidia-container-toolkit.sources
+        $APT update
+        V=@NVIDIA_CONTAINER_TOOLKIT_VERSION@
+        $APT install -y --no-install-recommends \
+          nvidia-container-toolkit="$V" nvidia-container-toolkit-base="$V" \
+          libnvidia-container-tools="$V" libnvidia-container1="$V"
       fi
 
       # --- VS Code Remote: keep the server off the NFS home ----------------
@@ -174,6 +217,13 @@ write_files:
       curl -fsS "$SEED/artifacts.tar.gz" | tar -xz --no-overwrite-dir -C /
       chmod 0755 /etc/update-motd.d/99-whistler-devbase
       chmod 0644 /etc/profile.d/50-whistler-devbase.sh
+      chmod 0755 /usr/local/lib/whistler/docker-mtu
+      # Now that the shipped daemon.json is in place: add the `nvidia` runtime
+      # to it (`--runtime=nvidia`, compose `runtime: nvidia`), keeping the
+      # other keys. Not the default runtime — `--gpus` does not need that.
+      if [ -n "@NVIDIA_CONTAINER_TOOLKIT_VERSION@" ]; then
+        nvidia-ctk runtime configure --runtime=docker
+      fi
 
       # What this image is, resolved once here instead of on every login (the
       # motd hook just cats it). Doubles as a build receipt: `cat
@@ -189,6 +239,9 @@ write_files:
         echo "  docker    $(dockerd --version | sed 's/^Docker version \([^,]*\).*/\1/')"
         if [ -n "@NVIDIA_DRIVER_PACKAGE@" ]; then
           echo "  nvidia    @NVIDIA_DRIVER_PACKAGE@ (GPU runtime; nvidia-smi, nvtop)"
+        fi
+        if [ -n "@NVIDIA_CONTAINER_TOOLKIT_VERSION@" ]; then
+          echo "  nvct      $(nvidia-ctk --version | head -1 | sed 's/.*version //') (docker run --gpus)"
         fi
       } > /etc/whistler-devbase-release
 

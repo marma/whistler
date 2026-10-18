@@ -24,7 +24,7 @@
 # PUSH=1 to docker-push, VARIANT (below), DISK_SIZE, QEMU_MEM (4096),
 # QEMU_SMP (min(8,nproc)), BASE_IMAGE_SERIAL (release = newest), BASE_IMAGE_URL, CACHE_DIR
 # (~/.cache/whistler/vm-images), BAKE_TIMEOUT (2700s), PIXI_VERSION,
-# NVIDIA_DRIVER_PACKAGE.
+# NVIDIA_DRIVER_PACKAGE, NVIDIA_CONTAINER_TOOLKIT_VERSION.
 #
 # TWO VARIANTS, selected by VARIANT and distinguished by the image NAME:
 #
@@ -35,7 +35,8 @@
 #                     nvidia-smi. This is what PyTorch/JAX wheels and Blender
 #                     actually load (they carry their own cudart/cuBLAS/cuDNN).
 #                     No nvcc, no CUDA headers, no docs — the same content
-#                     split as the -cuda desktop images.
+#                     split as the -cuda desktop images. Plus the NVIDIA
+#                     Container Toolkit, so `docker run --gpus` works.
 #
 # A template names the base image; a session with a GPU boots the -cuda one in
 # its place (gpu_image_variant in whistler/config.py). The CUDA *SDK* (nvcc,
@@ -87,11 +88,15 @@ PIXI_VERSION="${PIXI_VERSION:-0.76.2}"
 case "$VARIANT" in
   base)
     NVIDIA_DRIVER_PACKAGE=""
+    NVIDIA_CONTAINER_TOOLKIT_VERSION=""
     DISK_SIZE="${DISK_SIZE:-16G}"
     ;;
   cuda)
     # 26.04's open-kernel driver branch. A wrong name fails the bake.
     NVIDIA_DRIVER_PACKAGE="${NVIDIA_DRIVER_PACKAGE:-nvidia-driver-595-open}"
+    # NVIDIA's own apt repo (the toolkit is not in Ubuntu's archive); pinned
+    # like pixi, bump deliberately. The apt version string, epoch-less.
+    NVIDIA_CONTAINER_TOOLKIT_VERSION="${NVIDIA_CONTAINER_TOOLKIT_VERSION:-1.20.1-1}"
     IMAGE="${IMAGE}-cuda"
     DISK_SIZE="${DISK_SIZE:-24G}"
     ;;
@@ -131,6 +136,7 @@ sed -e "s/@HTTP_PORT@/$HTTP_PORT/g" \
     -e "s/@VARIANT@/$VARIANT/g" \
     -e "s/@PIXI_VERSION@/$PIXI_VERSION/g" \
     -e "s/@NVIDIA_DRIVER_PACKAGE@/$NVIDIA_DRIVER_PACKAGE/g" \
+    -e "s/@NVIDIA_CONTAINER_TOOLKIT_VERSION@/$NVIDIA_CONTAINER_TOOLKIT_VERSION/g" \
     bake/user-data.in > "$SEED_DIR/user-data"
 printf 'instance-id: whistler-bake\nlocal-hostname: bake\n' > "$SEED_DIR/meta-data"
 docker build -f bake/Dockerfile.bake -t whistler-vm-bake bake/

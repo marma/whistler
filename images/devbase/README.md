@@ -9,7 +9,7 @@ Two variants, one bake script:
 | VARIANT    | image                          | what it adds                                       | disk |
 |------------|--------------------------------|----------------------------------------------------|------|
 | `base`     | `whistler-devbase`             | the toolchain only; runs on any node                | 16G  |
-| `cuda`     | `whistler-devbase-cuda`        | + NVIDIA open driver = the GPU **runtime** (no nvcc)| 24G  |
+| `cuda`     | `whistler-devbase-cuda`        | + NVIDIA open driver = the GPU **runtime** (no nvcc), Container Toolkit | 24G  |
 
 ```bash
 make devbase-image                        # base + cuda
@@ -45,7 +45,7 @@ resolved versions; it is also the login MOTD. On Ubuntu 26.04:
 - vim, nano, tmux, htop, less, man.
 - **Docker** — `docker.io` from the archive, with the `compose` and `buildx`
   plugins; see [Docker](#docker).
-- `nvtop` in the two CUDA variants.
+- `nvtop` and the NVIDIA Container Toolkit in the `cuda` variant.
 
 ### pixi and $HOME
 
@@ -90,8 +90,36 @@ started. 198.18/15 is reserved for benchmarking and is not used on real
 networks. If it collides anyway, change `/etc/docker/daemon.json` and
 `sudo systemctl restart docker`.
 
-GPUs in containers (`docker run --gpus`) are not wired up: that needs the
-NVIDIA Container Toolkit, which is not in the Ubuntu archive.
+Docker's networks get the **MTU of the VM's uplink**, not Docker's fixed 1500.
+A session's uplink is whatever the cluster's pod network is: 1450 under
+flannel VXLAN (k3s's default), 1500 under `host-gw`, 8950 on jumbo frames.
+Above the uplink's MTU a container's packets are not refused but dropped on the
+way out, so small requests work and a TLS handshake or a `docker pull` hangs.
+Each time dockerd starts, `/usr/local/lib/whistler/docker-mtu` (an
+`ExecStartPre` in `/etc/systemd/system/docker.service.d/10-whistler-mtu.conf`)
+writes the uplink's MTU into `daemon.json` as `mtu` (the default bridge) and as
+the bridge driver's default `com.docker.network.driver.mtu` (`docker network
+create`, compose), leaving the other keys alone. A network created earlier
+keeps the MTU it was made with, so after a cluster's MTU changes, recreate it
+(`docker compose down && docker compose up`). To set your own MTU, delete the
+drop-in, `sudo systemctl daemon-reload`, and edit `daemon.json`.
+
+**GPUs in containers** work in the `cuda` variant, which bakes the NVIDIA
+Container Toolkit (from NVIDIA's apt repo, pinned by
+`NVIDIA_CONTAINER_TOOLKIT_VERSION` in build.sh; it is not in Ubuntu's archive):
+
+```bash
+docker run --rm --gpus all ubuntu nvidia-smi       # the toolkit mounts nvidia-smi in
+docker run --rm --device nvidia.com/gpu=all ...   # CDI
+docker run --rm --runtime=nvidia ...              # the registered runtime
+```
+
+Compose's `deploy.resources.reservations.devices` with `driver: nvidia` works
+too. The `nvidia` runtime is in `daemon.json` but is not the default. The CDI
+spec (`/var/run/cdi/nvidia.yaml`) is made at each boot by the toolkit's
+`nvidia-cdi-refresh`, which udev starts when the driver loads, and Docker
+waits for it. The image is pulled like any other, so the zone needs egress to
+its registry. The `base` variant has neither the driver nor the toolkit.
 
 ### VS Code Remote
 

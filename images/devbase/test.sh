@@ -124,8 +124,15 @@ check "nfs client"        'command -v mount.nfs4'
 # dockerd, containerd, runc and the overlay snapshotter work in the guest, as
 # the session user, without sudo.
 check "docker on demand"  'systemctl is-enabled -q docker.socket && ! systemctl is-active -q docker.service && echo "socket enabled, dockerd not started at boot"'
+# qemu user-net is 1500, which is what Docker would pick anyway. Shrink the
+# uplink to a VXLAN pod network's 1450 before the first `docker` starts dockerd,
+# so "docker mtu" below can tell docker-mtu's value from Docker's default.
+check "uplink at 1450"    'dev=$(ip -o -4 route show default | sed -n "s/.* dev \([^ ]*\).*/\1/p" | head -1) && test -n "$dev" && sudo ip link set dev "$dev" mtu 1450 && echo "$dev mtu 1450 before dockerd starts"'
 check "docker (no sudo)"  'docker version --format "server {{.Server.Version}}"'
 check "docker run"        'd=$(mktemp -d) && printf "#include <stdio.h>\nint main(){puts(\"container ok\");}\n" > $d/h.c && clang -static $d/h.c -o $d/h && tar -C $d -c h | docker import - whistler-test:h >/dev/null && docker run --rm --network none whistler-test:h /h'
+# What a container actually gets, on the default bridge and on a network made
+# afterwards (compose's path): its eth0 MTU, read from inside.
+check "docker mtu"        'd=$(mktemp -d) && printf "#include <stdio.h>\nint main(){FILE*f=fopen(\"/sys/class/net/eth0/mtu\",\"r\");int m=0;if(!f||fscanf(f,\"%%d\",&m)!=1)return 1;printf(\"%%d\\\\n\",m);return 0;}\n" > $d/m.c && clang -static $d/m.c -o $d/m && tar -C $d -c m | docker import - whistler-test:m >/dev/null && a=$(docker run --rm whistler-test:m /m) && docker network create whistler-mtu >/dev/null && b=$(docker run --rm --network whistler-mtu whistler-test:m /m); docker network rm whistler-mtu >/dev/null; test "$a" = 1450 && test "$b" = 1450 && echo "bridge $a, new network $b (uplink 1450)"'
 check "docker stays off-path" 'ip -4 -o addr show docker0 | grep -q " 198\.18\.0\.1/24 " && echo "docker0 198.18.0.1/24 (and this ssh survived it)"'
 check "compose + buildx"  'docker compose version && docker buildx version >/dev/null'
 check "no desktop baked"  '! command -v Xvfb >/dev/null && ! systemctl list-unit-files 2>/dev/null | grep -q whistler-streamer && echo "no X, no streamer (server image)"'
@@ -134,6 +141,12 @@ check "no desktop baked"  '! command -v Xvfb >/dev/null && ! systemctl list-unit
 # passthrough device, so it is only reported.
 if "${SSH[@]}" 'command -v nvidia-smi >/dev/null' 2>/dev/null; then
   echo "note: nvidia-smi present (GPU runtime baked); it cannot run here — no passthrough GPU under this qemu"
+  # The container toolkit: no GPU here either, so this checks the wiring, not
+  # a `--gpus` run. dockerd is already up (and docker-mtu has rewritten
+  # daemon.json), so a registered runtime also proves the MTU rewrite kept it.
+  check "nvidia-ctk"           'nvidia-ctk --version | head -1'
+  check "docker nvidia runtime" 'docker info --format "{{json .Runtimes}}" | grep -q "\"nvidia\"" && echo "nvidia runtime registered (mtu $(docker network inspect -f "{{index .Options \"com.docker.network.driver.mtu\"}}" bridge) kept beside it)"'
+  check "cdi refresh on boot"  'systemctl is-enabled -q nvidia-cdi-refresh.path && test -f /lib/udev/rules.d/99-nvidia-cdi-refresh.rules && echo "nvidia-cdi-refresh enabled; udev starts it on module load"'
 fi
 
 # Regression guard shared with the desktop images: once the NFS home shadows
