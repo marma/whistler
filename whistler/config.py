@@ -1670,6 +1670,20 @@ class KubeConfigManager(ConfigManager):
         # gateway must agree on the string.
         self.ssh_domain_suffix = os.environ.get(
             "WHISTLER_SSH_DOMAIN_SUFFIX", ".w")
+        # How users reach the gateway (`whistler.ssh.gateway`), for the
+        # stanza `ssh <gateway> ssh-config` prints and the launcher's help.
+        # The gateway cannot know the name or port it was dialled by (a
+        # NodePort, a load balancer), so the chart says; unset, both surfaces
+        # print a placeholder for the user to fill in.
+        self.ssh_gateway_host = (
+            os.environ.get("WHISTLER_SSH_GATEWAY_HOST", "").strip() or None)
+        try:
+            self.ssh_gateway_port = int(
+                os.environ.get("WHISTLER_SSH_GATEWAY_PORT", "") or 0) or None
+        except ValueError:
+            logger.warning("Ignoring WHISTLER_SSH_GATEWAY_PORT=%r: not a port",
+                           os.environ.get("WHISTLER_SSH_GATEWAY_PORT"))
+            self.ssh_gateway_port = None
         # Per-user NFS storage gateway (VM homes): image plus values-level
         # placement/limits, passed by the chart as JSON envs (nodeSelector
         # and resources are maps, which a plain env var can't carry).

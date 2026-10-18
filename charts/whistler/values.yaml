@@ -341,6 +341,19 @@ whistler:
   ssh:
     domainSuffix: ".w"
 
+    # How users reach the gateway, for the ~/.ssh/config that
+    # `ssh <gateway> ssh-config` prints (and the launcher's `?` screen). The
+    # gateway cannot know the name or port it was dialled by, so say it here:
+    # host is a DNS name or address, port the externally reachable one (a
+    # NodePort, a load balancer port) and omitted when it is 22. Unset, the
+    # stanza says `HostName <gateway-host>` for the user to fill in. The
+    # stanza's gateway alias is derived from domainSuffix
+    # (`whistler-gateway-w`), so two installs' stanzas can share one file —
+    # give them different suffixes.
+    gateway:
+      host: ""
+      port: null
+
     # The pre-ProxyJump username convention: `ssh user-myinstance@gateway`
     # meaning "connect user to myinstance". DEPRECATED — instances are
     # addressed by name now — and kept for one release so muscle memory and

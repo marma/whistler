@@ -70,9 +70,12 @@ async def test_ssh_config_emits_both_host_blocks(make_config):
     await sess._run_gateway_command("ssh-config")
 
     out = sess._chan.out
-    assert "Host whistler-gateway" in out
-    assert "Host *.w" in out
-    assert "ProxyJump whistler-gateway" in out
+    assert "Host whistler-gateway-w\n" in out
+    assert "Host *.w\n" in out
+    assert "ProxyJump whistler-gateway-w\n" in out
+    # Nothing told the chart where the gateway is: say so, don't guess.
+    assert "HostName <gateway-host>" in out
+    assert "Port " not in out
     assert "    User alice" in out
     # Unindented Host lines: this is appended to a config file.
     assert "\nHost *.w" in out
@@ -174,3 +177,28 @@ async def test_over_a_real_channel_the_output_is_appendable(make_config):
     assert known_hosts.stdout == "@cert-authority *.w ssh-ed25519 AAAAFAKE\n"
     assert "Host *.w" in config.stdout and "ProxyJump" in config.stdout
     assert unknown.exit_status == 1 and "known-hosts" in unknown.stderr
+
+
+@pytest.mark.asyncio
+async def test_ssh_config_names_the_gateway_the_chart_was_given(make_config):
+    sess = _session(make_config, ssh_gateway_host="ssh.example.com",
+                    ssh_gateway_port=30022)
+    await sess._run_gateway_command("ssh-config")
+
+    out = sess._chan.out
+    assert "    HostName ssh.example.com\n    Port 30022\n" in out
+    assert "<gateway-host>" not in out
+
+
+@pytest.mark.asyncio
+async def test_two_installs_stanzas_do_not_collide(make_config):
+    """Appending a second install's stanza must give its instances their own
+    gateway: OpenSSH takes the first matching value, so a shared alias meant
+    the second block was never read."""
+    outs = []
+    for suffix in (".w", ".wp"):
+        sess = _session(make_config, ssh_domain_suffix=suffix)
+        await sess._run_gateway_command("ssh-config")
+        outs.append(sess._chan.out)
+    assert "ProxyJump whistler-gateway-w\n" in outs[0]
+    assert "ProxyJump whistler-gateway-wp\n" in outs[1]

@@ -31,7 +31,9 @@ from textual.containers import Container, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from whistler.status import status_group
 import asyncio
+import fnmatch
 import logging
+import re
 
 logger = logging.getLogger("whistler.tui")
 
@@ -177,8 +179,34 @@ LOGO = _square_block(r"""
  ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝╚══════╝   ╚═╝   ╚══════╝╚══════╝╚═╝  ╚═╝""")
 
 
+def gateway_alias(suffix: str) -> str:
+    """The ``Host`` alias the gateway gets in ``~/.ssh/config``.
+
+    Named after the suffix so two installs' stanzas can sit in one file
+    (``whistler-gateway-w`` beside ``whistler-gateway-wp``): a single fixed
+    alias meant the second ``ssh-config`` appended a block OpenSSH never
+    reads, since the first match wins, and its instances jumped through the
+    wrong gateway. Dots become dashes rather than staying, because
+    ``whistler-gateway.w`` would match ``Host *.w`` and jump through itself.
+    """
+    tag = re.sub(r"[^A-Za-z0-9]+", "-", suffix).strip("-")
+    return f"whistler-gateway-{tag}" if tag else "whistler-gateway"
+
+
+def gateway_destination(username: str, host: str | None = None,
+                        port: int | None = None) -> tuple[str, str]:
+    """``(jump, login)`` for reaching the gateway by hand: the ``-J`` spec,
+    and the arguments an ``ssh`` that logs in to the gateway itself takes.
+    The placeholder stands in for a host the chart was not told."""
+    host = host or GATEWAY_HOST_PLACEHOLDER
+    if not port or int(port) == 22:
+        return f"{username}@{host}", f"{username}@{host}"
+    return f"{username}@{host}:{port}", f"-p {port} {username}@{host}"
+
+
 def ssh_config_stanza(username: str, suffix: str,
-                      gateway_host: str = GATEWAY_HOST_PLACEHOLDER) -> str:
+                      gateway_host: str | None = None,
+                      gateway_port: int | None = None) -> str:
     """The ``~/.ssh/config`` a jump needs, as plain unindented text.
 
     One consumer now: ``ssh <gateway> ssh-config``, which prints it for
@@ -186,18 +214,33 @@ def ssh_config_stanza(username: str, suffix: str,
     stopped — a terminal in mouse-reporting mode hands drags to the
     application instead of selecting text, so the on-screen copy was the one
     thing here nobody could actually copy, and it was most of the screen.
+
+    ``gateway_host``/``gateway_port`` are what the chart says the gateway is
+    reached as (``whistler.ssh.gateway``); unset, the host is a placeholder
+    for the user to fill in, since the gateway cannot know the name it was
+    dialled by.
     """
-    return "\n".join([
-        "Host whistler-gateway",
-        f"    HostName {gateway_host}",
+    alias = gateway_alias(suffix)
+    pattern = f"*{suffix}"
+    # A suffix without a leading dot can still make the alias match its own
+    # instance pattern; a negation keeps the gateway from jumping via itself.
+    host_line = (f"Host {pattern} !{alias}"
+                 if fnmatch.fnmatchcase(alias, pattern) else f"Host {pattern}")
+    gateway = [
+        f"Host {alias}",
+        f"    HostName {gateway_host or GATEWAY_HOST_PLACEHOLDER}",
+    ]
+    if gateway_port and int(gateway_port) != 22:
+        gateway.append(f"    Port {gateway_port}")
+    return "\n".join(gateway + [
         f"    User {username}",
         "    AddKeysToAgent yes",
         "    ControlMaster auto",
         "    ControlPath ~/.ssh/cm-%C",
         "    ControlPersist 10m",
         "",
-        f"Host *{suffix}",
-        "    ProxyJump whistler-gateway",
+        host_line,
+        f"    ProxyJump {alias}",
         f"    User {username}",
         "    AddKeysToAgent yes",
         "    ControlMaster auto",
@@ -241,12 +284,15 @@ class SshHelpScreen(ModalScreen):
     """
 
     def __init__(self, username: str, suffix: str, known_hosts: str | None,
-                 example: str):
+                 example: str, gateway_host: str | None = None,
+                 gateway_port: int | None = None):
         super().__init__()
         self.username = username
         self.suffix = suffix
         self.known_hosts = known_hosts
         self.example = example
+        self.gateway_host = gateway_host
+        self.gateway_port = gateway_port
 
     def help_text(self) -> str:
         """The instructions, as plain text — built here rather than inline in
@@ -259,12 +305,13 @@ class SshHelpScreen(ModalScreen):
         `ssh <gateway> ssh-config` puts it there. What is worth showing is the
         explicit `-J` form, because that one *is* typed by hand — it is how
         you reach an instance before any config exists."""
-        gw = f"{self.username}@{GATEWAY_HOST_PLACEHOLDER}"
+        jump, gw = gateway_destination(
+            self.username, self.gateway_host, self.gateway_port)
         body = [
             "[b]Direct ssh access[/b] — access to running instances uses",
             "the SSH ProxyJump capability, which can be used explicitly:",
             "",
-            f"    ssh -J {gw} {self.username}@{self.example}{self.suffix}",
+            f"    ssh -J {jump} {self.username}@{self.example}{self.suffix}",
             "",
             "Configuration for the proxy can be retrieved from the gateway",
             "and added permanently to [b]~/.ssh/config[/b]:",
@@ -516,7 +563,9 @@ class WhistlerApp(App):
     def action_ssh_help(self) -> None:
         example = self._get_selected_instance() or "<instance>"
         self.push_screen(SshHelpScreen(
-            self.username, self.suffix, self._known_hosts or None, example))
+            self.username, self.suffix, self._known_hosts or None, example,
+            gateway_host=getattr(self.config_manager, "ssh_gateway_host", None),
+            gateway_port=getattr(self.config_manager, "ssh_gateway_port", None)))
 
     def action_connect_instance(self) -> None:
         """Hand this session over to the instance.

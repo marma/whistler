@@ -928,7 +928,10 @@ class WhistlerSession(asyncssh.SSHServerSession):
         elif name == "ssh-config":
             out(ssh_config_stanza(
                 self.username,
-                getattr(cm, "ssh_domain_suffix", "")).replace("\n", nl) + nl)
+                getattr(cm, "ssh_domain_suffix", ""),
+                gateway_host=getattr(cm, "ssh_gateway_host", None),
+                gateway_port=getattr(cm, "ssh_gateway_port", None),
+            ).replace("\n", nl) + nl)
         else:
             err(f"Unknown gateway command '{name}'.{nl}"
                 f"Try one of: known-hosts, ssh-config — or connect to an "

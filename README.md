@@ -451,6 +451,9 @@ whistler:
 
   ssh:
     domainSuffix: ".w"       # client-side convention; nothing resolves it
+    gateway:
+      host: ssh.example.com  # what `ssh <gateway> ssh-config` names the gateway
+      port: 22               # externally reachable port; omit for 22
 
   # Named egress postures. A session picks one via its template and changes
   # zone only on reboot. "default" exists whether or not you define it.

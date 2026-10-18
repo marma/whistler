@@ -249,6 +249,23 @@ async def test_ssh_help_screen_shows_the_three_commands(make_config):
 
 
 @pytest.mark.asyncio
+async def test_ssh_help_screen_uses_the_configured_gateway(make_config):
+    cm = _config(make_config, sessions=[_vm("box")])
+    cm.ssh_gateway_host, cm.ssh_gateway_port = "ssh.example.com", 30022
+    app = WhistlerApp(config_manager=cm, username="alice")
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one("#instances_table").focus()
+        app.action_ssh_help()
+        await pilot.pause()
+        text = app.screen.help_text()
+        assert "ssh -J alice@ssh.example.com:30022 alice@box.w" in text
+        assert "ssh -p 30022 alice@ssh.example.com ssh-config" in text
+        assert "<gateway-host>" not in text
+
+
+@pytest.mark.asyncio
 async def test_ssh_help_screen_does_not_reprint_the_config_stanza(make_config):
     """It is 16 lines whose only use is being in a file, and the command
     beside it puts them there — while a terminal in mouse mode won't let you

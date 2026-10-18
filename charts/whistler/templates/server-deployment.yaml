@@ -47,6 +47,18 @@ spec:
               value: "{{ .Release.Name }}-ssh-ca"
             - name: WHISTLER_SSH_DOMAIN_SUFFIX
               value: {{ .Values.whistler.ssh.domainSuffix | quote }}
+            # What `ssh <gateway> ssh-config` and the launcher's help name
+            # the gateway as; unset prints a placeholder.
+            {{- with .Values.whistler.ssh.gateway }}
+            {{- if .host }}
+            - name: WHISTLER_SSH_GATEWAY_HOST
+              value: {{ .host | quote }}
+            {{- end }}
+            {{- if .port }}
+            - name: WHISTLER_SSH_GATEWAY_PORT
+              value: {{ .port | quote }}
+            {{- end }}
+            {{- end }}
             - name: WHISTLER_LEGACY_USERNAME_ROUTING
               value: {{ .Values.whistler.ssh.legacyUsernameRouting | quote }}
             - name: WHISTLER_FORCE_KATA_FOR_PRIVILEGED

@@ -28,7 +28,8 @@ class FakeConfigManager(ConfigManager):
                  desktop_templates=None, desktop_sessions=None, gpu_types=None,
                  zones=None, ssh_targets=None, ssh_domain_suffix=".w",
                  ssh_ca_public_key=None, vm_access_keys=None, groups=None,
-                 home_volumes=None, home_volume_holders=None):
+                 home_volumes=None, home_volume_holders=None,
+                 ssh_gateway_host=None, ssh_gateway_port=None):
         self.users: Dict[str, Dict[str, Any]] = users or {}
         # {group name: spec} — resolved through the same pure helpers the real
         # manager uses, so a test of the fake is a test of the rule.
@@ -36,6 +37,8 @@ class FakeConfigManager(ConfigManager):
         # {username: {name: {...resolve_ssh_target dict...}}} for jump routing.
         self._ssh_targets: Dict[str, Dict[str, Any]] = ssh_targets or {}
         self.ssh_domain_suffix = ssh_domain_suffix
+        self.ssh_gateway_host = ssh_gateway_host
+        self.ssh_gateway_port = ssh_gateway_port
         self.started: List[tuple] = []
         # (user, instance, run_overrides) for each start — see
         # trigger_instance_start.
