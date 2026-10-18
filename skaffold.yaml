@@ -33,6 +33,15 @@ deploy:
           # k3d/docker-desktop have no "kata" RuntimeClass, so coercing
           # privileged templates to kata would leave pods unschedulable.
           whistler.security.forceKataForPrivileged: false
+          # No pre-delete hook, so stopping skaffold (which `helm uninstall`s)
+          # removes only what Helm rendered: user namespaces, Sessions,
+          # HomeVolumes and running VMs survive, and the next operator adopts
+          # them. With the hook, every Ctrl-C deleted the user namespaces and
+          # took a "final" backup. Better still, skip the uninstall entirely
+          # with `skaffold dev --cleanup=false` (or SKAFFOLD_CLEANUP=false):
+          # that keeps the install id too, so the backup service doesn't see
+          # a new install and offer a restore at the next admin login.
+          uninstall.enabled: false
           server.service.type: NodePort
           server.service.nodePort: 30022
           # Real passwords (whistler/passwords.py). The bootstrap admin's
