@@ -3,6 +3,7 @@
 Pure manifest assertions (no cluster); the e2e path is exercised by
 tests/integration/test_vm.py on clusters that have KubeVirt installed."""
 import pytest
+import yaml
 
 from whistler.config import (KubeConfigManager, PolicyError,
                              VM_RUN_STRATEGY_RUNNING)
@@ -498,8 +499,45 @@ def test_patch_is_none_when_nothing_changed():
     # Server-defaulted fields we never set must not read as drift.
     current["template"]["spec"]["architecture"] = "amd64"
     current["template"]["spec"]["domain"]["machine"] = {"type": "q35"}
-    current["template"]["spec"]["domain"]["firmware"] = {"uuid": "abc"}
     assert _patch(current) is None
+
+
+def _firmware_uuid(vm):
+    return vm["spec"]["template"]["spec"]["domain"]["firmware"]["uuid"]
+
+
+def test_firmware_uuid_is_stable_for_unchanged_user_data():
+    """The UUID is cloud-init's instance-id: if it moved between reconciles
+    of an unchanged session, every boot would be a "new instance"."""
+    assert _firmware_uuid(_build()) == _firmware_uuid(_build())
+
+
+def test_firmware_uuid_follows_the_user_data():
+    """A key added after first boot must change the instance-id, or a
+    persistent root never applies it (cloud-init reuses cached user-data)."""
+    more_keys = {"name": "alice", "uid": 1001,
+                 "publicKeys": ["ssh-ed25519 AAA alice", "ssh-ed25519 BBB new"]}
+    assert (_firmware_uuid(_build())
+            != _firmware_uuid(_build(user_details=more_keys)))
+    # Same document, another VM: still distinct.
+    assert (_firmware_uuid(_build())
+            != _firmware_uuid(_build(session_name="alice-other")))
+
+
+def test_patch_replaces_kubevirts_default_firmware_uuid():
+    """The upgrade path: a VM created before this carries KubeVirt's own
+    UUID, and replacing it is what makes its next boot re-apply."""
+    current = _build()["spec"]
+    current["template"]["spec"]["domain"]["firmware"] = {"uuid": "abc"}
+    patch = _patch(current)
+    assert patch["template"]["spec"]["domain"]["firmware"]["uuid"] == (
+        _firmware_uuid(_build()))
+
+
+def test_new_instance_keeps_the_guests_host_keys():
+    """A changed document is a new cloud-init instance, and cc_ssh deletes
+    host keys on one by default — a host-key-changed warning per edit."""
+    assert yaml.safe_load(_cloud_init())["ssh_deletekeys"] is False
 
 
 def test_patch_excludes_run_strategy():

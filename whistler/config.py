@@ -24,7 +24,8 @@ import yaml
 from xml.etree import ElementTree
 
 from whistler.cloudinit import (HOME_DISK_SERIAL, S3_PROXY_BUCKET,
-                                build_user_data, resolve_uid, resolve_gid)
+                                build_user_data, instance_uuid, resolve_uid,
+                                resolve_gid)
 from whistler import dataset_accounts, hostca, passwords, reattach
 
 logger = logging.getLogger(__name__)
@@ -4923,7 +4924,13 @@ class KubeConfigManager(ConfigManager):
             "stringData": {"userdata": user_data},
         }
 
-        domain = {"devices": devices}
+        # The cloud-init instance-id: changes exactly when the user-data does,
+        # so a persistent root re-applies keys, certificate and mounts on the
+        # next boot instead of never (cloudinit.instance_uuid).
+        domain = {"devices": devices,
+                  "firmware": {"uuid": instance_uuid(
+                      self._get_user_namespace(username), session_name,
+                      user_data)}}
         vm_spec = {
             # runStrategy (not `running`) so stop/start is a spec patch:
             # Halted = stopped-but-existing, RerunOnFailure = running (and

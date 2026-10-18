@@ -59,6 +59,8 @@ was considered and deferred; it adds a Secret lifecycle and UI surface for no
 additional isolation.)
 """
 
+import uuid
+
 import yaml
 
 from .hostca import (DEFAULT_HOST_KEY_PATHS, GUEST_HOST_CERT_PATH,
@@ -98,6 +100,30 @@ DATASET_MOUNT_LINK = "/shared"
 # volume because S3 bucket naming is far narrower than Whistler volume naming
 # (no uppercase, no underscores, 3-63 chars).
 S3_PROXY_BUCKET = "data"
+
+
+# Namespace for instance_uuid; any fixed UUID works, this one is uuid4 once.
+_INSTANCE_UUID_NAMESPACE = uuid.UUID("5b0b8f0e-6a8e-4c43-9a51-0f2a3f6c2e1d")
+
+
+def instance_uuid(namespace: str, name: str, user_data: str) -> str:
+    """The firmware UUID for a VM, derived from its user-data.
+
+    KubeVirt gives NoCloud no meta-data of its own, so the cloud-init
+    instance-id is ``domain.firmware.uuid`` (``cloudInitUUIDFromVMI`` in
+    pkg/cloud-init), which is fixed for a VM's lifetime. cloud-init runs its
+    per-instance modules (users, ssh keys, write_files, runcmd) once per
+    instance-id and otherwise reuses its *cached* user-data — so on a
+    persistent root a key added after first boot, a re-issued host
+    certificate or a newly chosen dataset never reached the guest, even
+    though the operator kept the Secret current. Hashing the document into
+    the UUID makes a changed document a new instance, applied on the next
+    boot; an unchanged one keeps its UUID, so this needs ``build_user_data``
+    to be deterministic. Name and namespace are in the hash so two VMs with
+    identical documents still differ.
+    """
+    return str(uuid.uuid5(_INSTANCE_UUID_NAMESPACE,
+                          f"{namespace}/{name}\n{user_data}"))
 
 
 def build_user_data(*, username: str, uid: int, ssh_keys: list,
@@ -406,6 +432,12 @@ exit 0
         ])
     doc = {
         "hostname": hostname,
+        # A changed user-data is a new cloud-init *instance* (see
+        # instance_uuid), and on a new instance cc_ssh deletes and regenerates
+        # the image's host keys by default. On a persistent root that would
+        # be a host-key-changed warning for every client that pinned the
+        # plain key, once per config change. Missing keys are still generated.
+        "ssh_deletekeys": False,
         # Early mount kick (see module docstring): bootcmd runs in the init
         # stage BEFORE write_files, so poll for the script and run it as
         # soon as it lands — detached (setsid, fds closed) so cloud-init is
