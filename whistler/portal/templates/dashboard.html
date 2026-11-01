@@ -45,6 +45,35 @@
 {% endif %}
 
 <h3 class="ui header" style="margin-top:2rem">
+  <i class="hdd icon"></i>
+  <div class="content">Node disk
+    <div class="sub header">
+      Where VM scratch disks and root overlays are written, per node. Their
+      sizes are ceilings, not reservations: what new writes come out of is
+      the free space here. A node that runs out pauses the VMs writing to it,
+      and kubelet starts evicting pods at 10% free by default.
+    </div>
+  </div>
+</h3>
+{% for d in res.disks %}
+  {% if d.error %}
+  <div class="resource-meter">
+    <div class="resource-meter-header">
+      <span>{{ d.node }}</span>
+      <span class="meta">unavailable</span>
+    </div>
+    <p style="color:#767676; margin:0">{{ d.error }}</p>
+  </div>
+  {% else %}
+  {% with title=d.node ~ " (" ~ d.freeGiB ~ " GiB free)", view=d %}
+  {% include "_resource_meter.html" %}
+  {% endwith %}
+  {% endif %}
+{% else %}
+<p style="color:#767676">No nodes found.</p>
+{% endfor %}
+
+<h3 class="ui header" style="margin-top:2rem">
   <i class="play icon"></i>
   <div class="content">Running Instances</div>
 </h3>

@@ -100,6 +100,19 @@ spec:
                         must have that many reserved or the VM never
                         schedules. Set to "" to opt this template out and run
                         it on 4KiB pages.
+                    scratchSize:
+                      type: string
+                      description: >-
+                        VM-only. Capacity of a scratch disk (a KubeVirt
+                        emptyDisk) mounted at /scratch, e.g. "512Gi". Blank at
+                        every start and discarded at every stop; an in-guest
+                        reboot keeps it. /var/lib/docker, /var/lib/containerd
+                        and /var/tmp live on it. A ceiling, not a
+                        reservation: the disk is a sparse image on the node's
+                        own disk and nothing checks the size against what the
+                        node has, so the node runs out when guests actually
+                        write past it (the VM pauses). Absent means no scratch
+                        disk.
                 nodeSelector:
                   type: object
                   additionalProperties:

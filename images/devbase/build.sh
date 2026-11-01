@@ -85,11 +85,15 @@ BAKE_TIMEOUT="${BAKE_TIMEOUT:-2700}"
 # would be per-user, un-updatable by a rebuild, and shadowed across images.)
 PIXI_VERSION="${PIXI_VERSION:-0.76.2}"
 
+# DISK_SIZE is the root's virtual size, and 64G costs nothing: the qcow2 is
+# sparse, `qemu-img convert` drops the unused space, and a containerDisk root
+# is a per-VMI overlay that is discarded at stop. Sizing it to the toolchain
+# (16G) is what made a few `docker pull`s fill the root.
 case "$VARIANT" in
   base)
     NVIDIA_DRIVER_PACKAGE=""
     NVIDIA_CONTAINER_TOOLKIT_VERSION=""
-    DISK_SIZE="${DISK_SIZE:-16G}"
+    DISK_SIZE="${DISK_SIZE:-64G}"
     ;;
   cuda)
     # 26.04's open-kernel driver branch. A wrong name fails the bake.
@@ -98,7 +102,7 @@ case "$VARIANT" in
     # like pixi, bump deliberately. The apt version string, epoch-less.
     NVIDIA_CONTAINER_TOOLKIT_VERSION="${NVIDIA_CONTAINER_TOOLKIT_VERSION:-1.20.1-1}"
     IMAGE="${IMAGE}-cuda"
-    DISK_SIZE="${DISK_SIZE:-24G}"
+    DISK_SIZE="${DISK_SIZE:-64G}"
     ;;
   *)
     echo "ERROR: VARIANT must be one of: base, cuda (got '$VARIANT')" >&2

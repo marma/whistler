@@ -76,3 +76,6 @@ templates:
     resources:
       cpu: "4"
       memory: 8Gi
+      # /scratch: Docker and /var/tmp, emptied at every stop. A
+      # sparse image on the node's disk: a ceiling, not a reservation.
+      scratchSize: 512Gi

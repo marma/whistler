@@ -591,3 +591,37 @@ def test_patch_updates_image_and_zone_labels():
     patch = _patch(current, template_spec={"image": "new:2"})
     volumes = patch["template"]["spec"]["volumes"]
     assert volumes[0]["containerDisk"]["image"] == "new:2"
+
+
+# --- the scratch disk ------------------------------------------------------ #
+
+def _scratch_template(size):
+    return {"image": "quay.io/example/desktop:latest",
+            "resources": {"scratchSize": size}}
+
+
+def test_scratch_size_attaches_an_empty_disk_found_by_serial():
+    from whistler.cloudinit import SCRATCH_DISK_SERIAL, SCRATCH_DISK_PATH
+    vm, secret = _build_both(template_spec=_scratch_template("512Gi"))
+    spec = vm["spec"]["template"]["spec"]
+    vol = next(v for v in spec["volumes"] if v["name"] == "scratchdisk")
+    # emptyDisk: blank at every VMI start, gone at its end.
+    assert vol == {"name": "scratchdisk", "emptyDisk": {"capacity": "512Gi"}}
+    disk = next(d for d in spec["domain"]["devices"]["disks"]
+                if d["name"] == "scratchdisk")
+    assert disk["serial"] == SCRATCH_DISK_SERIAL
+    assert SCRATCH_DISK_PATH in secret["stringData"]["userdata"]
+
+
+def test_no_scratch_size_no_scratch_disk():
+    spec = _build()["spec"]["template"]["spec"]
+    assert not any(v["name"] == "scratchdisk" for v in spec["volumes"])
+    assert "whistlerscratch" not in _cloud_init()
+
+
+@pytest.mark.parametrize("bad", ["512GB", "lots", "0", "-1Gi"])
+def test_unparseable_scratch_size_refuses_the_session(bad):
+    # Not a silent drop: a VM that put Docker back on its root would be found
+    # much later than a session that says why it did not start.
+    with pytest.raises(PolicyError, match="scratchSize"):
+        _build(template_spec=_scratch_template(bad))

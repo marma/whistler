@@ -73,6 +73,21 @@ STREAMER_ENV_PATH = "/etc/whistler/streamer.env"
 # alphanumeric — KubeVirt caps the serial and udev does not escape it.
 HOME_DISK_SERIAL = "whistlerhome"
 HOME_DISK_PATH = f"/dev/disk/by-id/virtio-{HOME_DISK_SERIAL}"
+# The scratch disk (template resources.scratchSize): a KubeVirt emptyDisk,
+# blank at every VMI start and gone at its end, mounted at SCRATCH_MOUNT.
+# Same serial contract as the home disk.
+SCRATCH_DISK_SERIAL = "whistlerscratch"
+SCRATCH_DISK_PATH = f"/dev/disk/by-id/virtio-{SCRATCH_DISK_SERIAL}"
+SCRATCH_MOUNT = "/scratch"
+# System directories that live on the scratch disk instead of the root: what
+# fills a root disk in practice. Bind-mounted from SCRATCH_MOUNT/.system/<name>
+# before containerd or dockerd can start. Not all of /var: that would hide the
+# image's dpkg database, apt state and /var/lib/cloud.
+SCRATCH_SYSTEM_BINDS = {
+    "docker": "/var/lib/docker",
+    "containerd": "/var/lib/containerd",
+    "var-tmp": "/var/tmp",
+}
 # Root-only: it holds the keys that open this session's dataset proxies.
 RCLONE_CONF_PATH = "/etc/whistler/rclone.conf"
 # Where datasets are really mounted, and the friendly path symlinked to it.
@@ -133,7 +148,8 @@ def build_user_data(*, username: str, uid: int, ssh_keys: list,
                     autologin: bool = True, desktop: bool = False,
                     streamer_env: dict = None,
                     display_port: int = None,
-                    host_key: bytes = None, host_cert: str = None) -> str:
+                    host_key: bytes = None, host_cert: str = None,
+                    scratch_disk: bool = False) -> str:
     """Return a ``#cloud-config`` userData document for cloudInitNoCloud.
 
     ``home_disk`` is whether this session has a per-instance home disk to
@@ -168,6 +184,16 @@ def build_user_data(*, username: str, uid: int, ssh_keys: list,
     per-session Service and the portal proxy are built from) always wins
     over a stray streamerEnv override — they must agree or the viewer
     can't reach the streamer.
+
+    ``scratch_disk`` is whether the VM carries a scratch emptyDisk (template
+    ``resources.scratchSize``). It is formatted when blank and mounted at
+    ``/scratch`` from bootcmd, which runs before sysinit.target and so before
+    containerd or dockerd could write to the root; ``/var/lib/docker``,
+    ``/var/lib/containerd`` and ``/var/tmp`` are bind-mounted onto it;
+    ``~/.cache`` stays on the home. The disk
+    lives as long as the VMI: an in-guest reboot keeps it (hence format only
+    when blank), a stop discards it, so nothing on it can outlive the run —
+    or cross into another zone.
     """
     home = f"/home/{username}"
     keys = list(ssh_keys or [])
@@ -474,6 +500,57 @@ exit 0
         "write_files": write_files,
         "runcmd": ["systemctl daemon-reload"],
     }
+    if scratch_disk:
+        # Synchronous, in bootcmd, and before the home poller below. bootcmd
+        # runs in cloud-init.service, which is ordered Before=sysinit.target:
+        # earlier than containerd or a socket-activated dockerd can start, so
+        # neither ever writes to the root in place of the scratch disk. A unit
+        # written by write_files could not promise that on first boot — it
+        # lands after the boot transaction is already computed. bootcmd runs
+        # on every boot, which is what a persistent root needs too.
+        #
+        # A subshell, because `exit` in a bootcmd entry would end the whole
+        # bootcmd script and take the home poller with it.
+        #
+        # Format only when blkid finds nothing: an in-guest reboot keeps the
+        # VMI and so the disk, and its contents with it. The same blkid guard
+        # as the home, though here the cost of being wrong is scratch data.
+        # -m 0: no root reservation on scratch. nodiscard: the disk is a fresh
+        # sparse image, so mkfs's whole-device discard is time for nothing.
+        # Mounted with `discard` so what the guest deletes is handed back to
+        # the node at once; the image lives on the node's disk, shared with
+        # every other VM there, and fstrim.timer is weekly.
+        # Not nosuid/nodev (unlike the home): this is system space, and
+        # Docker's image layers live on it.
+        binds = "".join(
+            f'    mkdir -p {SCRATCH_MOUNT}/.system/{name} {path}\n'
+            f'    mountpoint -q {path} || mount --bind'
+            f' {SCRATCH_MOUNT}/.system/{name} {path}\n'
+            for name, path in SCRATCH_SYSTEM_BINDS.items())
+        doc["bootcmd"].append(
+            "(\n"
+            f"    DISK={SCRATCH_DISK_PATH}\n"
+            f"    mountpoint -q {SCRATCH_MOUNT} && exit 0\n"
+            "    i=0\n"
+            '    while [ ! -e "$DISK" ] && [ "$i" -lt 30 ]; do'
+            " i=$((i + 1)); sleep 1; done\n"
+            '    [ -e "$DISK" ] || { echo "whistler: scratch disk $DISK never'
+            ' appeared" >&2; exit 1; }\n'
+            "    command -v blkid >/dev/null 2>&1 || { echo \"whistler: blkid"
+            ' missing; not formatting $DISK" >&2; exit 1; }\n'
+            '    if ! blkid "$DISK" >/dev/null 2>&1; then\n'
+            "        mkfs.ext4 -q -m 0 -E nodiscard -L whistler-scratch"
+            ' "$DISK" || exit 1\n'
+            "    fi\n"
+            f"    mkdir -p {SCRATCH_MOUNT}\n"
+            f'    mount -o discard "$DISK" {SCRATCH_MOUNT} || exit 1\n'
+            # The space is the session user's; the system part is root's.
+            f"    chown {uid}:{gid} {SCRATCH_MOUNT}\n"
+            f"    mkdir -p {SCRATCH_MOUNT}/.system\n"
+            f"    chmod 0755 {SCRATCH_MOUNT}/.system\n"
+            f"{binds}"
+            "    chmod 1777 /var/tmp\n"
+            ")")
     if home_disk:
         # Early mount kick (see module docstring): bootcmd runs in the init
         # stage BEFORE write_files, so poll for the script and run it as soon

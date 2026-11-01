@@ -6,10 +6,10 @@ set up for development out of the box.
 
 Two variants, one bake script:
 
-| VARIANT    | image                          | what it adds                                       | disk |
+| VARIANT    | image                          | what it adds                                       | root (virtual) |
 |------------|--------------------------------|----------------------------------------------------|------|
-| `base`     | `whistler-devbase`             | the toolchain only; runs on any node                | 16G  |
-| `cuda`     | `whistler-devbase-cuda`        | + NVIDIA open driver = the GPU **runtime** (no nvcc), Container Toolkit | 24G  |
+| `base`     | `whistler-devbase`             | the toolchain only; runs on any node                | 64G  |
+| `cuda`     | `whistler-devbase-cuda`        | + NVIDIA open driver = the GPU **runtime** (no nvcc), Container Toolkit | 64G  |
 
 ```bash
 make devbase-image                        # base + cuda
@@ -74,9 +74,13 @@ at boot, so sessions that never use it don't pay for it at startup. A container
 with a restart policy therefore stays down after a reboot until the socket is
 touched; `sudo systemctl enable docker` restores the stock behaviour.
 
-Images and containers live in `/var/lib/docker` on the **root disk**, not the
-home. On a containerDisk boot that disk is ephemeral and 16G (24G for `-cuda`),
-so pulled images are gone at the next session and large ones fill it. Pulling
+Images and containers live in `/var/lib/docker`, never on the home. With a
+**scratch disk** (template `resources.scratchSize`, `512Gi` on the dev
+template) that directory, `/var/lib/containerd` and `/var/tmp` are
+bind-mounted onto it at boot, before containerd or dockerd can start. Without
+one they are on the root disk, which on a containerDisk boot is 64G (virtual;
+it occupies only what is written). Either way they are emptied at every stop,
+so pulled images are gone at the next session. Pulling
 also needs a zone with egress to the registry (`registry-1.docker.io`,
 `production.cloudflare.docker.com` for Docker Hub). Container logs use the
 `local` driver, which rotates.

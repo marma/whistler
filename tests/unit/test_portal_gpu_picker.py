@@ -239,3 +239,13 @@ def test_viewer_is_desktop_only_and_enum_bound():
     for bad in (None, "", "rdp"):
         d = _template_form_data(**{**_TPL_BASE, "mode": "desktop", "viewer": bad})
         assert "viewer" not in d, bad
+
+
+def test_scratch_size_is_written_and_an_empty_box_removes_it():
+    # The save replaces the whole resources map, so an empty box is how a
+    # template loses its scratch disk.
+    data = _template_form_data(**_TPL_BASE, gpu_type=GPU_NONE,
+                               scratch_size=" 512Gi ")
+    assert data["resources"]["scratchSize"] == "512Gi"
+    data = _template_form_data(**_TPL_BASE, gpu_type=GPU_NONE, scratch_size="")
+    assert "scratchSize" not in data["resources"]

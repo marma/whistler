@@ -8,7 +8,8 @@ import yaml
 from whistler.cloudinit import (
     build_user_data, resolve_uid, resolve_gid, HOME_DISK_PATH,
     HOME_DISK_SERIAL, S3_PROXY_BUCKET, DATASET_MOUNT_ROOT,
-    DATASET_MOUNT_LINK,
+    DATASET_MOUNT_LINK, SCRATCH_DISK_PATH, SCRATCH_MOUNT,
+    SCRATCH_SYSTEM_BINDS,
 )
 
 MOUNT_SCRIPT = "/usr/local/sbin/whistler-mount-home"
@@ -524,3 +525,73 @@ def test_primary_group_defaults_to_uid_when_gid_omitted():
 # --------------------------------------------------------------------------- #
 # Directory delegations                                                        #
 
+
+
+# --- the scratch disk ------------------------------------------------------ #
+
+def _scratch_cmd(**overrides):
+    (cmd,) = [c for c in _doc(scratch_disk=True, **overrides)["bootcmd"]
+              if SCRATCH_DISK_PATH in c]
+    return cmd
+
+
+def test_no_scratch_disk_emits_nothing_and_leaves_the_document_unchanged():
+    # Byte-identical, not merely equivalent: the document is hashed into the
+    # firmware UUID (instance_uuid), so a change here would re-run cloud-init
+    # on every existing VM for nothing.
+    plain = build_user_data(username="alice", uid=1001, ssh_keys=[],
+                            hostname="desk")
+    assert plain == build_user_data(username="alice", uid=1001, ssh_keys=[],
+                                    hostname="desk", scratch_disk=False)
+    assert SCRATCH_MOUNT not in plain
+
+
+def test_scratch_mounted_synchronously_in_bootcmd_before_the_home_poller():
+    # Synchronous in bootcmd (cloud-init.service, Before=sysinit.target) is
+    # what keeps containerd/dockerd from writing to the root first; before
+    # the home poller so ~/.cache has somewhere to bind to.
+    bootcmd = _doc(scratch_disk=True)["bootcmd"]
+    at = next(i for i, c in enumerate(bootcmd) if SCRATCH_DISK_PATH in c)
+    poller = next(i for i, c in enumerate(bootcmd) if "setsid" in c)
+    assert at < poller
+    cmd = bootcmd[at]
+    assert not cmd.rstrip().endswith("&")
+    # A subshell: an `exit` must not end the bootcmd script and the poller.
+    assert cmd.startswith("(") and cmd.rstrip().endswith(")")
+
+
+def test_scratch_formatted_only_when_blank_and_never_forced():
+    # An in-guest reboot keeps the VMI and so the disk's contents.
+    cmd = _scratch_cmd()
+    assert 'if ! blkid "$DISK"' in cmd
+    assert "command -v blkid" in cmd
+    assert "mkfs.ext4" in cmd and " -F" not in cmd
+
+
+def test_scratch_hosts_docker_containerd_and_var_tmp_but_not_all_of_var():
+    cmd = _scratch_cmd()
+    for name, path in SCRATCH_SYSTEM_BINDS.items():
+        assert f"mount --bind {SCRATCH_MOUNT}/.system/{name} {path}" in cmd
+    # Hiding /var would hide the image's dpkg database and cloud-init state.
+    assert set(SCRATCH_SYSTEM_BINDS.values()) == {
+        "/var/lib/docker", "/var/lib/containerd", "/var/tmp"}
+    assert "chmod 1777 /var/tmp" in cmd
+
+
+def test_scratch_belongs_to_the_session_user_and_frees_space_on_delete():
+    cmd = _scratch_cmd(gid=2002)
+    assert f"chown 1001:2002 {SCRATCH_MOUNT}" in cmd
+    # The image is on the node's disk, shared with every VM there.
+    assert f'mount -o discard "$DISK" {SCRATCH_MOUNT}' in cmd
+
+
+def test_cache_stays_on_the_home():
+    # ~/.cache is not moved to scratch: the home mount script is the same
+    # with or without a scratch disk.
+    assert _script(scratch_disk=True) == _script()
+    assert ".cache" not in _scratch_cmd()
+
+
+def test_scratch_shell_parses():
+    for text in (_scratch_cmd(), _script(scratch_disk=True), _script()):
+        subprocess.run(["sh", "-n"], input=text, text=True, check=True)

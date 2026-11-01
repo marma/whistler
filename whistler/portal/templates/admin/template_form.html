@@ -119,7 +119,7 @@
              value="{{ tpl.description if tpl else '' }}">
     </div>
 
-    <div class="two fields">
+    <div class="three fields">
       <div class="field">
         <label>CPU</label>
         <input name="cpu" type="text" placeholder="500m"
@@ -131,6 +131,16 @@
         <input name="memory" type="text" placeholder="512Mi"
                value="{{ (tpl.resources or {}).get('memory', '') if tpl else '' }}">
         <div class="ui pointing label">e.g. 512Mi, 4Gi</div>
+      </div>
+      <div class="field">
+        <label>Scratch disk</label>
+        <input name="scratch_size" type="text" placeholder="none"
+               value="{{ (tpl.resources or {}).get('scratchSize', '') if tpl else '' }}">
+        <div class="ui pointing label">
+          VM only, e.g. 512Gi. Mounted at <code>/scratch</code>, holds Docker and
+          <code>/var/tmp</code>, emptied at every stop.
+          A ceiling on the node's disk, not a reservation. Empty: no scratch disk.
+        </div>
       </div>
     </div>
 

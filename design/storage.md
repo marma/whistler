@@ -830,6 +830,48 @@ visible only as the server pod's `Init:Error` and the check's log line — the
 portal does not show it yet. On an RWO claim every dataset's server must land
 on one node; Kubernetes enforces that by leaving the others Pending.
 
+## Scratch: owned by the run, not the user
+
+**Decided 2026-11-01.** Temporary files and Docker's images are what fill a
+disk, and none of them belong to a person: they belong to a run. Giving them
+their own disk with a lifetime they cannot outlive means nobody has to know how
+to clean them, and gives every user scratch space without a dataset per user.
+
+A template's `resources.scratchSize` gives each VM a KubeVirt **`emptyDisk`**
+of that capacity: a sparse qcow2 in the virt-launcher pod (on the node's own
+disk, under `/var/run/libvirt/empty-disks/`), created with the VMI and deleted
+with it. The guest formats it when it is blank and mounts it at `/scratch`
+(owned by the session user), with `/var/lib/docker`, `/var/lib/containerd`
+and `/var/tmp` bound onto it. Not all of `/var`, which would hide
+the image's dpkg database and cloud-init state. The mount is a synchronous
+`bootcmd`, because cloud-init.service is ordered before `sysinit.target` and so
+before containerd or a socket-activated dockerd can write to the root. Docker in devbase
+uses the containerd image store, so binding `/var/lib/docker` alone would have
+missed the images.
+
+**Zones:** the disk lives exactly as long as the VMI. An in-guest reboot keeps
+it (so the guest formats only a blank disk), a stop discards it, and a run
+never changes zone. Nothing on it can reach another zone, so the access matrix
+has nothing to say about it.
+
+**A ceiling, not a reservation.** Measured on KubeVirt 1.9.0: four 2Ti
+emptyDisks started on a node with 222G free, each holding 224KiB, and the
+launcher requests a flat `ephemeral-storage: 50M` whatever the sizes. What runs
+out is the node, when guests actually write, and the disks run with
+`error_policy='stop'`: qemu pauses the VM rather than the guest seeing ENOSPC,
+unless kubelet's disk-pressure eviction gets there first (it evicts the
+launcher furthest past its request, i.e. the biggest scratch user). Size it to
+what the node's disk can hold for the VMs that land there, and watch the node.
+The scratch filesystem is mounted with `discard`, so deleted data goes back to
+the node at once: a 512Gi disk took 46M fresh, 2.3G after a `docker pull` plus
+2G written, and 60M after deleting both (k3s-metal, 2026-11-01).
+
+**What it costs:** Docker images are pulled again at every start, and in a
+zone without egress they cannot be. `~/.cache` (pip, uv, rattler/pixi,
+HuggingFace, torch) stays on the home for the same reason: moving it was
+considered and dropped, because a cache that survives restarts is what users
+expect, and in a no-egress zone it is effectively data.
+
 ## Still open
 
 - **Securing external access** — TLS on the external host, running behind a

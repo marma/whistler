@@ -118,3 +118,61 @@ def test_hugepage_quantities_picks_out_the_pools():
     assert _hugepage_quantities({"cpu": "4", "memory": "1Gi", "hugepages-2Mi": "2Gi",
                                  "hugepages-1Gi": "0"}) == {"2Mi": "2Gi", "1Gi": "0"}
     assert _hugepage_quantities(None) == {}
+
+
+# --- node disk (kubelet /stats/summary) ------------------------------------ #
+
+def _stats(capacity, available, pods=()):
+    return {"node": {"fs": {"capacityBytes": capacity,
+                            "availableBytes": available}},
+            "pods": [{"podRef": {"namespace": ns, "name": name},
+                      "ephemeral-storage": {"usedBytes": used}}
+                     for ns, name, used in pods]}
+
+
+def test_node_disk_splits_whistler_pods_from_everything_else():
+    G = 2**30
+    stats = {"n1": _stats(1000 * G, 300 * G, [
+        ("whistler-alice", "virt-launcher-box-abcde", 40 * G),
+        ("whistler-bob", "virt-launcher-spot-fghij", 10 * G),
+        ("kube-system", "coredns-1", 1 * G),
+    ])}
+    buckets = {("whistler-alice", "virt-launcher-box-abcde"): "whistler",
+               ("whistler-bob", "virt-launcher-spot-fghij"): "whistlerPreemptible",
+               ("kube-system", "coredns-1"): "other"}
+    (d,) = KubeConfigManager._summarize_node_disks(stats, buckets)
+    assert d == {"node": "n1", "total": 1000 * G, "free": 300 * G,
+                 "whistler": 40 * G, "whistlerPreemptible": 10 * G,
+                 # Used but not Whistler's: OS, images, other pods.
+                 "other": 650 * G}
+
+
+def test_node_disk_is_per_node_and_an_unreadable_node_keeps_its_row():
+    stats = {"b": _stats(100, 50), "a": "URLError: timed out"}
+    rows = KubeConfigManager._summarize_node_disks(stats, {})
+    assert [r["node"] for r in rows] == ["a", "b"]
+    assert rows[0] == {"node": "a", "error": "URLError: timed out"}
+    assert rows[1]["free"] == 50 and rows[1]["other"] == 50
+
+
+def test_node_disk_pods_without_a_known_bucket_count_as_other():
+    # A pod that started after the pod list was read is not Whistler's yet.
+    stats = {"n": _stats(100, 40, [("x", "new-pod", 20)])}
+    (d,) = KubeConfigManager._summarize_node_disks(stats, {})
+    assert d["whistler"] == 0 and d["other"] == 60
+
+
+def test_dashboard_disk_view_carries_errors_and_free_space():
+    from whistler.portal.management import _dashboard_resource_views
+    G = 2**30
+    zero = {"total": 0, "free": 0, "whistler": 0,
+            "whistlerPreemptible": 0, "other": 0}
+    view = _dashboard_resource_views({
+        "cpu": zero, "memory": zero, "gpus": [],
+        "disks": [{"node": "a", "error": "no"},
+                  {"node": "b", "total": 100 * G, "free": 25 * G,
+                   "whistler": 5 * G, "whistlerPreemptible": 0,
+                   "other": 70 * G}]})
+    assert view["disks"][0] == {"node": "a", "error": "no"}
+    b = view["disks"][1]
+    assert b["freeGiB"] == 25.0 and b["used"] == 75.0 and b["unit"] == "GiB"

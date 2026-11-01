@@ -1149,7 +1149,8 @@ def _resource_meter_view(summary: dict, *, unit: str, to_display=float, decimals
 
 
 def _dashboard_resource_views(resources: dict) -> dict:
-    """Build the CPU/memory/hugepage/per-GPU-type meter view-models for dashboard.html."""
+    """Build the CPU/memory/hugepage/per-GPU-type/per-node-disk meter
+    view-models for dashboard.html."""
     gib = lambda v: float(v) / (1024 ** 3)  # noqa: E731
     return {
         "cpu": _resource_meter_view(resources["cpu"], unit="cores"),
@@ -1161,6 +1162,13 @@ def _dashboard_resource_views(resources: dict) -> dict:
         "gpus": [
             {"type": g["type"], **_resource_meter_view(g, unit="GPUs", to_display=int, decimals=0)}
             for g in resources["gpus"]
+        ],
+        # Per node: an unreadable node keeps its row, with the reason.
+        "disks": [
+            {"node": d["node"], "error": d["error"]} if "error" in d else
+            {"node": d["node"], "freeGiB": round(gib(d["free"]), 1),
+             **_resource_meter_view(d, unit="GiB", to_display=gib)}
+            for d in resources.get("disks", [])
         ],
     }
 
@@ -1399,6 +1407,7 @@ async def admin_template_create(
     description:    Annotated[Optional[str], Form()] = None,
     cpu:            Annotated[Optional[str], Form()] = None,
     memory:         Annotated[Optional[str], Form()] = None,
+    scratch_size:   Annotated[Optional[str], Form()] = None,
     gpu:            Annotated[Optional[str], Form()] = None,
     gpu_type:       Annotated[Optional[str], Form()] = None,
     mode:           Annotated[str, Form()] = "ssh",
@@ -1412,6 +1421,7 @@ async def admin_template_create(
     data = _template_form_data(
         name=slug.strip(), display_name=display_name, image=image,
         description=description, cpu=cpu, memory=memory, gpu=gpu, gpu_type=gpu_type,
+        scratch_size=scratch_size,
         mode=mode, runtime=runtime, privileged=privileged, fuse=fuse,
         display_port=display_port, viewer=viewer, zone=zone,
     )
@@ -1445,6 +1455,7 @@ async def admin_template_update(
     description:    Annotated[Optional[str], Form()] = None,
     cpu:            Annotated[Optional[str], Form()] = None,
     memory:         Annotated[Optional[str], Form()] = None,
+    scratch_size:   Annotated[Optional[str], Form()] = None,
     gpu:            Annotated[Optional[str], Form()] = None,
     gpu_type:       Annotated[Optional[str], Form()] = None,
     mode:           Annotated[str, Form()] = "ssh",
@@ -1458,6 +1469,7 @@ async def admin_template_update(
     data = _template_form_data(
         name=name, display_name=display_name, image=image,
         description=description, cpu=cpu, memory=memory, gpu=gpu, gpu_type=gpu_type,
+        scratch_size=scratch_size,
         mode=mode, runtime=runtime, privileged=privileged, fuse=fuse,
         display_port=display_port, viewer=viewer, zone=zone,
     )
@@ -2697,7 +2709,7 @@ def _build_session_overrides(*, cpu=None, memory=None,
 def _template_form_data(*, name, display_name, image, description, cpu, memory,
                         mode, runtime, privileged, fuse,
                         display_port, viewer, gpu=None, gpu_type=None,
-                        zone=None) -> dict:
+                        zone=None, scratch_size=None) -> dict:
     """Assemble a save_system_template payload from the admin template form,
     including the access mode / runtime / privileged toggles. Desktop-only
     fields are only included when mode == 'desktop'. gpu (count) maps to
@@ -2725,8 +2737,11 @@ def _template_form_data(*, name, display_name, image, description, cpu, memory,
         "displayName": display_name.strip(),
         "image": image.strip(),
         "description": (description or "").strip(),
+        # scratchSize is VM-only and ignored by the pod builder; an empty box
+        # removes it, since the save replaces the whole resources map.
         "resources": _nonempty({"cpu": cpu, "memory": memory,
-                                "gpu": "" if no_gpu else gpu}),
+                                "gpu": "" if no_gpu else gpu,
+                                "scratchSize": scratch_size}),
         "nodeSelector": _nonempty({GPU_NODE_LABEL: "" if no_gpu else gpu_type}),
         "mode": mode if mode in ("ssh", "desktop") else "ssh",
         "runtime": runtime if runtime in ("container", "kata", "vm") else "container",

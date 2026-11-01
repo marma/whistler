@@ -24,6 +24,7 @@ import yaml
 from xml.etree import ElementTree
 
 from whistler.cloudinit import (HOME_DISK_SERIAL, S3_PROXY_BUCKET,
+                                SCRATCH_DISK_SERIAL,
                                 build_user_data, instance_uuid, resolve_uid,
                                 resolve_gid)
 from whistler import dataset_accounts, hostca, passwords, reattach
@@ -2396,6 +2397,36 @@ class KubeConfigManager(ConfigManager):
             f"multiple VM GPU types available "
             f"({[e['name'] for e in vm_capable]}); the template must pin one "
             f"via its gpuType")
+
+    @staticmethod
+    def _vm_scratch_size(resources: Dict[str, Any]) -> Optional[str]:
+        """The capacity of this VM's scratch emptyDisk, or None for none.
+
+        A ceiling, not a reservation: KubeVirt creates the emptyDisk as a
+        sparse qcow2 on the node (virt-launcher's /var/run/libvirt), and
+        nothing — scheduler, kubelet, KubeVirt — checks it against the node's
+        disk. Measured on KubeVirt 1.9.0: four 2Ti emptyDisks started on a
+        node with 222G free, each holding 224KiB, with a flat 50M
+        ephemeral-storage request on the launcher. What runs out is the node,
+        when guests actually write: qemu pauses the VM (error_policy=stop),
+        or kubelet evicts the launcher using the most past its request.
+
+        An unparseable size refuses the session rather than starting it
+        without the disk: "512GB" (not a Kubernetes quantity) is the likely
+        typo, and a VM that silently put Docker back on its root would be
+        found much later than a session that says why it did not start."""
+        raw = resources.get('scratchSize')
+        if raw in (None, ""):
+            return None
+        size = str(raw).strip()
+        try:
+            if parse_quantity(size) <= 0:
+                raise ValueError("must be positive")
+        except (ValueError, TypeError) as e:
+            raise PolicyError(
+                f"invalid scratchSize {raw!r} ({e}); use a Kubernetes "
+                f"quantity such as 512Gi")
+        return size
 
     def _vm_shutdown_grace(self, resources: Dict[str, Any]) -> int:
         """Seconds this guest gets to shut down cleanly before the domain is
@@ -4848,6 +4879,14 @@ class KubeConfigManager(ConfigManager):
                 "serial": HOME_DISK_SERIAL,
                 "disk": {"bus": "virtio"},
             })
+        scratch_size = self._vm_scratch_size(resources)
+        if scratch_size:
+            # Found by serial, like the home (cloudinit.SCRATCH_DISK_PATH).
+            devices["disks"].append({
+                "name": "scratchdisk",
+                "serial": SCRATCH_DISK_SERIAL,
+                "disk": {"bus": "virtio"},
+            })
         gpu_count = requested_gpu_count(resources)
         if gpu_count:
             # Presence is not enough: a zero count must attach nothing. A
@@ -4904,6 +4943,7 @@ class KubeConfigManager(ConfigManager):
             display_port=display_port if desktop_stream else None,
             host_key=host_key,
             host_cert=host_cert,
+            scratch_disk=bool(scratch_size),
         )
 
         if image_url:
@@ -5003,7 +5043,12 @@ class KubeConfigManager(ConfigManager):
                     ] + ([
                         {"name": "homedisk", "persistentVolumeClaim": {
                             "claimName": home_pvc}},
-                    ] if home_pvc else []),
+                    ] if home_pvc else []) + ([
+                        # Blank at every VMI start, deleted at its end: the
+                        # lifetime is what keeps scratch from crossing zones.
+                        {"name": "scratchdisk", "emptyDisk": {
+                            "capacity": scratch_size}},
+                    ] if scratch_size else []),
                 },
             },
         }
@@ -9817,6 +9862,7 @@ class KubeConfigManager(ConfigManager):
             pod_items = []
 
         pod_requests = []
+        pod_buckets: Dict[Tuple[str, str], str] = {}
         for pod in pod_items:
             if pod.status.phase in ("Succeeded", "Failed") or pod.metadata.deletion_timestamp:
                 continue
@@ -9856,8 +9902,124 @@ class KubeConfigManager(ConfigManager):
                 "bucket": bucket, "cpu": cpu, "memory": memory,
                 "hugepages": hugepages, "gpuType": gpu_type, "gpuCount": gpu_count,
             })
+            pod_buckets[(pod.metadata.namespace, pod.metadata.name)] = bucket
 
-        return self._summarize_cluster_resources(nodes, pod_requests)
+        result = self._summarize_cluster_resources(nodes, pod_requests)
+        result["disks"] = self._summarize_node_disks(
+            self._node_fs_stats(node_items), pod_buckets)
+        return result
+
+    # Kubelet stats are fetched per dashboard load, one request per node in
+    # parallel; a node that does not answer in time reads as unavailable
+    # rather than holding up the page.
+    _KUBELET_STATS_TIMEOUT = 3.0
+    _SERVICE_ACCOUNT_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+    def _node_fs_stats(self, node_items) -> Dict[str, Any]:
+        """``{node name: kubelet /stats/summary JSON, or an error string}``.
+
+        In the cluster the portal asks each kubelet **directly**, with its
+        own token: kubelet authorizes ``/stats/*`` as the ``nodes/stats``
+        subresource, which is all rbac.yaml grants. Not through the API
+        server's node proxy, which needs ``nodes/proxy`` — and that verb is
+        command execution on every node via the kubelet's exec endpoints, not
+        a read permission. The kubelet's serving certificate is verified
+        against the cluster CA (k3s signs it with that CA and puts the node
+        IP in it); one that does not verify is reported, never trusted, since
+        the request carries the portal's token.
+
+        Out of the cluster (a portal run from a workstation) there is no
+        token file, so it goes through the API server proxy with whatever the
+        kubeconfig holds."""
+        from concurrent.futures import ThreadPoolExecutor
+        token_path = os.path.join(self._SERVICE_ACCOUNT_DIR, "token")
+        in_cluster = os.path.exists(token_path)
+
+        def fetch(node):
+            name = node.metadata.name
+            try:
+                if in_cluster:
+                    return name, self._kubelet_summary_direct(node, token_path)
+                resp = client.CoreV1Api().connect_get_node_proxy_with_path(
+                    name, "stats/summary", _preload_content=False,
+                    _request_timeout=self._KUBELET_STATS_TIMEOUT)
+                return name, json.loads(resp.data)
+            except Exception as e:  # noqa: BLE001 — one node must not sink the page
+                logger.warning(f"Disk stats for node {name} unavailable: {e}")
+                return name, f"{type(e).__name__}: {e}"
+
+        if not node_items:
+            return {}
+        with ThreadPoolExecutor(max_workers=min(8, len(node_items))) as pool:
+            return dict(pool.map(fetch, node_items))
+
+    def _kubelet_summary_direct(self, node, token_path: str) -> Dict[str, Any]:
+        import ssl
+        import urllib.request
+        address = next((a.address for a in (node.status.addresses or [])
+                        if a.type == "InternalIP"), None)
+        if not address:
+            raise RuntimeError("node has no InternalIP")
+        endpoint = getattr(getattr(node.status, "daemon_endpoints", None),
+                           "kubelet_endpoint", None)
+        port = getattr(endpoint, "port", None) or 10250
+        host = f"[{address}]" if ":" in address else address
+        ctx = ssl.create_default_context(
+            cafile=os.path.join(self._SERVICE_ACCOUNT_DIR, "ca.crt"))
+        with open(token_path) as f:
+            token = f.read().strip()
+        req = urllib.request.Request(
+            f"https://{host}:{port}/stats/summary",
+            headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=self._KUBELET_STATS_TIMEOUT,
+                                    context=ctx) as resp:
+            return json.loads(resp.read())
+
+    @staticmethod
+    def _summarize_node_disks(stats: Dict[str, Any],
+                              pod_buckets: Dict[Tuple[str, str], str]
+                              ) -> List[Dict[str, Any]]:
+        """Per-node disk meters for the dashboard. Pure.
+
+        Per node, not cluster-wide like CPU: a VM's scratch disk and root
+        overlay are written on the node it runs on, so free space on one node
+        is no help to a VM on another.
+
+        The filesystem is kubelet's ``node.fs`` — the one holding pod
+        emptyDirs, which is where a virt-launcher keeps a VM's emptyDisks
+        (``/var/run/libvirt/empty-disks``) and its containerDisk overlay.
+        Whistler's share is the pods' ``ephemeral-storage.usedBytes`` (what
+        those sparse images actually occupy, as kubelet measures it — by a
+        periodic du, so it trails writes by a minute or two; free space is
+        read off the filesystem and is current), split
+        by the same buckets as the CPU meter; ``other`` is the rest of what
+        is used: the OS, images, other pods, the root reservation. Free is
+        ``availableBytes``, which is what writes come out of — scratch sizes
+        are ceilings, so the sum of them says nothing.
+
+        A node whose stats could not be read is listed with its ``error``,
+        so a node that cannot be measured is not mistaken for one with no
+        disk."""
+        out = []
+        for name in sorted(stats):
+            data = stats[name]
+            if not isinstance(data, dict):
+                out.append({"node": name, "error": str(data)})
+                continue
+            fs = (data.get("node") or {}).get("fs") or {}
+            total = int(fs.get("capacityBytes") or 0)
+            free = int(fs.get("availableBytes") or 0)
+            used = {"whistler": 0, "whistlerPreemptible": 0}
+            for pod in data.get("pods") or []:
+                ref = pod.get("podRef") or {}
+                bucket = pod_buckets.get((ref.get("namespace"), ref.get("name")))
+                if bucket in used:
+                    used[bucket] += int(
+                        (pod.get("ephemeral-storage") or {}).get("usedBytes") or 0)
+            other = max(total - free - sum(used.values()), 0)
+            out.append({"node": name, "total": total, "free": free,
+                        "other": other, **used})
+        return out
 
     def _summarize_cluster_resources(self, nodes: List[Dict[str, Any]],
                                      pod_requests: List[Dict[str, Any]]) -> Dict[str, Any]:

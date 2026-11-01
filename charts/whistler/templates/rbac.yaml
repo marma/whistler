@@ -246,6 +246,13 @@ rules:
   - apiGroups: [kubevirt.io]
     resources: [kubevirts]
     verbs: [get, list]
+  # Dashboard node-disk meters: the portal asks each kubelet's /stats/summary
+  # directly, which kubelet authorizes as nodes/stats. Deliberately NOT
+  # nodes/proxy (the API server's node proxy): that verb reaches the
+  # kubelet's exec endpoints, i.e. a shell in any pod on any node.
+  - apiGroups: [""]
+    resources: [nodes/stats]
+    verbs: [get]
 
   # Web terminal: the portal shells out to `kubectl exec` into the session pod
   # (whistler.portal.terminal), so it needs the pods/exec subresource — same
